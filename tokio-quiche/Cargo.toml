@@ -40,6 +40,9 @@ capture_keylogs = []
 # Enable scheduling & poll duration histograms for tokio tasks.
 tokio-task-metrics = []
 
+# Enable multicast client receive integration backed by mcrx-core.
+multicast = ["dep:mcrx-core"]
+
 [lints.rust]
 # capture_keylogs: enable SSLKEYLOGFILE capturing for QUIC connections.
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(capture_keylogs)'] }
@@ -57,6 +60,7 @@ futures = { workspace = true }
 futures-util = { workspace = true }
 ipnetwork = { workspace = true }
 log = { workspace = true }
+mcrx-core = { workspace = true, optional = true }
 octets = { workspace = true }
 pin-project = { workspace = true }
 quiche = { workspace = true, features = ["boringssl-boring-crate", "qlog"] }

@@ -26,6 +26,7 @@
 
 use std::convert::TryInto;
 
+use crate::multicast;
 use crate::Error;
 use crate::Result;
 
@@ -184,6 +185,8 @@ pub enum Frame {
     DatagramHeader {
         length: usize,
     },
+
+    Multicast(multicast::Frame),
 }
 
 impl Frame {
@@ -331,6 +334,10 @@ impl Frame {
 
             0x30 | 0x31 => parse_datagram_frame(frame_type, b)?,
 
+            _ if multicast::is_frame_type(frame_type) => Frame::Multicast(
+                multicast::Frame::decode_from_type(frame_type, b)?,
+            ),
+
             _ => return Err(Error::InvalidFrame),
         };
 
@@ -353,6 +360,10 @@ impl Frame {
             (_, Frame::ACK { .. }) => true,
             (_, Frame::Crypto { .. }) => true,
             (_, Frame::ConnectionClose { .. }) => true,
+
+            // Multicast control frames are only carried on 1-RTT packets.
+            (packet::Type::Short, Frame::Multicast(..)) => true,
+            (_, Frame::Multicast(..)) => false,
 
             // All frames are allowed on 0-RTT and 1-RTT packets.
             (packet::Type::Short, _) => true,
@@ -593,6 +604,10 @@ impl Frame {
             },
 
             Frame::DatagramHeader { .. } => (),
+
+            Frame::Multicast(frame) => {
+                frame.encode(b)?;
+            },
         }
 
         Ok(before - b.cap())
@@ -808,6 +823,8 @@ impl Frame {
                 2 + // length, always encode as 2-byte varint
                 *length // data
             },
+
+            Frame::Multicast(frame) => frame.wire_len(),
         }
     }
 
@@ -818,7 +835,8 @@ impl Frame {
             Frame::Padding { .. } |
                 Frame::ACK { .. } |
                 Frame::ApplicationClose { .. } |
-                Frame::ConnectionClose { .. }
+                Frame::ConnectionClose { .. } |
+                Frame::Multicast(multicast::Frame::Ack(..))
         )
     }
 
@@ -1083,6 +1101,11 @@ impl Frame {
                     data: None,
                 })),
             },
+
+            Frame::Multicast(frame) => QuicFrame::Unknown {
+                frame_type_bytes: Some(frame.frame_type()),
+                raw: None,
+            },
         }
     }
 }
@@ -1249,6 +1272,14 @@ impl std::fmt::Debug for Frame {
 
             Frame::DatagramHeader { length } => {
                 write!(f, "DATAGRAM len={length}")?;
+            },
+
+            Frame::Multicast(frame) => {
+                write!(
+                    f,
+                    "MULTICAST_CONTROL type={:x} frame={frame:?}",
+                    frame.frame_type()
+                )?;
             },
         }
 

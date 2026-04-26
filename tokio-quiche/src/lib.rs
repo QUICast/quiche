@@ -88,6 +88,8 @@
 //!   durations, including protocol overhead and network delays.
 //! - `tokio-task-metrics`: Scheduling & poll duration histograms for tokio
 //!   tasks.
+//! - `multicast`: IPv4-first multicast client receive integration backed by
+//!   `mcrx-core`.
 //!
 //! Other parts of the crate are enabled by separate build flags instead, to be
 //! controlled by the final binary:
@@ -100,6 +102,8 @@ pub extern crate quiche;
 pub mod buf_factory;
 pub mod http3;
 pub mod metrics;
+#[cfg(feature = "multicast")]
+pub mod multicast;
 pub mod quic;
 mod result;
 pub mod settings;

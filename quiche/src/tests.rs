@@ -53,6 +53,8 @@ fn transport_params() {
         initial_source_connection_id: Some(b"woot woot".to_vec().into()),
         retry_source_connection_id: Some(b"retry".to_vec().into()),
         max_datagram_frame_size: Some(32),
+        multicast_server_support: false,
+        multicast_client_params: None,
         unknown_params: Default::default(),
     };
 
@@ -83,6 +85,8 @@ fn transport_params() {
         initial_source_connection_id: Some(b"woot woot".to_vec().into()),
         retry_source_connection_id: None,
         max_datagram_frame_size: Some(32),
+        multicast_server_support: false,
+        multicast_client_params: None,
         unknown_params: Default::default(),
     };
 
@@ -94,6 +98,222 @@ fn transport_params() {
     let new_tp = TransportParams::decode(raw_params, true, None).unwrap();
 
     assert_eq!(new_tp, tp);
+}
+
+#[test]
+fn transport_params_multicast_roundtrip() {
+    let client_params = multicast::ClientTransportParams {
+        limits: multicast::ClientLimits {
+            ipv6_channels_allowed: true,
+            ipv4_channels_allowed: true,
+            max_aggregate_rate_kibps: 8192,
+            max_channel_ids: 32,
+        },
+        hash_algorithms: vec![1, 2],
+        encryption_algorithms: vec![0x1301, 0x1302],
+    };
+
+    let client_tp = TransportParams {
+        multicast_client_params: Some(client_params.clone()),
+        ..Default::default()
+    };
+
+    let mut client_raw_params = [0; 256];
+    let client_raw_params =
+        TransportParams::encode(&client_tp, false, &mut client_raw_params)
+            .unwrap();
+    let decoded_client_tp =
+        TransportParams::decode(client_raw_params, true, None).unwrap();
+
+    assert_eq!(
+        decoded_client_tp.multicast_client_params,
+        Some(client_params)
+    );
+
+    let server_tp = TransportParams {
+        multicast_server_support: true,
+        ..Default::default()
+    };
+
+    let mut server_raw_params = [0; 256];
+    let server_raw_params =
+        TransportParams::encode(&server_tp, true, &mut server_raw_params)
+            .unwrap();
+    let decoded_server_tp =
+        TransportParams::decode(server_raw_params, false, None).unwrap();
+
+    assert!(decoded_server_tp.multicast_server_support);
+}
+
+#[test]
+fn transport_params_multicast_negotiated_in_handshake() {
+    let client_params = multicast::ClientTransportParams {
+        limits: multicast::ClientLimits {
+            ipv6_channels_allowed: true,
+            ipv4_channels_allowed: false,
+            max_aggregate_rate_kibps: 4096,
+            max_channel_ids: 8,
+        },
+        hash_algorithms: vec![1],
+        encryption_algorithms: vec![0x1301],
+    };
+
+    let mut client_config = test_utils::Pipe::default_config("cubic").unwrap();
+    client_config.set_multicast_client_params(Some(client_params.clone()));
+
+    let mut server_config = test_utils::Pipe::default_config("cubic").unwrap();
+    server_config.enable_multicast_server_support(true);
+
+    let mut pipe = test_utils::Pipe::with_client_and_server_config(
+        &mut client_config,
+        &mut server_config,
+    )
+    .unwrap();
+
+    assert!(pipe.handshake().is_ok());
+
+    assert_eq!(
+        pipe.server
+            .peer_transport_params()
+            .unwrap()
+            .multicast_client_params,
+        Some(client_params)
+    );
+    assert!(
+        pipe.client
+            .peer_transport_params()
+            .unwrap()
+            .multicast_server_support
+    );
+}
+
+fn multicast_test_client_params() -> multicast::ClientTransportParams {
+    multicast::ClientTransportParams {
+        limits: multicast::ClientLimits {
+            ipv6_channels_allowed: true,
+            ipv4_channels_allowed: true,
+            max_aggregate_rate_kibps: 8192,
+            max_channel_ids: 32,
+        },
+        hash_algorithms: vec![1, 2],
+        encryption_algorithms: vec![0x1301, 0x1302],
+    }
+}
+
+fn multicast_test_server_frame() -> multicast::Frame {
+    multicast::Frame::Announce(multicast::Announce {
+        channel_id: vec![1, 2, 3, 4],
+        source: std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1)),
+        group: std::net::IpAddr::V4(std::net::Ipv4Addr::new(239, 1, 2, 3)),
+        udp_port: 4444,
+        header_protection_algorithm: 0x1301,
+        header_secret: vec![0xaa, 0xbb, 0xcc, 0xdd],
+        aead_algorithm: 0x1301,
+        integrity_hash_algorithm: 1,
+        max_rate_kibps: 4096,
+        max_ack_delay_ms: 25,
+    })
+}
+
+fn multicast_test_client_frame() -> multicast::Frame {
+    multicast::Frame::Limits(multicast::Limits {
+        sequence: 7,
+        limits: multicast::ClientLimits {
+            ipv6_channels_allowed: true,
+            ipv4_channels_allowed: false,
+            max_aggregate_rate_kibps: 2048,
+            max_channel_ids: 16,
+        },
+        max_joined_count: 4,
+    })
+}
+
+fn multicast_negotiated_pipe() -> test_utils::Pipe {
+    let mut client_config = test_utils::Pipe::default_config("cubic").unwrap();
+    client_config
+        .set_multicast_client_params(Some(multicast_test_client_params()));
+
+    let mut server_config = test_utils::Pipe::default_config("cubic").unwrap();
+    server_config.enable_multicast_server_support(true);
+
+    let mut pipe = test_utils::Pipe::with_client_and_server_config(
+        &mut client_config,
+        &mut server_config,
+    )
+    .unwrap();
+
+    assert_eq!(pipe.handshake(), Ok(()));
+
+    pipe
+}
+
+#[test]
+fn multicast_control_frame_server_to_client_roundtrip() {
+    let mut pipe = multicast_negotiated_pipe();
+    let frame = multicast_test_server_frame();
+
+    assert_eq!(pipe.server.multicast_send(frame.clone()), Ok(()));
+    assert_eq!(pipe.server.multicast_send_queue_len(), 1);
+
+    let flight = test_utils::emit_flight(&mut pipe.server).unwrap();
+    assert_eq!(pipe.server.multicast_send_queue_len(), 0);
+
+    test_utils::process_flight(&mut pipe.client, flight).unwrap();
+
+    assert!(pipe.client.is_multicast_readable());
+    assert_eq!(pipe.client.multicast_recv_queue_len(), 1);
+    assert_eq!(pipe.client.multicast_recv(), Ok(frame));
+    assert_eq!(pipe.client.multicast_recv(), Err(Error::Done));
+}
+
+#[test]
+fn multicast_control_frame_client_to_server_roundtrip() {
+    let mut pipe = multicast_negotiated_pipe();
+    let frame = multicast_test_client_frame();
+
+    assert_eq!(pipe.client.multicast_send(frame.clone()), Ok(()));
+    assert_eq!(pipe.client.multicast_send_queue_len(), 1);
+
+    let flight = test_utils::emit_flight(&mut pipe.client).unwrap();
+    assert_eq!(pipe.client.multicast_send_queue_len(), 0);
+
+    test_utils::process_flight(&mut pipe.server, flight).unwrap();
+
+    assert!(pipe.server.is_multicast_readable());
+    assert_eq!(pipe.server.multicast_recv_queue_len(), 1);
+    assert_eq!(pipe.server.multicast_recv(), Ok(frame));
+    assert_eq!(pipe.server.multicast_recv(), Err(Error::Done));
+}
+
+#[test]
+fn multicast_control_frame_send_requires_negotiation() {
+    let mut pipe = test_utils::Pipe::new("cubic").unwrap();
+    assert_eq!(pipe.handshake(), Ok(()));
+
+    assert_eq!(
+        pipe.server.multicast_send(multicast_test_server_frame()),
+        Err(Error::InvalidState)
+    );
+    assert_eq!(
+        pipe.client.multicast_send(multicast_test_client_frame()),
+        Err(Error::InvalidState)
+    );
+}
+
+#[test]
+fn multicast_control_frame_rejects_wrong_sender() {
+    let mut pipe = multicast_negotiated_pipe();
+    let frames = vec![frame::Frame::Multicast(multicast_test_server_frame())];
+    let mut buf = [0; 65535];
+
+    let written =
+        test_utils::encode_pkt(&mut pipe.client, Type::Short, &frames, &mut buf)
+            .unwrap();
+
+    assert_eq!(
+        pipe.server_recv(&mut buf[..written]),
+        Err(Error::InvalidFrame)
+    );
 }
 
 #[test]

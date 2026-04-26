@@ -30,6 +30,7 @@
 use std::collections::HashSet;
 use std::mem::size_of;
 
+use crate::multicast;
 use crate::ConnectionId;
 use crate::Error;
 use crate::Result;
@@ -185,6 +186,11 @@ pub struct TransportParams {
     pub retry_source_connection_id: Option<ConnectionId<'static>>,
     /// DATAGRAM frame extension parameter, if any.
     pub max_datagram_frame_size: Option<u64>,
+    /// Whether the peer advertised support for server-side multicast control
+    /// frames.
+    pub multicast_server_support: bool,
+    /// The peer's multicast client capabilities, if any.
+    pub multicast_client_params: Option<multicast::ClientTransportParams>,
     /// Unknown peer transport parameters and values, if any.
     pub unknown_params: Option<UnknownTransportParameters>,
     // pub preferred_address: ...,
@@ -210,6 +216,8 @@ impl Default for TransportParams {
             initial_source_connection_id: None,
             retry_source_connection_id: None,
             max_datagram_frame_size: None,
+            multicast_server_support: false,
+            multicast_client_params: None,
             unknown_params: Default::default(),
         }
     }
@@ -368,6 +376,24 @@ impl TransportParams {
 
                 0x0020 => {
                     tp.max_datagram_frame_size = Some(val.get_varint()?);
+                },
+
+                multicast::CLIENT_PARAMS_TRANSPORT_PARAMETER_ID => {
+                    if !is_server {
+                        return Err(Error::InvalidTransportParam);
+                    }
+
+                    tp.multicast_client_params = Some(
+                        multicast::ClientTransportParams::from_bytes(val.buf())?,
+                    );
+                },
+
+                multicast::SERVER_SUPPORT_TRANSPORT_PARAMETER_ID => {
+                    if is_server || !val.is_empty() {
+                        return Err(Error::InvalidTransportParam);
+                    }
+
+                    tp.multicast_server_support = true;
                 },
 
                 // Track unknown transport parameters specially.
@@ -553,6 +579,26 @@ impl TransportParams {
                 octets::varint_len(max_datagram_frame_size),
             )?;
             b.put_varint(max_datagram_frame_size)?;
+        }
+
+        if !is_server {
+            if let Some(multicast_client_params) = &tp.multicast_client_params {
+                TransportParams::encode_param(
+                    &mut b,
+                    multicast::CLIENT_PARAMS_TRANSPORT_PARAMETER_ID,
+                    multicast_client_params.wire_len(),
+                )?;
+
+                multicast_client_params.encode(&mut b)?;
+            }
+        }
+
+        if is_server && tp.multicast_server_support {
+            TransportParams::encode_param(
+                &mut b,
+                multicast::SERVER_SUPPORT_TRANSPORT_PARAMETER_ID,
+                0,
+            )?;
         }
 
         let out_len = b.off();

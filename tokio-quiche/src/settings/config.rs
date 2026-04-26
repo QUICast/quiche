@@ -146,6 +146,16 @@ fn make_quiche_config(
         quic_settings.dgram_recv_max_queue_len,
         quic_settings.dgram_send_max_queue_len,
     );
+    config
+        .enable_multicast_server_support(quic_settings.multicast_server_support);
+
+    #[cfg(feature = "multicast")]
+    config.set_multicast_client_params(
+        params
+            .multicast_client
+            .as_ref()
+            .map(|settings| settings.transport_params.clone()),
+    );
 
     config.set_max_recv_udp_payload_size(quic_settings.max_recv_udp_payload_size);
     config.set_max_send_udp_payload_size(quic_settings.max_send_udp_payload_size);
