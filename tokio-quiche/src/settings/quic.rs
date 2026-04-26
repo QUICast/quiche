@@ -27,6 +27,10 @@
 use foundations::settings::settings;
 use serde_with::serde_as;
 use serde_with::DurationMilliSeconds;
+#[cfg(feature = "multicast")]
+use std::net::Ipv4Addr;
+#[cfg(feature = "multicast")]
+use std::net::Ipv6Addr;
 use std::time::Duration;
 
 pub use qlog::writer::QlogCompression;
@@ -60,6 +64,12 @@ pub struct QuicSettings {
     /// Defaults to `2^16`.
     #[serde(default = "QuicSettings::default_dgram_max_queue_len")]
     pub dgram_send_max_queue_len: usize,
+
+    /// Configures whether to advertise multicast server support during the
+    /// QUIC handshake.
+    ///
+    /// Defaults to `false`.
+    pub multicast_server_support: bool,
 
     /// Configures whether to enable early data (0-RTT) support. Currently only
     /// supported for servers.
@@ -364,6 +374,26 @@ pub struct QuicSettings {
     /// Defaults to `true`.
     #[serde(default = "QuicSettings::default_pool_send_buffer")]
     pub pool_send_buffer: bool,
+}
+
+/// Client-side multicast settings used by the tokio-quiche multicast helper.
+#[cfg(feature = "multicast")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MulticastClientSettings {
+    /// Initial multicast transport parameters advertised in the QUIC
+    /// handshake.
+    pub transport_params: quiche::multicast::ClientTransportParams,
+
+    /// Maximum number of concurrently joined multicast channels.
+    pub max_joined_channels: u64,
+
+    /// Optional IPv4 interface to join multicast groups on.
+    pub ipv4_interface: Option<Ipv4Addr>,
+
+    /// Placeholder for future IPv6 multicast interface selection.
+    ///
+    /// The current multicast helper only supports IPv4 joins.
+    pub ipv6_interface: Option<Ipv6Addr>,
 }
 
 impl QuicSettings {

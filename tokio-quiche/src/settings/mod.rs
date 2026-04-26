@@ -49,6 +49,12 @@ pub use self::tls::*;
 pub struct ConnectionParams<'a> {
     /// QUIC connection settings.
     pub settings: QuicSettings,
+    /// Optional multicast client configuration used to advertise client-side
+    /// multicast support and drive the tokio-quiche multicast helper.
+    ///
+    /// This is intended to be configured programmatically.
+    #[cfg(feature = "multicast")]
+    pub multicast_client: Option<MulticastClientSettings>,
     /// Optional TLS credentials to authenticate with.
     pub tls_cert: Option<TlsCertificatePaths<'a>>,
     /// Hooks to use for the connection.
@@ -72,8 +78,12 @@ impl core::fmt::Debug for ConnectionParams<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Avoid printing 'session' since it contains connection secrets.
         let mut s = f.debug_struct("ConnectionParams");
-        s.field("settings", &self.settings)
-            .field("tls_cert", &self.tls_cert)
+        s.field("settings", &self.settings);
+
+        #[cfg(feature = "multicast")]
+        s.field("multicast_client", &self.multicast_client);
+
+        s.field("tls_cert", &self.tls_cert)
             .field("hooks", &self.hooks);
 
         #[cfg(feature = "custom-client-dcid")]
@@ -92,6 +102,8 @@ impl<'a> ConnectionParams<'a> {
     ) -> Self {
         Self {
             settings,
+            #[cfg(feature = "multicast")]
+            multicast_client: None,
             tls_cert: Some(tls_cert),
             hooks,
             session: None,
@@ -109,6 +121,8 @@ impl<'a> ConnectionParams<'a> {
     ) -> Self {
         Self {
             settings,
+            #[cfg(feature = "multicast")]
+            multicast_client: None,
             tls_cert,
             hooks,
             session: None,

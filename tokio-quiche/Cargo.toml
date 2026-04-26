@@ -42,6 +42,9 @@ capture_keylogs = []
 # Enable scheduling & poll duration histograms for tokio tasks.
 tokio-task-metrics = []
 
+# Enable multicast client receive integration backed by mcrx-core.
+multicast = ["dep:mcrx-core"]
+
 # Enable gzip compression for QLOG output files. Forwards to the
 # `qlog` crate's `gzip` feature so `QuicSettings::qlog_compression =
 # QlogCompression::Gzip` is available at runtime and emits
@@ -79,6 +82,7 @@ futures = { workspace = true }
 futures-util = { workspace = true }
 ipnetwork = { workspace = true }
 log = { workspace = true }
+mcrx-core = { workspace = true, optional = true }
 octets = { workspace = true }
 pin-project = { workspace = true }
 qlog = { workspace = true, features = ["foundations"] }

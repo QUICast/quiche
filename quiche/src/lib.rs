@@ -466,6 +466,9 @@ const MAX_SEND_UDP_PAYLOAD_SIZE: usize = 1200;
 // The default length of DATAGRAM queues.
 const DEFAULT_MAX_DGRAM_QUEUE_LEN: usize = 0;
 
+// The default length of multicast control frame receive queues.
+const DEFAULT_MAX_MULTICAST_QUEUE_LEN: usize = 32;
+
 // The default length of PATH_CHALLENGE receive queue.
 const DEFAULT_MAX_PATH_CHALLENGE_RX_QUEUE_LEN: usize = 3;
 
@@ -590,6 +593,7 @@ pub struct Config {
 
     dgram_recv_max_queue_len: usize,
     dgram_send_max_queue_len: usize,
+    multicast_recv_max_queue_len: usize,
 
     path_challenge_recv_max_queue_len: usize,
 
@@ -668,6 +672,7 @@ impl Config {
 
             dgram_recv_max_queue_len: DEFAULT_MAX_DGRAM_QUEUE_LEN,
             dgram_send_max_queue_len: DEFAULT_MAX_DGRAM_QUEUE_LEN,
+            multicast_recv_max_queue_len: DEFAULT_MAX_MULTICAST_QUEUE_LEN,
 
             path_challenge_recv_max_queue_len:
                 DEFAULT_MAX_PATH_CHALLENGE_RX_QUEUE_LEN,
@@ -1189,6 +1194,26 @@ impl Config {
         self.dgram_send_max_queue_len = send_queue_len;
     }
 
+    /// Configures whether this endpoint advertises server-side multicast
+    /// support using the experimental draft-08 transport parameter.
+    ///
+    /// This controls the `multicast_server_support` transport parameter.
+    ///
+    /// The default is `false`.
+    pub fn enable_multicast_server_support(&mut self, enabled: bool) {
+        self.local_transport_params.multicast_server_support = enabled;
+    }
+
+    /// Sets the experimental draft-08 multicast client capabilities transport
+    /// parameter for this endpoint.
+    ///
+    /// Pass `None` to stop advertising multicast client capabilities.
+    pub fn set_multicast_client_params(
+        &mut self, params: Option<multicast::ClientTransportParams>,
+    ) {
+        self.local_transport_params.multicast_client_params = params;
+    }
+
     /// Configures the max number of queued received PATH_CHALLENGE frames.
     ///
     /// When an endpoint receives a PATH_CHALLENGE frame and the queue is full,
@@ -1197,6 +1222,16 @@ impl Config {
     /// The default is 3.
     pub fn set_path_challenge_recv_max_queue_len(&mut self, queue_len: usize) {
         self.path_challenge_recv_max_queue_len = queue_len;
+    }
+
+    /// Configures the max number of queued received multicast control frames.
+    ///
+    /// When an endpoint receives a multicast control frame and the queue is
+    /// full, the oldest frame is discarded.
+    ///
+    /// The default is 32.
+    pub fn set_multicast_recv_max_queue_len(&mut self, queue_len: usize) {
+        self.multicast_recv_max_queue_len = queue_len;
     }
 
     /// Sets the maximum size of the connection window.
@@ -1535,6 +1570,10 @@ where
     /// DATAGRAM queues.
     dgram_recv_queue: dgram::DatagramQueue<F>,
     dgram_send_queue: dgram::DatagramQueue<F>,
+
+    /// Multicast control frame queues.
+    multicast_recv_queue: multicast::ControlFrameQueue,
+    multicast_send_queue: VecDeque<multicast::Frame>,
 
     /// Whether to emit DATAGRAM frames in the next packet.
     emit_dgram: bool,
@@ -2190,6 +2229,10 @@ impl<F: BufFactory> Connection<F> {
             dgram_send_queue: dgram::DatagramQueue::new(
                 config.dgram_send_max_queue_len,
             ),
+            multicast_recv_queue: multicast::ControlFrameQueue::new(
+                config.multicast_recv_max_queue_len,
+            ),
+            multicast_send_queue: VecDeque::new(),
 
             emit_dgram: true,
 
@@ -3582,6 +3625,8 @@ impl<F: BufFactory> Connection<F> {
                         }
                     },
 
+                    frame::Frame::Multicast(..) => (),
+
                     frame::Frame::CryptoHeader { offset, length } => {
                         self.crypto_ctx[epoch]
                             .crypto_stream
@@ -4216,6 +4261,14 @@ impl<F: BufFactory> Connection<F> {
 
                     frame::Frame::ACK { .. } => {
                         pkt_space.ack_elicited = true;
+                    },
+
+                    frame::Frame::Multicast(frame) => {
+                        if frame.retransmit_on_loss() {
+                            self.multicast_send_queue.push_front(frame);
+                        } else {
+                            pkt_space.ack_elicited = true;
+                        }
                     },
 
                     frame::Frame::ResetStream {
@@ -4961,6 +5014,22 @@ impl<F: BufFactory> Connection<F> {
 
                     ack_eliciting = true;
                     in_flight = true;
+                } else {
+                    break;
+                }
+            }
+
+            while let Some(frame) = self.multicast_send_queue.front().cloned() {
+                let ack_eliciting_frame = frame.ack_eliciting();
+                let frame = frame::Frame::Multicast(frame);
+
+                if push_frame_to_pkt!(b, frames, frame, left) {
+                    self.multicast_send_queue.pop_front();
+
+                    if ack_eliciting_frame {
+                        ack_eliciting = true;
+                        in_flight = true;
+                    }
                 } else {
                     break;
                 }
@@ -7002,10 +7071,112 @@ impl<F: BufFactory> Connection<F> {
         }
     }
 
+    /// Reads the first received multicast control frame.
+    #[inline]
+    pub fn multicast_recv(&mut self) -> Result<multicast::Frame> {
+        self.multicast_recv_queue.pop().ok_or(Error::Done)
+    }
+
+    /// Returns whether there is a multicast control frame available to read.
+    #[inline]
+    pub fn is_multicast_readable(&self) -> bool {
+        self.multicast_recv_queue.has_pending()
+    }
+
+    /// Returns the number of items in the multicast control frame receive
+    /// queue.
+    #[inline]
+    pub fn multicast_recv_queue_len(&self) -> usize {
+        self.multicast_recv_queue.len()
+    }
+
+    /// Returns the number of items in the multicast control frame send queue.
+    #[inline]
+    pub fn multicast_send_queue_len(&self) -> usize {
+        self.multicast_send_queue.len()
+    }
+
+    /// Queues a multicast control frame for transmission on the unicast
+    /// connection.
+    ///
+    /// [`InvalidState`] is returned if the peer has not negotiated support for
+    /// receiving multicast frames from this endpoint, or if the frame exceeds
+    /// the current maximum writable 1-RTT payload size.
+    pub fn multicast_send(&mut self, frame: multicast::Frame) -> Result<()> {
+        if !self.multicast_send_enabled() {
+            return Err(Error::InvalidState);
+        }
+
+        if !self.multicast_frame_sent_by_local(&frame) {
+            return Err(Error::InvalidFrame);
+        }
+
+        if frame.wire_len() > self.max_multicast_frame_len()? {
+            return Err(Error::BufferTooShort);
+        }
+
+        self.multicast_send_queue.push_back(frame);
+
+        Ok(())
+    }
+
     fn dgram_enabled(&self) -> bool {
         self.local_transport_params
             .max_datagram_frame_size
             .is_some()
+    }
+
+    fn max_multicast_frame_len(&self) -> Result<usize> {
+        let dcid = self.destination_id();
+        let mut max_len = self.max_send_udp_payload_size();
+
+        max_len = max_len.saturating_sub(1 + dcid.len());
+        max_len = max_len.saturating_sub(packet::MAX_PKT_NUM_LEN);
+        max_len = max_len.saturating_sub(
+            self.crypto_ctx[packet::Epoch::Application]
+                .crypto_overhead()
+                .ok_or(Error::InvalidState)?,
+        );
+
+        Ok(max_len)
+    }
+
+    fn multicast_frame_recv_enabled(&self) -> bool {
+        if self.is_server {
+            self.local_transport_params.multicast_server_support
+        } else {
+            self.local_transport_params
+                .multicast_client_params
+                .is_some()
+        }
+    }
+
+    fn multicast_send_enabled(&self) -> bool {
+        if !self.parsed_peer_transport_params {
+            return false;
+        }
+
+        if self.is_server {
+            self.peer_transport_params.multicast_client_params.is_some()
+        } else {
+            self.peer_transport_params.multicast_server_support
+        }
+    }
+
+    fn multicast_frame_sent_by_local(&self, frame: &multicast::Frame) -> bool {
+        matches!(
+            (self.is_server, frame.sender()),
+            (true, multicast::Sender::Server) |
+                (false, multicast::Sender::Client)
+        )
+    }
+
+    fn multicast_frame_sent_by_peer(&self, frame: &multicast::Frame) -> bool {
+        matches!(
+            (self.is_server, frame.sender()),
+            (true, multicast::Sender::Client) |
+                (false, multicast::Sender::Server)
+        )
     }
 
     /// Returns when the next timeout event will occur.
@@ -8226,6 +8397,7 @@ impl<F: BufFactory> Connection<F> {
                     .has_pending_stream_blocked_frame() ||
                 self.streams_blocked_uni_state
                     .has_pending_stream_blocked_frame() ||
+                !self.multicast_send_queue.is_empty() ||
                 self.dgram_send_queue.has_pending() ||
                 self.local_error
                     .as_ref()
@@ -8776,6 +8948,22 @@ impl<F: BufFactory> Connection<F> {
 
             frame::Frame::PathResponse { data } => {
                 self.paths.on_response_received(data)?;
+            },
+
+            frame::Frame::Multicast(frame) => {
+                if !self.multicast_frame_recv_enabled() {
+                    return Err(Error::InvalidState);
+                }
+
+                if !self.multicast_frame_sent_by_peer(&frame) {
+                    return Err(Error::InvalidFrame);
+                }
+
+                if self.multicast_recv_queue.is_full() {
+                    self.multicast_recv_queue.pop();
+                }
+
+                self.multicast_recv_queue.push(frame)?;
             },
 
             frame::Frame::ConnectionClose {
@@ -9537,6 +9725,7 @@ mod flowcontrol;
 mod frame;
 pub mod h3;
 mod minmax;
+pub mod multicast;
 mod packet;
 mod path;
 mod pmtud;
