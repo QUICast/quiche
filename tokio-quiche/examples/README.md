@@ -126,3 +126,50 @@ By default, the server uses loopback-friendly multicast settings:
 --multicast-group 232.1.2.3
 --multicast-port 4444
 ```
+
+# Running the multicast file transfer examples
+
+These examples use the multicast data path for something concrete: the server
+repeats a file forever as multicast DATAGRAM chunks, with a small in-band
+manifest packet mixed in regularly so a client can join mid-stream and still
+learn the file layout.
+
+Start the file sender:
+
+```shell
+RUST_LOG=info cargo run -p tokio-quiche --example async_multicast_file_server --features multicast -- --address 127.0.0.1:5757 --file ./README.md
+```
+
+Then start the receiver:
+
+```shell
+RUST_LOG=info cargo run -p tokio-quiche --example async_multicast_file_client --features multicast -- --connect-to 127.0.0.1:5757 --multicast-interface 127.0.0.1 --output /tmp/README.copy
+```
+
+You can start multiple receivers against the same sender. Each receiver gets
+its control plane through its own unicast QUIC connection, while the file data
+itself is delivered through the shared multicast stream:
+
+```shell
+RUST_LOG=info cargo run -p tokio-quiche --example async_multicast_file_client --features multicast -- --connect-to 127.0.0.1:5757 --multicast-interface 127.0.0.1 --output /tmp/README.client1
+RUST_LOG=info cargo run -p tokio-quiche --example async_multicast_file_client --features multicast -- --connect-to 127.0.0.1:5757 --multicast-interface 127.0.0.1 --output /tmp/README.client2
+```
+
+Useful flags:
+
+```shell
+--chunk-payload-bytes 1024
+--manifest-interval-packets 32
+--publish-interval-ms 20
+--max-run-secs 300
+```
+
+Notes:
+
+- The file example is IPv4-only on the multicast path, matching the current
+  `mcrx-core` / `mctx-core` integration.
+- The sender is now a shared multicast publisher that runs independently of
+  any single client connection. Each client receives only draft control frames
+  over unicast, while the file chunks themselves stay on multicast.
+- The current example relies on looped chunks rather than `MC_ACK`. A client
+  exits as soon as it has received every chunk once.
