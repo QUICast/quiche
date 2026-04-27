@@ -88,8 +88,8 @@
 //!   durations, including protocol overhead and network delays.
 //! - `tokio-task-metrics`: Scheduling & poll duration histograms for tokio
 //!   tasks.
-//! - `multicast`: IPv4-first multicast client receive integration backed by
-//!   `mcrx-core`.
+//! - `multicast`: IPv4-first multicast client receive and server send
+//!   integration backed by `mcrx-core` and `mctx-core`.
 //!
 //! Other parts of the crate are enabled by separate build flags instead, to be
 //! controlled by the final binary:
