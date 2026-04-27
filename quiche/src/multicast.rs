@@ -30,7 +30,8 @@
 //! This module currently provides:
 //! - codecs for the draft's multicast transport parameters; and
 //! - codecs for the multicast control frames exchanged on the unicast QUIC
-//!   connection.
+//!   connection; and
+//! - send/receive helpers for multicast channel 1-RTT packets.
 //!
 //! The actual multicast channel packet processing, recovery, and socket
 //! integration remain higher-level work.
@@ -47,6 +48,7 @@ use ring::digest;
 use crate::crypto;
 use crate::frame;
 use crate::packet;
+use crate::range_buf::RangeBuf;
 use crate::stream;
 use crate::Error;
 use crate::Result;
@@ -1004,6 +1006,152 @@ pub struct ChannelPacket {
     pub frames: Vec<ChannelFrame>,
 }
 
+/// The result of encoding one multicast channel packet.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChannelSendOutput {
+    /// The packet number used in the encoded channel packet.
+    pub packet_number: u64,
+
+    /// The key sequence used to encrypt the packet.
+    pub key_sequence: u64,
+
+    /// The short-header key phase bit encoded into the packet.
+    pub key_phase: bool,
+
+    /// The number of bytes written into the caller's output buffer.
+    pub packet_len: usize,
+
+    /// The matching `MC_INTEGRITY` payload for the encoded packet.
+    pub integrity: Integrity,
+}
+
+/// Send-side state for one multicast channel's encrypted 1-RTT packets.
+///
+/// This tracks the immutable channel properties from [`Announce`], the active
+/// [`Key`] used for payload protection, and the next packet number in the
+/// channel's packet number space.
+pub struct ChannelSendState {
+    announce: Announce,
+    key: Key,
+    seal: crypto::Seal,
+    integrity_hash: IntegrityHashAlgorithm,
+    next_packet_number: u64,
+}
+
+impl ChannelSendState {
+    /// Creates send-side state for the announced channel and active key.
+    ///
+    /// The current implementation supports the QUIC v1 TLS cipher suite values
+    /// `0x1301`, `0x1302`, and `0x1303`, and the named-information hash IDs
+    /// `1..=8`. Other algorithm identifiers are reserved for future work.
+    pub fn new(announce: Announce, key: Key) -> Result<Self> {
+        if key.channel_id != announce.channel_id {
+            return Err(Error::InvalidState);
+        }
+
+        Ok(Self {
+            seal: build_channel_packet_seal(&announce, &key)?,
+            integrity_hash: IntegrityHashAlgorithm::from_id(
+                announce.integrity_hash_algorithm,
+            )?,
+            next_packet_number: key.from_packet_number,
+            announce,
+            key,
+        })
+    }
+
+    /// Returns the announced channel properties used by this sender.
+    pub fn announce(&self) -> &Announce {
+        &self.announce
+    }
+
+    /// Returns the active payload-protection key.
+    pub fn key(&self) -> &Key {
+        &self.key
+    }
+
+    /// Returns the next packet number that will be assigned.
+    pub fn next_packet_number(&self) -> u64 {
+        self.next_packet_number
+    }
+
+    /// Updates the sender with a retransmitted `MC_ANNOUNCE`.
+    ///
+    /// Since the draft treats channel properties as immutable for a channel's
+    /// lifetime, any announce that differs from the current one is rejected.
+    pub fn update_announce(&mut self, announce: Announce) -> Result<()> {
+        if self.announce.channel_id != announce.channel_id {
+            return Err(Error::InvalidState);
+        }
+
+        if self.announce != announce {
+            return Err(Error::InvalidState);
+        }
+
+        Ok(())
+    }
+
+    /// Replaces the active `MC_KEY` used to protect newly encoded packets.
+    pub fn update_key(&mut self, key: Key) -> Result<()> {
+        if key.channel_id != self.announce.channel_id {
+            return Err(Error::InvalidState);
+        }
+
+        if key.key_sequence == self.key.key_sequence &&
+            (key.from_packet_number != self.key.from_packet_number ||
+                key.secret != self.key.secret)
+        {
+            return Err(Error::InvalidState);
+        }
+
+        self.seal = build_channel_packet_seal(&self.announce, &key)?;
+
+        if self.next_packet_number < key.from_packet_number {
+            self.next_packet_number = key.from_packet_number;
+        }
+
+        self.key = key;
+
+        Ok(())
+    }
+
+    /// Encodes one multicast packet carrying the provided channel frames.
+    ///
+    /// The encoded bytes are written into `out`. On success, the returned
+    /// [`ChannelSendOutput`] includes the matching [`Integrity`] payload that
+    /// should be sent to receivers on the unicast control channel.
+    pub fn write_packet(
+        &mut self, frames: &[ChannelFrame], out: &mut [u8],
+    ) -> Result<ChannelSendOutput> {
+        let packet_number = self.next_packet_number;
+        let key_phase = self.key.key_sequence % 2 == 1;
+        let packet_len = encode_channel_packet_bytes(
+            &self.announce,
+            &mut self.seal,
+            packet_number,
+            key_phase,
+            frames,
+            out,
+        )?;
+        let packet = &out[..packet_len];
+
+        self.next_packet_number += 1;
+
+        Ok(ChannelSendOutput {
+            packet_number,
+            key_sequence: self.key.key_sequence,
+            key_phase,
+            packet_len,
+            integrity: Integrity {
+                channel_id: self.announce.channel_id.clone(),
+                packet_number_start: packet_number,
+                packet_hash_count: Some(1),
+                packet_hashes: self.integrity_hash.hash(packet),
+            },
+        })
+    }
+}
+
 /// An outcome emitted by [`ChannelReceiveState`] when a packet becomes ready.
 #[derive(Debug)]
 pub enum ChannelReceiveEvent<M> {
@@ -1747,6 +1895,107 @@ fn build_packet_open(announce: &Announce, key: &Key) -> Result<crypto::Open> {
     crypto::Open::new(payload_alg, pkt_key, pkt_iv, hp_key, key.secret.clone())
 }
 
+fn build_channel_packet_seal(
+    announce: &Announce, key: &Key,
+) -> Result<crypto::Seal> {
+    let header_alg =
+        tls_cipher_to_algorithm(announce.header_protection_algorithm)?;
+    let payload_alg = tls_cipher_to_algorithm(announce.aead_algorithm)?;
+
+    if header_alg != payload_alg {
+        return Err(Error::InvalidState);
+    }
+
+    let mut pkt_key = vec![0; payload_alg.key_len()];
+    let mut pkt_iv = vec![0; payload_alg.nonce_len()];
+    let mut hp_key = vec![0; payload_alg.key_len()];
+
+    crypto::derive_pkt_key(payload_alg, &key.secret, &mut pkt_key)?;
+    crypto::derive_pkt_iv(payload_alg, &key.secret, &mut pkt_iv)?;
+    crypto::derive_hdr_key(payload_alg, &announce.header_secret, &mut hp_key)?;
+
+    crypto::Seal::new(payload_alg, pkt_key, pkt_iv, hp_key, key.secret.clone())
+}
+
+fn encode_channel_packet_bytes(
+    announce: &Announce, seal: &mut crypto::Seal, packet_number: u64,
+    key_phase: bool, frames: &[ChannelFrame], out: &mut [u8],
+) -> Result<usize> {
+    if announce.channel_id.is_empty() ||
+        announce.channel_id.len() > packet::MAX_CID_LEN as usize
+    {
+        return Err(Error::InvalidState);
+    }
+
+    let mut b = octets::OctetsMut::with_slice(out);
+    let packet_number_len = 4;
+    let first = 0x40 |
+        (((key_phase as u8) << 2) & 0x04) |
+        ((packet_number_len as u8) - 1);
+
+    b.put_u8(first)?;
+    b.put_bytes(&announce.channel_id)?;
+    packet::encode_pkt_num(packet_number, packet_number_len, &mut b)?;
+
+    let payload_offset = b.off();
+
+    for frame in frames {
+        encode_channel_frame(frame)?.to_bytes(&mut b)?;
+    }
+
+    let payload_len = b.off() - payload_offset;
+
+    packet::encrypt_pkt(
+        &mut b,
+        packet_number,
+        packet_number_len,
+        payload_len,
+        payload_offset,
+        None,
+        seal,
+    )
+}
+
+fn encode_channel_frame(frame: &ChannelFrame) -> Result<frame::Frame> {
+    match frame {
+        ChannelFrame::Padding { len } => Ok(frame::Frame::Padding { len: *len }),
+
+        ChannelFrame::Ping => Ok(frame::Frame::Ping { mtu_probe: None }),
+
+        ChannelFrame::ResetStream {
+            stream_id,
+            error_code,
+            final_size,
+        } => Ok(frame::Frame::ResetStream {
+            stream_id: *stream_id,
+            error_code: *error_code,
+            final_size: *final_size,
+        }),
+
+        ChannelFrame::Stream {
+            stream_id,
+            offset,
+            fin,
+            data,
+        } => Ok(frame::Frame::Stream {
+            stream_id: *stream_id,
+            data: RangeBuf::from(data.as_ref(), *offset, *fin),
+        }),
+
+        ChannelFrame::Datagram { data } =>
+            Ok(frame::Frame::Datagram { data: data.clone() }),
+
+        ChannelFrame::Multicast(frame) => match frame {
+            Frame::Key(..) |
+            Frame::Leave(..) |
+            Frame::Integrity(..) |
+            Frame::Retire(..) => Ok(frame::Frame::Multicast(frame.clone())),
+
+            _ => Err(Error::InvalidFrame),
+        },
+    }
+}
+
 fn tls_cipher_to_algorithm(id: u16) -> Result<crypto::Algorithm> {
     match id {
         0x1301 => Ok(crypto::Algorithm::AES128_GCM),
@@ -1963,6 +2212,51 @@ mod tests {
             )
             .unwrap()
             .hash(packet),
+        }
+    }
+
+    #[test]
+    fn channel_send_state_roundtrip() {
+        let announce = test_announce();
+        let key = test_key(&announce.channel_id);
+        let mut sender =
+            ChannelSendState::new(announce.clone(), key.clone()).unwrap();
+        let mut receiver = ChannelReceiveState::new(announce).unwrap();
+        let mut out = [0; 256];
+
+        receiver.insert_key(key).unwrap();
+
+        let sent = sender
+            .write_packet(
+                &[ChannelFrame::Datagram {
+                    data: b"hello multicast".to_vec(),
+                }],
+                &mut out,
+            )
+            .unwrap();
+        let events = receiver.insert_integrity(sent.integrity.clone()).unwrap();
+
+        assert!(events.is_empty());
+
+        let events = receiver.recv(&out[..sent.packet_len], ()).unwrap();
+        assert_eq!(events.len(), 1);
+
+        match &events[0] {
+            ChannelReceiveEvent::Packet {
+                packet,
+                metadata: (),
+            } => {
+                assert_eq!(packet.packet_number, sent.packet_number);
+                assert_eq!(packet.key_sequence, sent.key_sequence);
+                assert!(packet.key_phase);
+                assert_eq!(packet.frames, vec![ChannelFrame::Datagram {
+                    data: b"hello multicast".to_vec(),
+                }]);
+            },
+
+            ChannelReceiveEvent::Error { error, .. } => {
+                panic!("unexpected receive error: {error:?}");
+            },
         }
     }
 

@@ -63,3 +63,66 @@ endpoint, `n` bytes will come back in the response body:
 [2025-07-08T00:05:42.211850000Z INFO  quiche_apps::common] 1/1 response(s) received in 9.849541ms, closing...
 [2025-07-08T00:05:42.270737000Z INFO  quiche_apps::client] connection closed, recv=9 sent=13 lost=0 retrans=0 sent_bytes=2805 recv_bytes=2436 lost_bytes=0 [local_addr=0.0.0.0:61497 peer_addr=127.0.0.1:5757 validation_state=Validated active=true recv=9 sent=13 lost=0 retrans=0 rtt=5.045481ms min_rtt=Some(130.486µs) rttvar=3.559643ms cwnd=13500 sent_bytes=2805 recv_bytes=2436 lost_bytes=0 stream_retrans_bytes=0 pmtu=1350 delivery_rate=1104879]
 ```
+
+# Running the multicast client example
+
+The multicast client example lives on the `tokio-quiche` side because that is
+where the current `mcrx-core` integration exists. It sends one HTTP/3 `GET`
+request and keeps the connection alive long enough to print multicast announce,
+state, and decoded packet events.
+
+Build it with the `multicast` feature enabled:
+
+```shell
+RUST_LOG=info cargo run -p tokio-quiche --example async_multicast_client --features multicast -- https://test.com/ --connect-to 127.0.0.1:5757
+```
+
+Useful flags:
+
+```shell
+--run-for-secs 60
+--multicast-interface 192.0.2.10
+--max-joined-channels 8
+--max-aggregate-rate-kibps 16384
+```
+
+Notes:
+
+- Peer verification is off by default, matching `tokio-quiche`'s client
+  defaults. Pass `--verify-peer` if you want certificate validation.
+- The current multicast receive path is IPv4-only. IPv6 announces are surfaced
+  as explicit placeholder events instead of being joined.
+- If the server does not advertise multicast support, the example still works
+  as a normal HTTP/3 client and will only print HTTP/3 events.
+
+# Running the multicast server example
+
+The multicast server example pairs with the client example above. It serves the
+same simple HTTP/3 responses as `async_http3_server`, but it also:
+
+- advertises multicast server support during the QUIC handshake
+- announces one IPv4 multicast channel
+- sends `MC_KEY` and `MC_JOIN`
+- starts publishing multicast DATAGRAM packets after the client reports
+  `Joined`
+
+Start it like this:
+
+```shell
+RUST_LOG=info cargo run -p tokio-quiche --example async_multicast_server --features multicast -- --address 127.0.0.1:5757
+```
+
+Then connect with the multicast client example:
+
+```shell
+RUST_LOG=info cargo run -p tokio-quiche --example async_multicast_client --features multicast -- https://test.com/ --connect-to 127.0.0.1:5757 --multicast-interface 127.0.0.1 --run-for-secs 10
+```
+
+By default, the server uses loopback-friendly multicast settings:
+
+```shell
+--multicast-source 127.0.0.1
+--multicast-interface 127.0.0.1
+--multicast-group 232.1.2.3
+--multicast-port 4444
+```
