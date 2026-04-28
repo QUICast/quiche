@@ -476,6 +476,25 @@ fn handle_multicast_event(event: ClientEvent) {
             );
         },
 
+        ClientEvent::MetricsUpdated {
+            channel_id,
+            metrics,
+        } => {
+            println!(
+                "multicast metrics: channel={} socket_pkts={} socket_bytes={} \
+                 recv_calls={} delivered={} pending={} wait_key={} \
+                 wait_integrity={}",
+                format_channel_id(&channel_id),
+                metrics.socket.packets_received,
+                metrics.socket.bytes_received,
+                metrics.receive.recv_calls,
+                metrics.receive.packets_delivered,
+                metrics.receive.pending_packets,
+                metrics.receive.waiting_for_key_packets,
+                metrics.receive.waiting_for_integrity_packets,
+            );
+        },
+
         ClientEvent::Packet {
             channel_id,
             packet,

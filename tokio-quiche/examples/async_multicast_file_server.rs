@@ -58,6 +58,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 #[cfg(feature = "multicast")]
 use std::time::Duration;
+#[cfg(feature = "multicast")]
+use std::time::Instant;
 
 #[cfg(feature = "multicast")]
 use anyhow::Context;
@@ -73,6 +75,8 @@ use mctx_core::Publication;
 use mctx_core::PublicationConfig;
 #[cfg(feature = "multicast")]
 use mctx_core::PublicationId;
+#[cfg(feature = "multicast")]
+use mctx_core::PublicationMetricsSnapshot;
 #[cfg(feature = "multicast")]
 use tokio::net::UdpSocket;
 #[cfg(feature = "multicast")]
@@ -182,6 +186,11 @@ struct Args {
     /// Milliseconds between multicast packets.
     #[arg(long, default_value_t = 20)]
     publish_interval_ms: u64,
+
+    /// Seconds between multicast publisher metrics summaries. Set to `0` to
+    /// disable.
+    #[arg(long, default_value_t = 5)]
+    metrics_interval_secs: u64,
 }
 
 #[cfg(feature = "multicast")]
@@ -435,19 +444,31 @@ impl ApplicationOverQuic for FileControlApp {
     }
 
     fn on_conn_close<M: tokio_quiche::metrics::Metrics>(
-        &mut self, _qconn: &mut QuicheConnection, _metrics: &M,
+        &mut self, qconn: &mut QuicheConnection, _metrics: &M,
         connection_result: &QuicResult<()>,
     ) {
         self.pending_integrities.clear();
         self.joined = false;
         self.join_sent = false;
+        let stats = qconn.stats();
         println!(
-            "control connection closed: result={}",
+            "control connection closed: result={} detail={:?} local_error={:?} \
+             peer_error={:?} sent={} recv={} lost={} retrans={} sent_bytes={} \
+             recv_bytes={}",
             if connection_result.is_ok() {
                 "ok"
             } else {
                 "error"
             },
+            connection_result,
+            qconn.local_error(),
+            qconn.peer_error(),
+            stats.sent,
+            stats.recv,
+            stats.lost,
+            stats.retrans,
+            stats.sent_bytes,
+            stats.recv_bytes,
         );
     }
 }
@@ -544,6 +565,7 @@ async fn run() -> anyhow::Result<()> {
             publisher_shared,
             publisher_transfer,
             publish_interval,
+            args.metrics_interval_secs,
             args.manifest_interval_packets,
         )
         .await
@@ -590,12 +612,18 @@ async fn publish_loop(
     publication: Publication,
     mut send_state: quiche::multicast::ChannelSendState,
     shared: Arc<SharedControlChannel>, transfer: Arc<PreparedTransfer>,
-    publish_interval: Duration, manifest_interval_packets: u32,
+    publish_interval: Duration, metrics_interval_secs: u64,
+    manifest_interval_packets: u32,
 ) -> anyhow::Result<()> {
     let mut looping =
         LoopingTransfer::new((*transfer).clone(), manifest_interval_packets)?;
     let mut ticker = interval(publish_interval);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let metrics_interval = (metrics_interval_secs != 0)
+        .then(|| Duration::from_secs(metrics_interval_secs));
+    let mut last_metrics_at = Instant::now();
+    let mut previous_publication_metrics = publication.metrics_snapshot();
+    let mut previous_send_metrics = send_state.metrics_snapshot();
 
     let mut packet_buf = vec![0; 64 * 1024];
     let mut sent_packets = 0u64;
@@ -631,9 +659,21 @@ async fn publish_loop(
                 }
             },
 
-            Err(error) if publish_would_block(&error) => continue,
+            Err(error) if publish_would_block(&error) => (),
 
             Err(error) => return Err(anyhow::Error::new(error)),
+        }
+
+        if let Some(metrics_interval) = metrics_interval {
+            if last_metrics_at.elapsed() >= metrics_interval {
+                print_publisher_metrics(
+                    &send_state,
+                    &publication,
+                    &mut previous_send_metrics,
+                    &mut previous_publication_metrics,
+                );
+                last_metrics_at = Instant::now();
+            }
         }
     }
 }
@@ -655,6 +695,40 @@ fn format_channel_id(id: &[u8]) -> String {
     }
 
     out
+}
+
+#[cfg(feature = "multicast")]
+fn print_publisher_metrics(
+    send_state: &quiche::multicast::ChannelSendState, publication: &Publication,
+    previous_send_metrics: &mut quiche::multicast::ChannelSendMetricsSnapshot,
+    previous_publication_metrics: &mut PublicationMetricsSnapshot,
+) {
+    let current_send_metrics = send_state.metrics_snapshot();
+    let current_publication_metrics = publication.metrics_snapshot();
+    let send_delta = quiche::multicast::ChannelSendMetricsDelta::between(
+        *previous_send_metrics,
+        current_send_metrics,
+    );
+    let publication_delta = mctx_core::PublicationMetricsDelta::between(
+        *previous_publication_metrics,
+        current_publication_metrics,
+    );
+
+    *previous_send_metrics = current_send_metrics;
+    *previous_publication_metrics = current_publication_metrics;
+
+    println!(
+        "[metrics] tx encoded_pkts={} encoded_bytes={} encoded_frames={} \
+         send_calls={} wire_pkts={} wire_bytes={} send_errors={} next_pn={}",
+        send_delta.packets_encoded,
+        send_delta.bytes_encoded,
+        send_delta.frames_encoded,
+        publication_delta.send_calls,
+        publication_delta.packets_sent,
+        publication_delta.bytes_sent,
+        publication_delta.send_errors,
+        send_delta.next_packet_number,
+    );
 }
 
 #[cfg(feature = "multicast")]
