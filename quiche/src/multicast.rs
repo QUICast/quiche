@@ -548,25 +548,8 @@ impl Frame {
                 after_packet_number: b.get_varint()?,
             })),
 
-            FRAME_TYPE_INTEGRITY | FRAME_TYPE_INTEGRITY_WITH_LENGTH => {
-                let channel_id = decode_channel_id(b, true)?;
-                let packet_number_start = b.get_varint()?;
-                let packet_hash_count = if ty == FRAME_TYPE_INTEGRITY_WITH_LENGTH
-                {
-                    Some(b.get_varint()?)
-                } else {
-                    None
-                };
-
-                let packet_hashes = b.get_bytes(b.cap())?.to_vec();
-
-                Ok(Frame::Integrity(Integrity {
-                    channel_id,
-                    packet_number_start,
-                    packet_hash_count,
-                    packet_hashes,
-                }))
-            },
+            FRAME_TYPE_INTEGRITY | FRAME_TYPE_INTEGRITY_WITH_LENGTH =>
+                decode_integrity_frame(ty, b, None, false),
 
             FRAME_TYPE_ACK | FRAME_TYPE_ACK_ECN => {
                 let channel_id = decode_channel_id(b, true)?;
@@ -638,6 +621,17 @@ impl Frame {
             },
 
             _ => Err(Error::InvalidFrame),
+        }
+    }
+
+    pub(crate) fn decode_from_type_with_integrity_hash_len(
+        ty: u64, b: &mut octets::Octets, integrity_hash_len: usize,
+    ) -> Result<Self> {
+        match ty {
+            FRAME_TYPE_INTEGRITY | FRAME_TYPE_INTEGRITY_WITH_LENGTH =>
+                decode_integrity_frame(ty, b, Some(integrity_hash_len), true),
+
+            _ => Self::decode_from_type(ty, b),
         }
     }
 
@@ -936,6 +930,16 @@ impl Frame {
     pub(crate) fn retransmit_on_loss(&self) -> bool {
         !matches!(self, Frame::Ack(..))
     }
+
+    pub(crate) fn requires_packet_end(&self) -> bool {
+        matches!(
+            self,
+            Frame::Integrity(Integrity {
+                packet_hash_count: None,
+                ..
+            })
+        )
+    }
 }
 
 /// A multicast channel frame carried in a multicast 1-RTT packet.
@@ -1025,6 +1029,88 @@ pub struct ChannelSendOutput {
     pub integrity: Integrity,
 }
 
+/// A point-in-time snapshot of multicast channel send metrics.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ChannelSendMetricsSnapshot {
+    /// Total calls made to [`ChannelSendState::write_packet()`].
+    pub write_calls: u64,
+
+    /// Total multicast channel packets encoded successfully.
+    pub packets_encoded: u64,
+
+    /// Total encoded multicast channel bytes produced.
+    pub bytes_encoded: u64,
+
+    /// Total channel frames encoded into multicast packets.
+    pub frames_encoded: u64,
+
+    /// Total successful payload-protection key updates.
+    pub key_updates: u64,
+
+    /// Total failed encode attempts from [`ChannelSendState::write_packet()`].
+    pub encode_errors: u64,
+
+    /// The most recently assigned multicast packet number, if any.
+    pub last_packet_number: Option<u64>,
+
+    /// The next multicast packet number that will be assigned.
+    pub next_packet_number: u64,
+}
+
+/// The difference between two send metrics snapshots.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ChannelSendMetricsDelta {
+    /// Change in [`ChannelSendMetricsSnapshot::write_calls`].
+    pub write_calls: u64,
+
+    /// Change in [`ChannelSendMetricsSnapshot::packets_encoded`].
+    pub packets_encoded: u64,
+
+    /// Change in [`ChannelSendMetricsSnapshot::bytes_encoded`].
+    pub bytes_encoded: u64,
+
+    /// Change in [`ChannelSendMetricsSnapshot::frames_encoded`].
+    pub frames_encoded: u64,
+
+    /// Change in [`ChannelSendMetricsSnapshot::key_updates`].
+    pub key_updates: u64,
+
+    /// Change in [`ChannelSendMetricsSnapshot::encode_errors`].
+    pub encode_errors: u64,
+
+    /// The latest assigned packet number sampled at the end of the interval.
+    pub last_packet_number: Option<u64>,
+
+    /// The next packet number sampled at the end of the interval.
+    pub next_packet_number: u64,
+}
+
+impl ChannelSendMetricsDelta {
+    /// Computes the delta between two send metrics snapshots.
+    pub fn between(
+        before: ChannelSendMetricsSnapshot, after: ChannelSendMetricsSnapshot,
+    ) -> Self {
+        Self {
+            write_calls: after.write_calls.saturating_sub(before.write_calls),
+            packets_encoded: after
+                .packets_encoded
+                .saturating_sub(before.packets_encoded),
+            bytes_encoded: after
+                .bytes_encoded
+                .saturating_sub(before.bytes_encoded),
+            frames_encoded: after
+                .frames_encoded
+                .saturating_sub(before.frames_encoded),
+            key_updates: after.key_updates.saturating_sub(before.key_updates),
+            encode_errors: after
+                .encode_errors
+                .saturating_sub(before.encode_errors),
+            last_packet_number: after.last_packet_number,
+            next_packet_number: after.next_packet_number,
+        }
+    }
+}
+
 /// Send-side state for one multicast channel's encrypted 1-RTT packets.
 ///
 /// This tracks the immutable channel properties from [`Announce`], the active
@@ -1036,6 +1122,7 @@ pub struct ChannelSendState {
     seal: crypto::Seal,
     integrity_hash: IntegrityHashAlgorithm,
     next_packet_number: u64,
+    metrics: ChannelSendMetricsState,
 }
 
 impl ChannelSendState {
@@ -1055,6 +1142,7 @@ impl ChannelSendState {
                 announce.integrity_hash_algorithm,
             )?,
             next_packet_number: key.from_packet_number,
+            metrics: ChannelSendMetricsState::default(),
             announce,
             key,
         })
@@ -1073,6 +1161,11 @@ impl ChannelSendState {
     /// Returns the next packet number that will be assigned.
     pub fn next_packet_number(&self) -> u64 {
         self.next_packet_number
+    }
+
+    /// Returns a snapshot of the sender's current metrics.
+    pub fn metrics_snapshot(&self) -> ChannelSendMetricsSnapshot {
+        self.metrics.snapshot(self.next_packet_number)
     }
 
     /// Updates the sender with a retransmitted `MC_ANNOUNCE`.
@@ -1111,6 +1204,7 @@ impl ChannelSendState {
         }
 
         self.key = key;
+        self.metrics.key_updates = self.metrics.key_updates.saturating_add(1);
 
         Ok(())
     }
@@ -1123,19 +1217,37 @@ impl ChannelSendState {
     pub fn write_packet(
         &mut self, frames: &[ChannelFrame], out: &mut [u8],
     ) -> Result<ChannelSendOutput> {
+        self.metrics.write_calls = self.metrics.write_calls.saturating_add(1);
         let packet_number = self.next_packet_number;
         let key_phase = self.key.key_sequence % 2 == 1;
-        let packet_len = encode_channel_packet_bytes(
+        let packet_len = match encode_channel_packet_bytes(
             &self.announce,
             &mut self.seal,
             packet_number,
             key_phase,
             frames,
             out,
-        )?;
+        ) {
+            Ok(packet_len) => packet_len,
+
+            Err(error) => {
+                self.metrics.encode_errors =
+                    self.metrics.encode_errors.saturating_add(1);
+                return Err(error);
+            },
+        };
         let packet = &out[..packet_len];
 
         self.next_packet_number += 1;
+        self.metrics.packets_encoded =
+            self.metrics.packets_encoded.saturating_add(1);
+        self.metrics.bytes_encoded =
+            self.metrics.bytes_encoded.saturating_add(packet_len as u64);
+        self.metrics.frames_encoded = self
+            .metrics
+            .frames_encoded
+            .saturating_add(frames.len() as u64);
+        self.metrics.last_packet_number = Some(packet_number);
 
         Ok(ChannelSendOutput {
             packet_number,
@@ -1193,6 +1305,7 @@ pub struct ChannelReceiveState<M = ()> {
     pending_packets: BTreeMap<u64, PendingChannelPacket<M>>,
     accepted_packets: BTreeSet<u64>,
     largest_observed_pkt_num: u64,
+    metrics: ChannelReceiveMetricsState,
 }
 
 impl<M> ChannelReceiveState<M> {
@@ -1213,12 +1326,18 @@ impl<M> ChannelReceiveState<M> {
             pending_packets: BTreeMap::new(),
             accepted_packets: BTreeSet::new(),
             largest_observed_pkt_num: 0,
+            metrics: ChannelReceiveMetricsState::default(),
         })
     }
 
     /// Returns the announced channel properties used by this receiver.
     pub fn announce(&self) -> &Announce {
         &self.announce
+    }
+
+    /// Returns a snapshot of the receiver's current metrics.
+    pub fn metrics_snapshot(&self) -> ChannelReceiveMetricsSnapshot {
+        self.metrics.snapshot(self)
     }
 
     /// Updates the receiver with a retransmitted `MC_ANNOUNCE`.
@@ -1246,6 +1365,8 @@ impl<M> ChannelReceiveState<M> {
             return Err(Error::InvalidState);
         }
 
+        self.metrics.keys_received = self.metrics.keys_received.saturating_add(1);
+
         if let Some(existing) = self
             .keys
             .iter()
@@ -1257,7 +1378,9 @@ impl<M> ChannelReceiveState<M> {
                 return Err(Error::InvalidFrame);
             }
 
-            return self.release_ready_packets();
+            self.metrics.duplicate_keys =
+                self.metrics.duplicate_keys.saturating_add(1);
+            return self.release_ready_packets(ReleaseTrigger::Key);
         }
 
         self.keys.push(ChannelKey {
@@ -1270,7 +1393,7 @@ impl<M> ChannelReceiveState<M> {
 
         self.keys.sort_by_key(|key| key.from_packet_number);
 
-        self.release_ready_packets()
+        self.release_ready_packets(ReleaseTrigger::Key)
     }
 
     /// Stores packet hashes from an `MC_INTEGRITY` frame and releases any
@@ -1282,6 +1405,8 @@ impl<M> ChannelReceiveState<M> {
             return Err(Error::InvalidState);
         }
 
+        self.metrics.integrity_frames_received =
+            self.metrics.integrity_frames_received.saturating_add(1);
         let hash_len = self.integrity_hash.output_len();
         let hash_count = integrity
             .packet_hash_count
@@ -1296,6 +1421,11 @@ impl<M> ChannelReceiveState<M> {
             return Err(Error::InvalidFrame);
         }
 
+        self.metrics.integrity_hashes_received = self
+            .metrics
+            .integrity_hashes_received
+            .saturating_add(hash_count);
+
         for idx in 0..hash_count {
             let pn = integrity
                 .packet_number_start
@@ -1307,11 +1437,17 @@ impl<M> ChannelReceiveState<M> {
                 .ok_or(Error::InvalidFrame)?;
             let end = start.checked_add(hash_len).ok_or(Error::InvalidFrame)?;
 
-            self.integrity_packets
-                .insert(pn, integrity.packet_hashes[start..end].to_vec());
+            if self
+                .integrity_packets
+                .insert(pn, integrity.packet_hashes[start..end].to_vec())
+                .is_some()
+            {
+                self.metrics.integrity_hash_overwrites =
+                    self.metrics.integrity_hash_overwrites.saturating_add(1);
+            }
         }
 
-        self.release_ready_packets()
+        self.release_ready_packets(ReleaseTrigger::Integrity)
     }
 
     /// Feeds a received encrypted multicast datagram into the channel state.
@@ -1322,10 +1458,14 @@ impl<M> ChannelReceiveState<M> {
     pub fn recv(
         &mut self, buf: &[u8], metadata: M,
     ) -> Result<Vec<ChannelReceiveEvent<M>>> {
+        self.metrics.recv_calls = self.metrics.recv_calls.saturating_add(1);
+        self.metrics.recv_bytes =
+            self.metrics.recv_bytes.saturating_add(buf.len() as u64);
         let packet = match self.parse_packet_metadata(buf) {
             Ok(packet) => packet,
 
             Err(error) => {
+                self.metrics.record_error(error);
                 return Ok(vec![ChannelReceiveEvent::Error { error, metadata }]);
             },
         };
@@ -1336,9 +1476,13 @@ impl<M> ChannelReceiveState<M> {
         if self.accepted_packets.contains(&packet.packet_number) ||
             self.pending_packets.contains_key(&packet.packet_number)
         {
+            self.metrics.duplicate_packets =
+                self.metrics.duplicate_packets.saturating_add(1);
             return Ok(Vec::new());
         }
 
+        self.metrics.packets_buffered =
+            self.metrics.packets_buffered.saturating_add(1);
         self.pending_packets
             .insert(packet.packet_number, PendingChannelPacket {
                 buf: buf.to_vec(),
@@ -1348,20 +1492,26 @@ impl<M> ChannelReceiveState<M> {
 
         let mut events = Vec::new();
 
-        if let Some(event) = self.try_release_packet(packet.packet_number)? {
+        if let Some(event) =
+            self.try_release_packet(packet.packet_number, ReleaseTrigger::Recv)?
+        {
             events.push(event);
         }
 
         Ok(events)
     }
 
-    fn release_ready_packets(&mut self) -> Result<Vec<ChannelReceiveEvent<M>>> {
+    fn release_ready_packets(
+        &mut self, trigger: ReleaseTrigger,
+    ) -> Result<Vec<ChannelReceiveEvent<M>>> {
         let packet_numbers =
             self.pending_packets.keys().copied().collect::<Vec<_>>();
         let mut events = Vec::new();
 
         for packet_number in packet_numbers {
-            if let Some(event) = self.try_release_packet(packet_number)? {
+            if let Some(event) =
+                self.try_release_packet(packet_number, trigger)?
+            {
                 events.push(event);
             }
         }
@@ -1370,7 +1520,7 @@ impl<M> ChannelReceiveState<M> {
     }
 
     fn try_release_packet(
-        &mut self, packet_number: u64,
+        &mut self, packet_number: u64, trigger: ReleaseTrigger,
     ) -> Result<Option<ChannelReceiveEvent<M>>> {
         if !self.integrity_packets.contains_key(&packet_number) {
             return Ok(None);
@@ -1407,6 +1557,8 @@ impl<M> ChannelReceiveState<M> {
                 .pending_packets
                 .remove(&packet_number)
                 .expect("pending packet exists");
+            self.metrics.integrity_mismatch_errors =
+                self.metrics.integrity_mismatch_errors.saturating_add(1);
 
             return Ok(Some(ChannelReceiveEvent::Error {
                 error: Error::CryptoFail,
@@ -1427,6 +1579,7 @@ impl<M> ChannelReceiveState<M> {
             Ok(packet) => packet,
 
             Err(error) => {
+                self.metrics.record_error(error);
                 return Ok(Some(ChannelReceiveEvent::Error {
                     error,
                     metadata: pending.metadata,
@@ -1435,6 +1588,9 @@ impl<M> ChannelReceiveState<M> {
         };
 
         self.accepted_packets.insert(packet_number);
+        self.metrics.packets_delivered =
+            self.metrics.packets_delivered.saturating_add(1);
+        self.metrics.record_release_success(trigger);
 
         Ok(Some(ChannelReceiveEvent::Packet {
             packet,
@@ -1602,6 +1758,368 @@ struct PendingChannelPacket<M> {
     metadata: M,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ChannelSendMetricsState {
+    write_calls: u64,
+    packets_encoded: u64,
+    bytes_encoded: u64,
+    frames_encoded: u64,
+    key_updates: u64,
+    encode_errors: u64,
+    last_packet_number: Option<u64>,
+}
+
+impl ChannelSendMetricsState {
+    fn snapshot(self, next_packet_number: u64) -> ChannelSendMetricsSnapshot {
+        ChannelSendMetricsSnapshot {
+            write_calls: self.write_calls,
+            packets_encoded: self.packets_encoded,
+            bytes_encoded: self.bytes_encoded,
+            frames_encoded: self.frames_encoded,
+            key_updates: self.key_updates,
+            encode_errors: self.encode_errors,
+            last_packet_number: self.last_packet_number,
+            next_packet_number,
+        }
+    }
+}
+
+/// A point-in-time snapshot of multicast channel receive metrics.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ChannelReceiveMetricsSnapshot {
+    /// Total datagrams fed into [`ChannelReceiveState::recv()`].
+    pub recv_calls: u64,
+
+    /// Total encrypted bytes fed into [`ChannelReceiveState::recv()`].
+    pub recv_bytes: u64,
+
+    /// Total unique packets buffered while waiting on metadata or keys.
+    pub packets_buffered: u64,
+
+    /// Total duplicate packet numbers ignored by the receiver.
+    pub duplicate_packets: u64,
+
+    /// Total multicast packets delivered successfully.
+    pub packets_delivered: u64,
+
+    /// Total packets delivered immediately during
+    /// [`ChannelReceiveState::recv()`].
+    pub packets_released_on_recv: u64,
+
+    /// Total packets released after a matching `MC_KEY`.
+    pub packets_released_on_key: u64,
+
+    /// Total packets released after matching `MC_INTEGRITY`.
+    pub packets_released_on_integrity: u64,
+
+    /// Total `MC_KEY` frames processed.
+    pub keys_received: u64,
+
+    /// Total duplicate `MC_KEY` frames accepted as retransmissions.
+    pub duplicate_keys: u64,
+
+    /// Total `MC_INTEGRITY` frames processed.
+    pub integrity_frames_received: u64,
+
+    /// Total packet hashes learned from `MC_INTEGRITY`.
+    pub integrity_hashes_received: u64,
+
+    /// Total hash entries overwritten by later `MC_INTEGRITY` frames.
+    pub integrity_hash_overwrites: u64,
+
+    /// Total integrity hash mismatches detected before decryption.
+    pub integrity_mismatch_errors: u64,
+
+    /// Total decryption failures after integrity validation.
+    pub decrypt_errors: u64,
+
+    /// Total invalid short-header or packet-format errors.
+    pub invalid_packet_errors: u64,
+
+    /// Total invalid frame decode errors after decryption.
+    pub invalid_frame_errors: u64,
+
+    /// Current number of installed payload-protection keys.
+    pub active_keys: usize,
+
+    /// Current number of buffered integrity hash entries.
+    pub buffered_integrity_entries: usize,
+
+    /// Current number of buffered encrypted packets.
+    pub pending_packets: usize,
+
+    /// Current number of accepted packet numbers tracked by the receiver.
+    pub accepted_packets: usize,
+
+    /// Current number of buffered packets waiting on a key.
+    pub waiting_for_key_packets: usize,
+
+    /// Current number of buffered packets waiting on integrity.
+    pub waiting_for_integrity_packets: usize,
+
+    /// The largest packet number observed so far.
+    pub largest_observed_packet_number: u64,
+}
+
+/// The difference between two receive metrics snapshots.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ChannelReceiveMetricsDelta {
+    /// Change in [`ChannelReceiveMetricsSnapshot::recv_calls`].
+    pub recv_calls: u64,
+
+    /// Change in [`ChannelReceiveMetricsSnapshot::recv_bytes`].
+    pub recv_bytes: u64,
+
+    /// Change in [`ChannelReceiveMetricsSnapshot::packets_buffered`].
+    pub packets_buffered: u64,
+
+    /// Change in [`ChannelReceiveMetricsSnapshot::duplicate_packets`].
+    pub duplicate_packets: u64,
+
+    /// Change in [`ChannelReceiveMetricsSnapshot::packets_delivered`].
+    pub packets_delivered: u64,
+
+    /// Change in [`ChannelReceiveMetricsSnapshot::packets_released_on_recv`].
+    pub packets_released_on_recv: u64,
+
+    /// Change in [`ChannelReceiveMetricsSnapshot::packets_released_on_key`].
+    pub packets_released_on_key: u64,
+
+    /// Change in [`ChannelReceiveMetricsSnapshot::packets_released_on_integrity`].
+    pub packets_released_on_integrity: u64,
+
+    /// Change in [`ChannelReceiveMetricsSnapshot::keys_received`].
+    pub keys_received: u64,
+
+    /// Change in [`ChannelReceiveMetricsSnapshot::duplicate_keys`].
+    pub duplicate_keys: u64,
+
+    /// Change in [`ChannelReceiveMetricsSnapshot::integrity_frames_received`].
+    pub integrity_frames_received: u64,
+
+    /// Change in [`ChannelReceiveMetricsSnapshot::integrity_hashes_received`].
+    pub integrity_hashes_received: u64,
+
+    /// Change in [`ChannelReceiveMetricsSnapshot::integrity_hash_overwrites`].
+    pub integrity_hash_overwrites: u64,
+
+    /// Change in [`ChannelReceiveMetricsSnapshot::integrity_mismatch_errors`].
+    pub integrity_mismatch_errors: u64,
+
+    /// Change in [`ChannelReceiveMetricsSnapshot::decrypt_errors`].
+    pub decrypt_errors: u64,
+
+    /// Change in [`ChannelReceiveMetricsSnapshot::invalid_packet_errors`].
+    pub invalid_packet_errors: u64,
+
+    /// Change in [`ChannelReceiveMetricsSnapshot::invalid_frame_errors`].
+    pub invalid_frame_errors: u64,
+
+    /// Current number of installed payload-protection keys.
+    pub active_keys: usize,
+
+    /// Current number of buffered integrity hash entries.
+    pub buffered_integrity_entries: usize,
+
+    /// Current number of buffered encrypted packets.
+    pub pending_packets: usize,
+
+    /// Current number of accepted packet numbers tracked by the receiver.
+    pub accepted_packets: usize,
+
+    /// Current number of buffered packets waiting on a key.
+    pub waiting_for_key_packets: usize,
+
+    /// Current number of buffered packets waiting on integrity.
+    pub waiting_for_integrity_packets: usize,
+
+    /// The largest packet number observed at the end of the interval.
+    pub largest_observed_packet_number: u64,
+}
+
+impl ChannelReceiveMetricsDelta {
+    /// Computes the delta between two receive metrics snapshots.
+    pub fn between(
+        before: ChannelReceiveMetricsSnapshot,
+        after: ChannelReceiveMetricsSnapshot,
+    ) -> Self {
+        Self {
+            recv_calls: after.recv_calls.saturating_sub(before.recv_calls),
+            recv_bytes: after.recv_bytes.saturating_sub(before.recv_bytes),
+            packets_buffered: after
+                .packets_buffered
+                .saturating_sub(before.packets_buffered),
+            duplicate_packets: after
+                .duplicate_packets
+                .saturating_sub(before.duplicate_packets),
+            packets_delivered: after
+                .packets_delivered
+                .saturating_sub(before.packets_delivered),
+            packets_released_on_recv: after
+                .packets_released_on_recv
+                .saturating_sub(before.packets_released_on_recv),
+            packets_released_on_key: after
+                .packets_released_on_key
+                .saturating_sub(before.packets_released_on_key),
+            packets_released_on_integrity: after
+                .packets_released_on_integrity
+                .saturating_sub(before.packets_released_on_integrity),
+            keys_received: after
+                .keys_received
+                .saturating_sub(before.keys_received),
+            duplicate_keys: after
+                .duplicate_keys
+                .saturating_sub(before.duplicate_keys),
+            integrity_frames_received: after
+                .integrity_frames_received
+                .saturating_sub(before.integrity_frames_received),
+            integrity_hashes_received: after
+                .integrity_hashes_received
+                .saturating_sub(before.integrity_hashes_received),
+            integrity_hash_overwrites: after
+                .integrity_hash_overwrites
+                .saturating_sub(before.integrity_hash_overwrites),
+            integrity_mismatch_errors: after
+                .integrity_mismatch_errors
+                .saturating_sub(before.integrity_mismatch_errors),
+            decrypt_errors: after
+                .decrypt_errors
+                .saturating_sub(before.decrypt_errors),
+            invalid_packet_errors: after
+                .invalid_packet_errors
+                .saturating_sub(before.invalid_packet_errors),
+            invalid_frame_errors: after
+                .invalid_frame_errors
+                .saturating_sub(before.invalid_frame_errors),
+            active_keys: after.active_keys,
+            buffered_integrity_entries: after.buffered_integrity_entries,
+            pending_packets: after.pending_packets,
+            accepted_packets: after.accepted_packets,
+            waiting_for_key_packets: after.waiting_for_key_packets,
+            waiting_for_integrity_packets: after.waiting_for_integrity_packets,
+            largest_observed_packet_number: after.largest_observed_packet_number,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ChannelReceiveMetricsState {
+    recv_calls: u64,
+    recv_bytes: u64,
+    packets_buffered: u64,
+    duplicate_packets: u64,
+    packets_delivered: u64,
+    packets_released_on_recv: u64,
+    packets_released_on_key: u64,
+    packets_released_on_integrity: u64,
+    keys_received: u64,
+    duplicate_keys: u64,
+    integrity_frames_received: u64,
+    integrity_hashes_received: u64,
+    integrity_hash_overwrites: u64,
+    integrity_mismatch_errors: u64,
+    decrypt_errors: u64,
+    invalid_packet_errors: u64,
+    invalid_frame_errors: u64,
+}
+
+impl ChannelReceiveMetricsState {
+    fn record_error(&mut self, error: Error) {
+        match error {
+            Error::InvalidPacket => {
+                self.invalid_packet_errors =
+                    self.invalid_packet_errors.saturating_add(1);
+            },
+
+            Error::InvalidFrame => {
+                self.invalid_frame_errors =
+                    self.invalid_frame_errors.saturating_add(1);
+            },
+
+            Error::CryptoFail => {
+                self.decrypt_errors = self.decrypt_errors.saturating_add(1);
+            },
+
+            _ => (),
+        }
+    }
+
+    fn record_release_success(&mut self, trigger: ReleaseTrigger) {
+        match trigger {
+            ReleaseTrigger::Recv => {
+                self.packets_released_on_recv =
+                    self.packets_released_on_recv.saturating_add(1);
+            },
+
+            ReleaseTrigger::Key => {
+                self.packets_released_on_key =
+                    self.packets_released_on_key.saturating_add(1);
+            },
+
+            ReleaseTrigger::Integrity => {
+                self.packets_released_on_integrity =
+                    self.packets_released_on_integrity.saturating_add(1);
+            },
+        }
+    }
+
+    fn snapshot<M>(
+        self, state: &ChannelReceiveState<M>,
+    ) -> ChannelReceiveMetricsSnapshot {
+        let waiting_for_integrity_packets = state
+            .pending_packets
+            .keys()
+            .filter(|packet_number| {
+                !state.integrity_packets.contains_key(packet_number)
+            })
+            .count();
+        let waiting_for_key_packets = state
+            .pending_packets
+            .iter()
+            .filter(|(packet_number, pending)| {
+                state.integrity_packets.contains_key(packet_number) &&
+                    state
+                        .select_key_index(**packet_number, pending.key_phase)
+                        .is_none()
+            })
+            .count();
+
+        ChannelReceiveMetricsSnapshot {
+            recv_calls: self.recv_calls,
+            recv_bytes: self.recv_bytes,
+            packets_buffered: self.packets_buffered,
+            duplicate_packets: self.duplicate_packets,
+            packets_delivered: self.packets_delivered,
+            packets_released_on_recv: self.packets_released_on_recv,
+            packets_released_on_key: self.packets_released_on_key,
+            packets_released_on_integrity: self.packets_released_on_integrity,
+            keys_received: self.keys_received,
+            duplicate_keys: self.duplicate_keys,
+            integrity_frames_received: self.integrity_frames_received,
+            integrity_hashes_received: self.integrity_hashes_received,
+            integrity_hash_overwrites: self.integrity_hash_overwrites,
+            integrity_mismatch_errors: self.integrity_mismatch_errors,
+            decrypt_errors: self.decrypt_errors,
+            invalid_packet_errors: self.invalid_packet_errors,
+            invalid_frame_errors: self.invalid_frame_errors,
+            active_keys: state.keys.len(),
+            buffered_integrity_entries: state.integrity_packets.len(),
+            pending_packets: state.pending_packets.len(),
+            accepted_packets: state.accepted_packets.len(),
+            waiting_for_key_packets,
+            waiting_for_integrity_packets,
+            largest_observed_packet_number: state.largest_observed_pkt_num,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReleaseTrigger {
+    Recv,
+    Key,
+    Integrity,
+}
+
 struct ChannelKey {
     key_sequence: u64,
     key_phase: bool,
@@ -1747,7 +2265,7 @@ fn decode_ack_ranges(
     Ok(ack_ranges)
 }
 
-fn decode_channel_id(
+pub(crate) fn decode_channel_id(
     b: &mut octets::Octets, invalid_frame: bool,
 ) -> Result<Vec<u8>> {
     let channel_id_len = b.get_u8()?;
@@ -1761,6 +2279,60 @@ fn decode_channel_id(
     }
 
     Ok(b.get_bytes(channel_id_len as usize)?.to_vec())
+}
+
+pub(crate) fn integrity_hash_len_from_id(id: u16) -> Result<usize> {
+    Ok(IntegrityHashAlgorithm::from_id(id)?.output_len())
+}
+
+fn decode_integrity_frame(
+    ty: u64, b: &mut octets::Octets, integrity_hash_len: Option<usize>,
+    require_integrity_hash_len: bool,
+) -> Result<Frame> {
+    let channel_id = decode_channel_id(b, true)?;
+    let packet_number_start = b.get_varint()?;
+    let packet_hash_count = if ty == FRAME_TYPE_INTEGRITY_WITH_LENGTH {
+        Some(b.get_varint()?)
+    } else {
+        None
+    };
+
+    let packet_hashes = match packet_hash_count {
+        Some(packet_hash_count) => {
+            let hash_len = match integrity_hash_len {
+                Some(hash_len) => hash_len,
+
+                None => {
+                    if require_integrity_hash_len {
+                        return Err(Error::InvalidFrame);
+                    }
+
+                    return Ok(Frame::Integrity(Integrity {
+                        channel_id,
+                        packet_number_start,
+                        packet_hash_count: Some(packet_hash_count),
+                        packet_hashes: b.get_bytes(b.cap())?.to_vec(),
+                    }));
+                },
+            };
+
+            let packet_hashes_len = packet_hash_count
+                .checked_mul(hash_len as u64)
+                .and_then(|len| usize::try_from(len).ok())
+                .ok_or(Error::InvalidFrame)?;
+
+            b.get_bytes(packet_hashes_len)?.to_vec()
+        },
+
+        None => b.get_bytes(b.cap())?.to_vec(),
+    };
+
+    Ok(Frame::Integrity(Integrity {
+        channel_id,
+        packet_number_start,
+        packet_hash_count,
+        packet_hashes,
+    }))
 }
 
 fn decode_ip_addr(b: &mut octets::Octets, ty: u64) -> Result<IpAddr> {
@@ -2258,6 +2830,33 @@ mod tests {
                 panic!("unexpected receive error: {error:?}");
             },
         }
+
+        let send_metrics = sender.metrics_snapshot();
+        assert_eq!(send_metrics, ChannelSendMetricsSnapshot {
+            write_calls: 1,
+            packets_encoded: 1,
+            bytes_encoded: send_metrics.bytes_encoded,
+            frames_encoded: 1,
+            key_updates: 0,
+            encode_errors: 0,
+            last_packet_number: Some(0),
+            next_packet_number: 1,
+        });
+
+        let recv_metrics = receiver.metrics_snapshot();
+        assert_eq!(recv_metrics.recv_calls, 1);
+        assert_eq!(recv_metrics.recv_bytes, send_metrics.bytes_encoded);
+        assert_eq!(recv_metrics.packets_buffered, 1);
+        assert_eq!(recv_metrics.packets_delivered, 1);
+        assert_eq!(recv_metrics.packets_released_on_recv, 1);
+        assert_eq!(recv_metrics.packets_released_on_key, 0);
+        assert_eq!(recv_metrics.packets_released_on_integrity, 0);
+        assert_eq!(recv_metrics.keys_received, 1);
+        assert_eq!(recv_metrics.integrity_frames_received, 1);
+        assert_eq!(recv_metrics.integrity_hashes_received, 1);
+        assert_eq!(recv_metrics.pending_packets, 0);
+        assert_eq!(recv_metrics.waiting_for_key_packets, 0);
+        assert_eq!(recv_metrics.waiting_for_integrity_packets, 0);
     }
 
     #[test]
@@ -2288,6 +2887,11 @@ mod tests {
             ChannelReceiveEvent::Error { error, .. } =>
                 panic!("unexpected decode error: {error:?}"),
         }
+
+        let metrics = state.metrics_snapshot();
+        assert_eq!(metrics.packets_released_on_recv, 0);
+        assert_eq!(metrics.packets_released_on_key, 0);
+        assert_eq!(metrics.packets_released_on_integrity, 1);
     }
 
     #[test]
@@ -2316,6 +2920,11 @@ mod tests {
             ChannelReceiveEvent::Error { error, .. } =>
                 panic!("unexpected decode error: {error:?}"),
         }
+
+        let metrics = state.metrics_snapshot();
+        assert_eq!(metrics.packets_released_on_recv, 0);
+        assert_eq!(metrics.packets_released_on_key, 1);
+        assert_eq!(metrics.packets_released_on_integrity, 0);
     }
 
     #[test]
@@ -2347,5 +2956,67 @@ mod tests {
                 assert_eq!(*metadata, "bad-frame");
             },
         }
+
+        let metrics = state.metrics_snapshot();
+        assert_eq!(metrics.invalid_frame_errors, 1);
+        assert_eq!(metrics.packets_delivered, 0);
+    }
+
+    #[test]
+    fn channel_send_metrics_delta_tracks_changes() {
+        let announce = test_announce();
+        let key = test_key(&announce.channel_id);
+        let mut sender = ChannelSendState::new(announce, key).unwrap();
+        let before = sender.metrics_snapshot();
+        let mut out = [0; 256];
+
+        sender
+            .write_packet(&[ChannelFrame::Ping], &mut out)
+            .unwrap();
+
+        let after = sender.metrics_snapshot();
+        let delta = ChannelSendMetricsDelta::between(before, after);
+
+        assert_eq!(delta, ChannelSendMetricsDelta {
+            write_calls: 1,
+            packets_encoded: 1,
+            bytes_encoded: after.bytes_encoded,
+            frames_encoded: 1,
+            key_updates: 0,
+            encode_errors: 0,
+            last_packet_number: Some(0),
+            next_packet_number: 1,
+        });
+    }
+
+    #[test]
+    fn channel_receive_metrics_delta_tracks_changes() {
+        let announce = test_announce();
+        let key = test_key(&announce.channel_id);
+        let mut sender =
+            ChannelSendState::new(announce.clone(), key.clone()).unwrap();
+        let mut receiver = ChannelReceiveState::new(announce).unwrap();
+        let before = receiver.metrics_snapshot();
+        let mut out = [0; 256];
+
+        receiver.insert_key(key).unwrap();
+        let sent = sender
+            .write_packet(&[ChannelFrame::Ping], &mut out)
+            .unwrap();
+        receiver.insert_integrity(sent.integrity).unwrap();
+        receiver.recv(&out[..sent.packet_len], ()).unwrap();
+
+        let after = receiver.metrics_snapshot();
+        let delta = ChannelReceiveMetricsDelta::between(before, after);
+
+        assert_eq!(delta.recv_calls, 1);
+        assert_eq!(delta.recv_bytes, sent.packet_len as u64);
+        assert_eq!(delta.packets_buffered, 1);
+        assert_eq!(delta.packets_delivered, 1);
+        assert_eq!(delta.packets_released_on_recv, 1);
+        assert_eq!(delta.keys_received, 1);
+        assert_eq!(delta.integrity_frames_received, 1);
+        assert_eq!(delta.integrity_hashes_received, 1);
+        assert_eq!(delta.pending_packets, 0);
     }
 }

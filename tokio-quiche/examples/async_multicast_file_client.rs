@@ -38,6 +38,9 @@ fn main() {
 }
 
 #[cfg(feature = "multicast")]
+mod heimdall_metrics;
+
+#[cfg(feature = "multicast")]
 mod multicast_file;
 
 #[cfg(feature = "multicast")]
@@ -50,17 +53,33 @@ use std::path::PathBuf;
 use std::sync::Arc;
 #[cfg(feature = "multicast")]
 use std::time::Duration;
+#[cfg(feature = "multicast")]
+use std::time::Instant;
 
 #[cfg(feature = "multicast")]
 use anyhow::Context;
 #[cfg(feature = "multicast")]
 use clap::Parser;
 #[cfg(feature = "multicast")]
+use heimdall_metrics::sample_receiver_metrics;
+#[cfg(feature = "multicast")]
+use heimdall_metrics::HeimdallMetricsWriter;
+#[cfg(feature = "multicast")]
+use heimdall_metrics::ReceiverMetricSample;
+#[cfg(feature = "multicast")]
+use mcrx_core::SubscriptionMetricsSampler;
+#[cfg(feature = "multicast")]
 use tokio::net::UdpSocket;
 #[cfg(feature = "multicast")]
 use tokio::select;
 #[cfg(feature = "multicast")]
+use tokio::time::interval;
+#[cfg(feature = "multicast")]
 use tokio::time::sleep;
+#[cfg(feature = "multicast")]
+use tokio::time::MissedTickBehavior;
+#[cfg(feature = "multicast")]
+use tokio_quiche::multicast::ClientChannelMetricsSnapshot;
 #[cfg(feature = "multicast")]
 use tokio_quiche::multicast::ClientDriver as MulticastClientDriver;
 #[cfg(feature = "multicast")]
@@ -147,6 +166,17 @@ struct Args {
     /// Whether to forward quiche's internal logs into the logger.
     #[arg(long, default_value_t = false)]
     capture_quiche_logs: bool,
+
+    /// Seconds between multicast metrics summaries. Set to `0` to disable.
+    #[arg(long, default_value_t = 5)]
+    metrics_interval_secs: u64,
+
+    /// Optional receiver metrics JSONL path for Heimdall ingestion.
+    ///
+    /// The network metrics use this exact path, and hardware metrics are
+    /// written to a sibling `*_hardware.jsonl` file.
+    #[arg(long)]
+    heimdall_metrics_jsonl: Option<PathBuf>,
 }
 
 #[cfg(feature = "multicast")]
@@ -209,9 +239,47 @@ async fn run() -> anyhow::Result<()> {
 
     let mut receiver = FileReceiver::default();
     let mut last_reported_pct = None;
+    let mut latest_metrics: Option<(Vec<u8>, ClientChannelMetricsSnapshot)> =
+        None;
+    let mut heimdall_metrics_writer = args
+        .heimdall_metrics_jsonl
+        .clone()
+        .map(HeimdallMetricsWriter::new)
+        .transpose()?;
+    let mut previous_socket_metrics = SubscriptionMetricsSampler::new();
+    let mut previous_receive_metrics = None;
+    let mut last_metrics_at = Instant::now();
+    let mut decode_errors_total = 0_u64;
+    let mut last_decode_errors = 0_u64;
+    let mut receive_errors_total = 0_u64;
+    let mut last_receive_errors = 0_u64;
     let mut events = controller.take_event_receiver();
+    let emit_console_metrics = args.metrics_interval_secs > 0;
+    let emit_heimdall_metrics = heimdall_metrics_writer.is_some();
+    let metrics_tick_secs = if emit_console_metrics || emit_heimdall_metrics {
+        args.metrics_interval_secs.max(1)
+    } else {
+        1
+    };
+    let mut metrics_tick = interval(Duration::from_secs(metrics_tick_secs));
+    metrics_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    if emit_console_metrics || emit_heimdall_metrics {
+        metrics_tick.tick().await;
+    }
     let timeout = sleep(Duration::from_secs(args.max_run_secs));
     tokio::pin!(timeout);
+
+    if let Some(writer) = heimdall_metrics_writer.as_ref() {
+        println!(
+            "heimdall metrics export: network={} hardware={} quiche={}",
+            writer.network_path().display(),
+            writer
+                .hardware_path()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "<unsupported>".to_string()),
+            writer.quiche_path().display(),
+        );
+    }
 
     loop {
         select! {
@@ -263,6 +331,10 @@ async fn run() -> anyhow::Result<()> {
                             frame.reason_code,
                             String::from_utf8_lossy(&frame.reason_phrase),
                         );
+                    },
+
+                    ClientEvent::MetricsUpdated { channel_id, metrics } => {
+                        latest_metrics = Some((channel_id, metrics));
                     },
 
                     ClientEvent::Packet {
@@ -350,6 +422,8 @@ async fn run() -> anyhow::Result<()> {
                         error,
                         packet: _,
                     } => {
+                        decode_errors_total =
+                            decode_errors_total.saturating_add(1);
                         eprintln!(
                             "multicast decode error on channel {}: {error:?}",
                             format_channel_id(&channel_id),
@@ -360,11 +434,44 @@ async fn run() -> anyhow::Result<()> {
                         channel_id,
                         error,
                     } => {
+                        receive_errors_total =
+                            receive_errors_total.saturating_add(1);
                         eprintln!(
                             "multicast receive error on channel {}: {error}",
                             format_channel_id(&channel_id),
                         );
                     },
+                }
+            },
+
+            _ = metrics_tick.tick(), if emit_console_metrics || emit_heimdall_metrics => {
+                let Some((channel_id, metrics)) = latest_metrics.as_ref() else {
+                    continue;
+                };
+                let decode_errors =
+                    decode_errors_total.saturating_sub(last_decode_errors);
+                last_decode_errors = decode_errors_total;
+                let receive_errors =
+                    receive_errors_total.saturating_sub(last_receive_errors);
+                last_receive_errors = receive_errors_total;
+                let Some(sample) = sample_receiver_metrics(
+                    metrics,
+                    &mut previous_socket_metrics,
+                    &mut previous_receive_metrics,
+                    decode_errors,
+                    receive_errors,
+                ) else {
+                    continue;
+                };
+
+                if emit_console_metrics {
+                    let interval_secs = last_metrics_at.elapsed().as_secs_f64();
+                    last_metrics_at = Instant::now();
+                    print_metrics_summary(channel_id, &sample, interval_secs);
+                }
+
+                if let Some(writer) = heimdall_metrics_writer.as_mut() {
+                    writer.write_receiver_sample(channel_id, &sample)?;
                 }
             },
         }
@@ -407,4 +514,55 @@ fn format_channel_id(id: &[u8]) -> String {
     }
 
     out
+}
+
+#[cfg(feature = "multicast")]
+fn print_metrics_summary(
+    channel_id: &[u8], sample: &ReceiverMetricSample, interval_secs: f64,
+) {
+    println!(
+        "[metrics] channel={} interval={:.2}s socket_rx_pps={:.1} \
+         socket_rx_mbps={:.3} decode_rx_pps={:.1} decode_rx_mbps={:.3} \
+         would_block={} socket_rx_errors={}",
+        format_channel_id(channel_id),
+        interval_secs,
+        sample.socket_delta.packets_per_sec(),
+        ((sample.socket_delta.bytes_per_sec() * 8.0) / 1_000_000.0),
+        sample.receive_delta.recv_calls as f64 / interval_secs.max(f64::EPSILON),
+        ((sample.receive_delta.recv_bytes as f64 * 8.0) / 1_000_000.0) /
+            interval_secs.max(f64::EPSILON),
+        sample.socket_delta.would_block_count,
+        sample.socket_delta.receive_errors,
+    );
+    println!(
+        "[metrics] delivered={} inline={} after_key={} after_integrity={} \
+         pending={} wait_key={} wait_integrity={} last_src={} \
+         last_payload={:?}",
+        sample.receive_delta.packets_delivered,
+        sample.receive_delta.packets_released_on_recv,
+        sample.receive_delta.packets_released_on_key,
+        sample.receive_delta.packets_released_on_integrity,
+        sample.receive.pending_packets,
+        sample.receive.waiting_for_key_packets,
+        sample.receive.waiting_for_integrity_packets,
+        sample
+            .socket
+            .last_source
+            .map(|addr| addr.to_string())
+            .unwrap_or_else(|| "-".to_string()),
+        sample.socket.last_payload_len,
+    );
+    println!(
+        "[metrics] task_rx_failures={} decode_errors={} dup_pkts={} \
+         invalid_pkt={} invalid_frame={} integrity_mismatch={} decrypt={} \
+         largest_pn={}",
+        sample.receive_task_errors,
+        sample.decode_errors,
+        sample.receive_delta.duplicate_packets,
+        sample.receive_delta.invalid_packet_errors,
+        sample.receive_delta.invalid_frame_errors,
+        sample.receive_delta.integrity_mismatch_errors,
+        sample.receive_delta.decrypt_errors,
+        sample.receive.largest_observed_packet_number,
+    );
 }

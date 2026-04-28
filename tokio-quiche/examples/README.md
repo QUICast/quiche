@@ -155,13 +155,51 @@ RUST_LOG=info cargo run -p tokio-quiche --example async_multicast_file_client --
 RUST_LOG=info cargo run -p tokio-quiche --example async_multicast_file_client --features multicast -- --connect-to 127.0.0.1:5757 --multicast-interface 127.0.0.1 --output /tmp/README.client2
 ```
 
+To emit Heimdall-ingestible receiver metrics while receiving the file:
+
+```shell
+RUST_LOG=info cargo run -p tokio-quiche --example async_multicast_file_client --features multicast -- --connect-to 127.0.0.1:5757 --multicast-interface 127.0.0.1 --output /tmp/README.client1 --heimdall-metrics-jsonl /tmp/receiver-a.jsonl
+```
+
 Useful flags:
 
 ```shell
 --chunk-payload-bytes 1024
 --manifest-interval-packets 32
 --publish-interval-ms 20
+--metrics-interval-secs 5
+--heimdall-metrics-jsonl /tmp/receiver-a.jsonl
 --max-run-secs 300
+```
+
+To stress the shared multicast publisher with a rolling wave of receivers, use
+the helper script in [tools/run_multicast_file_stress.sh](/Users/mfranke/Devtools/Multicast/quiche/tools/run_multicast_file_stress.sh). It starts one server, then launches a new client every second until something fails or you stop it:
+
+```shell
+tools/run_multicast_file_stress.sh --file /tmp/quicast-100m.bin
+```
+
+By default it creates one run directory and then nests each receiver under
+`client-<id>/`, so Heimdall-ready files land in a shape like:
+
+```text
+<run>/
+  client-0001/network.jsonl
+  client-0001/network_hardware.jsonl
+  client-0001/network_quiche.jsonl
+  client-0002/network.jsonl
+  ...
+```
+
+Handy options for that script:
+
+```shell
+--generate-file-mb 100
+--client-interval-secs 1
+--max-clients 50
+--publish-interval-ms 1
+--heimdall-metrics
+--work-dir /tmp/quicast-stress-run
 ```
 
 Notes:
@@ -171,5 +209,24 @@ Notes:
 - The sender is now a shared multicast publisher that runs independently of
   any single client connection. Each client receives only draft control frames
   over unicast, while the file chunks themselves stay on multicast.
+- Both the sender and receiver can emit periodic metrics summaries. The sender
+  reports `mctx-core` send counters plus `quiche` channel-encode counters; the
+  receiver reports `mcrx-core` socket counters together with `quiche` channel
+  decode/buffering counters and async receive/decode error counts.
+- The paired receiver metrics are useful for spotting whether a bottleneck is
+  before decode (`mcrx-core` sees packets but `quiche` does not), or inside
+  the draft receive path because packets are delayed waiting for `MC_KEY` or
+  `MC_INTEGRITY`.
+- `--heimdall-metrics-jsonl` writes an `mcrx`-compatible network metrics file
+  plus sibling `*_hardware.jsonl` and `*_quiche.jsonl` files. The network and
+  hardware files are directly ingestible by Heimdall:
+
+```shell
+heimdall ingest-mcrx --run-id run-001 receiver-a /tmp/receiver-a.jsonl /path/to/heimdall-workspace
+heimdall ingest-mcrx-hardware --run-id run-001 receiver-a /tmp/receiver-a_hardware.jsonl /path/to/heimdall-workspace
+```
+
+- The `*_quiche.jsonl` sidecar keeps the receiver-side draft/decode counters in
+  a separate log file, so the main `mcrx` network JSONL stays clean.
 - The current example relies on looped chunks rather than `MC_ACK`. A client
   exits as soon as it has received every chunk once.

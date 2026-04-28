@@ -41,8 +41,13 @@ capture_keylogs = []
 tokio-task-metrics = []
 
 # Enable multicast client receive and server send integration backed by
-# mcrx-core and mctx-core.
-multicast = ["dep:mcrx-core", "dep:mctx-core"]
+# mcrx-core and mctx-core, including their socket/publication metrics.
+multicast = [
+  "dep:mcrx-core",
+  "dep:mctx-core",
+  "mcrx-core/metrics",
+  "mctx-core/metrics",
+]
 
 [lints.rust]
 # capture_keylogs: enable SSLKEYLOGFILE capturing for QUIC connections.

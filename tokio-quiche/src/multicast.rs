@@ -41,6 +41,7 @@ use std::time::Duration;
 use mcrx_core::Context as MulticastContext;
 use mcrx_core::PacketWithMetadata;
 use mcrx_core::SubscriptionConfig;
+use mcrx_core::SubscriptionMetricsSnapshot;
 use mcrx_core::TokioReceiveError;
 use mcrx_core::TokioSubscription;
 use mctx_core::MctxError;
@@ -64,6 +65,16 @@ pub use crate::settings::MulticastClientSettings as ClientSettings;
 const STATE_REASON_UNSPECIFIED_OTHER: u64 = 0x0;
 const PUBLISH_RETRY_DELAY: Duration = Duration::from_millis(10);
 
+/// A point-in-time multicast receive metrics snapshot for one joined channel.
+#[derive(Clone, Debug)]
+pub struct ClientChannelMetricsSnapshot {
+    /// Socket-level receive metrics from `mcrx-core`.
+    pub socket: SubscriptionMetricsSnapshot,
+
+    /// Decode and buffering metrics from `quiche`'s channel receiver.
+    pub receive: quiche::multicast::ChannelReceiveMetricsSnapshot,
+}
+
 /// Events emitted by [`ClientDriver`].
 #[derive(Debug)]
 pub enum ClientEvent {
@@ -78,6 +89,15 @@ pub enum ClientEvent {
 
     /// A local multicast state transition was reported back to the server.
     LocalState(quiche::multicast::State),
+
+    /// Updated multicast receive metrics for a joined channel.
+    MetricsUpdated {
+        /// The QUIC multicast channel ID associated with the metrics.
+        channel_id: Vec<u8>,
+
+        /// The latest paired socket and decode metrics snapshot.
+        metrics: ClientChannelMetricsSnapshot,
+    },
 
     /// A multicast UDP packet was validated and decoded for a joined channel.
     Packet {
@@ -361,11 +381,29 @@ impl<B: JoinBackend> ClientRuntime<B> {
             progressed = true;
 
             match event {
-                IngressEvent::Packet { channel_id, packet } => {
-                    self.handle_ingress_packet(qconn, channel_id, packet)?;
+                IngressEvent::Packet {
+                    channel_id,
+                    packet,
+                    socket_metrics,
+                } => {
+                    self.handle_ingress_packet(
+                        qconn,
+                        channel_id,
+                        socket_metrics,
+                        packet,
+                    )?;
                 },
 
-                IngressEvent::ReceiveError { channel_id, error } => {
+                IngressEvent::ReceiveError {
+                    channel_id,
+                    error,
+                    socket_metrics,
+                } => {
+                    self.channels
+                        .entry(channel_id.clone())
+                        .or_default()
+                        .last_subscription_metrics = Some(socket_metrics);
+                    self.emit_channel_metrics(&channel_id);
                     let _ = self
                         .event_sender
                         .send(ClientEvent::ReceiveError { channel_id, error });
@@ -378,30 +416,37 @@ impl<B: JoinBackend> ClientRuntime<B> {
 
     fn handle_ingress_packet(
         &mut self, qconn: &mut QuicheConnection, channel_id: Vec<u8>,
-        packet: PacketWithMetadata,
+        socket_metrics: SubscriptionMetricsSnapshot, packet: PacketWithMetadata,
     ) -> QuicResult<()> {
-        let events = {
+        {
             let channel = self.channels.entry(channel_id.clone()).or_default();
+            channel.last_subscription_metrics = Some(socket_metrics);
 
             Self::ensure_channel_decoder(channel);
+        }
 
-            let Some(receiver) = channel.receive_state.as_mut() else {
-                let _ = self.event_sender.send(ClientEvent::DecodeError {
-                    channel_id,
-                    error: quiche::Error::InvalidState,
-                    packet,
-                });
-
-                return Ok(());
-            };
-
-            let payload = packet.packet.payload().to_vec();
-            receiver.recv(&payload, packet)?
+        let Some(receiver) = self
+            .channels
+            .get_mut(&channel_id)
+            .and_then(|channel| channel.receive_state.as_mut())
+        else {
+            let _ = self.event_sender.send(ClientEvent::DecodeError {
+                channel_id: channel_id.clone(),
+                error: quiche::Error::InvalidState,
+                packet,
+            });
+            self.emit_channel_metrics(&channel_id);
+            return Ok(());
         };
+
+        let payload = packet.packet.payload().to_vec();
+        let events = receiver.recv(&payload, packet)?;
 
         for event in events {
             self.handle_channel_receive_event(qconn, channel_id.clone(), event)?;
         }
+
+        self.emit_channel_metrics(&channel_id);
 
         Ok(())
     }
@@ -533,6 +578,8 @@ impl<B: JoinBackend> ClientRuntime<B> {
             self.handle_channel_receive_event(qconn, channel_id.clone(), event)?;
         }
 
+        self.emit_channel_metrics(&channel_id);
+
         Ok(())
     }
 
@@ -555,6 +602,8 @@ impl<B: JoinBackend> ClientRuntime<B> {
         for event in events {
             self.handle_channel_receive_event(qconn, channel_id.clone(), event)?;
         }
+
+        self.emit_channel_metrics(&channel_id);
 
         Ok(())
     }
@@ -835,6 +884,26 @@ impl<B: JoinBackend> ClientRuntime<B> {
             .unwrap_or(false)
     }
 
+    fn emit_channel_metrics(&self, channel_id: &[u8]) {
+        let Some(channel) = self.channels.get(channel_id) else {
+            return;
+        };
+        let Some(receive_state) = channel.receive_state.as_ref() else {
+            return;
+        };
+        let Some(socket) = channel.last_subscription_metrics.clone() else {
+            return;
+        };
+
+        let _ = self.event_sender.send(ClientEvent::MetricsUpdated {
+            channel_id: channel_id.to_vec(),
+            metrics: ClientChannelMetricsSnapshot {
+                socket,
+                receive: receive_state.metrics_snapshot(),
+            },
+        });
+    }
+
     fn ensure_channel_decoder(channel: &mut Channel<B::Handle>) {
         if channel.receive_state.is_some() || channel.decoder_error.is_some() {
             return;
@@ -877,6 +946,7 @@ struct Channel<H> {
     announce: Option<quiche::multicast::Announce>,
     key: Option<quiche::multicast::Key>,
     decoder_error: Option<Vec<u8>>,
+    last_subscription_metrics: Option<SubscriptionMetricsSnapshot>,
     receive_state:
         Option<quiche::multicast::ChannelReceiveState<PacketWithMetadata>>,
     next_state_sequence: u64,
@@ -889,6 +959,7 @@ impl<H> Default for Channel<H> {
             announce: None,
             key: None,
             decoder_error: None,
+            last_subscription_metrics: None,
             receive_state: None,
             next_state_sequence: 0,
             receive_handle: None,
@@ -917,11 +988,13 @@ struct JoinError {
 enum IngressEvent {
     Packet {
         channel_id: Vec<u8>,
+        socket_metrics: SubscriptionMetricsSnapshot,
         packet: PacketWithMetadata,
     },
 
     ReceiveError {
         channel_id: Vec<u8>,
+        socket_metrics: SubscriptionMetricsSnapshot,
         error: TokioReceiveError,
     },
 }
@@ -973,7 +1046,7 @@ impl JoinBackend for McrxJoinBackend {
                     reason_phrase: b"mcrx join failed: missing subscription"
                         .to_vec(),
                 })?;
-        let subscription = TokioSubscription::new(subscription)
+        let mut subscription = TokioSubscription::new(subscription)
             .map_err(McrxJoinBackend::join_error)?;
 
         let channel_id = channel_id.to_vec();
@@ -981,15 +1054,21 @@ impl JoinBackend for McrxJoinBackend {
             loop {
                 match subscription.recv_with_metadata().await {
                     Ok(packet) => {
+                        let socket_metrics =
+                            subscription.subscription().metrics_snapshot();
                         let _ = ingress_sender.send(IngressEvent::Packet {
                             channel_id: channel_id.clone(),
+                            socket_metrics,
                             packet,
                         });
                     },
 
                     Err(error) => {
+                        let socket_metrics =
+                            subscription.subscription().metrics_snapshot();
                         let _ = ingress_sender.send(IngressEvent::ReceiveError {
                             channel_id: channel_id.clone(),
+                            socket_metrics,
                             error,
                         });
                         break;
@@ -1867,6 +1946,24 @@ mod tests {
         }
     }
 
+    fn assert_next_local_state(
+        event_receiver: &mut UnboundedReceiver<ClientEvent>,
+        expected: quiche::multicast::ChannelState,
+    ) {
+        loop {
+            match event_receiver.try_recv() {
+                Ok(ClientEvent::LocalState(frame)) => {
+                    assert_eq!(frame.state, expected);
+                    return;
+                },
+
+                Ok(ClientEvent::MetricsUpdated { .. }) => continue,
+
+                other => panic!("expected local state, got {other:?}"),
+            }
+        }
+    }
+
     #[test]
     fn runtime_sends_initial_limits() {
         let settings = test_settings();
@@ -1957,11 +2054,10 @@ mod tests {
             event_receiver.try_recv(),
             Ok(ClientEvent::Announce(frame)) if frame == announce
         ));
-        assert!(matches!(
-            event_receiver.try_recv(),
-            Ok(ClientEvent::LocalState(frame))
-                if frame.state == quiche::multicast::ChannelState::Joined
-        ));
+        assert_next_local_state(
+            &mut event_receiver,
+            quiche::multicast::ChannelState::Joined,
+        );
     }
 
     #[test]
@@ -2019,11 +2115,10 @@ mod tests {
             event_receiver.try_recv(),
             Ok(ClientEvent::UnsupportedIpv6Announce(frame)) if frame == announce
         ));
-        assert!(matches!(
-            event_receiver.try_recv(),
-            Ok(ClientEvent::LocalState(frame))
-                if frame.state == quiche::multicast::ChannelState::DeclinedJoin
-        ));
+        assert_next_local_state(
+            &mut event_receiver,
+            quiche::multicast::ChannelState::DeclinedJoin,
+        );
     }
 
     #[test]

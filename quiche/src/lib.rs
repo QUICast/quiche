@@ -385,6 +385,8 @@ extern crate log;
 
 use std::cmp;
 
+use std::collections::BTreeMap;
+
 use std::collections::VecDeque;
 
 use debug_panic::debug_panic;
@@ -1590,6 +1592,7 @@ where
     /// Multicast control frame queues.
     multicast_recv_queue: multicast::ControlFrameQueue,
     multicast_send_queue: VecDeque<multicast::Frame>,
+    multicast_peer_integrity_hash_lens: BTreeMap<Vec<u8>, usize>,
 
     /// Whether to emit DATAGRAM frames in the next packet.
     emit_dgram: bool,
@@ -2257,6 +2260,7 @@ impl<F: BufFactory> Connection<F> {
                 config.multicast_recv_max_queue_len,
             ),
             multicast_send_queue: VecDeque::new(),
+            multicast_peer_integrity_hash_lens: BTreeMap::new(),
 
             emit_dgram: true,
 
@@ -3520,7 +3524,7 @@ impl<F: BufFactory> Connection<F> {
 
         // Process packet payload.
         while payload.cap() > 0 {
-            let frame = frame::Frame::from_bytes(&mut payload, hdr.ty)?;
+            let frame = self.parse_frame(&mut payload, hdr.ty)?;
 
             qlog_with_type!(QLOG_PACKET_RX, self.qlog, _q, {
                 qlog_frames.push(frame.to_qlog());
@@ -5045,6 +5049,7 @@ impl<F: BufFactory> Connection<F> {
 
             while let Some(frame) = self.multicast_send_queue.front().cloned() {
                 let ack_eliciting_frame = frame.ack_eliciting();
+                let requires_packet_end = frame.requires_packet_end();
                 let frame = frame::Frame::Multicast(frame);
 
                 if push_frame_to_pkt!(b, frames, frame, left) {
@@ -5053,6 +5058,10 @@ impl<F: BufFactory> Connection<F> {
                     if ack_eliciting_frame {
                         ack_eliciting = true;
                         in_flight = true;
+                    }
+
+                    if requires_packet_end {
+                        break;
                     }
                 } else {
                     break;
@@ -7139,6 +7148,44 @@ impl<F: BufFactory> Connection<F> {
         )
     }
 
+    fn multicast_integrity_hash_len(&self, channel_id: &[u8]) -> Option<usize> {
+        self.multicast_peer_integrity_hash_lens
+            .get(channel_id)
+            .copied()
+    }
+
+    fn parse_frame(
+        &self, b: &mut octets::Octets, pkt: Type,
+    ) -> Result<frame::Frame> {
+        let mut peek = b.peek_bytes(b.cap())?;
+        let frame_type = peek.get_varint()?;
+
+        if !multicast::is_frame_type(frame_type) {
+            return frame::Frame::from_bytes(b, pkt);
+        }
+
+        if pkt != Type::Short {
+            return Err(Error::InvalidPacket);
+        }
+
+        let _ = b.get_varint()?;
+
+        let frame = if frame_type == multicast::FRAME_TYPE_INTEGRITY_WITH_LENGTH {
+            let channel_id = multicast::decode_channel_id(&mut peek, true)?;
+            let hash_len = self
+                .multicast_integrity_hash_len(&channel_id)
+                .ok_or(Error::InvalidFrame)?;
+
+            multicast::Frame::decode_from_type_with_integrity_hash_len(
+                frame_type, b, hash_len,
+            )?
+        } else {
+            multicast::Frame::decode_from_type(frame_type, b)?
+        };
+
+        Ok(frame::Frame::Multicast(frame))
+    }
+
     /// Returns when the next timeout event will occur.
     ///
     /// Once the timeout Instant has been reached, the [`on_timeout()`] method
@@ -8923,6 +8970,16 @@ impl<F: BufFactory> Connection<F> {
 
                 if !self.multicast_frame_sent_by_peer(&frame) {
                     return Err(Error::InvalidFrame);
+                }
+
+                if let multicast::Frame::Announce(announce) = &frame {
+                    let hash_len = multicast::integrity_hash_len_from_id(
+                        announce.integrity_hash_algorithm,
+                    )
+                    .map_err(|_| Error::InvalidFrame)?;
+
+                    self.multicast_peer_integrity_hash_lens
+                        .insert(announce.channel_id.clone(), hash_len);
                 }
 
                 if self.multicast_recv_queue.is_full() {

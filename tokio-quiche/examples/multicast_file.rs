@@ -101,6 +101,32 @@ impl ApplicationOverQuic for IdleApp {
     ) -> QuicResult<()> {
         Ok(())
     }
+
+    fn on_conn_close<M: tokio_quiche::metrics::Metrics>(
+        &mut self, qconn: &mut QuicheConnection, _metrics: &M,
+        connection_result: &QuicResult<()>,
+    ) {
+        let stats = qconn.stats();
+        println!(
+            "control connection closed: result={} detail={:?} local_error={:?} \
+             peer_error={:?} sent={} recv={} lost={} retrans={} sent_bytes={} \
+             recv_bytes={}",
+            if connection_result.is_ok() {
+                "ok"
+            } else {
+                "error"
+            },
+            connection_result,
+            qconn.local_error(),
+            qconn.peer_error(),
+            stats.sent,
+            stats.recv,
+            stats.lost,
+            stats.retrans,
+            stats.sent_bytes,
+            stats.recv_bytes,
+        );
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

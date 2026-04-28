@@ -228,6 +228,26 @@ fn multicast_test_client_frame() -> multicast::Frame {
     })
 }
 
+fn multicast_test_server_key_frame() -> multicast::Frame {
+    multicast::Frame::Key(multicast::Key {
+        channel_id: vec![1, 2, 3, 4],
+        key_sequence: 1,
+        from_packet_number: 0,
+        secret: vec![0xaa; 16],
+    })
+}
+
+fn multicast_test_integrity_frame(
+    packet_number_start: u64, hash_byte: u8, packet_hash_count: Option<u64>,
+) -> multicast::Frame {
+    multicast::Frame::Integrity(multicast::Integrity {
+        channel_id: vec![1, 2, 3, 4],
+        packet_number_start,
+        packet_hash_count,
+        packet_hashes: vec![hash_byte; 32],
+    })
+}
+
 fn multicast_negotiated_pipe() -> test_utils::Pipe {
     let mut client_config = test_utils::Pipe::default_config("cubic").unwrap();
     client_config
@@ -283,6 +303,54 @@ fn multicast_control_frame_client_to_server_roundtrip() {
     assert_eq!(pipe.server.multicast_recv_queue_len(), 1);
     assert_eq!(pipe.server.multicast_recv(), Ok(frame));
     assert_eq!(pipe.server.multicast_recv(), Err(Error::Done));
+}
+
+#[test]
+fn multicast_control_frame_coalesced_integrity_roundtrip() {
+    let mut pipe = multicast_negotiated_pipe();
+    let announce = multicast_test_server_frame();
+    let integrity_a = multicast_test_integrity_frame(1, 0xaa, Some(1));
+    let integrity_b = multicast_test_integrity_frame(2, 0xbb, Some(1));
+
+    assert_eq!(pipe.server.multicast_send(announce.clone()), Ok(()));
+
+    let flight = test_utils::emit_flight(&mut pipe.server).unwrap();
+    test_utils::process_flight(&mut pipe.client, flight).unwrap();
+
+    assert_eq!(pipe.client.multicast_recv(), Ok(announce));
+
+    assert_eq!(pipe.server.multicast_send(integrity_a.clone()), Ok(()));
+    assert_eq!(pipe.server.multicast_send(integrity_b.clone()), Ok(()));
+
+    let flight = test_utils::emit_flight(&mut pipe.server).unwrap();
+    assert_eq!(flight.len(), 1);
+
+    test_utils::process_flight(&mut pipe.client, flight).unwrap();
+
+    assert_eq!(pipe.client.multicast_recv_queue_len(), 2);
+    assert_eq!(pipe.client.multicast_recv(), Ok(integrity_a));
+    assert_eq!(pipe.client.multicast_recv(), Ok(integrity_b));
+    assert_eq!(pipe.client.multicast_recv(), Err(Error::Done));
+}
+
+#[test]
+fn multicast_legacy_integrity_stays_at_end_of_packet() {
+    let mut pipe = multicast_negotiated_pipe();
+    let integrity = multicast_test_integrity_frame(1, 0xaa, None);
+    let key = multicast_test_server_key_frame();
+
+    assert_eq!(pipe.server.multicast_send(integrity.clone()), Ok(()));
+    assert_eq!(pipe.server.multicast_send(key.clone()), Ok(()));
+
+    let flight = test_utils::emit_flight(&mut pipe.server).unwrap();
+    assert_eq!(flight.len(), 2);
+
+    test_utils::process_flight(&mut pipe.client, flight).unwrap();
+
+    assert_eq!(pipe.client.multicast_recv_queue_len(), 2);
+    assert_eq!(pipe.client.multicast_recv(), Ok(integrity));
+    assert_eq!(pipe.client.multicast_recv(), Ok(key));
+    assert_eq!(pipe.client.multicast_recv(), Err(Error::Done));
 }
 
 #[test]
