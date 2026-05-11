@@ -49,9 +49,60 @@ const FILE_PACKET_KIND_CHUNK: u8 = 2;
 
 pub const DEFAULT_ENCRYPTION_ALGORITHM: u16 = 0x1301;
 pub const DEFAULT_HASH_ALGORITHM: u16 = 1;
+pub const DEFAULT_HASH_ALGORITHM_NAME: &str = "sha256-32";
 pub const DEFAULT_HEADER_SECRET: [u8; 16] = [0xaa; 16];
 pub const DEFAULT_PAYLOAD_SECRET: [u8; 16] = [0xcc; 16];
 pub const FILE_CHANNEL_ID: [u8; 8] = *b"qmcfile1";
+
+pub fn parse_hash_algorithm_id(value: &str) -> anyhow::Result<u16> {
+    let normalized = value.trim().to_ascii_lowercase();
+
+    match normalized.as_str() {
+        "1" | "sha256" | "sha256-32" => Ok(1),
+        "2" | "sha256-16" => Ok(2),
+        "3" | "sha256-15" => Ok(3),
+        "4" | "sha256-12" => Ok(4),
+        "5" | "sha256-8" => Ok(5),
+        "6" | "sha256-4" => Ok(6),
+        "7" | "sha384" | "sha384-48" => Ok(7),
+        "8" | "sha512" | "sha512-64" => Ok(8),
+
+        _ => anyhow::bail!(
+            "unknown integrity hash algorithm `{value}`; expected one of \
+             sha256-32, sha256-16, sha256-15, sha256-12, sha256-8, \
+             sha256-4, sha384-48, sha512-64"
+        ),
+    }
+}
+
+pub fn describe_hash_algorithm(id: u16) -> &'static str {
+    match id {
+        1 => "sha256-32",
+        2 => "sha256-16",
+        3 => "sha256-15",
+        4 => "sha256-12",
+        5 => "sha256-8",
+        6 => "sha256-4",
+        7 => "sha384-48",
+        8 => "sha512-64",
+        _ => "unknown",
+    }
+}
+
+pub fn hash_algorithm_output_len(id: u16) -> anyhow::Result<usize> {
+    Ok(match id {
+        1 => 32,
+        2 => 16,
+        3 => 15,
+        4 => 12,
+        5 => 8,
+        6 => 4,
+        7 => 48,
+        8 => 64,
+
+        _ => anyhow::bail!("unknown integrity hash algorithm id `{id}`"),
+    })
+}
 
 pub struct IdleApp {
     out: Vec<u8>,
