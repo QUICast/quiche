@@ -42,6 +42,7 @@ use std::collections::VecDeque;
 use std::net::IpAddr;
 use std::net::Ipv4Addr;
 use std::net::Ipv6Addr;
+use std::time::Instant;
 
 use ring::digest;
 
@@ -471,6 +472,72 @@ pub struct State {
 
     /// The UTF-8-free-form reason phrase bytes.
     pub reason_phrase: Vec<u8>,
+}
+
+/// The current multicast viability status for one channel on one connection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProbeStatus {
+    /// Multicast probing is in progress for this channel.
+    Probing,
+
+    /// Multicast delivery has been proven viable for this channel.
+    Viable,
+
+    /// Multicast probing timed out before the channel became viable.
+    TimedOut,
+
+    /// The multicast join request failed for this channel.
+    JoinFailed,
+
+    /// The multicast channel was left before becoming retired.
+    Left,
+
+    /// The multicast channel is retired.
+    Retired,
+}
+
+/// A multicast probe state transition for one channel on one connection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProbeEvent {
+    /// The channel whose probe state changed.
+    pub channel_id: Vec<u8>,
+
+    /// The new probe status for the channel.
+    pub status: ProbeStatus,
+
+    /// The optional state-reason scope that caused the transition.
+    pub reason_scope: Option<StateReasonScope>,
+
+    /// The optional state-reason code that caused the transition.
+    pub reason_code: Option<u64>,
+
+    /// The optional state-reason phrase that caused the transition.
+    pub reason_phrase: Vec<u8>,
+}
+
+/// One decoded multicast DATAGRAM payload delivered by a channel packet.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChannelDatagram {
+    /// The channel ID that delivered the DATAGRAM.
+    pub channel_id: Vec<u8>,
+
+    /// The multicast packet number that carried the DATAGRAM.
+    pub packet_number: u64,
+
+    /// The DATAGRAM payload bytes.
+    pub data: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ProbeState {
+    pub(crate) status: ProbeStatus,
+    pub(crate) deadline: Option<Instant>,
+}
+
+impl ProbeState {
+    pub(crate) fn new(status: ProbeStatus, deadline: Option<Instant>) -> Self {
+        Self { status, deadline }
+    }
 }
 
 /// Multicast control frames defined by the draft.
@@ -1050,6 +1117,22 @@ pub struct ChannelSendMetricsSnapshot {
     /// Total failed encode attempts from [`ChannelSendState::write_packet()`].
     pub encode_errors: u64,
 
+    /// Total valid `MC_ACK` frames processed by [`ChannelSendState::on_ack()`].
+    pub ack_frames_processed: u64,
+
+    /// Total acknowledged blocks processed across all `MC_ACK` frames.
+    pub ack_blocks_processed: u64,
+
+    /// Total packet numbers reported as acknowledged by peer `MC_ACK` frames.
+    pub acked_packets_reported: u64,
+
+    /// Total invalid `MC_ACK` frames rejected by
+    /// [`ChannelSendState::on_ack()`].
+    pub ack_errors: u64,
+
+    /// The largest multicast packet number acknowledged so far, if any.
+    pub largest_acknowledged: Option<u64>,
+
     /// The most recently assigned multicast packet number, if any.
     pub last_packet_number: Option<u64>,
 
@@ -1078,6 +1161,21 @@ pub struct ChannelSendMetricsDelta {
     /// Change in [`ChannelSendMetricsSnapshot::encode_errors`].
     pub encode_errors: u64,
 
+    /// Change in [`ChannelSendMetricsSnapshot::ack_frames_processed`].
+    pub ack_frames_processed: u64,
+
+    /// Change in [`ChannelSendMetricsSnapshot::ack_blocks_processed`].
+    pub ack_blocks_processed: u64,
+
+    /// Change in [`ChannelSendMetricsSnapshot::acked_packets_reported`].
+    pub acked_packets_reported: u64,
+
+    /// Change in [`ChannelSendMetricsSnapshot::ack_errors`].
+    pub ack_errors: u64,
+
+    /// The largest packet number acknowledged at the end of the interval.
+    pub largest_acknowledged: Option<u64>,
+
     /// The latest assigned packet number sampled at the end of the interval.
     pub last_packet_number: Option<u64>,
 
@@ -1105,10 +1203,37 @@ impl ChannelSendMetricsDelta {
             encode_errors: after
                 .encode_errors
                 .saturating_sub(before.encode_errors),
+            ack_frames_processed: after
+                .ack_frames_processed
+                .saturating_sub(before.ack_frames_processed),
+            ack_blocks_processed: after
+                .ack_blocks_processed
+                .saturating_sub(before.ack_blocks_processed),
+            acked_packets_reported: after
+                .acked_packets_reported
+                .saturating_sub(before.acked_packets_reported),
+            ack_errors: after.ack_errors.saturating_sub(before.ack_errors),
+            largest_acknowledged: after.largest_acknowledged,
             last_packet_number: after.last_packet_number,
             next_packet_number: after.next_packet_number,
         }
     }
+}
+
+/// Summary returned after processing one peer `MC_ACK`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ChannelSendAckSummary {
+    /// Total acknowledged blocks carried by the frame.
+    pub ack_blocks: u64,
+
+    /// Total packet numbers covered by all acknowledged blocks.
+    pub acked_packets: u64,
+
+    /// The largest packet number acknowledged by the frame.
+    pub largest_acknowledged: u64,
+
+    /// The smallest packet number acknowledged by the frame.
+    pub smallest_acknowledged: u64,
 }
 
 /// Send-side state for one multicast channel's encrypted 1-RTT packets.
@@ -1209,6 +1334,48 @@ impl ChannelSendState {
         Ok(())
     }
 
+    /// Processes one peer `MC_ACK` for this channel.
+    ///
+    /// This validates the acknowledged ranges against the sender's channel ID
+    /// and the packet number space already assigned by this sender, then
+    /// updates sender-side ACK metrics.
+    pub fn on_ack(&mut self, ack: &Ack) -> Result<ChannelSendAckSummary> {
+        if ack.channel_id != self.announce.channel_id {
+            self.metrics.ack_errors = self.metrics.ack_errors.saturating_add(1);
+            return Err(Error::InvalidState);
+        }
+
+        let summary = match summarize_ack(ack, self.next_packet_number) {
+            Ok(summary) => summary,
+
+            Err(error) => {
+                self.metrics.ack_errors =
+                    self.metrics.ack_errors.saturating_add(1);
+                return Err(error);
+            },
+        };
+
+        self.metrics.ack_frames_processed =
+            self.metrics.ack_frames_processed.saturating_add(1);
+        self.metrics.ack_blocks_processed = self
+            .metrics
+            .ack_blocks_processed
+            .saturating_add(summary.ack_blocks);
+        self.metrics.acked_packets_reported = self
+            .metrics
+            .acked_packets_reported
+            .saturating_add(summary.acked_packets);
+        self.metrics.largest_acknowledged = Some(
+            self.metrics
+                .largest_acknowledged
+                .map_or(summary.largest_acknowledged, |largest| {
+                    largest.max(summary.largest_acknowledged)
+                }),
+        );
+
+        Ok(summary)
+    }
+
     /// Encodes one multicast packet carrying the provided channel frames.
     ///
     /// The encoded bytes are written into `out`. On success, the returned
@@ -1262,6 +1429,141 @@ impl ChannelSendState {
             },
         })
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AckSpan {
+    start: u64,
+    end: u64,
+}
+
+/// Tracks cumulative multicast packet acknowledgments for a channel.
+///
+/// This helper records packet numbers that have been validated and decoded,
+/// merges them into disjoint contiguous ranges, and can synthesize the next
+/// `MC_ACK` payload to send back over the control connection.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AckTracker {
+    ranges: Vec<AckSpan>,
+    pending: bool,
+}
+
+impl AckTracker {
+    /// Records a decoded multicast packet number.
+    pub fn record_packet(&mut self, packet_number: u64) {
+        let mut start = packet_number;
+        let mut end = packet_number;
+        let mut insert_at = 0;
+
+        while insert_at < self.ranges.len() {
+            let existing = self.ranges[insert_at];
+
+            if end.saturating_add(1) < existing.start {
+                break;
+            }
+
+            if existing.end.saturating_add(1) < start {
+                insert_at += 1;
+                continue;
+            }
+
+            start = start.min(existing.start);
+            end = end.max(existing.end);
+            self.ranges.remove(insert_at);
+        }
+
+        self.ranges.insert(insert_at, AckSpan { start, end });
+        self.pending = true;
+    }
+
+    /// Builds the pending `MC_ACK` frame for `channel_id`, if any.
+    pub fn pending_ack(&self, channel_id: &[u8]) -> Option<Ack> {
+        if !self.pending || self.ranges.is_empty() {
+            return None;
+        }
+
+        let newest = self.ranges.last().copied()?;
+        let mut smallest_ack = newest.start;
+        let mut ack_ranges =
+            Vec::with_capacity(self.ranges.len().saturating_sub(1));
+
+        for span in self.ranges[..self.ranges.len().saturating_sub(1)]
+            .iter()
+            .rev()
+        {
+            let gap = smallest_ack
+                .checked_sub(span.end)
+                .and_then(|delta| delta.checked_sub(2))
+                .expect("ack spans must be ordered and disjoint");
+
+            ack_ranges.push(AckRange {
+                gap,
+                ack_range_length: span.end - span.start,
+            });
+
+            smallest_ack = span.start;
+        }
+
+        Some(Ack {
+            channel_id: channel_id.to_vec(),
+            largest_acknowledged: newest.end,
+            ack_delay: 0,
+            first_ack_range: newest.end - newest.start,
+            ack_ranges,
+            ecn_counts: None,
+        })
+    }
+
+    /// Marks the currently pending `MC_ACK` state as sent.
+    pub fn mark_sent(&mut self) {
+        self.pending = false;
+    }
+}
+
+fn summarize_ack(
+    ack: &Ack, next_packet_number: u64,
+) -> Result<ChannelSendAckSummary> {
+    if ack.largest_acknowledged >= next_packet_number {
+        return Err(Error::InvalidAckRange);
+    }
+
+    let mut ack_blocks = 1_u64;
+    let mut acked_packets = ack
+        .first_ack_range
+        .checked_add(1)
+        .ok_or(Error::InvalidAckRange)?;
+    let mut smallest_acknowledged = ack
+        .largest_acknowledged
+        .checked_sub(ack.first_ack_range)
+        .ok_or(Error::InvalidAckRange)?;
+
+    for range in &ack.ack_ranges {
+        let largest = smallest_acknowledged
+            .checked_sub(range.gap)
+            .and_then(|value| value.checked_sub(2))
+            .ok_or(Error::InvalidAckRange)?;
+        let smallest = largest
+            .checked_sub(range.ack_range_length)
+            .ok_or(Error::InvalidAckRange)?;
+
+        ack_blocks = ack_blocks.checked_add(1).ok_or(Error::InvalidAckRange)?;
+        acked_packets = acked_packets
+            .checked_add(
+                range
+                    .ack_range_length
+                    .checked_add(1)
+                    .ok_or(Error::InvalidAckRange)?,
+            )
+            .ok_or(Error::InvalidAckRange)?;
+        smallest_acknowledged = smallest;
+    }
+
+    Ok(ChannelSendAckSummary {
+        ack_blocks,
+        acked_packets,
+        largest_acknowledged: ack.largest_acknowledged,
+        smallest_acknowledged,
+    })
 }
 
 /// An outcome emitted by [`ChannelReceiveState`] when a packet becomes ready.
@@ -1766,6 +2068,11 @@ struct ChannelSendMetricsState {
     frames_encoded: u64,
     key_updates: u64,
     encode_errors: u64,
+    ack_frames_processed: u64,
+    ack_blocks_processed: u64,
+    acked_packets_reported: u64,
+    ack_errors: u64,
+    largest_acknowledged: Option<u64>,
     last_packet_number: Option<u64>,
 }
 
@@ -1778,6 +2085,11 @@ impl ChannelSendMetricsState {
             frames_encoded: self.frames_encoded,
             key_updates: self.key_updates,
             encode_errors: self.encode_errors,
+            ack_frames_processed: self.ack_frames_processed,
+            ack_blocks_processed: self.ack_blocks_processed,
+            acked_packets_reported: self.acked_packets_reported,
+            ack_errors: self.ack_errors,
+            largest_acknowledged: self.largest_acknowledged,
             last_packet_number: self.last_packet_number,
             next_packet_number,
         }
@@ -2205,6 +2517,88 @@ impl ControlFrameQueue {
     }
 
     pub(crate) fn pop(&mut self) -> Option<Frame> {
+        self.queue.pop_front()
+    }
+
+    pub(crate) fn has_pending(&self) -> bool {
+        !self.queue.is_empty()
+    }
+
+    pub(crate) fn is_full(&self) -> bool {
+        self.queue.len() == self.queue_max_len
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.queue.len()
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct ProbeEventQueue {
+    queue: VecDeque<ProbeEvent>,
+    queue_max_len: usize,
+}
+
+impl ProbeEventQueue {
+    pub(crate) fn new(queue_max_len: usize) -> Self {
+        ProbeEventQueue {
+            queue: VecDeque::new(),
+            queue_max_len,
+        }
+    }
+
+    pub(crate) fn push(&mut self, event: ProbeEvent) -> Result<()> {
+        if self.is_full() {
+            return Err(Error::Done);
+        }
+
+        self.queue.push_back(event);
+
+        Ok(())
+    }
+
+    pub(crate) fn pop(&mut self) -> Option<ProbeEvent> {
+        self.queue.pop_front()
+    }
+
+    pub(crate) fn has_pending(&self) -> bool {
+        !self.queue.is_empty()
+    }
+
+    pub(crate) fn is_full(&self) -> bool {
+        self.queue.len() == self.queue_max_len
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.queue.len()
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct ChannelDatagramQueue {
+    queue: VecDeque<ChannelDatagram>,
+    queue_max_len: usize,
+}
+
+impl ChannelDatagramQueue {
+    pub(crate) fn new(queue_max_len: usize) -> Self {
+        ChannelDatagramQueue {
+            queue: VecDeque::new(),
+            queue_max_len,
+        }
+    }
+
+    pub(crate) fn push(&mut self, dgram: ChannelDatagram) -> Result<()> {
+        if self.is_full() {
+            return Err(Error::Done);
+        }
+
+        self.queue.push_back(dgram);
+
+        Ok(())
+    }
+
+    pub(crate) fn pop(&mut self) -> Option<ChannelDatagram> {
         self.queue.pop_front()
     }
 
@@ -2677,6 +3071,111 @@ mod tests {
     }
 
     #[test]
+    fn ack_tracker_encodes_non_contiguous_ranges() {
+        let mut tracker = AckTracker::default();
+
+        for packet_number in [0, 2, 3, 6] {
+            tracker.record_packet(packet_number);
+        }
+
+        let ack = tracker.pending_ack(&[1, 2, 3, 4]).unwrap();
+
+        assert_eq!(ack.channel_id, vec![1, 2, 3, 4]);
+        assert_eq!(ack.largest_acknowledged, 6);
+        assert_eq!(ack.ack_delay, 0);
+        assert_eq!(ack.first_ack_range, 0);
+        assert_eq!(ack.ack_ranges, vec![
+            AckRange {
+                gap: 1,
+                ack_range_length: 1,
+            },
+            AckRange {
+                gap: 0,
+                ack_range_length: 0,
+            },
+        ]);
+        assert_eq!(ack.ecn_counts, None);
+
+        tracker.mark_sent();
+        assert_eq!(tracker.pending_ack(&[1, 2, 3, 4]), None);
+    }
+
+    #[test]
+    fn channel_send_state_processes_ack() {
+        let announce = test_announce();
+        let key = test_key(&announce.channel_id);
+        let mut sender = ChannelSendState::new(announce.clone(), key).unwrap();
+        let mut out = [0; 256];
+
+        for _ in 0..7 {
+            sender
+                .write_packet(&[ChannelFrame::Ping], &mut out)
+                .unwrap();
+        }
+
+        let summary = sender
+            .on_ack(&Ack {
+                channel_id: announce.channel_id,
+                largest_acknowledged: 6,
+                ack_delay: 0,
+                first_ack_range: 0,
+                ack_ranges: vec![
+                    AckRange {
+                        gap: 1,
+                        ack_range_length: 1,
+                    },
+                    AckRange {
+                        gap: 0,
+                        ack_range_length: 0,
+                    },
+                ],
+                ecn_counts: None,
+            })
+            .unwrap();
+
+        assert_eq!(summary, ChannelSendAckSummary {
+            ack_blocks: 3,
+            acked_packets: 4,
+            largest_acknowledged: 6,
+            smallest_acknowledged: 0,
+        });
+        let metrics = sender.metrics_snapshot();
+
+        assert_eq!(metrics.write_calls, 7);
+        assert_eq!(metrics.packets_encoded, 7);
+        assert_eq!(metrics.frames_encoded, 7);
+        assert_eq!(metrics.key_updates, 0);
+        assert_eq!(metrics.encode_errors, 0);
+        assert_eq!(metrics.ack_frames_processed, 1);
+        assert_eq!(metrics.ack_blocks_processed, 3);
+        assert_eq!(metrics.acked_packets_reported, 4);
+        assert_eq!(metrics.ack_errors, 0);
+        assert_eq!(metrics.largest_acknowledged, Some(6));
+        assert_eq!(metrics.last_packet_number, Some(6));
+        assert_eq!(metrics.next_packet_number, 7);
+    }
+
+    #[test]
+    fn channel_send_state_rejects_ack_for_unsent_packet() {
+        let announce = test_announce();
+        let key = test_key(&announce.channel_id);
+        let mut sender = ChannelSendState::new(announce.clone(), key).unwrap();
+
+        assert_eq!(
+            sender.on_ack(&Ack {
+                channel_id: announce.channel_id,
+                largest_acknowledged: 0,
+                ack_delay: 0,
+                first_ack_range: 0,
+                ack_ranges: Vec::new(),
+                ecn_counts: None,
+            }),
+            Err(Error::InvalidAckRange)
+        );
+        assert_eq!(sender.metrics_snapshot().ack_errors, 1);
+    }
+
+    #[test]
     fn state_roundtrip() {
         let frame = Frame::State(State {
             channel_id: vec![9, 9, 9, 9],
@@ -2839,6 +3338,11 @@ mod tests {
             frames_encoded: 1,
             key_updates: 0,
             encode_errors: 0,
+            ack_frames_processed: 0,
+            ack_blocks_processed: 0,
+            acked_packets_reported: 0,
+            ack_errors: 0,
+            largest_acknowledged: None,
             last_packet_number: Some(0),
             next_packet_number: 1,
         });
@@ -2984,6 +3488,11 @@ mod tests {
             frames_encoded: 1,
             key_updates: 0,
             encode_errors: 0,
+            ack_frames_processed: 0,
+            ack_blocks_processed: 0,
+            acked_packets_reported: 0,
+            ack_errors: 0,
+            largest_acknowledged: None,
             last_packet_number: Some(0),
             next_packet_number: 1,
         });

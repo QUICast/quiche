@@ -1593,6 +1593,9 @@ where
     multicast_recv_queue: multicast::ControlFrameQueue,
     multicast_send_queue: VecDeque<multicast::Frame>,
     multicast_peer_integrity_hash_lens: BTreeMap<Vec<u8>, usize>,
+    multicast_dgram_recv_queue: multicast::ChannelDatagramQueue,
+    multicast_probe_event_queue: multicast::ProbeEventQueue,
+    multicast_probe_states: BTreeMap<Vec<u8>, multicast::ProbeState>,
 
     /// Whether to emit DATAGRAM frames in the next packet.
     emit_dgram: bool,
@@ -2261,6 +2264,13 @@ impl<F: BufFactory> Connection<F> {
             ),
             multicast_send_queue: VecDeque::new(),
             multicast_peer_integrity_hash_lens: BTreeMap::new(),
+            multicast_dgram_recv_queue: multicast::ChannelDatagramQueue::new(
+                config.multicast_recv_max_queue_len,
+            ),
+            multicast_probe_event_queue: multicast::ProbeEventQueue::new(
+                config.multicast_recv_max_queue_len,
+            ),
+            multicast_probe_states: BTreeMap::new(),
 
             emit_dgram: true,
 
@@ -7065,6 +7075,115 @@ impl<F: BufFactory> Connection<F> {
         self.multicast_send_queue.len()
     }
 
+    /// Starts multicast probing for the provided channel on this connection.
+    ///
+    /// The first valid peer `MC_ACK` processed for the channel will mark it as
+    /// viable. If no valid `MC_ACK` arrives before `timeout`, the channel will
+    /// transition to timed out the next time [`on_timeout()`] runs.
+    pub fn multicast_probe_start(
+        &mut self, channel_id: &[u8], timeout: Duration,
+    ) -> Result<()> {
+        let deadline = Instant::now() + timeout;
+
+        self.multicast_set_probe_state(
+            channel_id.to_vec(),
+            multicast::ProbeStatus::Probing,
+            Some(deadline),
+            None,
+            None,
+            Vec::new(),
+            true,
+        )
+    }
+
+    /// Returns the current multicast probe status for the provided channel.
+    pub fn multicast_probe_status(
+        &self, channel_id: &[u8],
+    ) -> Option<multicast::ProbeStatus> {
+        self.multicast_probe_states
+            .get(channel_id)
+            .map(|state| state.status)
+    }
+
+    /// Reads the first pending multicast probe event.
+    #[inline]
+    pub fn multicast_probe_recv(&mut self) -> Result<multicast::ProbeEvent> {
+        self.multicast_probe_event_queue.pop().ok_or(Error::Done)
+    }
+
+    /// Returns whether there is a multicast probe event available to read.
+    #[inline]
+    pub fn is_multicast_probe_readable(&self) -> bool {
+        self.multicast_probe_event_queue.has_pending()
+    }
+
+    /// Returns the number of pending multicast probe events.
+    #[inline]
+    pub fn multicast_probe_queue_len(&self) -> usize {
+        self.multicast_probe_event_queue.len()
+    }
+
+    /// Updates connection-local multicast probe state using one local
+    /// `MC_STATE` transition.
+    pub fn multicast_process_local_state(
+        &mut self, frame: multicast::State,
+    ) -> Result<()> {
+        self.multicast_on_state_frame(&frame)
+    }
+
+    /// Updates connection-local multicast probe state using one validated peer
+    /// `MC_ACK`.
+    pub fn multicast_process_peer_ack(
+        &mut self, frame: multicast::Ack,
+    ) -> Result<()> {
+        self.multicast_on_peer_ack(&frame)
+    }
+
+    /// Queues decoded multicast DATAGRAM payloads from one channel packet.
+    pub fn multicast_process_channel_packet(
+        &mut self, packet: multicast::ChannelPacket,
+    ) -> Result<()> {
+        let channel_id = packet.channel_id;
+        let packet_number = packet.packet_number;
+
+        for frame in packet.frames {
+            let multicast::ChannelFrame::Datagram { data } = frame else {
+                continue;
+            };
+
+            if self.multicast_dgram_recv_queue.is_full() {
+                self.multicast_dgram_recv_queue.pop();
+            }
+
+            self.multicast_dgram_recv_queue
+                .push(multicast::ChannelDatagram {
+                    channel_id: channel_id.clone(),
+                    packet_number,
+                    data,
+                })?;
+        }
+
+        Ok(())
+    }
+
+    /// Reads the first decoded multicast DATAGRAM payload.
+    #[inline]
+    pub fn multicast_dgram_recv(&mut self) -> Result<multicast::ChannelDatagram> {
+        self.multicast_dgram_recv_queue.pop().ok_or(Error::Done)
+    }
+
+    /// Returns whether there is a decoded multicast DATAGRAM available.
+    #[inline]
+    pub fn is_multicast_dgram_readable(&self) -> bool {
+        self.multicast_dgram_recv_queue.has_pending()
+    }
+
+    /// Returns the number of queued decoded multicast DATAGRAM payloads.
+    #[inline]
+    pub fn multicast_dgram_recv_queue_len(&self) -> usize {
+        self.multicast_dgram_recv_queue.len()
+    }
+
     /// Queues a multicast control frame for transmission on the unicast
     /// connection.
     ///
@@ -7154,6 +7273,128 @@ impl<F: BufFactory> Connection<F> {
             .copied()
     }
 
+    fn multicast_set_probe_state(
+        &mut self, channel_id: Vec<u8>, status: multicast::ProbeStatus,
+        deadline: Option<Instant>,
+        reason_scope: Option<multicast::StateReasonScope>,
+        reason_code: Option<u64>, reason_phrase: Vec<u8>,
+        emit_if_unchanged: bool,
+    ) -> Result<()> {
+        let existed = self.multicast_probe_states.contains_key(&channel_id);
+        let state = self
+            .multicast_probe_states
+            .entry(channel_id.clone())
+            .or_insert_with(|| multicast::ProbeState::new(status, deadline));
+
+        let changed =
+            !existed || state.status != status || state.deadline != deadline;
+        state.status = status;
+        state.deadline = deadline;
+
+        if !changed && !emit_if_unchanged {
+            return Ok(());
+        }
+
+        if self.multicast_probe_event_queue.is_full() {
+            self.multicast_probe_event_queue.pop();
+        }
+
+        self.multicast_probe_event_queue
+            .push(multicast::ProbeEvent {
+                channel_id,
+                status,
+                reason_scope,
+                reason_code,
+                reason_phrase,
+            })?;
+
+        Ok(())
+    }
+
+    fn multicast_on_state_frame(
+        &mut self, frame: &multicast::State,
+    ) -> Result<()> {
+        let status = match frame.state {
+            multicast::ChannelState::Joined => multicast::ProbeStatus::Probing,
+            multicast::ChannelState::DeclinedJoin =>
+                multicast::ProbeStatus::JoinFailed,
+            multicast::ChannelState::Left => multicast::ProbeStatus::Left,
+            multicast::ChannelState::Retired => multicast::ProbeStatus::Retired,
+        };
+
+        let deadline = if status == multicast::ProbeStatus::Probing {
+            self.multicast_probe_states
+                .get(frame.channel_id.as_slice())
+                .and_then(|state| state.deadline)
+        } else {
+            None
+        };
+
+        self.multicast_set_probe_state(
+            frame.channel_id.clone(),
+            status,
+            deadline,
+            Some(frame.reason_scope),
+            Some(frame.reason_code),
+            frame.reason_phrase.clone(),
+            false,
+        )
+    }
+
+    fn multicast_on_peer_ack(&mut self, frame: &multicast::Ack) -> Result<()> {
+        self.multicast_set_probe_state(
+            frame.channel_id.clone(),
+            multicast::ProbeStatus::Viable,
+            None,
+            None,
+            None,
+            Vec::new(),
+            false,
+        )
+    }
+
+    fn multicast_probe_deadline(&self) -> Option<Instant> {
+        self.multicast_probe_states
+            .values()
+            .filter(|state| state.status == multicast::ProbeStatus::Probing)
+            .filter_map(|state| state.deadline)
+            .min()
+    }
+
+    fn multicast_on_timeout(&mut self, now: Instant) {
+        let timed_out = self
+            .multicast_probe_states
+            .iter_mut()
+            .filter_map(|(channel_id, state)| {
+                if state.status != multicast::ProbeStatus::Probing {
+                    return None;
+                }
+
+                let deadline = state.deadline?;
+
+                if deadline > now {
+                    return None;
+                }
+
+                state.status = multicast::ProbeStatus::TimedOut;
+                state.deadline = None;
+                Some(channel_id.clone())
+            })
+            .collect::<Vec<_>>();
+
+        for channel_id in timed_out {
+            let _ = self.multicast_set_probe_state(
+                channel_id,
+                multicast::ProbeStatus::TimedOut,
+                None,
+                None,
+                None,
+                Vec::new(),
+                true,
+            );
+        }
+    }
+
     fn parse_frame(
         &self, b: &mut octets::Octets, pkt: Type,
     ) -> Result<frame::Frame> {
@@ -7219,7 +7460,10 @@ impl<F: BufFactory> Connection<F> {
                 .as_ref()
                 .map(|key_update| key_update.timer);
 
-            let timers = [self.idle_timer, path_timer, key_update_timer];
+            let probe_timer = self.multicast_probe_deadline();
+
+            let timers =
+                [self.idle_timer, path_timer, key_update_timer, probe_timer];
 
             timers.iter().filter_map(|&x| x).min()
         }
@@ -7284,6 +7528,8 @@ impl<F: BufFactory> Connection<F> {
                     .take();
             }
         }
+
+        self.multicast_on_timeout(now);
 
         let handshake_status = self.handshake_status();
 
@@ -8980,6 +9226,10 @@ impl<F: BufFactory> Connection<F> {
 
                     self.multicast_peer_integrity_hash_lens
                         .insert(announce.channel_id.clone(), hash_len);
+                }
+
+                if let multicast::Frame::State(state) = &frame {
+                    self.multicast_on_state_frame(state)?;
                 }
 
                 if self.multicast_recv_queue.is_full() {
