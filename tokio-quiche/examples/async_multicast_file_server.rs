@@ -1183,7 +1183,9 @@ fn print_publisher_metrics(
 
     println!(
         "[metrics] tx encoded_pkts={} encoded_bytes={} encoded_frames={} \
-         send_calls={} wire_pkts={} wire_bytes={} send_errors={} next_pn={}",
+         send_calls={} wire_pkts={} wire_bytes={} send_errors={} \
+         ack_frames={} ack_blocks={} acked_pkts={} ack_errors={} \
+         largest_acked={:?} next_pn={}",
         send_delta.packets_encoded,
         send_delta.bytes_encoded,
         send_delta.frames_encoded,
@@ -1191,6 +1193,11 @@ fn print_publisher_metrics(
         publication_delta.packets_sent,
         publication_delta.bytes_sent,
         publication_delta.send_errors,
+        send_delta.ack_frames_processed,
+        send_delta.ack_blocks_processed,
+        send_delta.acked_packets_reported,
+        send_delta.ack_errors,
+        current_send_metrics.largest_acknowledged,
         send_delta.next_packet_number,
     );
     println!(

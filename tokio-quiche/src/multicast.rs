@@ -490,6 +490,8 @@ impl<B: JoinBackend> ClientRuntime<B> {
             }
         }
 
+        qconn.multicast_process_channel_packet(packet.clone())?;
+
         let _ = self.event_sender.send(ClientEvent::Packet {
             channel_id,
             packet,
@@ -796,6 +798,7 @@ impl<B: JoinBackend> ClientRuntime<B> {
         };
 
         qconn.multicast_send(quiche::multicast::Frame::State(frame.clone()))?;
+        qconn.multicast_process_local_state(frame.clone())?;
 
         let _ = self.event_sender.send(ClientEvent::LocalState(frame));
 
@@ -900,7 +903,7 @@ impl<B: JoinBackend> ClientRuntime<B> {
             .filter_map(|(channel_id, channel)| {
                 channel
                     .ack_state
-                    .pending_frame(channel_id)
+                    .pending_ack(channel_id)
                     .map(|frame| (channel_id.clone(), frame))
             })
             .collect::<Vec<_>>();
@@ -987,7 +990,7 @@ struct Channel<H> {
     last_subscription_metrics: Option<SubscriptionMetricsSnapshot>,
     receive_state:
         Option<quiche::multicast::ChannelReceiveState<PacketWithMetadata>>,
-    ack_state: ChannelAckState,
+    ack_state: quiche::multicast::AckTracker,
     next_state_sequence: u64,
     receive_handle: Option<H>,
 }
@@ -1000,91 +1003,10 @@ impl<H> Default for Channel<H> {
             decoder_error: None,
             last_subscription_metrics: None,
             receive_state: None,
-            ack_state: ChannelAckState::default(),
+            ack_state: quiche::multicast::AckTracker::default(),
             next_state_sequence: 0,
             receive_handle: None,
         }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct AckSpan {
-    start: u64,
-    end: u64,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct ChannelAckState {
-    ranges: Vec<AckSpan>,
-    pending: bool,
-}
-
-impl ChannelAckState {
-    fn record_packet(&mut self, packet_number: u64) {
-        let mut start = packet_number;
-        let mut end = packet_number;
-        let mut insert_at = 0;
-
-        while insert_at < self.ranges.len() {
-            let existing = self.ranges[insert_at];
-
-            if end.saturating_add(1) < existing.start {
-                break;
-            }
-
-            if existing.end.saturating_add(1) < start {
-                insert_at += 1;
-                continue;
-            }
-
-            start = start.min(existing.start);
-            end = end.max(existing.end);
-            self.ranges.remove(insert_at);
-        }
-
-        self.ranges.insert(insert_at, AckSpan { start, end });
-        self.pending = true;
-    }
-
-    fn pending_frame(&self, channel_id: &[u8]) -> Option<quiche::multicast::Ack> {
-        if !self.pending || self.ranges.is_empty() {
-            return None;
-        }
-
-        let newest = self.ranges.last().copied()?;
-        let mut smallest_ack = newest.start;
-        let mut ack_ranges =
-            Vec::with_capacity(self.ranges.len().saturating_sub(1));
-
-        for span in self.ranges[..self.ranges.len().saturating_sub(1)]
-            .iter()
-            .rev()
-        {
-            let gap = smallest_ack
-                .checked_sub(span.end)
-                .and_then(|delta| delta.checked_sub(2))
-                .expect("ack spans must be ordered and disjoint");
-
-            ack_ranges.push(quiche::multicast::AckRange {
-                gap,
-                ack_range_length: span.end - span.start,
-            });
-
-            smallest_ack = span.start;
-        }
-
-        Some(quiche::multicast::Ack {
-            channel_id: channel_id.to_vec(),
-            largest_acknowledged: newest.end,
-            ack_delay: 0,
-            first_ack_range: newest.end - newest.start,
-            ack_ranges,
-            ecn_counts: None,
-        })
-    }
-
-    fn mark_sent(&mut self) {
-        self.pending = false;
     }
 }
 
@@ -1663,6 +1585,12 @@ impl<B: PublishBackend> ServerRuntime<B> {
             },
 
             quiche::multicast::Frame::Ack(frame) => {
+                if let Some(channel) = self.channels.get_mut(&frame.channel_id) {
+                    channel.send_state.on_ack(&frame)?;
+                }
+
+                qconn.multicast_process_peer_ack(frame.clone())?;
+
                 let _ = self.event_sender.send(ServerEvent::ClientAck(frame));
             },
 
@@ -2342,6 +2270,15 @@ mod tests {
         };
 
         runtime.on_conn_established(&mut pipe.server).unwrap();
+        let mut out = [0; 256];
+        let channel = runtime.channels.get_mut(&ack.channel_id).unwrap();
+
+        for _ in 0..8 {
+            channel
+                .send_state
+                .write_packet(&[quiche::multicast::ChannelFrame::Ping], &mut out)
+                .unwrap();
+        }
 
         pipe.client
             .multicast_send(quiche::multicast::Frame::Ack(ack.clone()))
@@ -2356,6 +2293,31 @@ mod tests {
             event_receiver.try_recv(),
             Ok(ServerEvent::ClientAck(frame)) if frame == ack
         ));
+        assert_eq!(
+            pipe.server.multicast_probe_status(&[1, 2, 3, 4]),
+            Some(quiche::multicast::ProbeStatus::Viable)
+        );
+        assert_eq!(
+            pipe.server.multicast_probe_recv(),
+            Ok(quiche::multicast::ProbeEvent {
+                channel_id: vec![1, 2, 3, 4],
+                status: quiche::multicast::ProbeStatus::Viable,
+                reason_scope: None,
+                reason_code: None,
+                reason_phrase: Vec::new(),
+            })
+        );
+        let metrics = runtime
+            .channels
+            .get(&[1, 2, 3, 4].to_vec())
+            .unwrap()
+            .send_state
+            .metrics_snapshot();
+        assert_eq!(metrics.ack_frames_processed, 1);
+        assert_eq!(metrics.ack_blocks_processed, 2);
+        assert_eq!(metrics.acked_packets_reported, 3);
+        assert_eq!(metrics.ack_errors, 0);
+        assert_eq!(metrics.largest_acknowledged, Some(7));
     }
 
     #[test]
@@ -2439,13 +2401,13 @@ mod tests {
 
     #[test]
     fn channel_ack_state_encodes_non_contiguous_ranges() {
-        let mut ack_state = ChannelAckState::default();
+        let mut ack_state = quiche::multicast::AckTracker::default();
 
         for packet_number in [0, 2, 3, 6] {
             ack_state.record_packet(packet_number);
         }
 
-        let ack = ack_state.pending_frame(&[1, 2, 3, 4]).unwrap();
+        let ack = ack_state.pending_ack(&[1, 2, 3, 4]).unwrap();
 
         assert_eq!(ack.channel_id, vec![1, 2, 3, 4]);
         assert_eq!(ack.largest_acknowledged, 6);
@@ -2464,7 +2426,7 @@ mod tests {
         assert_eq!(ack.ecn_counts, None);
 
         ack_state.mark_sent();
-        assert_eq!(ack_state.pending_frame(&[1, 2, 3, 4]), None);
+        assert_eq!(ack_state.pending_ack(&[1, 2, 3, 4]), None);
     }
 
     #[test]

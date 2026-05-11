@@ -385,6 +385,182 @@ fn multicast_control_frame_rejects_wrong_sender() {
 }
 
 #[test]
+fn multicast_state_frame_updates_probe_state_on_receive() {
+    let mut pipe = multicast_negotiated_pipe();
+    let frame = multicast::Frame::State(multicast::State {
+        channel_id: vec![1, 2, 3, 4],
+        sequence: 1,
+        state: multicast::ChannelState::Joined,
+        reason_scope: multicast::StateReasonScope::Transport,
+        reason_code: multicast::STATE_REASON_REQUESTED_BY_SERVER,
+        reason_phrase: Vec::new(),
+    });
+
+    assert_eq!(pipe.client.multicast_send(frame.clone()), Ok(()));
+
+    let flight = test_utils::emit_flight(&mut pipe.client).unwrap();
+    test_utils::process_flight(&mut pipe.server, flight).unwrap();
+
+    assert_eq!(
+        pipe.server.multicast_probe_status(&[1, 2, 3, 4]),
+        Some(multicast::ProbeStatus::Probing)
+    );
+    assert_eq!(
+        pipe.server.multicast_probe_recv(),
+        Ok(multicast::ProbeEvent {
+            channel_id: vec![1, 2, 3, 4],
+            status: multicast::ProbeStatus::Probing,
+            reason_scope: Some(multicast::StateReasonScope::Transport),
+            reason_code: Some(multicast::STATE_REASON_REQUESTED_BY_SERVER),
+            reason_phrase: Vec::new(),
+        })
+    );
+    assert_eq!(pipe.server.multicast_recv(), Ok(frame));
+}
+
+#[test]
+fn multicast_probe_becomes_viable_on_first_ack() {
+    let mut pipe = multicast_negotiated_pipe();
+    let ack = multicast::Ack {
+        channel_id: vec![1, 2, 3, 4],
+        largest_acknowledged: 7,
+        ack_delay: 0,
+        first_ack_range: 0,
+        ack_ranges: Vec::new(),
+        ecn_counts: None,
+    };
+
+    pipe.server
+        .multicast_probe_start(&ack.channel_id, Duration::from_secs(1))
+        .unwrap();
+    assert_eq!(
+        pipe.server.multicast_probe_recv(),
+        Ok(multicast::ProbeEvent {
+            channel_id: ack.channel_id.clone(),
+            status: multicast::ProbeStatus::Probing,
+            reason_scope: None,
+            reason_code: None,
+            reason_phrase: Vec::new(),
+        })
+    );
+
+    pipe.server.multicast_process_peer_ack(ack.clone()).unwrap();
+
+    assert_eq!(
+        pipe.server.multicast_probe_status(&ack.channel_id),
+        Some(multicast::ProbeStatus::Viable)
+    );
+    assert_eq!(
+        pipe.server.multicast_probe_recv(),
+        Ok(multicast::ProbeEvent {
+            channel_id: ack.channel_id,
+            status: multicast::ProbeStatus::Viable,
+            reason_scope: None,
+            reason_code: None,
+            reason_phrase: Vec::new(),
+        })
+    );
+}
+
+#[test]
+fn multicast_probe_times_out() {
+    let mut pipe = multicast_negotiated_pipe();
+    let channel_id = vec![1, 2, 3, 4];
+
+    pipe.server
+        .multicast_probe_start(&channel_id, Duration::ZERO)
+        .unwrap();
+    assert_eq!(
+        pipe.server.multicast_probe_recv(),
+        Ok(multicast::ProbeEvent {
+            channel_id: channel_id.clone(),
+            status: multicast::ProbeStatus::Probing,
+            reason_scope: None,
+            reason_code: None,
+            reason_phrase: Vec::new(),
+        })
+    );
+
+    pipe.server.on_timeout();
+
+    assert_eq!(
+        pipe.server.multicast_probe_status(&channel_id),
+        Some(multicast::ProbeStatus::TimedOut)
+    );
+    assert_eq!(
+        pipe.server.multicast_probe_recv(),
+        Ok(multicast::ProbeEvent {
+            channel_id,
+            status: multicast::ProbeStatus::TimedOut,
+            reason_scope: None,
+            reason_code: None,
+            reason_phrase: Vec::new(),
+        })
+    );
+}
+
+#[test]
+fn multicast_process_local_state_reports_join_failed() {
+    let mut pipe = multicast_negotiated_pipe();
+    let state = multicast::State {
+        channel_id: vec![1, 2, 3, 4],
+        sequence: 1,
+        state: multicast::ChannelState::DeclinedJoin,
+        reason_scope: multicast::StateReasonScope::Transport,
+        reason_code: 9,
+        reason_phrase: b"join failed".to_vec(),
+    };
+
+    pipe.client.multicast_process_local_state(state).unwrap();
+
+    assert_eq!(
+        pipe.client.multicast_probe_status(&[1, 2, 3, 4]),
+        Some(multicast::ProbeStatus::JoinFailed)
+    );
+    assert_eq!(
+        pipe.client.multicast_probe_recv(),
+        Ok(multicast::ProbeEvent {
+            channel_id: vec![1, 2, 3, 4],
+            status: multicast::ProbeStatus::JoinFailed,
+            reason_scope: Some(multicast::StateReasonScope::Transport),
+            reason_code: Some(9),
+            reason_phrase: b"join failed".to_vec(),
+        })
+    );
+}
+
+#[test]
+fn multicast_process_channel_packet_queues_datagram() {
+    let mut pipe = multicast_negotiated_pipe();
+    let packet = multicast::ChannelPacket {
+        channel_id: vec![1, 2, 3, 4],
+        packet_number: 11,
+        key_sequence: 0,
+        key_phase: false,
+        frames: vec![
+            multicast::ChannelFrame::Ping,
+            multicast::ChannelFrame::Datagram {
+                data: b"hello multicast".to_vec(),
+            },
+        ],
+    };
+
+    pipe.client
+        .multicast_process_channel_packet(packet)
+        .unwrap();
+
+    assert_eq!(
+        pipe.client.multicast_dgram_recv(),
+        Ok(multicast::ChannelDatagram {
+            channel_id: vec![1, 2, 3, 4],
+            packet_number: 11,
+            data: b"hello multicast".to_vec(),
+        })
+    );
+    assert_eq!(pipe.client.multicast_dgram_recv(), Err(Error::Done));
+}
+
+#[test]
 fn transport_params_forbid_duplicates() {
     // Given an encoded param.
     let initial_source_connection_id = b"id";
