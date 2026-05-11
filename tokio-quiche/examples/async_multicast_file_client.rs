@@ -63,6 +63,8 @@ use clap::Parser;
 #[cfg(feature = "multicast")]
 use heimdall_metrics::sample_receiver_metrics;
 #[cfg(feature = "multicast")]
+use heimdall_metrics::HeimdallJsonlMetadata;
+#[cfg(feature = "multicast")]
 use heimdall_metrics::HeimdallMetricsWriter;
 #[cfg(feature = "multicast")]
 use heimdall_metrics::ReceiverMetricSample;
@@ -100,6 +102,10 @@ use tokio_quiche::ConnectionParams;
 #[cfg(feature = "multicast")]
 use crate::multicast_file::decode_file_packet;
 #[cfg(feature = "multicast")]
+use crate::multicast_file::describe_hash_algorithm;
+#[cfg(feature = "multicast")]
+use crate::multicast_file::parse_hash_algorithm_id;
+#[cfg(feature = "multicast")]
 use crate::multicast_file::FileReceiver;
 #[cfg(feature = "multicast")]
 use crate::multicast_file::IdleApp;
@@ -108,7 +114,7 @@ use crate::multicast_file::ReceiveUpdate;
 #[cfg(feature = "multicast")]
 use crate::multicast_file::DEFAULT_ENCRYPTION_ALGORITHM;
 #[cfg(feature = "multicast")]
-use crate::multicast_file::DEFAULT_HASH_ALGORITHM;
+use crate::multicast_file::DEFAULT_HASH_ALGORITHM_NAME;
 #[cfg(feature = "multicast")]
 use crate::multicast_file::FILE_CHANNEL_ID;
 
@@ -154,6 +160,15 @@ struct Args {
     /// Maximum aggregate IPv4 multicast receive rate in Kibps.
     #[arg(long, default_value_t = 8192)]
     max_aggregate_rate_kibps: u64,
+
+    /// Supported multicast integrity hash algorithm to advertise.
+    #[arg(long, default_value = DEFAULT_HASH_ALGORITHM_NAME)]
+    integrity_hash_algorithm: String,
+
+    /// Metadata-only hint for how many packet hashes the sender aggregates per
+    /// `MC_INTEGRITY` frame.
+    #[arg(long, default_value_t = 1)]
+    integrity_hashes_per_frame: usize,
 
     /// Maximum number of multicast channel IDs to track.
     #[arg(long, default_value_t = 16)]
@@ -216,7 +231,9 @@ async fn run() -> anyhow::Result<()> {
         Some(Duration::from_secs(args.idle_timeout_secs));
     quic_settings.verify_peer = args.verify_peer;
 
-    let multicast_settings = build_multicast_settings(&args);
+    let multicast_settings = build_multicast_settings(&args)?;
+    let supported_hash_algorithm =
+        multicast_settings.transport_params.hash_algorithms[0];
     let mut params =
         ConnectionParams::new_client(quic_settings, None, Hooks::default());
     params.multicast_client = Some(multicast_settings.clone());
@@ -236,6 +253,10 @@ async fn run() -> anyhow::Result<()> {
         conn.peer_addr(),
         format_channel_id(conn.scid().as_ref()),
     );
+    println!(
+        "multicast client hash support: {}",
+        describe_hash_algorithm(supported_hash_algorithm),
+    );
 
     let mut receiver = FileReceiver::default();
     let mut last_reported_pct = None;
@@ -244,7 +265,12 @@ async fn run() -> anyhow::Result<()> {
     let mut heimdall_metrics_writer = args
         .heimdall_metrics_jsonl
         .clone()
-        .map(HeimdallMetricsWriter::new)
+        .map(|path| {
+            HeimdallMetricsWriter::new(
+                path,
+                build_heimdall_metadata(&args, supported_hash_algorithm),
+            )
+        })
         .transpose()?;
     let mut previous_socket_metrics = SubscriptionMetricsSampler::new();
     let mut previous_receive_metrics = None;
@@ -479,8 +505,12 @@ async fn run() -> anyhow::Result<()> {
 }
 
 #[cfg(feature = "multicast")]
-fn build_multicast_settings(args: &Args) -> MulticastClientSettings {
-    MulticastClientSettings {
+fn build_multicast_settings(
+    args: &Args,
+) -> anyhow::Result<MulticastClientSettings> {
+    let hash_algorithm = parse_hash_algorithm_id(&args.integrity_hash_algorithm)?;
+
+    Ok(MulticastClientSettings {
         transport_params: quiche::multicast::ClientTransportParams {
             limits: quiche::multicast::ClientLimits {
                 ipv6_channels_allowed: false,
@@ -488,12 +518,37 @@ fn build_multicast_settings(args: &Args) -> MulticastClientSettings {
                 max_aggregate_rate_kibps: args.max_aggregate_rate_kibps,
                 max_channel_ids: args.max_channel_ids,
             },
-            hash_algorithms: vec![DEFAULT_HASH_ALGORITHM],
+            hash_algorithms: vec![hash_algorithm],
             encryption_algorithms: vec![DEFAULT_ENCRYPTION_ALGORITHM],
         },
         max_joined_channels: args.max_joined_channels,
         ipv4_interface: args.multicast_interface,
         ipv6_interface: None,
+    })
+}
+
+#[cfg(feature = "multicast")]
+fn build_heimdall_metadata(
+    args: &Args, supported_hash_algorithm: u16,
+) -> HeimdallJsonlMetadata {
+    HeimdallJsonlMetadata {
+        node_id: None,
+        producer: "tokio-quiche/async_multicast_file_client",
+        transport: "quic-multicast-draft-08".to_string(),
+        role: "receiver".to_string(),
+        connect_to: args.connect_to.to_string(),
+        multicast_interface: args
+            .multicast_interface
+            .map(|addr| addr.to_string()),
+        integrity_hash_algorithm: describe_hash_algorithm(
+            supported_hash_algorithm,
+        )
+        .to_string(),
+        integrity_hash_algorithm_id: supported_hash_algorithm,
+        integrity_hashes_per_frame: args.integrity_hashes_per_frame,
+        max_joined_channels: args.max_joined_channels,
+        max_aggregate_rate_kibps: args.max_aggregate_rate_kibps,
+        max_channel_ids: args.max_channel_ids,
     }
 }
 

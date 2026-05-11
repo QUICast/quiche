@@ -49,11 +49,15 @@ use std::future::Future;
 #[cfg(feature = "multicast")]
 use std::io::ErrorKind;
 #[cfg(feature = "multicast")]
-use std::net::IpAddr;
-#[cfg(feature = "multicast")]
 use std::net::Ipv4Addr;
 #[cfg(feature = "multicast")]
 use std::path::PathBuf;
+#[cfg(feature = "multicast")]
+use std::sync::atomic::AtomicU64;
+#[cfg(feature = "multicast")]
+use std::sync::atomic::AtomicUsize;
+#[cfg(feature = "multicast")]
+use std::sync::atomic::Ordering;
 #[cfg(feature = "multicast")]
 use std::sync::Arc;
 #[cfg(feature = "multicast")]
@@ -109,13 +113,19 @@ use tokio_quiche::ConnectionParams;
 use tokio_quiche::QuicResult;
 
 #[cfg(feature = "multicast")]
+use crate::multicast_file::describe_hash_algorithm;
+#[cfg(feature = "multicast")]
+use crate::multicast_file::hash_algorithm_output_len;
+#[cfg(feature = "multicast")]
+use crate::multicast_file::parse_hash_algorithm_id;
+#[cfg(feature = "multicast")]
 use crate::multicast_file::LoopingTransfer;
 #[cfg(feature = "multicast")]
 use crate::multicast_file::PreparedTransfer;
 #[cfg(feature = "multicast")]
 use crate::multicast_file::DEFAULT_ENCRYPTION_ALGORITHM;
 #[cfg(feature = "multicast")]
-use crate::multicast_file::DEFAULT_HASH_ALGORITHM;
+use crate::multicast_file::DEFAULT_HASH_ALGORITHM_NAME;
 #[cfg(feature = "multicast")]
 use crate::multicast_file::DEFAULT_HEADER_SECRET;
 #[cfg(feature = "multicast")]
@@ -187,6 +197,14 @@ struct Args {
     #[arg(long, default_value_t = 20)]
     publish_interval_ms: u64,
 
+    /// Multicast integrity hash algorithm to announce and use.
+    #[arg(long, default_value = DEFAULT_HASH_ALGORITHM_NAME)]
+    integrity_hash_algorithm: String,
+
+    /// Number of packet hashes to aggregate into one `MC_INTEGRITY` frame.
+    #[arg(long, default_value_t = 1)]
+    integrity_hashes_per_frame: usize,
+
     /// Seconds between multicast publisher metrics summaries. Set to `0` to
     /// disable.
     #[arg(long, default_value_t = 5)]
@@ -198,7 +216,9 @@ struct Args {
 struct SharedControlChannel {
     announce: quiche::multicast::Announce,
     key: quiche::multicast::Key,
+    integrity_hash_len: usize,
     integrity_sender: broadcast::Sender<quiche::multicast::Integrity>,
+    metrics: Arc<ControlFanoutMetrics>,
 }
 
 #[cfg(feature = "multicast")]
@@ -209,10 +229,341 @@ impl SharedControlChannel {
 }
 
 #[cfg(feature = "multicast")]
+#[derive(Default)]
+struct ControlFanoutMetrics {
+    connected_clients: AtomicUsize,
+    joined_clients: AtomicUsize,
+    total_connections: AtomicU64,
+    total_join_events: AtomicU64,
+    total_leave_events: AtomicU64,
+    client_ack_frames: AtomicU64,
+    client_ack_ranges: AtomicU64,
+    client_acked_packets: AtomicU64,
+    client_largest_acked_packet: AtomicU64,
+    integrity_frames_published: AtomicU64,
+    integrity_hashes_published: AtomicU64,
+    integrity_hash_bytes_published: AtomicU64,
+    integrity_frames_unicast_sent: AtomicU64,
+    integrity_hashes_unicast_sent: AtomicU64,
+    integrity_hash_bytes_unicast_sent: AtomicU64,
+    integrity_send_blocked: AtomicU64,
+    integrity_send_errors: AtomicU64,
+    integrity_receiver_lagged_events: AtomicU64,
+    integrity_receiver_lagged_messages: AtomicU64,
+    max_pending_integrities: AtomicUsize,
+}
+
+#[cfg(feature = "multicast")]
+#[derive(Clone, Copy, Debug, Default)]
+struct ControlFanoutMetricsSnapshot {
+    connected_clients: usize,
+    joined_clients: usize,
+    total_connections: u64,
+    total_join_events: u64,
+    total_leave_events: u64,
+    client_ack_frames: u64,
+    client_ack_ranges: u64,
+    client_acked_packets: u64,
+    client_largest_acked_packet: u64,
+    integrity_frames_published: u64,
+    integrity_hashes_published: u64,
+    integrity_hash_bytes_published: u64,
+    integrity_frames_unicast_sent: u64,
+    integrity_hashes_unicast_sent: u64,
+    integrity_hash_bytes_unicast_sent: u64,
+    integrity_send_blocked: u64,
+    integrity_send_errors: u64,
+    integrity_receiver_lagged_events: u64,
+    integrity_receiver_lagged_messages: u64,
+    max_pending_integrities: usize,
+}
+
+#[cfg(feature = "multicast")]
+#[derive(Clone, Copy, Debug, Default)]
+struct ControlFanoutMetricsDelta {
+    total_connections: u64,
+    total_join_events: u64,
+    total_leave_events: u64,
+    client_ack_frames: u64,
+    client_ack_ranges: u64,
+    client_acked_packets: u64,
+    integrity_frames_published: u64,
+    integrity_hashes_published: u64,
+    integrity_hash_bytes_published: u64,
+    integrity_frames_unicast_sent: u64,
+    integrity_hashes_unicast_sent: u64,
+    integrity_hash_bytes_unicast_sent: u64,
+    integrity_send_blocked: u64,
+    integrity_send_errors: u64,
+    integrity_receiver_lagged_events: u64,
+    integrity_receiver_lagged_messages: u64,
+}
+
+#[cfg(feature = "multicast")]
+impl ControlFanoutMetrics {
+    fn snapshot(&self) -> ControlFanoutMetricsSnapshot {
+        ControlFanoutMetricsSnapshot {
+            connected_clients: self.connected_clients.load(Ordering::Relaxed),
+            joined_clients: self.joined_clients.load(Ordering::Relaxed),
+            total_connections: self.total_connections.load(Ordering::Relaxed),
+            total_join_events: self.total_join_events.load(Ordering::Relaxed),
+            total_leave_events: self.total_leave_events.load(Ordering::Relaxed),
+            client_ack_frames: self.client_ack_frames.load(Ordering::Relaxed),
+            client_ack_ranges: self.client_ack_ranges.load(Ordering::Relaxed),
+            client_acked_packets: self
+                .client_acked_packets
+                .load(Ordering::Relaxed),
+            client_largest_acked_packet: self
+                .client_largest_acked_packet
+                .load(Ordering::Relaxed),
+            integrity_frames_published: self
+                .integrity_frames_published
+                .load(Ordering::Relaxed),
+            integrity_hashes_published: self
+                .integrity_hashes_published
+                .load(Ordering::Relaxed),
+            integrity_hash_bytes_published: self
+                .integrity_hash_bytes_published
+                .load(Ordering::Relaxed),
+            integrity_frames_unicast_sent: self
+                .integrity_frames_unicast_sent
+                .load(Ordering::Relaxed),
+            integrity_hashes_unicast_sent: self
+                .integrity_hashes_unicast_sent
+                .load(Ordering::Relaxed),
+            integrity_hash_bytes_unicast_sent: self
+                .integrity_hash_bytes_unicast_sent
+                .load(Ordering::Relaxed),
+            integrity_send_blocked: self
+                .integrity_send_blocked
+                .load(Ordering::Relaxed),
+            integrity_send_errors: self
+                .integrity_send_errors
+                .load(Ordering::Relaxed),
+            integrity_receiver_lagged_events: self
+                .integrity_receiver_lagged_events
+                .load(Ordering::Relaxed),
+            integrity_receiver_lagged_messages: self
+                .integrity_receiver_lagged_messages
+                .load(Ordering::Relaxed),
+            max_pending_integrities: self
+                .max_pending_integrities
+                .load(Ordering::Relaxed),
+        }
+    }
+
+    fn on_control_connected(&self) {
+        self.connected_clients.fetch_add(1, Ordering::Relaxed);
+        self.total_connections.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn on_control_disconnected(&self) {
+        self.connected_clients.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    fn on_joined(&self) {
+        self.joined_clients.fetch_add(1, Ordering::Relaxed);
+        self.total_join_events.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn on_left(&self) {
+        self.joined_clients.fetch_sub(1, Ordering::Relaxed);
+        self.total_leave_events.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn on_client_ack(&self, ack: &quiche::multicast::Ack) {
+        self.client_ack_frames.fetch_add(1, Ordering::Relaxed);
+        self.client_ack_ranges
+            .fetch_add(ack.ack_ranges.len() as u64, Ordering::Relaxed);
+        self.client_acked_packets.fetch_add(
+            ack.first_ack_range.saturating_add(1) +
+                ack.ack_ranges
+                    .iter()
+                    .map(|range| range.ack_range_length.saturating_add(1))
+                    .sum::<u64>(),
+            Ordering::Relaxed,
+        );
+        self.client_largest_acked_packet
+            .fetch_max(ack.largest_acknowledged, Ordering::Relaxed);
+    }
+
+    fn on_integrity_published(
+        &self, integrity: &quiche::multicast::Integrity, hash_len: usize,
+    ) {
+        self.integrity_frames_published
+            .fetch_add(1, Ordering::Relaxed);
+        self.integrity_hashes_published.fetch_add(
+            integrity_hash_count(integrity, hash_len),
+            Ordering::Relaxed,
+        );
+        self.integrity_hash_bytes_published
+            .fetch_add(integrity.packet_hashes.len() as u64, Ordering::Relaxed);
+    }
+
+    fn on_integrity_unicast_sent(
+        &self, integrity: &quiche::multicast::Integrity, hash_len: usize,
+    ) {
+        self.integrity_frames_unicast_sent
+            .fetch_add(1, Ordering::Relaxed);
+        self.integrity_hashes_unicast_sent.fetch_add(
+            integrity_hash_count(integrity, hash_len),
+            Ordering::Relaxed,
+        );
+        self.integrity_hash_bytes_unicast_sent
+            .fetch_add(integrity.packet_hashes.len() as u64, Ordering::Relaxed);
+    }
+
+    fn on_integrity_send_blocked(&self) {
+        self.integrity_send_blocked.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn on_integrity_send_error(&self) {
+        self.integrity_send_errors.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn on_integrity_receiver_lagged(&self, skipped: u64) {
+        self.integrity_receiver_lagged_events
+            .fetch_add(1, Ordering::Relaxed);
+        self.integrity_receiver_lagged_messages
+            .fetch_add(skipped, Ordering::Relaxed);
+    }
+
+    fn observe_pending_integrities(&self, pending: usize) {
+        self.max_pending_integrities
+            .fetch_max(pending, Ordering::Relaxed);
+    }
+}
+
+#[cfg(feature = "multicast")]
+impl ControlFanoutMetricsDelta {
+    fn between(
+        before: ControlFanoutMetricsSnapshot, after: ControlFanoutMetricsSnapshot,
+    ) -> Self {
+        Self {
+            total_connections: after
+                .total_connections
+                .saturating_sub(before.total_connections),
+            total_join_events: after
+                .total_join_events
+                .saturating_sub(before.total_join_events),
+            total_leave_events: after
+                .total_leave_events
+                .saturating_sub(before.total_leave_events),
+            client_ack_frames: after
+                .client_ack_frames
+                .saturating_sub(before.client_ack_frames),
+            client_ack_ranges: after
+                .client_ack_ranges
+                .saturating_sub(before.client_ack_ranges),
+            client_acked_packets: after
+                .client_acked_packets
+                .saturating_sub(before.client_acked_packets),
+            integrity_frames_published: after
+                .integrity_frames_published
+                .saturating_sub(before.integrity_frames_published),
+            integrity_hashes_published: after
+                .integrity_hashes_published
+                .saturating_sub(before.integrity_hashes_published),
+            integrity_hash_bytes_published: after
+                .integrity_hash_bytes_published
+                .saturating_sub(before.integrity_hash_bytes_published),
+            integrity_frames_unicast_sent: after
+                .integrity_frames_unicast_sent
+                .saturating_sub(before.integrity_frames_unicast_sent),
+            integrity_hashes_unicast_sent: after
+                .integrity_hashes_unicast_sent
+                .saturating_sub(before.integrity_hashes_unicast_sent),
+            integrity_hash_bytes_unicast_sent: after
+                .integrity_hash_bytes_unicast_sent
+                .saturating_sub(before.integrity_hash_bytes_unicast_sent),
+            integrity_send_blocked: after
+                .integrity_send_blocked
+                .saturating_sub(before.integrity_send_blocked),
+            integrity_send_errors: after
+                .integrity_send_errors
+                .saturating_sub(before.integrity_send_errors),
+            integrity_receiver_lagged_events: after
+                .integrity_receiver_lagged_events
+                .saturating_sub(before.integrity_receiver_lagged_events),
+            integrity_receiver_lagged_messages: after
+                .integrity_receiver_lagged_messages
+                .saturating_sub(before.integrity_receiver_lagged_messages),
+        }
+    }
+}
+
+#[cfg(feature = "multicast")]
+struct IntegrityFrameBatcher {
+    hash_len: usize,
+    max_hashes_per_frame: usize,
+    pending: Option<quiche::multicast::Integrity>,
+}
+
+#[cfg(feature = "multicast")]
+impl IntegrityFrameBatcher {
+    fn new(hash_len: usize, max_hashes_per_frame: usize) -> anyhow::Result<Self> {
+        if max_hashes_per_frame == 0 {
+            anyhow::bail!("integrity hashes per frame must be greater than zero");
+        }
+
+        Ok(Self {
+            hash_len,
+            max_hashes_per_frame,
+            pending: None,
+        })
+    }
+
+    fn push(
+        &mut self, mut integrity: quiche::multicast::Integrity,
+    ) -> anyhow::Result<Vec<quiche::multicast::Integrity>> {
+        let mut ready = Vec::with_capacity(2);
+        let incoming_hashes =
+            integrity_hash_count_checked(&integrity, self.hash_len)?;
+        integrity.packet_hash_count = Some(incoming_hashes as u64);
+
+        if let Some(pending) = self.pending.as_mut() {
+            let pending_hashes =
+                integrity_hash_count_checked(pending, self.hash_len)?;
+            let pending_end = pending
+                .packet_number_start
+                .saturating_add(pending_hashes as u64);
+
+            if pending.channel_id == integrity.channel_id &&
+                pending_end == integrity.packet_number_start &&
+                pending_hashes + incoming_hashes <= self.max_hashes_per_frame
+            {
+                pending
+                    .packet_hashes
+                    .extend_from_slice(&integrity.packet_hashes);
+                pending.packet_hash_count =
+                    Some((pending_hashes + incoming_hashes) as u64);
+
+                if pending_hashes + incoming_hashes == self.max_hashes_per_frame {
+                    ready.push(self.pending.take().unwrap());
+                }
+
+                return Ok(ready);
+            }
+
+            ready.push(self.pending.take().unwrap());
+        }
+
+        if incoming_hashes >= self.max_hashes_per_frame {
+            ready.push(integrity);
+        } else {
+            self.pending = Some(integrity);
+        }
+
+        Ok(ready)
+    }
+}
+
+#[cfg(feature = "multicast")]
 struct FileControlApp {
     shared: Arc<SharedControlChannel>,
     integrity_receiver: broadcast::Receiver<quiche::multicast::Integrity>,
     pending_integrities: VecDeque<quiche::multicast::Integrity>,
+    connected: bool,
     multicast_enabled: bool,
     join_sent: bool,
     joined: bool,
@@ -226,6 +577,7 @@ impl FileControlApp {
             integrity_receiver: shared.subscribe(),
             shared,
             pending_integrities: VecDeque::new(),
+            connected: false,
             multicast_enabled: false,
             join_sent: false,
             joined: false,
@@ -252,6 +604,7 @@ impl FileControlApp {
             },
 
             quiche::multicast::Frame::Ack(frame) => {
+                self.shared.metrics.on_client_ack(&frame);
                 println!(
                     "client ack: channel={} largest={} delay={} ranges={}",
                     format_channel_id(&frame.channel_id),
@@ -313,6 +666,7 @@ impl FileControlApp {
             String::from_utf8_lossy(&frame.reason_phrase),
         );
 
+        let was_joined = self.joined;
         let is_joined =
             matches!(frame.state, quiche::multicast::ChannelState::Joined);
 
@@ -324,6 +678,12 @@ impl FileControlApp {
         }
 
         self.joined = is_joined;
+
+        if is_joined && !was_joined {
+            self.shared.metrics.on_joined();
+        } else if !is_joined && was_joined {
+            self.shared.metrics.on_left();
+        }
     }
 
     fn drain_integrities(&mut self) {
@@ -331,7 +691,10 @@ impl FileControlApp {
             match self.integrity_receiver.try_recv() {
                 Ok(integrity) => self.pending_integrities.push_back(integrity),
 
-                Err(broadcast::error::TryRecvError::Lagged(..)) => continue,
+                Err(broadcast::error::TryRecvError::Lagged(skipped)) => {
+                    self.shared.metrics.on_integrity_receiver_lagged(skipped);
+                    continue;
+                },
 
                 Err(broadcast::error::TryRecvError::Empty) |
                 Err(broadcast::error::TryRecvError::Closed) => return,
@@ -345,6 +708,8 @@ impl ApplicationOverQuic for FileControlApp {
     fn on_conn_established(
         &mut self, qconn: &mut QuicheConnection, _handshake_info: &HandshakeInfo,
     ) -> QuicResult<()> {
+        self.shared.metrics.on_control_connected();
+        self.connected = true;
         self.multicast_enabled = Self::peer_supports_multicast(qconn);
         self.join_sent = false;
         self.joined = false;
@@ -401,7 +766,12 @@ impl ApplicationOverQuic for FileControlApp {
                             return Ok(());
                         },
 
-                        Err(broadcast::error::RecvError::Lagged(..)) => continue,
+                        Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                            self.shared
+                                .metrics
+                                .on_integrity_receiver_lagged(skipped);
+                            continue;
+                        },
 
                         Err(broadcast::error::RecvError::Closed) => {
                             #[allow(unreachable_code)]
@@ -434,10 +804,30 @@ impl ApplicationOverQuic for FileControlApp {
         }
 
         self.drain_integrities();
+        self.shared
+            .metrics
+            .observe_pending_integrities(self.pending_integrities.len());
 
         while let Some(integrity) = self.pending_integrities.pop_front() {
-            qconn
-                .multicast_send(quiche::multicast::Frame::Integrity(integrity))?;
+            match qconn.multicast_send(quiche::multicast::Frame::Integrity(
+                integrity.clone(),
+            )) {
+                Ok(()) => self.shared.metrics.on_integrity_unicast_sent(
+                    &integrity,
+                    self.shared.integrity_hash_len,
+                ),
+
+                Err(quiche::Error::Done) => {
+                    self.shared.metrics.on_integrity_send_blocked();
+                    self.pending_integrities.push_front(integrity);
+                    break;
+                },
+
+                Err(err) => {
+                    self.shared.metrics.on_integrity_send_error();
+                    return Err(err.into());
+                },
+            }
         }
 
         Ok(())
@@ -448,6 +838,13 @@ impl ApplicationOverQuic for FileControlApp {
         connection_result: &QuicResult<()>,
     ) {
         self.pending_integrities.clear();
+        if self.connected {
+            self.shared.metrics.on_control_disconnected();
+        }
+        self.connected = false;
+        if self.joined {
+            self.shared.metrics.on_left();
+        }
         self.joined = false;
         self.join_sent = false;
         let stats = qconn.stats();
@@ -487,6 +884,9 @@ async fn run() -> anyhow::Result<()> {
     env_logger::builder().format_timestamp_nanos().init();
 
     let args = Args::parse();
+    let integrity_hash_algorithm =
+        parse_hash_algorithm_id(&args.integrity_hash_algorithm)?;
+    let integrity_hash_len = hash_algorithm_output_len(integrity_hash_algorithm)?;
     let transfer =
         PreparedTransfer::from_path(&args.file, args.chunk_payload_bytes)
             .with_context(|| {
@@ -507,13 +907,13 @@ async fn run() -> anyhow::Result<()> {
         .context("failed to derive multicast announce tuple")?;
     let announce = quiche::multicast::Announce {
         channel_id: FILE_CHANNEL_ID.to_vec(),
-        source: IpAddr::V4(source),
-        group: IpAddr::V4(group),
+        source,
+        group,
         udp_port,
         header_protection_algorithm: DEFAULT_ENCRYPTION_ALGORITHM,
         header_secret: DEFAULT_HEADER_SECRET.to_vec(),
         aead_algorithm: DEFAULT_ENCRYPTION_ALGORITHM,
-        integrity_hash_algorithm: DEFAULT_HASH_ALGORITHM,
+        integrity_hash_algorithm,
         max_rate_kibps: DEFAULT_MAX_RATE_KIBPS,
         max_ack_delay_ms: DEFAULT_MAX_ACK_DELAY_MS,
     };
@@ -531,10 +931,13 @@ async fn run() -> anyhow::Result<()> {
             )
         })?;
     let (integrity_sender, _) = broadcast::channel(INTEGRITY_BROADCAST_CAPACITY);
+    let control_metrics = Arc::new(ControlFanoutMetrics::default());
     let shared = Arc::new(SharedControlChannel {
         announce,
         key,
+        integrity_hash_len,
         integrity_sender,
+        metrics: control_metrics,
     });
 
     println!(
@@ -548,12 +951,15 @@ async fn run() -> anyhow::Result<()> {
     );
     println!(
         "shared multicast channel: channel={} source={} group={} port={} \
-         interval={}ms",
+         interval={}ms hash={} hash_len={}B hashes_per_integrity={}",
         format_channel_id(&shared.announce.channel_id),
         source,
         group,
         udp_port,
         args.publish_interval_ms,
+        describe_hash_algorithm(shared.announce.integrity_hash_algorithm),
+        integrity_hash_len,
+        args.integrity_hashes_per_frame,
     );
 
     let publisher_shared = Arc::clone(&shared);
@@ -567,6 +973,7 @@ async fn run() -> anyhow::Result<()> {
             publish_interval,
             args.metrics_interval_secs,
             args.manifest_interval_packets,
+            args.integrity_hashes_per_frame,
         )
         .await
         {
@@ -613,10 +1020,14 @@ async fn publish_loop(
     mut send_state: quiche::multicast::ChannelSendState,
     shared: Arc<SharedControlChannel>, transfer: Arc<PreparedTransfer>,
     publish_interval: Duration, metrics_interval_secs: u64,
-    manifest_interval_packets: u32,
+    manifest_interval_packets: u32, integrity_hashes_per_frame: usize,
 ) -> anyhow::Result<()> {
     let mut looping =
         LoopingTransfer::new((*transfer).clone(), manifest_interval_packets)?;
+    let mut integrity_batcher = IntegrityFrameBatcher::new(
+        shared.integrity_hash_len,
+        integrity_hashes_per_frame,
+    )?;
     let mut ticker = interval(publish_interval);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let metrics_interval = (metrics_interval_secs != 0)
@@ -624,6 +1035,7 @@ async fn publish_loop(
     let mut last_metrics_at = Instant::now();
     let mut previous_publication_metrics = publication.metrics_snapshot();
     let mut previous_send_metrics = send_state.metrics_snapshot();
+    let mut previous_control_metrics = shared.metrics.snapshot();
 
     let mut packet_buf = vec![0; 64 * 1024];
     let mut sent_packets = 0u64;
@@ -643,7 +1055,13 @@ async fn publish_loop(
 
         match publication.send(&packet_buf[..output.packet_len]) {
             Ok(report) => {
-                let _ = shared.integrity_sender.send(output.integrity);
+                for integrity in integrity_batcher.push(output.integrity)? {
+                    shared.metrics.on_integrity_published(
+                        &integrity,
+                        shared.integrity_hash_len,
+                    );
+                    let _ = shared.integrity_sender.send(integrity);
+                }
                 sent_packets += 1;
 
                 if sent_packets == 1 || sent_packets % PACKET_LOG_INTERVAL == 0 {
@@ -669,8 +1087,10 @@ async fn publish_loop(
                 print_publisher_metrics(
                     &send_state,
                     &publication,
+                    &shared.metrics,
                     &mut previous_send_metrics,
                     &mut previous_publication_metrics,
+                    &mut previous_control_metrics,
                 );
                 last_metrics_at = Instant::now();
             }
@@ -687,6 +1107,43 @@ fn publish_would_block(error: &MctxError) -> bool {
 }
 
 #[cfg(feature = "multicast")]
+fn integrity_hash_count(
+    integrity: &quiche::multicast::Integrity, hash_len: usize,
+) -> u64 {
+    integrity
+        .packet_hash_count
+        .unwrap_or_else(|| (integrity.packet_hashes.len() / hash_len) as u64)
+}
+
+#[cfg(feature = "multicast")]
+fn integrity_hash_count_checked(
+    integrity: &quiche::multicast::Integrity, hash_len: usize,
+) -> anyhow::Result<usize> {
+    let hash_count = integrity_hash_count(integrity, hash_len);
+
+    if hash_count == 0 {
+        anyhow::bail!("integrity frame must carry at least one packet hash");
+    }
+
+    let expected_len = usize::try_from(hash_count)
+        .ok()
+        .and_then(|count| count.checked_mul(hash_len))
+        .context("integrity frame hash count is too large")?;
+
+    if integrity.packet_hashes.len() != expected_len {
+        anyhow::bail!(
+            "integrity frame hash payload length {} does not match {} hashes \
+             of {} bytes",
+            integrity.packet_hashes.len(),
+            hash_count,
+            hash_len
+        );
+    }
+
+    Ok(expected_len / hash_len)
+}
+
+#[cfg(feature = "multicast")]
 fn format_channel_id(id: &[u8]) -> String {
     let mut out = String::with_capacity(id.len() * 2);
     for byte in id {
@@ -700,22 +1157,29 @@ fn format_channel_id(id: &[u8]) -> String {
 #[cfg(feature = "multicast")]
 fn print_publisher_metrics(
     send_state: &quiche::multicast::ChannelSendState, publication: &Publication,
+    control_metrics: &ControlFanoutMetrics,
     previous_send_metrics: &mut quiche::multicast::ChannelSendMetricsSnapshot,
     previous_publication_metrics: &mut PublicationMetricsSnapshot,
+    previous_control_metrics: &mut ControlFanoutMetricsSnapshot,
 ) {
     let current_send_metrics = send_state.metrics_snapshot();
     let current_publication_metrics = publication.metrics_snapshot();
+    let current_control_metrics = control_metrics.snapshot();
     let send_delta = quiche::multicast::ChannelSendMetricsDelta::between(
         *previous_send_metrics,
         current_send_metrics,
     );
-    let publication_delta = mctx_core::PublicationMetricsDelta::between(
-        *previous_publication_metrics,
-        current_publication_metrics,
+    let publication_delta = current_publication_metrics
+        .delta_since(previous_publication_metrics)
+        .expect("publication metrics snapshots should be monotonic");
+    let control_delta = ControlFanoutMetricsDelta::between(
+        *previous_control_metrics,
+        current_control_metrics,
     );
 
     *previous_send_metrics = current_send_metrics;
     *previous_publication_metrics = current_publication_metrics;
+    *previous_control_metrics = current_control_metrics;
 
     println!(
         "[metrics] tx encoded_pkts={} encoded_bytes={} encoded_frames={} \
@@ -728,6 +1192,34 @@ fn print_publisher_metrics(
         publication_delta.bytes_sent,
         publication_delta.send_errors,
         send_delta.next_packet_number,
+    );
+    println!(
+        "[metrics] ctrl connected={} joined={} accepted={} join_events={} \
+         leave_events={} ack_frames={} ack_ranges={} acked_pkts={} \
+         max_largest_ack={} published_int_frames={} published_hashes={} \
+         published_hash_bytes={} unicast_int_frames={} unicast_hashes={} \
+         unicast_hash_bytes={} send_blocked={} send_errors={} lag_events={} \
+         lagged_msgs={} max_pending={}",
+        current_control_metrics.connected_clients,
+        current_control_metrics.joined_clients,
+        control_delta.total_connections,
+        control_delta.total_join_events,
+        control_delta.total_leave_events,
+        control_delta.client_ack_frames,
+        control_delta.client_ack_ranges,
+        control_delta.client_acked_packets,
+        current_control_metrics.client_largest_acked_packet,
+        control_delta.integrity_frames_published,
+        control_delta.integrity_hashes_published,
+        control_delta.integrity_hash_bytes_published,
+        control_delta.integrity_frames_unicast_sent,
+        control_delta.integrity_hashes_unicast_sent,
+        control_delta.integrity_hash_bytes_unicast_sent,
+        control_delta.integrity_send_blocked,
+        control_delta.integrity_send_errors,
+        control_delta.integrity_receiver_lagged_events,
+        control_delta.integrity_receiver_lagged_messages,
+        current_control_metrics.max_pending_integrities,
     );
 }
 

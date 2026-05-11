@@ -242,6 +242,7 @@ impl<A: ApplicationOverQuic> ApplicationOverQuic for ClientDriver<A> {
 
     fn process_writes(&mut self, qconn: &mut QuicheConnection) -> QuicResult<()> {
         self.runtime.process_ingress(qconn)?;
+        self.runtime.flush_pending_acks(qconn)?;
 
         if self.inner.should_act() {
             self.inner.process_writes(qconn)?;
@@ -477,6 +478,12 @@ impl<B: JoinBackend> ClientRuntime<B> {
         &mut self, qconn: &mut QuicheConnection, channel_id: Vec<u8>,
         packet: quiche::multicast::ChannelPacket, received: PacketWithMetadata,
     ) -> QuicResult<()> {
+        self.channels
+            .entry(channel_id.clone())
+            .or_default()
+            .ack_state
+            .record_packet(packet.packet_number);
+
         for frame in &packet.frames {
             if let quiche::multicast::ChannelFrame::Multicast(frame) = frame {
                 self.handle_frame(qconn, frame.clone())?;
@@ -884,6 +891,37 @@ impl<B: JoinBackend> ClientRuntime<B> {
             .unwrap_or(false)
     }
 
+    fn flush_pending_acks(
+        &mut self, qconn: &mut QuicheConnection,
+    ) -> QuicResult<()> {
+        let pending = self
+            .channels
+            .iter()
+            .filter_map(|(channel_id, channel)| {
+                channel
+                    .ack_state
+                    .pending_frame(channel_id)
+                    .map(|frame| (channel_id.clone(), frame))
+            })
+            .collect::<Vec<_>>();
+
+        for (channel_id, frame) in pending {
+            match qconn.multicast_send(quiche::multicast::Frame::Ack(frame)) {
+                Ok(()) => (),
+
+                Err(quiche::Error::Done) => break,
+
+                Err(err) => return Err(err.into()),
+            }
+
+            if let Some(channel) = self.channels.get_mut(&channel_id) {
+                channel.ack_state.mark_sent();
+            }
+        }
+
+        Ok(())
+    }
+
     fn emit_channel_metrics(&self, channel_id: &[u8]) {
         let Some(channel) = self.channels.get(channel_id) else {
             return;
@@ -949,6 +987,7 @@ struct Channel<H> {
     last_subscription_metrics: Option<SubscriptionMetricsSnapshot>,
     receive_state:
         Option<quiche::multicast::ChannelReceiveState<PacketWithMetadata>>,
+    ack_state: ChannelAckState,
     next_state_sequence: u64,
     receive_handle: Option<H>,
 }
@@ -961,9 +1000,91 @@ impl<H> Default for Channel<H> {
             decoder_error: None,
             last_subscription_metrics: None,
             receive_state: None,
+            ack_state: ChannelAckState::default(),
             next_state_sequence: 0,
             receive_handle: None,
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AckSpan {
+    start: u64,
+    end: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ChannelAckState {
+    ranges: Vec<AckSpan>,
+    pending: bool,
+}
+
+impl ChannelAckState {
+    fn record_packet(&mut self, packet_number: u64) {
+        let mut start = packet_number;
+        let mut end = packet_number;
+        let mut insert_at = 0;
+
+        while insert_at < self.ranges.len() {
+            let existing = self.ranges[insert_at];
+
+            if end.saturating_add(1) < existing.start {
+                break;
+            }
+
+            if existing.end.saturating_add(1) < start {
+                insert_at += 1;
+                continue;
+            }
+
+            start = start.min(existing.start);
+            end = end.max(existing.end);
+            self.ranges.remove(insert_at);
+        }
+
+        self.ranges.insert(insert_at, AckSpan { start, end });
+        self.pending = true;
+    }
+
+    fn pending_frame(&self, channel_id: &[u8]) -> Option<quiche::multicast::Ack> {
+        if !self.pending || self.ranges.is_empty() {
+            return None;
+        }
+
+        let newest = self.ranges.last().copied()?;
+        let mut smallest_ack = newest.start;
+        let mut ack_ranges =
+            Vec::with_capacity(self.ranges.len().saturating_sub(1));
+
+        for span in self.ranges[..self.ranges.len().saturating_sub(1)]
+            .iter()
+            .rev()
+        {
+            let gap = smallest_ack
+                .checked_sub(span.end)
+                .and_then(|delta| delta.checked_sub(2))
+                .expect("ack spans must be ordered and disjoint");
+
+            ack_ranges.push(quiche::multicast::AckRange {
+                gap,
+                ack_range_length: span.end - span.start,
+            });
+
+            smallest_ack = span.start;
+        }
+
+        Some(quiche::multicast::Ack {
+            channel_id: channel_id.to_vec(),
+            largest_acknowledged: newest.end,
+            ack_delay: 0,
+            first_ack_range: newest.end - newest.start,
+            ack_ranges,
+            ecn_counts: None,
+        })
+    }
+
+    fn mark_sent(&mut self) {
+        self.pending = false;
     }
 }
 
@@ -1029,7 +1150,7 @@ impl JoinBackend for McrxJoinBackend {
         ingress_sender: UnboundedSender<IngressEvent>,
     ) -> Result<Self::Handle, JoinError> {
         let mut config = SubscriptionConfig::ssm(group, source, udp_port);
-        config.interface = interface;
+        config.interface = interface.map(IpAddr::V4);
 
         let mut context = MulticastContext::new();
         let subscription_id = context
@@ -1709,7 +1830,12 @@ impl PublishBackend for MctxPublishBackend {
     fn announce_tuple(
         &self, publication: &Self::Publication,
     ) -> Result<(Ipv4Addr, Ipv4Addr, u16), MctxError> {
-        publication.announce_tuple()
+        match publication.announce_tuple()? {
+            (IpAddr::V4(source), IpAddr::V4(group), udp_port) =>
+                Ok((source, group, udp_port)),
+
+            _ => Err(MctxError::OutgoingInterfaceFamilyMismatch),
+        }
     }
 
     fn send(
@@ -1797,8 +1923,14 @@ mod tests {
             &mut self, config: &PublicationConfig,
         ) -> Result<Self::Publication, MctxError> {
             Ok(FakePublication {
-                source: config.source_addr.unwrap_or(Ipv4Addr::new(10, 0, 0, 1)),
-                group: config.group,
+                source: match config.source_addr {
+                    Some(IpAddr::V4(source)) => source,
+                    _ => Ipv4Addr::new(10, 0, 0, 1),
+                },
+                group: match config.group {
+                    IpAddr::V4(group) => group,
+                    IpAddr::V6(_) => Ipv4Addr::UNSPECIFIED,
+                },
                 udp_port: config.dst_port,
             })
         }
@@ -1821,15 +1953,16 @@ mod tests {
 
             Ok(SendReport {
                 publication_id: mctx_core::PublicationId(0),
-                destination: std::net::SocketAddrV4::new(
-                    publication.group,
-                    publication.udp_port,
+                destination: std::net::SocketAddr::V4(
+                    std::net::SocketAddrV4::new(
+                        publication.group,
+                        publication.udp_port,
+                    ),
                 ),
-                local_addr: Some(std::net::SocketAddrV4::new(
-                    publication.source,
-                    0,
+                local_addr: Some(std::net::SocketAddr::V4(
+                    std::net::SocketAddrV4::new(publication.source, 0),
                 )),
-                source_addr: Some(publication.source),
+                source_addr: Some(IpAddr::V4(publication.source)),
                 bytes_sent: payload.len(),
             })
         }
@@ -2183,6 +2316,49 @@ mod tests {
     }
 
     #[test]
+    fn server_runtime_emits_client_ack() {
+        let settings = test_settings();
+        let server_settings = test_server_settings();
+        let mut pipe = test_pipe(&settings);
+        let backend = FakePublishBackend::default();
+        let (_command_sender, command_receiver) = mpsc::unbounded_channel();
+        let (event_sender, mut event_receiver) = mpsc::unbounded_channel();
+        let mut runtime = ServerRuntime::with_backend(
+            server_settings,
+            event_sender,
+            command_receiver,
+            backend,
+        );
+        let ack = quiche::multicast::Ack {
+            channel_id: vec![1, 2, 3, 4],
+            largest_acknowledged: 7,
+            ack_delay: 0,
+            first_ack_range: 0,
+            ack_ranges: vec![quiche::multicast::AckRange {
+                gap: 1,
+                ack_range_length: 1,
+            }],
+            ecn_counts: None,
+        };
+
+        runtime.on_conn_established(&mut pipe.server).unwrap();
+
+        pipe.client
+            .multicast_send(quiche::multicast::Frame::Ack(ack.clone()))
+            .unwrap();
+
+        let flight = quiche::test_utils::emit_flight(&mut pipe.client).unwrap();
+        quiche::test_utils::process_flight(&mut pipe.server, flight).unwrap();
+
+        runtime.process_reads(&mut pipe.server).unwrap();
+
+        assert!(matches!(
+            event_receiver.try_recv(),
+            Ok(ServerEvent::ClientAck(frame)) if frame == ack
+        ));
+    }
+
+    #[test]
     fn server_runtime_publishes_encoded_channel_packet() {
         let settings = test_settings();
         let server_settings = test_server_settings();
@@ -2259,5 +2435,69 @@ mod tests {
             }) if published_channel == channel_id &&
                 report.bytes_sent == packet.payload.len()
         ));
+    }
+
+    #[test]
+    fn channel_ack_state_encodes_non_contiguous_ranges() {
+        let mut ack_state = ChannelAckState::default();
+
+        for packet_number in [0, 2, 3, 6] {
+            ack_state.record_packet(packet_number);
+        }
+
+        let ack = ack_state.pending_frame(&[1, 2, 3, 4]).unwrap();
+
+        assert_eq!(ack.channel_id, vec![1, 2, 3, 4]);
+        assert_eq!(ack.largest_acknowledged, 6);
+        assert_eq!(ack.ack_delay, 0);
+        assert_eq!(ack.first_ack_range, 0);
+        assert_eq!(ack.ack_ranges, vec![
+            quiche::multicast::AckRange {
+                gap: 1,
+                ack_range_length: 1,
+            },
+            quiche::multicast::AckRange {
+                gap: 0,
+                ack_range_length: 0,
+            },
+        ]);
+        assert_eq!(ack.ecn_counts, None);
+
+        ack_state.mark_sent();
+        assert_eq!(ack_state.pending_frame(&[1, 2, 3, 4]), None);
+    }
+
+    #[test]
+    fn runtime_flushes_pending_mc_ack() {
+        let settings = test_settings();
+        let mut pipe = test_pipe(&settings);
+        let backend = FakeJoinBackend::default();
+        let (event_sender, _event_receiver) = mpsc::unbounded_channel();
+        let mut runtime =
+            ClientRuntime::with_backend(settings, event_sender, backend);
+        let announce = test_ipv4_announce();
+
+        runtime
+            .channels
+            .entry(announce.channel_id.clone())
+            .or_default()
+            .ack_state
+            .record_packet(7);
+        runtime.flush_pending_acks(&mut pipe.client).unwrap();
+
+        let flight = quiche::test_utils::emit_flight(&mut pipe.client).unwrap();
+        quiche::test_utils::process_flight(&mut pipe.server, flight).unwrap();
+
+        assert_eq!(
+            pipe.server.multicast_recv(),
+            Ok(quiche::multicast::Frame::Ack(quiche::multicast::Ack {
+                channel_id: announce.channel_id,
+                largest_acknowledged: 7,
+                ack_delay: 0,
+                first_ack_range: 0,
+                ack_ranges: Vec::new(),
+                ecn_counts: None,
+            }))
+        );
     }
 }

@@ -165,6 +165,8 @@ Useful flags:
 
 ```shell
 --chunk-payload-bytes 1024
+--integrity-hash-algorithm sha256-32
+--integrity-hashes-per-frame 1
 --manifest-interval-packets 32
 --publish-interval-ms 20
 --metrics-interval-secs 5
@@ -197,6 +199,8 @@ Handy options for that script:
 --generate-file-mb 100
 --client-interval-secs 1
 --max-clients 50
+--integrity-hash-algorithm sha256-32
+--integrity-hashes-per-frame 1
 --publish-interval-ms 1
 --heimdall-metrics
 --work-dir /tmp/quicast-stress-run
@@ -206,13 +210,23 @@ Notes:
 
 - The file example is IPv4-only on the multicast path, matching the current
   `mcrx-core` / `mctx-core` integration.
+- The default integrity hash algorithm is currently `sha256-32`, which maps to
+  draft hash algorithm ID `1` and emits a full 32-byte SHA-256 digest per
+  multicast packet.
 - The sender is now a shared multicast publisher that runs independently of
   any single client connection. Each client receives only draft control frames
   over unicast, while the file chunks themselves stay on multicast.
 - Both the sender and receiver can emit periodic metrics summaries. The sender
-  reports `mctx-core` send counters plus `quiche` channel-encode counters; the
-  receiver reports `mcrx-core` socket counters together with `quiche` channel
-  decode/buffering counters and async receive/decode error counts.
+  reports `mctx-core` send counters plus `quiche` channel-encode counters and
+  multicast control fanout counters; the receiver reports `mcrx-core` socket
+  counters together with `quiche` channel decode/buffering counters and async
+  receive/decode error counts.
+- `--integrity-hash-algorithm` accepts `sha256-32`, `sha256-16`, `sha256-15`,
+  `sha256-12`, `sha256-8`, `sha256-4`, `sha384-48`, or `sha512-64`.
+- `--integrity-hashes-per-frame` controls how many packet hashes are
+  aggregated into each `MC_INTEGRITY` frame, which directly changes the
+  control-plane frame size and the number of unicast integrity frames each
+  client must process.
 - The paired receiver metrics are useful for spotting whether a bottleneck is
   before decode (`mcrx-core` sees packets but `quiche` does not), or inside
   the draft receive path because packets are delayed waiting for `MC_KEY` or
@@ -228,5 +242,80 @@ heimdall ingest-mcrx-hardware --run-id run-001 receiver-a /tmp/receiver-a_hardwa
 
 - The `*_quiche.jsonl` sidecar keeps the receiver-side draft/decode counters in
   a separate log file, so the main `mcrx` network JSONL stays clean.
-- The current example relies on looped chunks rather than `MC_ACK`. A client
-  exits as soon as it has received every chunk once.
+- The JSONL files now begin with a single header line identified by
+  `schema="heimdall-jsonl-v1"`, carrying `artifact_type`, `node_id`,
+  `producer`, and a `flags` object. The metric rows that follow are
+  intentionally compact and inherit that context from the single file header,
+  which should make multi-file batch ingest much easier once Heimdall learns
+  the same convention.
+- Clients now emit `MC_ACK` frames for multicast packets they validate and
+  decode. The current example still relies on looped chunks rather than
+  `MC_ACK` for transfer completion, so a client exits as soon as it has
+  received every chunk once.
+- The file-transfer server now counts those `MC_ACK` frames in its periodic
+  control metrics, which makes it easier to compare “clients joined” versus
+  “clients are actively reporting multicast receive progress.”
+
+# Running the raw QUIC file transfer examples
+
+These examples use the same payload model as the multicast file demo, but send
+the entire file through plain unicast QUIC on a single stream. That gives you
+an easier apples-to-apples baseline when you want to compare connection count,
+throughput, and per-client transport cost without the multicast extension.
+
+Start the raw QUIC file server:
+
+```shell
+RUST_LOG=info cargo run -p tokio-quiche --example async_quic_file_server -- --address 127.0.0.1:5757 --file ./README.md
+```
+
+Then start one client:
+
+```shell
+RUST_LOG=info cargo run -p tokio-quiche --example async_quic_file_client -- --connect-to 127.0.0.1:5757 --output /tmp/README.quic.copy
+```
+
+You can also launch multiple clients against the same server. Unlike the draft
+multicast path, every client receives the entire file over its own unicast QUIC
+stream:
+
+```shell
+RUST_LOG=info cargo run -p tokio-quiche --example async_quic_file_client -- --connect-to 127.0.0.1:5757 --output /tmp/README.quic.client1
+RUST_LOG=info cargo run -p tokio-quiche --example async_quic_file_client -- --connect-to 127.0.0.1:5757 --output /tmp/README.quic.client2
+```
+
+Each client can also write a compact QUIC stats summary:
+
+```shell
+RUST_LOG=info cargo run -p tokio-quiche --example async_quic_file_client -- --connect-to 127.0.0.1:5757 --output /tmp/README.quic.client1 --stats-json /tmp/README.quic.client1.stats.json
+```
+
+To stress the unicast baseline with the same rolling-client pattern, use
+[tools/run_quic_file_stress.sh](/Users/mfranke/Devtools/Multicast/quiche/tools/run_quic_file_stress.sh):
+
+```shell
+tools/run_quic_file_stress.sh --file /tmp/quicast-100m.bin
+```
+
+It uses the same run-directory structure as the multicast stress helper, but
+each client directory contains raw QUIC output and stats instead:
+
+```text
+<run>/
+  client-0001/output.bin
+  client-0001/client.log
+  client-0001/stats.json
+  client-0002/output.bin
+  ...
+```
+
+Handy options for that script:
+
+```shell
+--generate-file-mb 100
+--client-interval-secs 1
+--max-clients 50
+--client-max-run-secs 300
+--work-dir /tmp/quicast-quic-stress-run
+--capture-quiche-logs
+```
