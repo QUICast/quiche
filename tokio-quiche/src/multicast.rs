@@ -1126,6 +1126,35 @@ impl JoinBackend for McrxJoinBackend {
 
 /// Server-side multicast settings for one connection wrapper.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ServerControlSettings {
+    /// The multicast channels this server may announce and manage through the
+    /// QUIC control connection.
+    pub channels: Vec<ServerControlChannelConfig>,
+}
+
+/// Control-plane configuration for one multicast channel.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServerControlChannelConfig {
+    /// The announced multicast channel properties.
+    pub announce: quiche::multicast::Announce,
+
+    /// The active multicast payload-protection key for the channel.
+    pub key: quiche::multicast::Key,
+}
+
+impl ServerControlChannelConfig {
+    fn validate(&self) -> QuicResult<()> {
+        if self.announce.channel_id != self.key.channel_id {
+            return Err(Box::new(quiche::Error::InvalidState));
+        }
+
+        Ok(())
+    }
+}
+
+/// Server-side multicast settings for one publication-owning connection
+/// wrapper.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ServerSettings {
     /// The multicast channels this server may announce and publish.
     pub channels: Vec<ServerChannelConfig>,
@@ -1169,6 +1198,15 @@ pub struct ServerChannelConfig {
 }
 
 impl ServerChannelConfig {
+    fn control_channel_from(
+        &self, source: Ipv4Addr, group: Ipv4Addr, udp_port: u16,
+    ) -> Result<ServerControlChannelConfig, MctxError> {
+        Ok(ServerControlChannelConfig {
+            announce: self.announce_from(source, group, udp_port)?,
+            key: self.key_frame(),
+        })
+    }
+
     fn announce_from(
         &self, source: Ipv4Addr, group: Ipv4Addr, udp_port: u16,
     ) -> Result<quiche::multicast::Announce, MctxError> {
@@ -1242,6 +1280,154 @@ pub enum ServerEvent {
 /// Event receiver for [`ServerDriver`].
 pub type ServerEventStream = UnboundedReceiver<ServerEvent>;
 
+/// Handle for consuming multicast control events and relaying integrity from
+/// an external multicast sender.
+pub struct ServerControlController {
+    command_sender: UnboundedSender<ServerControlCommand>,
+    event_receiver: ServerEventStream,
+}
+
+impl ServerControlController {
+    /// Queues one externally generated `MC_INTEGRITY` frame for relay on the
+    /// client-facing QUIC control connection.
+    pub fn send_integrity(
+        &self, frame: quiche::multicast::Integrity,
+    ) -> Result<(), mpsc::error::SendError<()>> {
+        self.command_sender
+            .send(ServerControlCommand::RelayIntegrity { frame })
+            .map_err(|_| mpsc::error::SendError(()))
+    }
+
+    /// Returns the underlying multicast event receiver.
+    pub fn event_receiver_mut(&mut self) -> &mut ServerEventStream {
+        &mut self.event_receiver
+    }
+
+    /// Consumes the controller and returns its event receiver.
+    pub fn take_event_receiver(&mut self) -> ServerEventStream {
+        std::mem::replace(&mut self.event_receiver, mpsc::unbounded_channel().1)
+    }
+}
+
+/// Wraps another [`ApplicationOverQuic`] with multicast control-plane logic
+/// only.
+///
+/// The wrapped application continues to own the regular QUIC and HTTP/3
+/// behavior while this wrapper announces configured multicast channels, reacts
+/// to client `MC_LIMITS` / `MC_STATE` / `MC_ACK` frames, and relays externally
+/// generated `MC_INTEGRITY` frames. It does not assume this QUIC endpoint owns
+/// multicast publication itself.
+pub struct ServerControlDriver<A> {
+    inner: A,
+    runtime: ServerControlRuntime,
+}
+
+impl<A> ServerControlDriver<A> {
+    /// Creates a new control-only multicast server wrapper and its
+    /// controller.
+    pub fn new(
+        inner: A, settings: ServerControlSettings,
+    ) -> (Self, ServerControlController) {
+        let (command_sender, command_receiver) = mpsc::unbounded_channel();
+        let (event_sender, event_receiver) = mpsc::unbounded_channel();
+
+        (
+            Self {
+                inner,
+                runtime: ServerControlRuntime::new(
+                    settings,
+                    event_sender,
+                    command_receiver,
+                ),
+            },
+            ServerControlController {
+                command_sender,
+                event_receiver,
+            },
+        )
+    }
+
+    /// Returns a shared reference to the wrapped application.
+    pub fn inner(&self) -> &A {
+        &self.inner
+    }
+
+    /// Returns a mutable reference to the wrapped application.
+    pub fn inner_mut(&mut self) -> &mut A {
+        &mut self.inner
+    }
+
+    /// Consumes the wrapper and returns the wrapped application.
+    pub fn into_inner(self) -> A {
+        self.inner
+    }
+}
+
+impl<A: ApplicationOverQuic> ApplicationOverQuic for ServerControlDriver<A> {
+    fn on_conn_established(
+        &mut self, qconn: &mut QuicheConnection,
+        handshake_info: &crate::quic::HandshakeInfo,
+    ) -> QuicResult<()> {
+        self.runtime.on_conn_established(qconn)?;
+        self.inner.on_conn_established(qconn, handshake_info)
+    }
+
+    fn should_act(&self) -> bool {
+        true
+    }
+
+    fn buffer(&mut self) -> &mut [u8] {
+        self.inner.buffer()
+    }
+
+    fn wait_for_data(
+        &mut self, qconn: &mut QuicheConnection,
+    ) -> impl std::future::Future<Output = QuicResult<()>> + Send {
+        async move {
+            if self.runtime.has_pending_work() {
+                return Ok(());
+            }
+
+            if self.inner.should_act() {
+                select! {
+                    res = self.inner.wait_for_data(qconn) => res,
+                    res = self.runtime.wait_for_work() => res,
+                }
+            } else {
+                self.runtime.wait_for_work().await
+            }
+        }
+    }
+
+    fn process_reads(&mut self, qconn: &mut QuicheConnection) -> QuicResult<()> {
+        self.runtime.process_reads(qconn)?;
+
+        if self.inner.should_act() {
+            self.inner.process_reads(qconn)?;
+        }
+
+        Ok(())
+    }
+
+    fn process_writes(&mut self, qconn: &mut QuicheConnection) -> QuicResult<()> {
+        self.runtime.process_writes(qconn)?;
+
+        if self.inner.should_act() {
+            self.inner.process_writes(qconn)?;
+        }
+
+        Ok(())
+    }
+
+    fn on_conn_close<M: crate::metrics::Metrics>(
+        &mut self, qconn: &mut QuicheConnection, metrics: &M,
+        connection_result: &QuicResult<()>,
+    ) {
+        self.runtime.clear();
+        self.inner.on_conn_close(qconn, metrics, connection_result);
+    }
+}
+
 /// Handle for consuming multicast events and publishing packets.
 pub struct ServerController {
     command_sender: UnboundedSender<ServerCommand>,
@@ -1255,6 +1441,16 @@ impl ServerController {
     ) -> Result<(), mpsc::error::SendError<()>> {
         self.command_sender
             .send(ServerCommand::Send { channel_id, frames })
+            .map_err(|_| mpsc::error::SendError(()))
+    }
+
+    /// Queues one externally generated `MC_INTEGRITY` frame for relay on the
+    /// client-facing QUIC control connection.
+    pub fn send_integrity(
+        &self, frame: quiche::multicast::Integrity,
+    ) -> Result<(), mpsc::error::SendError<()>> {
+        self.command_sender
+            .send(ServerCommand::RelayIntegrity { frame })
             .map_err(|_| mpsc::error::SendError(()))
     }
 
@@ -1393,10 +1589,213 @@ enum ServerError {
 }
 
 #[derive(Debug)]
+enum ServerControlCommand {
+    RelayIntegrity { frame: quiche::multicast::Integrity },
+}
+
+struct ServerControlChannel {
+    announce: quiche::multicast::Announce,
+    key: quiche::multicast::Key,
+    join_sent: bool,
+}
+
+struct ServerControlRuntime {
+    settings: ServerControlSettings,
+    event_sender: UnboundedSender<ServerEvent>,
+    command_receiver: UnboundedReceiver<ServerControlCommand>,
+    pending_integrities: VecDeque<quiche::multicast::Integrity>,
+    channels: BTreeMap<Vec<u8>, ServerControlChannel>,
+}
+
+impl ServerControlRuntime {
+    fn new(
+        settings: ServerControlSettings,
+        event_sender: UnboundedSender<ServerEvent>,
+        command_receiver: UnboundedReceiver<ServerControlCommand>,
+    ) -> Self {
+        Self {
+            settings,
+            event_sender,
+            command_receiver,
+            pending_integrities: VecDeque::new(),
+            channels: BTreeMap::new(),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.pending_integrities.clear();
+        self.channels.clear();
+
+        while self.command_receiver.try_recv().is_ok() {}
+    }
+
+    fn has_pending_work(&self) -> bool {
+        !self.pending_integrities.is_empty()
+    }
+
+    async fn wait_for_work(&mut self) -> QuicResult<()> {
+        match self.command_receiver.recv().await {
+            Some(ServerControlCommand::RelayIntegrity { frame }) => {
+                self.pending_integrities.push_back(frame);
+                Ok(())
+            },
+
+            None => {
+                #[allow(unreachable_code)]
+                {
+                    pending::<()>().await;
+                    Ok(())
+                }
+            },
+        }
+    }
+
+    fn on_conn_established(
+        &mut self, qconn: &mut QuicheConnection,
+    ) -> QuicResult<()> {
+        if !qconn.is_server() {
+            return Err(Box::new(ServerError::ClientConnectionUnsupported));
+        }
+
+        if self.peer_supports_multicast(qconn) {
+            self.initialize_channels(qconn)?;
+        }
+
+        Ok(())
+    }
+
+    fn process_reads(&mut self, qconn: &mut QuicheConnection) -> QuicResult<()> {
+        loop {
+            match qconn.multicast_recv() {
+                Ok(frame) => self.handle_frame(qconn, frame)?,
+
+                Err(quiche::Error::Done) => return Ok(()),
+
+                Err(err) => return Err(err.into()),
+            }
+        }
+    }
+
+    fn process_writes(&mut self, qconn: &mut QuicheConnection) -> QuicResult<()> {
+        while let Ok(ServerControlCommand::RelayIntegrity { frame }) =
+            self.command_receiver.try_recv()
+        {
+            self.pending_integrities.push_back(frame);
+        }
+
+        self.flush_pending_integrities(qconn)
+    }
+
+    fn initialize_channels(
+        &mut self, qconn: &mut QuicheConnection,
+    ) -> QuicResult<()> {
+        if !self.channels.is_empty() {
+            return Ok(());
+        }
+
+        for config in &self.settings.channels {
+            config.validate()?;
+
+            qconn.multicast_send(quiche::multicast::Frame::Announce(
+                config.announce.clone(),
+            ))?;
+            qconn.multicast_send(quiche::multicast::Frame::Key(
+                config.key.clone(),
+            ))?;
+
+            self.channels.insert(
+                config.announce.channel_id.clone(),
+                ServerControlChannel {
+                    announce: config.announce.clone(),
+                    key: config.key.clone(),
+                    join_sent: false,
+                },
+            );
+        }
+
+        Ok(())
+    }
+
+    fn handle_frame(
+        &mut self, qconn: &mut QuicheConnection, frame: quiche::multicast::Frame,
+    ) -> QuicResult<()> {
+        match frame {
+            quiche::multicast::Frame::Limits(frame) => {
+                self.handle_limits(qconn, frame)?;
+            },
+
+            quiche::multicast::Frame::State(frame) => {
+                let _ = self.event_sender.send(ServerEvent::ClientState(frame));
+            },
+
+            quiche::multicast::Frame::Ack(frame) => {
+                qconn.multicast_process_peer_ack(frame.clone())?;
+                let _ = self.event_sender.send(ServerEvent::ClientAck(frame));
+            },
+
+            quiche::multicast::Frame::Announce(..) |
+            quiche::multicast::Frame::Key(..) |
+            quiche::multicast::Frame::Join(..) |
+            quiche::multicast::Frame::Leave(..) |
+            quiche::multicast::Frame::Integrity(..) |
+            quiche::multicast::Frame::Retire(..) => (),
+        }
+
+        Ok(())
+    }
+
+    fn handle_limits(
+        &mut self, qconn: &mut QuicheConnection, frame: quiche::multicast::Limits,
+    ) -> QuicResult<()> {
+        let sequence = frame.sequence;
+        let _ = self.event_sender.send(ServerEvent::ClientLimits(frame));
+
+        for channel in self.channels.values_mut() {
+            if channel.join_sent {
+                continue;
+            }
+
+            qconn.multicast_send(quiche::multicast::Frame::Join(
+                quiche::multicast::Join {
+                    channel_id: channel.announce.channel_id.clone(),
+                    mc_limits_sequence: sequence,
+                    mc_state_sequence: 0,
+                    mc_key_sequence: channel.key.key_sequence,
+                },
+            ))?;
+            channel.join_sent = true;
+        }
+
+        Ok(())
+    }
+
+    fn flush_pending_integrities(
+        &mut self, qconn: &mut QuicheConnection,
+    ) -> QuicResult<()> {
+        while let Some(frame) = self.pending_integrities.pop_front() {
+            qconn.multicast_send(quiche::multicast::Frame::Integrity(frame))?;
+        }
+
+        Ok(())
+    }
+
+    fn peer_supports_multicast(&self, qconn: &QuicheConnection) -> bool {
+        qconn
+            .peer_transport_params()
+            .and_then(|params| params.multicast_client_params.as_ref())
+            .is_some()
+    }
+}
+
+#[derive(Debug)]
 enum ServerCommand {
     Send {
         channel_id: Vec<u8>,
         frames: Vec<quiche::multicast::ChannelFrame>,
+    },
+
+    RelayIntegrity {
+        frame: quiche::multicast::Integrity,
     },
 }
 
@@ -1414,6 +1813,7 @@ struct ServerRuntime<B: PublishBackend> {
     command_receiver: UnboundedReceiver<ServerCommand>,
     pending_commands: VecDeque<ServerCommand>,
     pending_publications: VecDeque<PendingPublication>,
+    pending_integrities: VecDeque<quiche::multicast::Integrity>,
     publish_retry_deadline: Option<Instant>,
     channels: BTreeMap<Vec<u8>, ServerChannel<B::Publication>>,
     backend: B,
@@ -1444,6 +1844,7 @@ impl<B: PublishBackend> ServerRuntime<B> {
             command_receiver,
             pending_commands: VecDeque::new(),
             pending_publications: VecDeque::new(),
+            pending_integrities: VecDeque::new(),
             publish_retry_deadline: None,
             channels: BTreeMap::new(),
             backend,
@@ -1453,6 +1854,7 @@ impl<B: PublishBackend> ServerRuntime<B> {
     fn clear(&mut self) {
         self.pending_commands.clear();
         self.pending_publications.clear();
+        self.pending_integrities.clear();
         self.publish_retry_deadline = None;
         self.channels.clear();
 
@@ -1460,7 +1862,9 @@ impl<B: PublishBackend> ServerRuntime<B> {
     }
 
     fn has_pending_work(&self) -> bool {
-        !self.pending_commands.is_empty() || !self.pending_publications.is_empty()
+        !self.pending_commands.is_empty() ||
+            !self.pending_publications.is_empty() ||
+            !self.pending_integrities.is_empty()
     }
 
     async fn wait_for_work(&mut self) -> QuicResult<()> {
@@ -1535,7 +1939,8 @@ impl<B: PublishBackend> ServerRuntime<B> {
         }
 
         self.encode_pending_commands();
-        self.flush_pending_publications(qconn)?;
+        self.flush_pending_publications()?;
+        self.flush_pending_integrities(qconn)?;
 
         Ok(())
     }
@@ -1551,15 +1956,16 @@ impl<B: PublishBackend> ServerRuntime<B> {
             let publication = self.backend.open(&config.publication)?;
             let (source, group, udp_port) =
                 self.backend.announce_tuple(&publication)?;
-            let announce = config.announce_from(source, group, udp_port)?;
-            let key = config.key_frame();
+            let control = config.control_channel_from(source, group, udp_port)?;
             let send_state = quiche::multicast::ChannelSendState::new(
-                announce.clone(),
-                key.clone(),
+                control.announce.clone(),
+                control.key.clone(),
             )?;
 
-            qconn.multicast_send(quiche::multicast::Frame::Announce(announce))?;
-            qconn.multicast_send(quiche::multicast::Frame::Key(key))?;
+            qconn.multicast_send(quiche::multicast::Frame::Announce(
+                control.announce,
+            ))?;
+            qconn.multicast_send(quiche::multicast::Frame::Key(control.key))?;
 
             self.channels
                 .insert(config.channel_id.clone(), ServerChannel {
@@ -1665,13 +2071,15 @@ impl<B: PublishBackend> ServerRuntime<B> {
                         },
                     }
                 },
+
+                ServerCommand::RelayIntegrity { frame } => {
+                    self.pending_integrities.push_back(frame);
+                },
             }
         }
     }
 
-    fn flush_pending_publications(
-        &mut self, qconn: &mut QuicheConnection,
-    ) -> QuicResult<()> {
+    fn flush_pending_publications(&mut self) -> QuicResult<()> {
         while let Some(pending) = self.pending_publications.pop_front() {
             let Some(channel) = self.channels.get(&pending.channel_id) else {
                 let _ = self.event_sender.send(ServerEvent::EncodeError {
@@ -1683,9 +2091,7 @@ impl<B: PublishBackend> ServerRuntime<B> {
 
             match self.backend.send(&channel.publication, &pending.packet) {
                 Ok(report) => {
-                    qconn.multicast_send(quiche::multicast::Frame::Integrity(
-                        pending.integrity,
-                    ))?;
+                    self.pending_integrities.push_back(pending.integrity);
                     let _ = self.event_sender.send(ServerEvent::Published {
                         channel_id: pending.channel_id,
                         packet_number: pending.packet_number,
@@ -1710,6 +2116,16 @@ impl<B: PublishBackend> ServerRuntime<B> {
         }
 
         self.publish_retry_deadline = None;
+
+        Ok(())
+    }
+
+    fn flush_pending_integrities(
+        &mut self, qconn: &mut QuicheConnection,
+    ) -> QuicResult<()> {
+        while let Some(frame) = self.pending_integrities.pop_front() {
+            qconn.multicast_send(quiche::multicast::Frame::Integrity(frame))?;
+        }
 
         Ok(())
     }
@@ -2007,6 +2423,15 @@ mod tests {
         }
     }
 
+    fn test_server_control_settings() -> ServerControlSettings {
+        ServerControlSettings {
+            channels: vec![ServerControlChannelConfig {
+                announce: test_ipv4_announce(),
+                key: test_key(&[1, 2, 3, 4]),
+            }],
+        }
+    }
+
     fn assert_next_local_state(
         event_receiver: &mut UnboundedReceiver<ClientEvent>,
         expected: quiche::multicast::ChannelState,
@@ -2244,6 +2669,65 @@ mod tests {
     }
 
     #[test]
+    fn server_control_runtime_announces_and_joins_after_limits() {
+        let settings = test_settings();
+        let server_settings = test_server_control_settings();
+        let mut pipe = test_pipe(&settings);
+        let (_command_sender, command_receiver) = mpsc::unbounded_channel();
+        let (event_sender, mut event_receiver) = mpsc::unbounded_channel();
+        let mut runtime = ServerControlRuntime::new(
+            server_settings,
+            event_sender,
+            command_receiver,
+        );
+
+        runtime.on_conn_established(&mut pipe.server).unwrap();
+
+        let flight = quiche::test_utils::emit_flight(&mut pipe.server).unwrap();
+        quiche::test_utils::process_flight(&mut pipe.client, flight).unwrap();
+
+        let announce = match pipe.client.multicast_recv() {
+            Ok(quiche::multicast::Frame::Announce(frame)) => frame,
+            other => panic!("expected announce, got {other:?}"),
+        };
+        let key = match pipe.client.multicast_recv() {
+            Ok(quiche::multicast::Frame::Key(frame)) => frame,
+            other => panic!("expected key, got {other:?}"),
+        };
+
+        assert_eq!(announce, test_ipv4_announce());
+        assert_eq!(key, test_key(&announce.channel_id));
+
+        pipe.client
+            .multicast_send(quiche::multicast::Frame::Limits(test_limits()))
+            .unwrap();
+
+        let flight = quiche::test_utils::emit_flight(&mut pipe.client).unwrap();
+        quiche::test_utils::process_flight(&mut pipe.server, flight).unwrap();
+
+        runtime.process_reads(&mut pipe.server).unwrap();
+
+        let flight = quiche::test_utils::emit_flight(&mut pipe.server).unwrap();
+        quiche::test_utils::process_flight(&mut pipe.client, flight).unwrap();
+
+        assert_eq!(
+            pipe.client.multicast_recv(),
+            Ok(quiche::multicast::Frame::Join(quiche::multicast::Join {
+                channel_id: announce.channel_id,
+                mc_limits_sequence: 1,
+                mc_state_sequence: 0,
+                mc_key_sequence: 1,
+            }))
+        );
+        assert!(matches!(
+            event_receiver.try_recv(),
+            Ok(ServerEvent::ClientLimits(frame))
+                if frame.sequence == 1 &&
+                    frame.limits == test_transport_params().limits
+        ));
+    }
+
+    #[test]
     fn server_runtime_emits_client_ack() {
         let settings = test_settings();
         let server_settings = test_server_settings();
@@ -2318,6 +2802,107 @@ mod tests {
         assert_eq!(metrics.acked_packets_reported, 3);
         assert_eq!(metrics.ack_errors, 0);
         assert_eq!(metrics.largest_acknowledged, Some(7));
+    }
+
+    #[test]
+    fn server_control_runtime_relays_external_integrity() {
+        let settings = test_settings();
+        let server_settings = test_server_control_settings();
+        let mut pipe = test_pipe(&settings);
+        let (command_sender, command_receiver) = mpsc::unbounded_channel();
+        let (event_sender, _event_receiver) = mpsc::unbounded_channel();
+        let mut runtime = ServerControlRuntime::new(
+            server_settings,
+            event_sender,
+            command_receiver,
+        );
+        let integrity = quiche::multicast::Integrity {
+            channel_id: vec![1, 2, 3, 4],
+            packet_number_start: 11,
+            packet_hash_count: Some(1),
+            packet_hashes: vec![0xaa; 32],
+        };
+
+        runtime.on_conn_established(&mut pipe.server).unwrap();
+
+        let flight = quiche::test_utils::emit_flight(&mut pipe.server).unwrap();
+        quiche::test_utils::process_flight(&mut pipe.client, flight).unwrap();
+
+        let _ = pipe.client.multicast_recv().unwrap();
+        let _ = pipe.client.multicast_recv().unwrap();
+
+        command_sender
+            .send(ServerControlCommand::RelayIntegrity {
+                frame: integrity.clone(),
+            })
+            .unwrap();
+
+        runtime.process_writes(&mut pipe.server).unwrap();
+
+        let flight = quiche::test_utils::emit_flight(&mut pipe.server).unwrap();
+        quiche::test_utils::process_flight(&mut pipe.client, flight).unwrap();
+
+        assert_eq!(
+            pipe.client.multicast_recv(),
+            Ok(quiche::multicast::Frame::Integrity(integrity))
+        );
+    }
+
+    #[test]
+    fn server_control_runtime_emits_client_state_and_ack() {
+        let settings = test_settings();
+        let server_settings = test_server_control_settings();
+        let mut pipe = test_pipe(&settings);
+        let (_command_sender, command_receiver) = mpsc::unbounded_channel();
+        let (event_sender, mut event_receiver) = mpsc::unbounded_channel();
+        let mut runtime = ServerControlRuntime::new(
+            server_settings,
+            event_sender,
+            command_receiver,
+        );
+        let state = quiche::multicast::State {
+            channel_id: vec![1, 2, 3, 4],
+            sequence: 1,
+            state: quiche::multicast::ChannelState::Joined,
+            reason_scope: quiche::multicast::StateReasonScope::Transport,
+            reason_code: quiche::multicast::STATE_REASON_REQUESTED_BY_SERVER,
+            reason_phrase: Vec::new(),
+        };
+        let ack = quiche::multicast::Ack {
+            channel_id: vec![1, 2, 3, 4],
+            largest_acknowledged: 3,
+            ack_delay: 0,
+            first_ack_range: 0,
+            ack_ranges: Vec::new(),
+            ecn_counts: None,
+        };
+
+        runtime.on_conn_established(&mut pipe.server).unwrap();
+
+        pipe.client
+            .multicast_send(quiche::multicast::Frame::State(state.clone()))
+            .unwrap();
+        pipe.client
+            .multicast_send(quiche::multicast::Frame::Ack(ack.clone()))
+            .unwrap();
+
+        let flight = quiche::test_utils::emit_flight(&mut pipe.client).unwrap();
+        quiche::test_utils::process_flight(&mut pipe.server, flight).unwrap();
+
+        runtime.process_reads(&mut pipe.server).unwrap();
+
+        assert!(matches!(
+            event_receiver.try_recv(),
+            Ok(ServerEvent::ClientState(frame)) if frame == state
+        ));
+        assert!(matches!(
+            event_receiver.try_recv(),
+            Ok(ServerEvent::ClientAck(frame)) if frame == ack
+        ));
+        assert_eq!(
+            pipe.server.multicast_probe_status(&[1, 2, 3, 4]),
+            Some(quiche::multicast::ProbeStatus::Viable)
+        );
     }
 
     #[test]
