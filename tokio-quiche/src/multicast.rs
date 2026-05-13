@@ -1127,9 +1127,26 @@ impl JoinBackend for McrxJoinBackend {
 /// Server-side multicast settings for one connection wrapper.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ServerControlSettings {
+    /// Whether configured control frames should be sent automatically or only
+    /// when driven explicitly through [`ServerControlController`].
+    pub mode: ServerControlMode,
+
     /// The multicast channels this server may announce and manage through the
     /// QUIC control connection.
     pub channels: Vec<ServerControlChannelConfig>,
+}
+
+/// Automatic or manual sequencing for multicast control frames.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ServerControlMode {
+    /// Send initial announces and keys automatically, then emit joins when the
+    /// peer advertises `MC_LIMITS`.
+    #[default]
+    Automatic,
+
+    /// Keep channel state locally but only send control frames when the
+    /// application explicitly requests them.
+    Manual,
 }
 
 /// Control-plane configuration for one multicast channel.
@@ -1288,6 +1305,46 @@ pub struct ServerControlController {
 }
 
 impl ServerControlController {
+    /// Stores or updates one channel definition.
+    ///
+    /// In automatic mode this also sends `MC_ANNOUNCE` and `MC_KEY`
+    /// immediately once the client connection is ready, and it will emit
+    /// `MC_JOIN` automatically if the peer has already sent `MC_LIMITS`.
+    pub fn upsert_channel(
+        &self, config: ServerControlChannelConfig,
+    ) -> Result<(), mpsc::error::SendError<()>> {
+        self.command_sender
+            .send(ServerControlCommand::UpsertChannel { config })
+            .map_err(|_| mpsc::error::SendError(()))
+    }
+
+    /// Queues one `MC_ANNOUNCE` frame for explicit transmission.
+    pub fn send_announce(
+        &self, frame: quiche::multicast::Announce,
+    ) -> Result<(), mpsc::error::SendError<()>> {
+        self.command_sender
+            .send(ServerControlCommand::SendAnnounce { frame })
+            .map_err(|_| mpsc::error::SendError(()))
+    }
+
+    /// Queues one `MC_KEY` frame for explicit transmission.
+    pub fn send_key(
+        &self, frame: quiche::multicast::Key,
+    ) -> Result<(), mpsc::error::SendError<()>> {
+        self.command_sender
+            .send(ServerControlCommand::SendKey { frame })
+            .map_err(|_| mpsc::error::SendError(()))
+    }
+
+    /// Queues one explicit `MC_JOIN` frame.
+    pub fn send_join(
+        &self, frame: quiche::multicast::Join,
+    ) -> Result<(), mpsc::error::SendError<()>> {
+        self.command_sender
+            .send(ServerControlCommand::SendJoin { frame })
+            .map_err(|_| mpsc::error::SendError(()))
+    }
+
     /// Queues one externally generated `MC_INTEGRITY` frame for relay on the
     /// client-facing QUIC control connection.
     pub fn send_integrity(
@@ -1590,12 +1647,17 @@ enum ServerError {
 
 #[derive(Debug)]
 enum ServerControlCommand {
+    UpsertChannel { config: ServerControlChannelConfig },
+    SendAnnounce { frame: quiche::multicast::Announce },
+    SendKey { frame: quiche::multicast::Key },
+    SendJoin { frame: quiche::multicast::Join },
     RelayIntegrity { frame: quiche::multicast::Integrity },
 }
 
+#[derive(Default)]
 struct ServerControlChannel {
-    announce: quiche::multicast::Announce,
-    key: quiche::multicast::Key,
+    announce: Option<quiche::multicast::Announce>,
+    key: Option<quiche::multicast::Key>,
     join_sent: bool,
 }
 
@@ -1603,8 +1665,10 @@ struct ServerControlRuntime {
     settings: ServerControlSettings,
     event_sender: UnboundedSender<ServerEvent>,
     command_receiver: UnboundedReceiver<ServerControlCommand>,
+    pending_commands: VecDeque<ServerControlCommand>,
     pending_integrities: VecDeque<quiche::multicast::Integrity>,
     channels: BTreeMap<Vec<u8>, ServerControlChannel>,
+    last_client_limits_sequence: Option<u64>,
 }
 
 impl ServerControlRuntime {
@@ -1617,26 +1681,30 @@ impl ServerControlRuntime {
             settings,
             event_sender,
             command_receiver,
+            pending_commands: VecDeque::new(),
             pending_integrities: VecDeque::new(),
             channels: BTreeMap::new(),
+            last_client_limits_sequence: None,
         }
     }
 
     fn clear(&mut self) {
+        self.pending_commands.clear();
         self.pending_integrities.clear();
         self.channels.clear();
+        self.last_client_limits_sequence = None;
 
         while self.command_receiver.try_recv().is_ok() {}
     }
 
     fn has_pending_work(&self) -> bool {
-        !self.pending_integrities.is_empty()
+        !self.pending_commands.is_empty() || !self.pending_integrities.is_empty()
     }
 
     async fn wait_for_work(&mut self) -> QuicResult<()> {
         match self.command_receiver.recv().await {
-            Some(ServerControlCommand::RelayIntegrity { frame }) => {
-                self.pending_integrities.push_back(frame);
+            Some(command) => {
+                self.pending_commands.push_back(command);
                 Ok(())
             },
 
@@ -1657,9 +1725,7 @@ impl ServerControlRuntime {
             return Err(Box::new(ServerError::ClientConnectionUnsupported));
         }
 
-        if self.peer_supports_multicast(qconn) {
-            self.initialize_channels(qconn)?;
-        }
+        self.initialize_channels(qconn)?;
 
         Ok(())
     }
@@ -1677,40 +1743,23 @@ impl ServerControlRuntime {
     }
 
     fn process_writes(&mut self, qconn: &mut QuicheConnection) -> QuicResult<()> {
-        while let Ok(ServerControlCommand::RelayIntegrity { frame }) =
-            self.command_receiver.try_recv()
-        {
-            self.pending_integrities.push_back(frame);
+        while let Ok(command) = self.command_receiver.try_recv() {
+            self.pending_commands.push_back(command);
         }
 
+        self.handle_pending_commands(qconn)?;
         self.flush_pending_integrities(qconn)
     }
 
     fn initialize_channels(
         &mut self, qconn: &mut QuicheConnection,
     ) -> QuicResult<()> {
-        if !self.channels.is_empty() {
-            return Ok(());
-        }
+        let auto_send = self.settings.mode == ServerControlMode::Automatic &&
+            self.peer_supports_multicast(qconn);
+        let channels = self.settings.channels.clone();
 
-        for config in &self.settings.channels {
-            config.validate()?;
-
-            qconn.multicast_send(quiche::multicast::Frame::Announce(
-                config.announce.clone(),
-            ))?;
-            qconn.multicast_send(quiche::multicast::Frame::Key(
-                config.key.clone(),
-            ))?;
-
-            self.channels.insert(
-                config.announce.channel_id.clone(),
-                ServerControlChannel {
-                    announce: config.announce.clone(),
-                    key: config.key.clone(),
-                    join_sent: false,
-                },
-            );
+        for config in channels {
+            self.upsert_channel_config(qconn, config, auto_send)?;
         }
 
         Ok(())
@@ -1747,24 +1796,131 @@ impl ServerControlRuntime {
     fn handle_limits(
         &mut self, qconn: &mut QuicheConnection, frame: quiche::multicast::Limits,
     ) -> QuicResult<()> {
-        let sequence = frame.sequence;
+        self.last_client_limits_sequence = Some(frame.sequence);
         let _ = self.event_sender.send(ServerEvent::ClientLimits(frame));
 
-        for channel in self.channels.values_mut() {
-            if channel.join_sent {
-                continue;
-            }
-
-            qconn.multicast_send(quiche::multicast::Frame::Join(
-                quiche::multicast::Join {
-                    channel_id: channel.announce.channel_id.clone(),
-                    mc_limits_sequence: sequence,
-                    mc_state_sequence: 0,
-                    mc_key_sequence: channel.key.key_sequence,
-                },
-            ))?;
-            channel.join_sent = true;
+        if self.settings.mode != ServerControlMode::Automatic {
+            return Ok(());
         }
+
+        let channel_ids = self.channels.keys().cloned().collect::<Vec<_>>();
+
+        for channel_id in channel_ids {
+            self.maybe_auto_join_channel(qconn, &channel_id)?;
+        }
+
+        Ok(())
+    }
+
+    fn handle_pending_commands(
+        &mut self, qconn: &mut QuicheConnection,
+    ) -> QuicResult<()> {
+        while let Some(command) = self.pending_commands.pop_front() {
+            match command {
+                ServerControlCommand::UpsertChannel { config } => {
+                    let auto_send = self.settings.mode ==
+                        ServerControlMode::Automatic &&
+                        self.peer_supports_multicast(qconn);
+                    self.upsert_channel_config(qconn, config, auto_send)?;
+                },
+
+                ServerControlCommand::SendAnnounce { frame } => {
+                    self.channels
+                        .entry(frame.channel_id.clone())
+                        .or_default()
+                        .announce = Some(frame.clone());
+                    self.channels
+                        .entry(frame.channel_id.clone())
+                        .or_default()
+                        .join_sent = false;
+                    qconn.multicast_send(quiche::multicast::Frame::Announce(
+                        frame,
+                    ))?;
+                },
+
+                ServerControlCommand::SendKey { frame } => {
+                    self.channels
+                        .entry(frame.channel_id.clone())
+                        .or_default()
+                        .key = Some(frame.clone());
+                    qconn.multicast_send(quiche::multicast::Frame::Key(frame))?;
+                },
+
+                ServerControlCommand::SendJoin { frame } => {
+                    self.channels
+                        .entry(frame.channel_id.clone())
+                        .or_default()
+                        .join_sent = true;
+                    qconn
+                        .multicast_send(quiche::multicast::Frame::Join(frame))?;
+                },
+
+                ServerControlCommand::RelayIntegrity { frame } => {
+                    self.pending_integrities.push_back(frame);
+                },
+            }
+        }
+
+        Ok(())
+    }
+
+    fn upsert_channel_config(
+        &mut self, qconn: &mut QuicheConnection,
+        config: ServerControlChannelConfig, auto_send: bool,
+    ) -> QuicResult<()> {
+        config.validate()?;
+
+        let channel_id = config.announce.channel_id.clone();
+        let channel = self.channels.entry(channel_id.clone()).or_default();
+        channel.announce = Some(config.announce.clone());
+        channel.key = Some(config.key.clone());
+        channel.join_sent = false;
+
+        if !auto_send {
+            return Ok(());
+        }
+
+        qconn.multicast_send(quiche::multicast::Frame::Announce(
+            config.announce,
+        ))?;
+        qconn.multicast_send(quiche::multicast::Frame::Key(config.key))?;
+        self.maybe_auto_join_channel(qconn, &channel_id)
+    }
+
+    fn maybe_auto_join_channel(
+        &mut self, qconn: &mut QuicheConnection, channel_id: &[u8],
+    ) -> QuicResult<()> {
+        if self.settings.mode != ServerControlMode::Automatic {
+            return Ok(());
+        }
+
+        let Some(sequence) = self.last_client_limits_sequence else {
+            return Ok(());
+        };
+
+        let Some(channel) = self.channels.get_mut(channel_id) else {
+            return Ok(());
+        };
+
+        if channel.join_sent {
+            return Ok(());
+        }
+
+        let (Some(announce), Some(key)) =
+            (channel.announce.as_ref(), channel.key.as_ref())
+        else {
+            return Ok(());
+        };
+
+        qconn.multicast_send(quiche::multicast::Frame::Join(
+            quiche::multicast::Join {
+                channel_id: announce.channel_id.clone(),
+                mc_limits_sequence: sequence,
+                mc_state_sequence: 0,
+                mc_key_sequence: key.key_sequence,
+            },
+        ))?;
+        channel.join_sent = true;
 
         Ok(())
     }
@@ -2425,6 +2581,7 @@ mod tests {
 
     fn test_server_control_settings() -> ServerControlSettings {
         ServerControlSettings {
+            mode: ServerControlMode::Automatic,
             channels: vec![ServerControlChannelConfig {
                 announce: test_ipv4_announce(),
                 key: test_key(&[1, 2, 3, 4]),
@@ -2845,6 +3002,154 @@ mod tests {
         assert_eq!(
             pipe.client.multicast_recv(),
             Ok(quiche::multicast::Frame::Integrity(integrity))
+        );
+    }
+
+    #[test]
+    fn server_control_runtime_upserts_channel_after_limits() {
+        let settings = test_settings();
+        let server_settings = ServerControlSettings {
+            mode: ServerControlMode::Automatic,
+            channels: Vec::new(),
+        };
+        let mut pipe = test_pipe(&settings);
+        let (command_sender, command_receiver) = mpsc::unbounded_channel();
+        let mut controller = ServerControlController {
+            command_sender,
+            event_receiver: mpsc::unbounded_channel().1,
+        };
+        let (event_sender, mut event_receiver) = mpsc::unbounded_channel();
+        let mut runtime = ServerControlRuntime::new(
+            server_settings,
+            event_sender,
+            command_receiver,
+        );
+        let config = ServerControlChannelConfig {
+            announce: test_ipv4_announce(),
+            key: test_key(&[1, 2, 3, 4]),
+        };
+
+        runtime.on_conn_established(&mut pipe.server).unwrap();
+
+        pipe.client
+            .multicast_send(quiche::multicast::Frame::Limits(test_limits()))
+            .unwrap();
+
+        let flight = quiche::test_utils::emit_flight(&mut pipe.client).unwrap();
+        quiche::test_utils::process_flight(&mut pipe.server, flight).unwrap();
+
+        runtime.process_reads(&mut pipe.server).unwrap();
+        assert!(matches!(
+            event_receiver.try_recv(),
+            Ok(ServerEvent::ClientLimits(frame))
+                if frame.sequence == 1 &&
+                    frame.limits == test_transport_params().limits
+        ));
+
+        controller.upsert_channel(config).unwrap();
+        runtime.process_writes(&mut pipe.server).unwrap();
+
+        let flight = quiche::test_utils::emit_flight(&mut pipe.server).unwrap();
+        quiche::test_utils::process_flight(&mut pipe.client, flight).unwrap();
+
+        let announce = match pipe.client.multicast_recv() {
+            Ok(quiche::multicast::Frame::Announce(frame)) => frame,
+            other => panic!("expected announce, got {other:?}"),
+        };
+        let key = match pipe.client.multicast_recv() {
+            Ok(quiche::multicast::Frame::Key(frame)) => frame,
+            other => panic!("expected key, got {other:?}"),
+        };
+        let join = match pipe.client.multicast_recv() {
+            Ok(quiche::multicast::Frame::Join(frame)) => frame,
+            other => panic!("expected join, got {other:?}"),
+        };
+
+        assert_eq!(announce, test_ipv4_announce());
+        assert_eq!(key, test_key(&[1, 2, 3, 4]));
+        assert_eq!(join, quiche::multicast::Join {
+            channel_id: vec![1, 2, 3, 4],
+            mc_limits_sequence: 1,
+            mc_state_sequence: 0,
+            mc_key_sequence: 1,
+        });
+
+        let _ = controller.take_event_receiver();
+    }
+
+    #[test]
+    fn server_control_runtime_manual_mode_allows_explicit_sequencing() {
+        let settings = test_settings();
+        let server_settings = ServerControlSettings {
+            mode: ServerControlMode::Manual,
+            channels: Vec::new(),
+        };
+        let mut pipe = test_pipe(&settings);
+        let (command_sender, command_receiver) = mpsc::unbounded_channel();
+        let controller = ServerControlController {
+            command_sender,
+            event_receiver: mpsc::unbounded_channel().1,
+        };
+        let (event_sender, mut event_receiver) = mpsc::unbounded_channel();
+        let mut runtime = ServerControlRuntime::new(
+            server_settings,
+            event_sender,
+            command_receiver,
+        );
+        let announce = test_ipv4_announce();
+        let key = test_key(&announce.channel_id);
+        let join = quiche::multicast::Join {
+            channel_id: announce.channel_id.clone(),
+            mc_limits_sequence: 1,
+            mc_state_sequence: 0,
+            mc_key_sequence: key.key_sequence,
+        };
+
+        runtime.on_conn_established(&mut pipe.server).unwrap();
+        if let Ok(flight) = quiche::test_utils::emit_flight(&mut pipe.server) {
+            quiche::test_utils::process_flight(&mut pipe.client, flight).unwrap();
+        }
+        assert_eq!(pipe.client.multicast_recv(), Err(quiche::Error::Done));
+
+        pipe.client
+            .multicast_send(quiche::multicast::Frame::Limits(test_limits()))
+            .unwrap();
+
+        let flight = quiche::test_utils::emit_flight(&mut pipe.client).unwrap();
+        quiche::test_utils::process_flight(&mut pipe.server, flight).unwrap();
+
+        runtime.process_reads(&mut pipe.server).unwrap();
+        assert!(matches!(
+            event_receiver.try_recv(),
+            Ok(ServerEvent::ClientLimits(frame))
+                if frame.sequence == 1 &&
+                    frame.limits == test_transport_params().limits
+        ));
+        if let Ok(flight) = quiche::test_utils::emit_flight(&mut pipe.server) {
+            quiche::test_utils::process_flight(&mut pipe.client, flight).unwrap();
+        }
+        assert_eq!(pipe.client.multicast_recv(), Err(quiche::Error::Done));
+
+        controller.send_announce(announce.clone()).unwrap();
+        controller.send_key(key.clone()).unwrap();
+        controller.send_join(join.clone()).unwrap();
+
+        runtime.process_writes(&mut pipe.server).unwrap();
+
+        let flight = quiche::test_utils::emit_flight(&mut pipe.server).unwrap();
+        quiche::test_utils::process_flight(&mut pipe.client, flight).unwrap();
+
+        assert_eq!(
+            pipe.client.multicast_recv(),
+            Ok(quiche::multicast::Frame::Announce(announce))
+        );
+        assert_eq!(
+            pipe.client.multicast_recv(),
+            Ok(quiche::multicast::Frame::Key(key))
+        );
+        assert_eq!(
+            pipe.client.multicast_recv(),
+            Ok(quiche::multicast::Frame::Join(join))
         );
     }
 
