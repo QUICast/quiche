@@ -2858,7 +2858,19 @@ fn build_packet_open(announce: &Announce, key: &Key) -> Result<crypto::Open> {
     crypto::derive_pkt_iv(payload_alg, &key.secret, &mut pkt_iv)?;
     crypto::derive_hdr_key(payload_alg, &announce.header_secret, &mut hp_key)?;
 
-    crypto::Open::new(payload_alg, pkt_key, pkt_iv, hp_key, key.secret.clone())
+    let mut open = crypto::Open::new(
+        payload_alg,
+        pkt_key,
+        pkt_iv,
+        hp_key,
+        key.secret.clone(),
+    )?;
+
+    if key.from_packet_number > 0 {
+        open.prime_for_nonzero_packet_number_space()?;
+    }
+
+    Ok(open)
 }
 
 fn build_channel_packet_seal(
@@ -2880,7 +2892,19 @@ fn build_channel_packet_seal(
     crypto::derive_pkt_iv(payload_alg, &key.secret, &mut pkt_iv)?;
     crypto::derive_hdr_key(payload_alg, &announce.header_secret, &mut hp_key)?;
 
-    crypto::Seal::new(payload_alg, pkt_key, pkt_iv, hp_key, key.secret.clone())
+    let mut seal = crypto::Seal::new(
+        payload_alg,
+        pkt_key,
+        pkt_iv,
+        hp_key,
+        key.secret.clone(),
+    )?;
+
+    if key.from_packet_number > 0 {
+        seal.prime_for_nonzero_packet_number_space()?;
+    }
+
+    Ok(seal)
 }
 
 fn encode_channel_packet_bytes(

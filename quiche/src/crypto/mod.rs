@@ -197,6 +197,18 @@ impl Open {
         })
     }
 
+    pub fn prime_for_nonzero_packet_number_space(&mut self) -> Result<()> {
+        let _ = self.packet.seal_with_u64_counter(
+            0,
+            b"",
+            &mut [0_u8; 16],
+            0,
+            None,
+        )?;
+
+        Ok(())
+    }
+
     pub fn open_with_u64_counter(
         &self, counter: u64, ad: &[u8], buf: &mut [u8],
     ) -> Result<usize> {
@@ -286,6 +298,18 @@ impl Seal {
 
             packet: next_packet_key,
         })
+    }
+
+    pub fn prime_for_nonzero_packet_number_space(&mut self) -> Result<()> {
+        let _ = self.packet.seal_with_u64_counter(
+            0,
+            b"",
+            &mut [0_u8; 16],
+            0,
+            None,
+        )?;
+
+        Ok(())
     }
 
     pub fn seal_with_u64_counter(
