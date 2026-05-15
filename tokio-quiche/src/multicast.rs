@@ -63,6 +63,7 @@ use crate::QuicResult;
 pub use crate::settings::MulticastClientSettings as ClientSettings;
 
 const STATE_REASON_UNSPECIFIED_OTHER: u64 = 0x0;
+const STATE_REASON_UNSYNCHRONIZED_PROPERTIES: u64 = 0x5;
 const PUBLISH_RETRY_DELAY: Duration = Duration::from_millis(10);
 
 /// A point-in-time multicast receive metrics snapshot for one joined channel.
@@ -643,11 +644,16 @@ impl<B: JoinBackend> ClientRuntime<B> {
             .channels
             .get(&channel_id)
             .and_then(|channel| channel.decoder_error.clone());
-        let has_key = self
+        let key_sequence = self
             .channels
             .get(&channel_id)
             .and_then(|channel| channel.key.as_ref())
-            .is_some();
+            .map(|key| key.key_sequence);
+        let state_sequence = self
+            .channels
+            .get(&channel_id)
+            .map(|channel| channel.next_state_sequence)
+            .unwrap_or_default();
         let already_joined = self
             .channels
             .get(&channel_id)
@@ -666,11 +672,23 @@ impl<B: JoinBackend> ClientRuntime<B> {
             );
         };
 
-        if !has_key {
+        let Some(key_sequence) = key_sequence else {
             return self.decline_join(
                 qconn,
                 channel_id,
                 b"missing multicast properties".to_vec(),
+            );
+        };
+
+        if frame.mc_limits_sequence > self.next_limits_sequence ||
+            frame.mc_state_sequence > state_sequence ||
+            frame.mc_key_sequence > key_sequence
+        {
+            return self.decline_join_with_reason(
+                qconn,
+                channel_id,
+                STATE_REASON_UNSYNCHRONIZED_PROPERTIES,
+                b"unsynchronized multicast properties".to_vec(),
             );
         }
 
@@ -809,11 +827,23 @@ impl<B: JoinBackend> ClientRuntime<B> {
         &mut self, qconn: &mut QuicheConnection, channel_id: Vec<u8>,
         reason_phrase: Vec<u8>,
     ) -> QuicResult<()> {
+        self.decline_join_with_reason(
+            qconn,
+            channel_id,
+            STATE_REASON_UNSPECIFIED_OTHER,
+            reason_phrase,
+        )
+    }
+
+    fn decline_join_with_reason(
+        &mut self, qconn: &mut QuicheConnection, channel_id: Vec<u8>,
+        reason_code: u64, reason_phrase: Vec<u8>,
+    ) -> QuicResult<()> {
         self.send_state(
             qconn,
             channel_id,
             quiche::multicast::ChannelState::DeclinedJoin,
-            STATE_REASON_UNSPECIFIED_OTHER,
+            reason_code,
             reason_phrase,
         )
     }
@@ -1778,7 +1808,9 @@ impl ServerControlRuntime {
             },
 
             quiche::multicast::Frame::Ack(frame) => {
-                qconn.multicast_process_peer_ack(frame.clone())?;
+                if self.channels.contains_key(&frame.channel_id) {
+                    qconn.multicast_process_peer_ack(frame.clone())?;
+                }
                 let _ = self.event_sender.send(ServerEvent::ClientAck(frame));
             },
 
@@ -1825,32 +1857,32 @@ impl ServerControlRuntime {
                 },
 
                 ServerControlCommand::SendAnnounce { frame } => {
-                    self.channels
+                    let channel = self
+                        .channels
                         .entry(frame.channel_id.clone())
-                        .or_default()
-                        .announce = Some(frame.clone());
-                    self.channels
-                        .entry(frame.channel_id.clone())
-                        .or_default()
-                        .join_sent = false;
+                        .or_default();
+                    channel.announce = Some(frame.clone());
+                    channel.join_sent = false;
                     qconn.multicast_send(quiche::multicast::Frame::Announce(
                         frame,
                     ))?;
                 },
 
                 ServerControlCommand::SendKey { frame } => {
-                    self.channels
+                    let channel = self
+                        .channels
                         .entry(frame.channel_id.clone())
-                        .or_default()
-                        .key = Some(frame.clone());
+                        .or_default();
+                    channel.key = Some(frame.clone());
                     qconn.multicast_send(quiche::multicast::Frame::Key(frame))?;
                 },
 
                 ServerControlCommand::SendJoin { frame } => {
-                    self.channels
+                    let channel = self
+                        .channels
                         .entry(frame.channel_id.clone())
-                        .or_default()
-                        .join_sent = true;
+                        .or_default();
+                    channel.join_sent = true;
                     qconn
                         .multicast_send(quiche::multicast::Frame::Join(frame))?;
                 },
@@ -2765,6 +2797,67 @@ mod tests {
     }
 
     #[test]
+    fn runtime_declines_join_for_missing_key_sequence() {
+        let settings = test_settings();
+        let mut pipe = test_pipe(&settings);
+        let backend = FakeJoinBackend::default();
+        let recorded = Arc::clone(&backend.joins);
+        let (event_sender, mut event_receiver) = mpsc::unbounded_channel();
+        let mut runtime =
+            ClientRuntime::with_backend(settings, event_sender, backend);
+        let announce = test_ipv4_announce();
+
+        pipe.server
+            .multicast_send(quiche::multicast::Frame::Announce(announce.clone()))
+            .unwrap();
+        pipe.server
+            .multicast_send(quiche::multicast::Frame::Key(test_key(
+                &announce.channel_id,
+            )))
+            .unwrap();
+        pipe.server
+            .multicast_send(quiche::multicast::Frame::Join(
+                quiche::multicast::Join {
+                    channel_id: announce.channel_id.clone(),
+                    mc_limits_sequence: 0,
+                    mc_state_sequence: 0,
+                    mc_key_sequence: 2,
+                },
+            ))
+            .unwrap();
+
+        let flight = quiche::test_utils::emit_flight(&mut pipe.server).unwrap();
+        quiche::test_utils::process_flight(&mut pipe.client, flight).unwrap();
+
+        runtime.process_reads(&mut pipe.client).unwrap();
+
+        let flight = quiche::test_utils::emit_flight(&mut pipe.client).unwrap();
+        quiche::test_utils::process_flight(&mut pipe.server, flight).unwrap();
+
+        assert_eq!(
+            pipe.server.multicast_recv(),
+            Ok(quiche::multicast::Frame::State(quiche::multicast::State {
+                channel_id: announce.channel_id.clone(),
+                sequence: 1,
+                state: quiche::multicast::ChannelState::DeclinedJoin,
+                reason_scope: quiche::multicast::StateReasonScope::Transport,
+                reason_code: STATE_REASON_UNSYNCHRONIZED_PROPERTIES,
+                reason_phrase: b"unsynchronized multicast properties".to_vec(),
+            }))
+        );
+
+        assert!(recorded.lock().unwrap().is_empty());
+        assert!(matches!(
+            event_receiver.try_recv(),
+            Ok(ClientEvent::Announce(frame)) if frame == announce
+        ));
+        assert_next_local_state(
+            &mut event_receiver,
+            quiche::multicast::ChannelState::DeclinedJoin,
+        );
+    }
+
+    #[test]
     fn server_runtime_announces_and_joins_after_limits() {
         let settings = test_settings();
         let server_settings = test_server_settings();
@@ -3208,6 +3301,49 @@ mod tests {
             pipe.server.multicast_probe_status(&[1, 2, 3, 4]),
             Some(quiche::multicast::ProbeStatus::Viable)
         );
+    }
+
+    #[test]
+    fn server_control_runtime_does_not_probe_unknown_ack() {
+        let settings = test_settings();
+        let server_settings = ServerControlSettings {
+            mode: ServerControlMode::Manual,
+            channels: Vec::new(),
+        };
+        let mut pipe = test_pipe(&settings);
+        let (_command_sender, command_receiver) = mpsc::unbounded_channel();
+        let (event_sender, mut event_receiver) = mpsc::unbounded_channel();
+        let mut runtime = ServerControlRuntime::new(
+            server_settings,
+            event_sender,
+            command_receiver,
+        );
+        let ack = quiche::multicast::Ack {
+            channel_id: vec![9, 9, 9, 9],
+            largest_acknowledged: 3,
+            ack_delay: 0,
+            first_ack_range: 0,
+            ack_ranges: Vec::new(),
+            ecn_counts: None,
+        };
+
+        runtime.on_conn_established(&mut pipe.server).unwrap();
+
+        pipe.client
+            .multicast_send(quiche::multicast::Frame::Ack(ack.clone()))
+            .unwrap();
+
+        let flight = quiche::test_utils::emit_flight(&mut pipe.client).unwrap();
+        quiche::test_utils::process_flight(&mut pipe.server, flight).unwrap();
+
+        runtime.process_reads(&mut pipe.server).unwrap();
+
+        assert!(matches!(
+            event_receiver.try_recv(),
+            Ok(ServerEvent::ClientAck(frame)) if frame == ack
+        ));
+        assert_eq!(pipe.server.multicast_probe_status(&ack.channel_id), None);
+        assert_eq!(pipe.server.multicast_probe_recv(), Err(quiche::Error::Done));
     }
 
     #[test]

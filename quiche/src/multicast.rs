@@ -1315,10 +1315,31 @@ impl ChannelSendState {
             return Err(Error::InvalidState);
         }
 
-        if key.key_sequence == self.key.key_sequence &&
-            (key.from_packet_number != self.key.from_packet_number ||
-                key.secret != self.key.secret)
+        if key.key_sequence < self.key.key_sequence {
+            return Err(Error::InvalidState);
+        }
+
+        if key.key_sequence == self.key.key_sequence {
+            if key.from_packet_number != self.key.from_packet_number ||
+                key.secret != self.key.secret
+            {
+                return Err(Error::InvalidState);
+            }
+
+            return Ok(());
+        }
+
+        if self
+            .key
+            .key_sequence
+            .checked_add(1)
+            .ok_or(Error::InvalidState)? !=
+            key.key_sequence
         {
+            return Err(Error::InvalidState);
+        }
+
+        if key.from_packet_number < self.key.from_packet_number {
             return Err(Error::InvalidState);
         }
 
@@ -2647,7 +2668,14 @@ fn announce_frame_type(frame: &Announce) -> Result<u64> {
 fn decode_ack_ranges(
     b: &mut octets::Octets, ack_range_count: u64,
 ) -> Result<Vec<AckRange>> {
-    let mut ack_ranges = Vec::with_capacity(ack_range_count as usize);
+    let ack_range_count =
+        usize::try_from(ack_range_count).map_err(|_| Error::InvalidFrame)?;
+
+    if ack_range_count > b.cap() / 2 {
+        return Err(Error::InvalidFrame);
+    }
+
+    let mut ack_ranges = Vec::with_capacity(ack_range_count);
 
     for _ in 0..ack_range_count {
         ack_ranges.push(AckRange {
@@ -2761,6 +2789,14 @@ fn decode_u16_list(
             Error::InvalidTransportParam
         }
     })?;
+
+    if count > b.cap() / 2 {
+        return Err(if invalid_frame {
+            Error::InvalidFrame
+        } else {
+            Error::InvalidTransportParam
+        });
+    }
 
     let mut out = Vec::with_capacity(count);
 
@@ -3197,6 +3233,66 @@ mod tests {
             Err(Error::InvalidAckRange)
         );
         assert_eq!(sender.metrics_snapshot().ack_errors, 1);
+    }
+
+    #[test]
+    fn channel_send_state_rejects_non_contiguous_key_update() {
+        let announce = test_announce();
+        let key = test_key(&announce.channel_id);
+        let mut sender =
+            ChannelSendState::new(announce.clone(), key.clone()).unwrap();
+
+        let mut skipped = key.clone();
+        skipped.key_sequence += 2;
+        skipped.secret = vec![0xdd; 16];
+
+        assert_eq!(sender.update_key(skipped), Err(Error::InvalidState));
+
+        let mut next = key.clone();
+        next.key_sequence += 1;
+        next.from_packet_number = 5;
+        next.secret = vec![0xee; 16];
+
+        assert_eq!(sender.update_key(next), Ok(()));
+        assert_eq!(sender.metrics_snapshot().key_updates, 1);
+
+        assert_eq!(sender.update_key(key), Err(Error::InvalidState));
+    }
+
+    #[test]
+    fn frame_decode_rejects_impossible_ack_range_count() {
+        let mut out = [0; 64];
+        let mut b = octets::OctetsMut::with_slice(&mut out);
+
+        b.put_varint(FRAME_TYPE_ACK).unwrap();
+        encode_channel_id(&[1, 2, 3, 4], &mut b).unwrap();
+        b.put_varint(0).unwrap();
+        b.put_varint(0).unwrap();
+        b.put_varint(2).unwrap();
+        b.put_varint(0).unwrap();
+
+        let written = b.off();
+
+        assert_eq!(Frame::from_bytes(&out[..written]), Err(Error::InvalidFrame));
+    }
+
+    #[test]
+    fn client_transport_params_reject_impossible_algorithm_count() {
+        let mut out = [0; 64];
+        let mut b = octets::OctetsMut::with_slice(&mut out);
+
+        b.put_u8(0).unwrap();
+        b.put_varint(0).unwrap();
+        b.put_varint(0).unwrap();
+        b.put_varint(2).unwrap();
+        b.put_varint(0).unwrap();
+
+        let written = b.off();
+
+        assert_eq!(
+            ClientTransportParams::from_bytes(&out[..written]),
+            Err(Error::InvalidTransportParam)
+        );
     }
 
     #[test]
