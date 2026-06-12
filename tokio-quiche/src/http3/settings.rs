@@ -61,6 +61,13 @@ pub struct Http3Settings {
     /// Set the `SETTINGS_ENABLE_CONNECT_PROTOCOL` HTTP/3 setting.
     /// See <https://www.rfc-editor.org/rfc/rfc9220#section-3-2>
     pub enable_extended_connect: bool,
+    /// Experimental escape hatch for interop harnesses that need to read
+    /// selected raw QUIC streams on an HTTP/3 connection.
+    ///
+    /// This is intentionally empty by default. When a stream ID is listed, the
+    /// server driver treats that stream as raw QUIC data and does not pass it
+    /// through the HTTP/3 parser.
+    pub experimental_raw_quic_stream_ids: Vec<u64>,
 }
 
 impl From<&Http3Settings> for quiche::h3::Config {

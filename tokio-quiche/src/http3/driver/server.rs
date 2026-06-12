@@ -158,6 +158,8 @@ const PRE_HEADERS_BOOSTED_PRIORITY_INCREMENTAL: bool = false;
 pub struct ServerHooks {
     /// Helper to enforce limits and timeouts on an HTTP/3 connection.
     settings_enforcer: Http3SettingsEnforcer,
+    /// Exact stream IDs to expose as raw QUIC data.
+    raw_quic_stream_ids: Vec<u64>,
     /// Tracks the number of requests that have been handled by this driver.
     requests: u64,
 
@@ -251,6 +253,9 @@ impl DriverHooks for ServerHooks {
     fn new(settings: &Http3Settings) -> Self {
         Self {
             settings_enforcer: settings.into(),
+            raw_quic_stream_ids: settings
+                .experimental_raw_quic_stream_ids
+                .clone(),
             requests: 0,
             post_accept_timeout: None,
         }
@@ -303,6 +308,13 @@ impl DriverHooks for ServerHooks {
         }
 
         Self::handle_request(driver, qconn, headers)
+    }
+
+    fn should_intercept_raw_stream(
+        driver: &H3Driver<Self>, stream_id: u64,
+    ) -> bool {
+        driver.hooks.raw_quic_stream_ids.contains(&stream_id) &&
+            !driver.stream_map.contains_key(&stream_id)
     }
 
     fn conn_command(

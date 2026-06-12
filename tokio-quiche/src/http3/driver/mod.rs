@@ -39,6 +39,7 @@ pub mod test_utils;
 mod tests;
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
 use std::marker::PhantomData;
@@ -257,6 +258,13 @@ pub enum H3Event {
         /// Whether the stream is finished and won't yield any more data.
         fin: bool,
     },
+    /// Raw QUIC stream data was received on a stream that the driver is not
+    /// treating as HTTP/3.
+    RawStreamData {
+        stream_id: u64,
+        data: Bytes,
+        fin: bool,
+    },
     /// The stream has been closed. This is used to signal stream closures that
     /// don't result from RST_STREAM frames, unlike the
     /// [`H3Event::ResetStream`] variant.
@@ -353,6 +361,10 @@ pub struct H3Driver<H: DriverHooks> {
     /// A buffer to receive H3 body data from quiche. We initialize a large
     /// buffer and then `split()` off filled parts until we need to reallocate.
     body_recv_buf: bytes::buf::Limit<BytesMut>,
+    /// Streams that have been claimed as raw QUIC streams rather than HTTP/3.
+    raw_streams: BTreeSet<u64>,
+    /// Scratch space for receiving raw QUIC stream data.
+    raw_stream_recv_buf: Vec<u8>,
 
     /// The buffer used to interact with the underlying IoWorker.
     io_worker_buf: Vec<u8>,
@@ -392,6 +404,8 @@ impl<H: DriverHooks> H3Driver<H> {
                 max_stream_seen: 0,
                 body_recv_buf: BytesMut::with_capacity(BufFactory::MAX_BUF_SIZE)
                     .limit(BufFactory::MAX_BUF_SIZE),
+                raw_streams: BTreeSet::new(),
+                raw_stream_recv_buf: vec![0u8; BufFactory::MAX_BUF_SIZE],
                 io_worker_buf: vec![0u8; BufFactory::MAX_BUF_SIZE],
 
                 waiting_streams: FuturesUnordered::new(),
@@ -1070,6 +1084,60 @@ impl<H: DriverHooks> H3Driver<H> {
 }
 
 impl<H: DriverHooks> H3Driver<H> {
+    /// Reads streams that have been explicitly claimed by the endpoint hooks as
+    /// raw QUIC streams rather than HTTP/3 streams.
+    fn process_raw_stream_reads(
+        &mut self, qconn: &mut QuicheConnection,
+    ) -> H3ConnectionResult<()> {
+        let readable = qconn.readable().collect::<Vec<_>>();
+
+        for stream_id in readable {
+            if !self.raw_streams.contains(&stream_id) &&
+                !H::should_intercept_raw_stream(self, stream_id)
+            {
+                continue;
+            }
+
+            self.raw_streams.insert(stream_id);
+
+            loop {
+                match qconn.stream_recv(stream_id, &mut self.raw_stream_recv_buf)
+                {
+                    Ok((read, fin)) => {
+                        if read != 0 || fin {
+                            let data = Bytes::copy_from_slice(
+                                &self.raw_stream_recv_buf[..read],
+                            );
+                            let event = H3Event::RawStreamData {
+                                stream_id,
+                                data,
+                                fin,
+                            };
+                            self.h3_event_sender.send(event.into()).map_err(
+                                |_| H3ConnectionError::ControllerWentAway,
+                            )?;
+                        }
+
+                        if read == 0 || fin {
+                            if fin {
+                                self.raw_streams.remove(&stream_id);
+                            }
+                            break;
+                        }
+                    },
+                    Err(quiche::Error::Done) => break,
+                    Err(quiche::Error::InvalidStreamState(_)) => {
+                        self.raw_streams.remove(&stream_id);
+                        break;
+                    },
+                    Err(err) => return Err(H3ConnectionError::from(err)),
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Reads all buffered datagrams out of `qconn` and distributes them to
     /// their flow channels.
     fn process_available_dgrams(
@@ -1236,6 +1304,8 @@ impl<H: DriverHooks> ApplicationOverQuic for H3Driver<H> {
     ///
     /// If a DATAGRAM is found, it is sent to the receiver on its channel.
     fn process_reads(&mut self, qconn: &mut QuicheConnection) -> QuicResult<()> {
+        self.process_raw_stream_reads(qconn)?;
+
         loop {
             match self.conn_mut()?.poll(qconn) {
                 Ok((stream_id, event)) =>

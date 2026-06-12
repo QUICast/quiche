@@ -75,6 +75,14 @@ pub trait DriverHooks: Sized + Send + 'static {
         headers: InboundHeaders,
     ) -> H3ConnectionResult<()>;
 
+    /// Determines whether the driver should claim a readable QUIC stream as a
+    /// raw stream instead of passing it to the HTTP/3 parser.
+    fn should_intercept_raw_stream(
+        _driver: &H3Driver<Self>, _stream_id: u64,
+    ) -> bool {
+        false
+    }
+
     /// Processes any command received from the
     /// [`H3Controller`](super::H3Controller). May use
     /// `H3Driver::handle_core_command` to handle regular [`H3Command`]s.
