@@ -61,6 +61,11 @@ pub struct Http3Settings {
     /// Set the `SETTINGS_ENABLE_CONNECT_PROTOCOL` HTTP/3 setting.
     /// See <https://www.rfc-editor.org/rfc/rfc9220#section-3-2>
     pub enable_extended_connect: bool,
+    /// Set the WebTransport-over-HTTP/3 SETTINGS_ENABLE_WEB_TRANSPORT setting.
+    ///
+    /// Chrome requires this in addition to extended CONNECT before it considers
+    /// WebTransport sessions negotiated.
+    pub enable_webtransport: bool,
     /// Experimental escape hatch for interop harnesses that need to read
     /// selected raw QUIC streams on an HTTP/3 connection.
     ///
@@ -88,6 +93,12 @@ impl From<&Http3Settings> for quiche::h3::Config {
 
         if value.enable_extended_connect {
             config.enable_extended_connect(value.enable_extended_connect)
+        }
+
+        if value.enable_extended_connect || value.enable_webtransport {
+            config
+                .set_additional_settings(vec![(0x2b60_3742, 1)])
+                .expect("WebTransport setting must not conflict with built-in H3 settings");
         }
 
         config
