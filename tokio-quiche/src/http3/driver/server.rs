@@ -24,9 +24,11 @@
 // NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 // SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+use std::collections::BTreeSet;
 use std::ops::Deref;
 use std::sync::Arc;
 
+use quiche::h3::NameValue as _;
 use tokio::sync::mpsc;
 
 use super::datagram;
@@ -147,6 +149,26 @@ impl From<QuicCommand> for ServerH3Command {
     }
 }
 
+fn is_webtransport_connect_headers(headers: &[quiche::h3::Header]) -> bool {
+    let mut method = None;
+    let mut protocol = None;
+
+    for header in headers {
+        match header.name() {
+            b":method" => method = Some(header.value()),
+            b":protocol" => protocol = Some(header.value()),
+            _ => {},
+        }
+
+        if method.is_some() && protocol.is_some() {
+            break;
+        }
+    }
+
+    method == Some(b"CONNECT".as_slice()) &&
+        protocol == Some(b"webtransport".as_slice())
+}
+
 // Quiche urgency is an 8-bit space. Internally, quiche reserves 0 for HTTP/3
 // control streams and request are shifted up by 124. Any value in that range is
 // suitable here.
@@ -160,6 +182,8 @@ pub struct ServerHooks {
     settings_enforcer: Http3SettingsEnforcer,
     /// Exact stream IDs to expose as raw QUIC data.
     raw_quic_stream_ids: Vec<u64>,
+    /// Request stream IDs that opened WebTransport sessions.
+    webtransport_session_stream_ids: BTreeSet<u64>,
     /// Tracks the number of requests that have been handled by this driver.
     requests: u64,
 
@@ -188,6 +212,13 @@ impl ServerHooks {
         // HEADERS (e.g. "trailers").
         if driver.stream_map.contains_key(&stream_id) {
             return Ok(());
+        }
+
+        if is_webtransport_connect_headers(&headers) {
+            driver
+                .hooks
+                .webtransport_session_stream_ids
+                .insert(stream_id);
         }
 
         let (mut stream_ctx, send, recv) =
@@ -256,6 +287,7 @@ impl DriverHooks for ServerHooks {
             raw_quic_stream_ids: settings
                 .experimental_raw_quic_stream_ids
                 .clone(),
+            webtransport_session_stream_ids: BTreeSet::new(),
             requests: 0,
             post_accept_timeout: None,
         }
@@ -313,8 +345,9 @@ impl DriverHooks for ServerHooks {
     fn should_intercept_raw_stream(
         driver: &H3Driver<Self>, stream_id: u64,
     ) -> bool {
-        driver.hooks.raw_quic_stream_ids.contains(&stream_id) &&
-            !driver.stream_map.contains_key(&stream_id)
+        !driver.stream_map.contains_key(&stream_id) &&
+            (driver.hooks.raw_quic_stream_ids.contains(&stream_id) ||
+                !driver.hooks.webtransport_session_stream_ids.is_empty())
     }
 
     fn conn_command(
