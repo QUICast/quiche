@@ -51,6 +51,12 @@ pub struct QuicSettings {
     #[serde(default = "QuicSettings::default_enable_dgram")]
     pub enable_dgram: bool,
 
+    /// Configures whether to advertise RESET_STREAM_AT support. Current
+    /// WebTransport over HTTP/3 requires this transport parameter.
+    ///
+    /// Defaults to `false`.
+    pub enable_reset_stream_at: bool,
+
     /// Max queue length for received DATAGRAM frames.
     ///
     /// Defaults to `2^16`.

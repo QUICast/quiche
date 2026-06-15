@@ -146,6 +146,7 @@ fn make_quiche_config(
         quic_settings.dgram_recv_max_queue_len,
         quic_settings.dgram_send_max_queue_len,
     );
+    config.enable_reset_stream_at(quic_settings.enable_reset_stream_at);
     config
         .enable_multicast_server_support(quic_settings.multicast_server_support);
 

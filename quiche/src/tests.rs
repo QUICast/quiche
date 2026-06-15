@@ -53,6 +53,7 @@ fn transport_params() {
         initial_source_connection_id: Some(b"woot woot".to_vec().into()),
         retry_source_connection_id: Some(b"retry".to_vec().into()),
         max_datagram_frame_size: Some(32),
+        reset_stream_at: false,
         multicast_server_support: false,
         multicast_client_params: None,
         unknown_params: Default::default(),
@@ -85,6 +86,7 @@ fn transport_params() {
         initial_source_connection_id: Some(b"woot woot".to_vec().into()),
         retry_source_connection_id: None,
         max_datagram_frame_size: Some(32),
+        reset_stream_at: false,
         multicast_server_support: false,
         multicast_client_params: None,
         unknown_params: Default::default(),
@@ -98,6 +100,38 @@ fn transport_params() {
     let new_tp = TransportParams::decode(raw_params, true, None).unwrap();
 
     assert_eq!(new_tp, tp);
+}
+
+#[test]
+fn transport_params_reset_stream_at_roundtrip() {
+    let tp = TransportParams {
+        reset_stream_at: true,
+        ..Default::default()
+    };
+
+    let mut raw_params = [0; 64];
+    let raw_params = TransportParams::encode(&tp, true, &mut raw_params).unwrap();
+    let decoded = TransportParams::decode(raw_params, false, None).unwrap();
+
+    assert!(decoded.reset_stream_at);
+
+    let mut bad_params = [0; 16];
+    let bad_params_len = {
+        let mut b = octets::OctetsMut::with_slice(&mut bad_params);
+        TransportParams::encode_param(
+            &mut b,
+            transport_params::RESET_STREAM_AT_TRANSPORT_PARAMETER_ID,
+            1,
+        )
+        .unwrap();
+        b.put_u8(0).unwrap();
+        b.off()
+    };
+
+    assert_eq!(
+        TransportParams::decode(&bad_params[..bad_params_len], false, None),
+        Err(Error::InvalidTransportParam)
+    );
 }
 
 #[test]

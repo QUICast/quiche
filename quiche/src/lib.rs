@@ -1200,6 +1200,17 @@ impl Config {
         self.dgram_send_max_queue_len = send_queue_len;
     }
 
+    /// Configures whether this endpoint advertises support for
+    /// RESET_STREAM_AT frames.
+    ///
+    /// The WebTransport over HTTP/3 draft requires the empty
+    /// `reset_stream_at` transport parameter during negotiation.
+    ///
+    /// The default is `false`.
+    pub fn enable_reset_stream_at(&mut self, enabled: bool) {
+        self.local_transport_params.reset_stream_at = enabled;
+    }
+
     /// Configures whether this endpoint advertises server-side multicast
     /// support using the experimental draft-08 transport parameter.
     ///
@@ -3764,7 +3775,8 @@ impl<F: BufFactory> Connection<F> {
                         self.handshake_done_acked = true;
                     },
 
-                    frame::Frame::ResetStream { stream_id, .. } => {
+                    frame::Frame::ResetStream { stream_id, .. } |
+                    frame::Frame::ResetStreamAt { stream_id, .. } => {
                         let stream = match self.streams.get_mut(stream_id) {
                             Some(v) => v,
 
@@ -4315,6 +4327,12 @@ impl<F: BufFactory> Connection<F> {
                         stream_id,
                         error_code,
                         final_size,
+                    } |
+                    frame::Frame::ResetStreamAt {
+                        stream_id,
+                        error_code,
+                        final_size,
+                        ..
                     } => {
                         self.streams
                             .insert_reset(stream_id, error_code, final_size);
@@ -8801,6 +8819,12 @@ impl<F: BufFactory> Connection<F> {
                 stream_id,
                 error_code,
                 final_size,
+            } |
+            frame::Frame::ResetStreamAt {
+                stream_id,
+                error_code,
+                final_size,
+                ..
             } => {
                 // Peer can't send on our unidirectional streams.
                 if !stream::is_bidi(stream_id) &&
