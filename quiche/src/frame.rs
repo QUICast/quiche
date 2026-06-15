@@ -82,6 +82,13 @@ pub enum Frame {
         final_size: u64,
     },
 
+    ResetStreamAt {
+        stream_id: u64,
+        error_code: u64,
+        final_size: u64,
+        reliable_size: u64,
+    },
+
     StopSending {
         stream_id: u64,
         error_code: u64,
@@ -216,6 +223,24 @@ impl Frame {
                 stream_id: b.get_varint()?,
                 error_code: b.get_varint()?,
                 final_size: b.get_varint()?,
+            },
+
+            0x24 => {
+                let stream_id = b.get_varint()?;
+                let error_code = b.get_varint()?;
+                let final_size = b.get_varint()?;
+                let reliable_size = b.get_varint()?;
+
+                if reliable_size > final_size {
+                    return Err(Error::InvalidFrame);
+                }
+
+                Frame::ResetStreamAt {
+                    stream_id,
+                    error_code,
+                    final_size,
+                    reliable_size,
+                }
             },
 
             0x05 => Frame::StopSending {
@@ -450,6 +475,20 @@ impl Frame {
                 b.put_varint(*final_size)?;
             },
 
+            Frame::ResetStreamAt {
+                stream_id,
+                error_code,
+                final_size,
+                reliable_size,
+            } => {
+                b.put_varint(0x24)?;
+
+                b.put_varint(*stream_id)?;
+                b.put_varint(*error_code)?;
+                b.put_varint(*final_size)?;
+                b.put_varint(*reliable_size)?;
+            },
+
             Frame::StopSending {
                 stream_id,
                 error_code,
@@ -665,6 +704,19 @@ impl Frame {
                 octets::varint_len(*stream_id) + // stream_id
                 octets::varint_len(*error_code) + // error_code
                 octets::varint_len(*final_size) // final_size
+            },
+
+            Frame::ResetStreamAt {
+                stream_id,
+                error_code,
+                final_size,
+                reliable_size,
+            } => {
+                1 + // frame type
+                octets::varint_len(*stream_id) + // stream_id
+                octets::varint_len(*error_code) + // error_code
+                octets::varint_len(*final_size) + // final_size
+                octets::varint_len(*reliable_size) // reliable_size
             },
 
             Frame::StopSending {
@@ -908,6 +960,19 @@ impl Frame {
                 raw: None,
             },
 
+            Frame::ResetStreamAt {
+                stream_id,
+                error_code,
+                final_size,
+                ..
+            } => QuicFrame::ResetStream {
+                stream_id: *stream_id,
+                error: qlog::events::ApplicationError::Unknown,
+                error_code: Some(*error_code),
+                final_size: *final_size,
+                raw: None,
+            },
+
             Frame::StopSending {
                 stream_id,
                 error_code,
@@ -1140,6 +1205,18 @@ impl std::fmt::Debug for Frame {
                 write!(
                     f,
                     "RESET_STREAM stream={stream_id} err={error_code:x} size={final_size}"
+                )?;
+            },
+
+            Frame::ResetStreamAt {
+                stream_id,
+                error_code,
+                final_size,
+                reliable_size,
+            } => {
+                write!(
+                    f,
+                    "RESET_STREAM_AT stream={stream_id} err={error_code:x} size={final_size} reliable_size={reliable_size}"
                 )?;
             },
 
@@ -1605,6 +1682,58 @@ mod tests {
 
         let mut b = octets::Octets::with_slice(&d);
         assert!(Frame::from_bytes(&mut b, packet::Type::Handshake).is_err());
+    }
+
+    #[test]
+    fn reset_stream_at() {
+        let mut d = [42; 128];
+
+        let frame = Frame::ResetStreamAt {
+            stream_id: 123_213,
+            error_code: 21_123_767,
+            final_size: 21_123_767,
+            reliable_size: 4,
+        };
+
+        let wire_len = {
+            let mut b = octets::OctetsMut::with_slice(&mut d);
+            frame.to_bytes(&mut b).unwrap()
+        };
+
+        assert_eq!(wire_len, 14);
+
+        let mut b = octets::Octets::with_slice(&d);
+        assert_eq!(Frame::from_bytes(&mut b, packet::Type::Short), Ok(frame));
+
+        let mut b = octets::Octets::with_slice(&d);
+        assert!(Frame::from_bytes(&mut b, packet::Type::ZeroRTT).is_ok());
+
+        let mut b = octets::Octets::with_slice(&d);
+        assert!(Frame::from_bytes(&mut b, packet::Type::Initial).is_err());
+
+        let mut b = octets::Octets::with_slice(&d);
+        assert!(Frame::from_bytes(&mut b, packet::Type::Handshake).is_err());
+    }
+
+    #[test]
+    fn reset_stream_at_rejects_reliable_size_larger_than_final_size() {
+        let mut d = [42; 128];
+
+        let wire_len = {
+            let mut b = octets::OctetsMut::with_slice(&mut d);
+            b.put_varint(0x24).unwrap();
+            b.put_varint(123_213).unwrap();
+            b.put_varint(21_123_767).unwrap();
+            b.put_varint(4).unwrap();
+            b.put_varint(5).unwrap();
+            b.off()
+        };
+
+        let mut b = octets::Octets::with_slice(&d[..wire_len]);
+        assert_eq!(
+            Frame::from_bytes(&mut b, packet::Type::Short),
+            Err(Error::InvalidFrame)
+        );
     }
 
     #[test]

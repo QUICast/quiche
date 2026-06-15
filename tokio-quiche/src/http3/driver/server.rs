@@ -166,7 +166,7 @@ fn is_webtransport_connect_headers(headers: &[quiche::h3::Header]) -> bool {
     }
 
     method == Some(b"CONNECT".as_slice()) &&
-        protocol == Some(b"webtransport".as_slice())
+        matches!(protocol, Some(b"webtransport") | Some(b"webtransport-h3"))
 }
 
 // Quiche urgency is an 8-bit space. Internally, quiche reserves 0 for HTTP/3

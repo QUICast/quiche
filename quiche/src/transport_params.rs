@@ -36,6 +36,8 @@ use crate::Error;
 use crate::Result;
 use crate::MAX_STREAM_ID;
 
+pub const RESET_STREAM_AT_TRANSPORT_PARAMETER_ID: u64 = 0x17f7586d2cb571;
+
 #[cfg(feature = "qlog")]
 use crate::crypto;
 #[cfg(feature = "qlog")]
@@ -190,6 +192,8 @@ pub struct TransportParams {
     pub retry_source_connection_id: Option<ConnectionId<'static>>,
     /// DATAGRAM frame extension parameter, if any.
     pub max_datagram_frame_size: Option<u64>,
+    /// Whether the endpoint advertised support for RESET_STREAM_AT frames.
+    pub reset_stream_at: bool,
     /// Whether the peer advertised support for server-side multicast control
     /// frames.
     pub multicast_server_support: bool,
@@ -220,6 +224,7 @@ impl Default for TransportParams {
             initial_source_connection_id: None,
             retry_source_connection_id: None,
             max_datagram_frame_size: None,
+            reset_stream_at: false,
             multicast_server_support: false,
             multicast_client_params: None,
             unknown_params: Default::default(),
@@ -380,6 +385,14 @@ impl TransportParams {
 
                 0x0020 => {
                     tp.max_datagram_frame_size = Some(val.get_varint()?);
+                },
+
+                RESET_STREAM_AT_TRANSPORT_PARAMETER_ID => {
+                    if !val.is_empty() {
+                        return Err(Error::InvalidTransportParam);
+                    }
+
+                    tp.reset_stream_at = true;
                 },
 
                 multicast::CLIENT_PARAMS_TRANSPORT_PARAMETER_ID => {
@@ -583,6 +596,14 @@ impl TransportParams {
                 octets::varint_len(max_datagram_frame_size),
             )?;
             b.put_varint(max_datagram_frame_size)?;
+        }
+
+        if tp.reset_stream_at {
+            TransportParams::encode_param(
+                &mut b,
+                RESET_STREAM_AT_TRANSPORT_PARAMETER_ID,
+                0,
+            )?;
         }
 
         if !is_server {

@@ -38,6 +38,9 @@ use tokio_util::time::delay_queue::{
     self,
 };
 
+const SETTINGS_ENABLE_WEBTRANSPORT_LEGACY: u64 = 0x2b60_3742;
+const SETTINGS_WT_ENABLED: u64 = 0x2c7c_f000;
+
 /// Unified configuration parameters for
 /// [H3Driver](crate::http3::driver::H3Driver)s.
 #[derive(Default, Clone, Debug)]
@@ -97,7 +100,10 @@ impl From<&Http3Settings> for quiche::h3::Config {
 
         if value.enable_extended_connect || value.enable_webtransport {
             config
-                .set_additional_settings(vec![(0x2b60_3742, 1)])
+                .set_additional_settings(vec![
+                    (SETTINGS_ENABLE_WEBTRANSPORT_LEGACY, 1),
+                    (SETTINGS_WT_ENABLED, 1),
+                ])
                 .expect("WebTransport setting must not conflict with built-in H3 settings");
         }
 
