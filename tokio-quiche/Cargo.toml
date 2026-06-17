@@ -125,11 +125,6 @@ serde_json = { workspace = true }
 tempfile = "3"
 tokio = { workspace = true, features = ["time", "test-util", "rt-multi-thread"] }
 
-[[example]]
-name = "heimdall_metrics"
-path = "examples/heimdall_metrics.rs"
-required-features = ["multicast"]
-
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = { workspace = true }
 nix = { workspace = true, features = ["signal"] }
