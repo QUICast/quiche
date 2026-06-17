@@ -36,6 +36,7 @@ use mcrx_core::jsonl::ensure_single_header;
 use mcrx_core::jsonl::header_json;
 use mcrx_core::jsonl::infer_node_id_from_path;
 use mcrx_core::jsonl::HARDWARE_ARTIFACT_TYPE;
+#[cfg(test)]
 use mcrx_core::jsonl::HEIMDALL_JSONL_SCHEMA;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use mcrx_core::HardwareMetricsSampler;
@@ -76,6 +77,9 @@ pub struct HeimdallJsonlMetadata {
 
 const MCRX_NETWORK_ARTIFACT_TYPE: &str = "mcrx-network";
 const QUICHE_RECEIVE_ARTIFACT_TYPE: &str = "quiche-receive";
+
+#[allow(dead_code)]
+fn main() {}
 
 pub fn sample_receiver_metrics(
     metrics: &ClientChannelMetricsSnapshot,

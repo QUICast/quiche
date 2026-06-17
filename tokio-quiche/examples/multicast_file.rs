@@ -75,6 +75,9 @@ pub fn parse_hash_algorithm_id(value: &str) -> anyhow::Result<u16> {
     }
 }
 
+#[allow(dead_code)]
+fn main() {}
+
 pub fn describe_hash_algorithm(id: u16) -> &'static str {
     match id {
         1 => "sha256-32",

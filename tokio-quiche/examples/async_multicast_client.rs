@@ -398,6 +398,18 @@ fn handle_core_h3_event(event: H3Event) -> bool {
             false
         },
 
+        H3Event::RawStreamData {
+            stream_id,
+            data,
+            fin,
+        } => {
+            println!(
+                "http3 raw stream data: stream={stream_id} bytes={} fin={fin}",
+                data.len()
+            );
+            false
+        },
+
         H3Event::ConnectionError(err) => {
             println!("http3 connection error: {err:?}");
             true
