@@ -42,6 +42,7 @@ const SETTINGS_ENABLE_WEBTRANSPORT_LEGACY: u64 = 0x2b60_3742;
 const SETTINGS_WT_ENABLED: u64 = 0x2c7c_f000;
 const SETTINGS_H3_DATAGRAM_DRAFT04: u64 = 0xffd277;
 const SETTINGS_WEBTRANSPORT_MAX_SESSIONS_DRAFT07: u64 = 0xc671_706a;
+const SETTINGS_WEBTRANSPORT_MAX_SESSIONS: u64 = 0x14e9_cd29;
 
 /// Unified configuration parameters for
 /// [H3Driver](crate::http3::driver::H3Driver)s.
@@ -107,6 +108,7 @@ impl From<&Http3Settings> for quiche::h3::Config {
                     (SETTINGS_WT_ENABLED, 1),
                     (SETTINGS_H3_DATAGRAM_DRAFT04, 1),
                     (SETTINGS_WEBTRANSPORT_MAX_SESSIONS_DRAFT07, 1),
+                    (SETTINGS_WEBTRANSPORT_MAX_SESSIONS, 1),
                 ])
                 .expect("WebTransport setting must not conflict with built-in H3 settings");
         }
