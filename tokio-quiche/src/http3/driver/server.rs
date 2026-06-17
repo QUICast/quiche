@@ -181,7 +181,7 @@ pub struct ServerHooks {
     /// Helper to enforce limits and timeouts on an HTTP/3 connection.
     settings_enforcer: Http3SettingsEnforcer,
     /// Exact stream IDs to expose as raw QUIC data.
-    raw_quic_stream_ids: Vec<u64>,
+    raw_quic_stream_ids: BTreeSet<u64>,
     /// Request stream IDs that opened WebTransport sessions.
     webtransport_session_stream_ids: BTreeSet<u64>,
     /// Tracks the number of requests that have been handled by this driver.
@@ -286,7 +286,9 @@ impl DriverHooks for ServerHooks {
             settings_enforcer: settings.into(),
             raw_quic_stream_ids: settings
                 .experimental_raw_quic_stream_ids
-                .clone(),
+                .iter()
+                .copied()
+                .collect(),
             webtransport_session_stream_ids: BTreeSet::new(),
             requests: 0,
             post_accept_timeout: None,
@@ -347,6 +349,9 @@ impl DriverHooks for ServerHooks {
     ) -> bool {
         !driver.stream_map.contains_key(&stream_id) &&
             (driver.hooks.raw_quic_stream_ids.contains(&stream_id) ||
+                // Firefox's interop harness opens MoQT streams inside a
+                // WebTransport session that this driver intentionally exposes
+                // as raw QUIC bytes instead of parsing as HTTP/3.
                 !driver.hooks.webtransport_session_stream_ids.is_empty())
     }
 

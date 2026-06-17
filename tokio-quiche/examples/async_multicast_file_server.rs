@@ -24,8 +24,6 @@
 // NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 // SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-#![cfg_attr(not(feature = "multicast"), allow(dead_code))]
-
 #[cfg(not(feature = "multicast"))]
 fn main() {
     eprintln!(
@@ -38,6 +36,7 @@ fn main() {
 }
 
 #[cfg(feature = "multicast")]
+#[path = "support/multicast_file.rs"]
 mod multicast_file;
 
 #[cfg(feature = "multicast")]

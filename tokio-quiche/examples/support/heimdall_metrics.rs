@@ -78,9 +78,6 @@ pub struct HeimdallJsonlMetadata {
 const MCRX_NETWORK_ARTIFACT_TYPE: &str = "mcrx-network";
 const QUICHE_RECEIVE_ARTIFACT_TYPE: &str = "quiche-receive";
 
-#[allow(dead_code)]
-fn main() {}
-
 pub fn sample_receiver_metrics(
     metrics: &ClientChannelMetricsSnapshot,
     previous_socket_metrics: &mut SubscriptionMetricsSampler,

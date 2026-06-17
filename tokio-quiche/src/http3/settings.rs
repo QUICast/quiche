@@ -97,11 +97,11 @@ impl From<&Http3Settings> for quiche::h3::Config {
             config.set_qpack_blocked_streams(v);
         }
 
-        if value.enable_extended_connect {
-            config.enable_extended_connect(value.enable_extended_connect)
+        if value.enable_extended_connect || value.enable_webtransport {
+            config.enable_extended_connect(true)
         }
 
-        if value.enable_extended_connect || value.enable_webtransport {
+        if value.enable_webtransport {
             config
                 .set_additional_settings(vec![
                     (SETTINGS_ENABLE_WEBTRANSPORT_LEGACY, 1),
