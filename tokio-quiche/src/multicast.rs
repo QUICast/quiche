@@ -212,22 +212,20 @@ impl<A: ApplicationOverQuic> ApplicationOverQuic for ClientDriver<A> {
         self.inner.buffer()
     }
 
-    fn wait_for_data(
+    async fn wait_for_data(
         &mut self, qconn: &mut QuicheConnection,
-    ) -> impl std::future::Future<Output = QuicResult<()>> + Send {
-        async move {
-            if self.runtime.has_pending_ingress() {
-                return Ok(());
-            }
+    ) -> QuicResult<()> {
+        if self.runtime.has_pending_ingress() {
+            return Ok(());
+        }
 
-            if self.inner.should_act() {
-                select! {
-                    res = self.inner.wait_for_data(qconn) => res,
-                    res = self.runtime.wait_for_ingress() => res,
-                }
-            } else {
-                self.runtime.wait_for_ingress().await
+        if self.inner.should_act() {
+            select! {
+                res = self.inner.wait_for_data(qconn) => res,
+                res = self.runtime.wait_for_ingress() => res,
             }
+        } else {
+            self.runtime.wait_for_ingress().await
         }
     }
 
@@ -1467,22 +1465,20 @@ impl<A: ApplicationOverQuic> ApplicationOverQuic for ServerControlDriver<A> {
         self.inner.buffer()
     }
 
-    fn wait_for_data(
+    async fn wait_for_data(
         &mut self, qconn: &mut QuicheConnection,
-    ) -> impl std::future::Future<Output = QuicResult<()>> + Send {
-        async move {
-            if self.runtime.has_pending_work() {
-                return Ok(());
-            }
+    ) -> QuicResult<()> {
+        if self.runtime.has_pending_work() {
+            return Ok(());
+        }
 
-            if self.inner.should_act() {
-                select! {
-                    res = self.inner.wait_for_data(qconn) => res,
-                    res = self.runtime.wait_for_work() => res,
-                }
-            } else {
-                self.runtime.wait_for_work().await
+        if self.inner.should_act() {
+            select! {
+                res = self.inner.wait_for_data(qconn) => res,
+                res = self.runtime.wait_for_work() => res,
             }
+        } else {
+            self.runtime.wait_for_work().await
         }
     }
 
@@ -1618,22 +1614,20 @@ impl<A: ApplicationOverQuic> ApplicationOverQuic for ServerDriver<A> {
         self.inner.buffer()
     }
 
-    fn wait_for_data(
+    async fn wait_for_data(
         &mut self, qconn: &mut QuicheConnection,
-    ) -> impl std::future::Future<Output = QuicResult<()>> + Send {
-        async move {
-            if self.runtime.has_pending_work() {
-                return Ok(());
-            }
+    ) -> QuicResult<()> {
+        if self.runtime.has_pending_work() {
+            return Ok(());
+        }
 
-            if self.inner.should_act() {
-                select! {
-                    res = self.inner.wait_for_data(qconn) => res,
-                    res = self.runtime.wait_for_work() => res,
-                }
-            } else {
-                self.runtime.wait_for_work().await
+        if self.inner.should_act() {
+            select! {
+                res = self.inner.wait_for_data(qconn) => res,
+                res = self.runtime.wait_for_work() => res,
             }
+        } else {
+            self.runtime.wait_for_work().await
         }
     }
 
@@ -3043,7 +3037,7 @@ mod tests {
         );
         let metrics = runtime
             .channels
-            .get(&[1, 2, 3, 4].to_vec())
+            .get([1, 2, 3, 4].as_slice())
             .unwrap()
             .send_state
             .metrics_snapshot();
