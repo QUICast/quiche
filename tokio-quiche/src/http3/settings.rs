@@ -43,6 +43,13 @@ const SETTINGS_WT_ENABLED: u64 = 0x2c7c_f000;
 const SETTINGS_H3_DATAGRAM_DRAFT04: u64 = 0xffd277;
 const SETTINGS_WEBTRANSPORT_MAX_SESSIONS_DRAFT07: u64 = 0xc671_706a;
 const SETTINGS_WEBTRANSPORT_MAX_SESSIONS: u64 = 0x14e9_cd29;
+const SETTINGS_WT_INITIAL_MAX_DATA: u64 = 0x2b61;
+const SETTINGS_WT_INITIAL_MAX_STREAMS_UNI: u64 = 0x2b64;
+const SETTINGS_WT_INITIAL_MAX_STREAMS_BIDI: u64 = 0x2b65;
+
+const WT_INITIAL_MAX_DATA: u64 = 8_388_608;
+const WT_INITIAL_MAX_STREAMS_UNI: u64 = 100;
+const WT_INITIAL_MAX_STREAMS_BIDI: u64 = 100;
 
 /// Unified configuration parameters for
 /// [H3Driver](crate::http3::driver::H3Driver)s.
@@ -109,6 +116,15 @@ impl From<&Http3Settings> for quiche::h3::Config {
                     (SETTINGS_H3_DATAGRAM_DRAFT04, 1),
                     (SETTINGS_WEBTRANSPORT_MAX_SESSIONS_DRAFT07, 1),
                     (SETTINGS_WEBTRANSPORT_MAX_SESSIONS, 1),
+                    (SETTINGS_WT_INITIAL_MAX_DATA, WT_INITIAL_MAX_DATA),
+                    (
+                        SETTINGS_WT_INITIAL_MAX_STREAMS_UNI,
+                        WT_INITIAL_MAX_STREAMS_UNI,
+                    ),
+                    (
+                        SETTINGS_WT_INITIAL_MAX_STREAMS_BIDI,
+                        WT_INITIAL_MAX_STREAMS_BIDI,
+                    ),
                 ])
                 .expect("WebTransport setting must not conflict with built-in H3 settings");
         }
@@ -239,5 +255,102 @@ impl TimeoutCheckResult {
 
         *field = true;
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    const TEST_CERT_FILE: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/",
+        "../quiche/examples/cert.crt"
+    );
+    const TEST_KEY_FILE: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/",
+        "../quiche/examples/cert.key"
+    );
+
+    fn h3_quiche_config() -> quiche::Result<quiche::Config> {
+        let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION)?;
+        config.load_cert_chain_from_pem_file(TEST_CERT_FILE)?;
+        config.load_priv_key_from_pem_file(TEST_KEY_FILE)?;
+        config.set_application_protos(&[b"h3"])?;
+        config.set_initial_max_data(1500);
+        config.set_initial_max_stream_data_bidi_local(150);
+        config.set_initial_max_stream_data_bidi_remote(150);
+        config.set_initial_max_stream_data_uni(150);
+        config.set_initial_max_streams_bidi(100);
+        config.set_initial_max_streams_uni(5);
+        config.verify_peer(false);
+        config.grease(false);
+        Ok(config)
+    }
+
+    #[test]
+    fn enable_webtransport_emits_all_webtransport_settings() -> TestResult {
+        let mut quic_config = h3_quiche_config()?;
+        let mut pipe = quiche::test_utils::Pipe::with_config(&mut quic_config)?;
+        pipe.handshake()?;
+
+        let h3_settings = Http3Settings {
+            enable_webtransport: true,
+            ..Default::default()
+        };
+        let webtransport_h3_config = quiche::h3::Config::from(&h3_settings);
+        let _client_h3 = quiche::h3::Connection::with_transport(
+            &mut pipe.client,
+            &webtransport_h3_config,
+        )?;
+
+        pipe.advance()?;
+
+        let mut server_h3 = quiche::h3::Connection::with_transport(
+            &mut pipe.server,
+            &quiche::h3::Config::new()?,
+        )?;
+        assert_eq!(
+            server_h3.poll(&mut pipe.server),
+            Err(quiche::h3::Error::Done)
+        );
+
+        let received_settings = server_h3
+            .peer_settings_raw()
+            .expect("peer settings must be received");
+
+        for (id, value) in [
+            (SETTINGS_ENABLE_WEBTRANSPORT_LEGACY, 1),
+            (SETTINGS_WT_ENABLED, 1),
+            (SETTINGS_H3_DATAGRAM_DRAFT04, 1),
+            (SETTINGS_WEBTRANSPORT_MAX_SESSIONS_DRAFT07, 1),
+            (SETTINGS_WEBTRANSPORT_MAX_SESSIONS, 1),
+            (SETTINGS_WT_INITIAL_MAX_DATA, WT_INITIAL_MAX_DATA),
+            (
+                SETTINGS_WT_INITIAL_MAX_STREAMS_UNI,
+                WT_INITIAL_MAX_STREAMS_UNI,
+            ),
+            (
+                SETTINGS_WT_INITIAL_MAX_STREAMS_BIDI,
+                WT_INITIAL_MAX_STREAMS_BIDI,
+            ),
+        ] {
+            let received_value = received_settings.iter().find_map(
+                |(received_id, received_value)| {
+                    (*received_id == id).then_some(*received_value)
+                },
+            );
+
+            assert_eq!(
+                received_value,
+                Some(value),
+                "missing WebTransport setting {id:#x}"
+            );
+        }
+
+        Ok(())
     }
 }

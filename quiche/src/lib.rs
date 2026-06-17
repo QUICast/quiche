@@ -1647,6 +1647,30 @@ where
     max_amplification_factor: usize,
 }
 
+struct MulticastProbeStateUpdate {
+    channel_id: Vec<u8>,
+    status: multicast::ProbeStatus,
+    deadline: Option<Instant>,
+    reason_scope: Option<multicast::StateReasonScope>,
+    reason_code: Option<u64>,
+    reason_phrase: Vec<u8>,
+    emit_if_unchanged: bool,
+}
+
+impl MulticastProbeStateUpdate {
+    fn new(channel_id: Vec<u8>, status: multicast::ProbeStatus) -> Self {
+        Self {
+            channel_id,
+            status,
+            deadline: None,
+            reason_scope: None,
+            reason_code: None,
+            reason_phrase: Vec::new(),
+            emit_if_unchanged: false,
+        }
+    }
+}
+
 /// Creates a new server-side connection.
 ///
 /// The `scid` parameter represents the server's source connection ID, while
@@ -7143,15 +7167,14 @@ impl<F: BufFactory> Connection<F> {
     ) -> Result<()> {
         let deadline = Instant::now() + timeout;
 
-        self.multicast_set_probe_state(
-            channel_id.to_vec(),
-            multicast::ProbeStatus::Probing,
-            Some(deadline),
-            None,
-            None,
-            Vec::new(),
-            true,
-        )
+        self.multicast_set_probe_state(MulticastProbeStateUpdate {
+            deadline: Some(deadline),
+            emit_if_unchanged: true,
+            ..MulticastProbeStateUpdate::new(
+                channel_id.to_vec(),
+                multicast::ProbeStatus::Probing,
+            )
+        })
     }
 
     /// Returns the current multicast probe status for the provided channel.
@@ -7332,12 +7355,18 @@ impl<F: BufFactory> Connection<F> {
     }
 
     fn multicast_set_probe_state(
-        &mut self, channel_id: Vec<u8>, status: multicast::ProbeStatus,
-        deadline: Option<Instant>,
-        reason_scope: Option<multicast::StateReasonScope>,
-        reason_code: Option<u64>, reason_phrase: Vec<u8>,
-        emit_if_unchanged: bool,
+        &mut self, update: MulticastProbeStateUpdate,
     ) -> Result<()> {
+        let MulticastProbeStateUpdate {
+            channel_id,
+            status,
+            deadline,
+            reason_scope,
+            reason_code,
+            reason_phrase,
+            emit_if_unchanged,
+        } = update;
+
         let existed = self.multicast_probe_states.contains_key(&channel_id);
         let state = self
             .multicast_probe_states
@@ -7388,27 +7417,20 @@ impl<F: BufFactory> Connection<F> {
             None
         };
 
-        self.multicast_set_probe_state(
-            frame.channel_id.clone(),
-            status,
+        self.multicast_set_probe_state(MulticastProbeStateUpdate {
             deadline,
-            Some(frame.reason_scope),
-            Some(frame.reason_code),
-            frame.reason_phrase.clone(),
-            false,
-        )
+            reason_scope: Some(frame.reason_scope),
+            reason_code: Some(frame.reason_code),
+            reason_phrase: frame.reason_phrase.clone(),
+            ..MulticastProbeStateUpdate::new(frame.channel_id.clone(), status)
+        })
     }
 
     fn multicast_on_peer_ack(&mut self, frame: &multicast::Ack) -> Result<()> {
-        self.multicast_set_probe_state(
+        self.multicast_set_probe_state(MulticastProbeStateUpdate::new(
             frame.channel_id.clone(),
             multicast::ProbeStatus::Viable,
-            None,
-            None,
-            None,
-            Vec::new(),
-            false,
-        )
+        ))
     }
 
     fn multicast_probe_deadline(&self) -> Option<Instant> {
@@ -7441,15 +7463,13 @@ impl<F: BufFactory> Connection<F> {
             .collect::<Vec<_>>();
 
         for channel_id in timed_out {
-            let _ = self.multicast_set_probe_state(
-                channel_id,
-                multicast::ProbeStatus::TimedOut,
-                None,
-                None,
-                None,
-                Vec::new(),
-                true,
-            );
+            let _ = self.multicast_set_probe_state(MulticastProbeStateUpdate {
+                emit_if_unchanged: true,
+                ..MulticastProbeStateUpdate::new(
+                    channel_id,
+                    multicast::ProbeStatus::TimedOut,
+                )
+            });
         }
     }
 

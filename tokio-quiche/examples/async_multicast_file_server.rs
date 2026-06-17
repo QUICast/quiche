@@ -44,8 +44,6 @@ use std::collections::VecDeque;
 #[cfg(feature = "multicast")]
 use std::future::pending;
 #[cfg(feature = "multicast")]
-use std::future::Future;
-#[cfg(feature = "multicast")]
 use std::io::ErrorKind;
 #[cfg(feature = "multicast")]
 use std::net::Ipv4Addr;
@@ -743,43 +741,39 @@ impl ApplicationOverQuic for FileControlApp {
         &mut self.out
     }
 
-    fn wait_for_data(
+    async fn wait_for_data(
         &mut self, _qconn: &mut QuicheConnection,
-    ) -> impl Future<Output = QuicResult<()>> + Send {
-        async move {
-            if !self.pending_integrities.is_empty() {
-                return Ok(());
+    ) -> QuicResult<()> {
+        if !self.pending_integrities.is_empty() {
+            return Ok(());
+        }
+
+        if !self.multicast_enabled || !self.joined {
+            #[allow(unreachable_code)]
+            {
+                let _ = pending::<QuicResult<()>>().await;
+                Ok(())
             }
+        } else {
+            loop {
+                match self.integrity_receiver.recv().await {
+                    Ok(integrity) => {
+                        self.pending_integrities.push_back(integrity);
+                        return Ok(());
+                    },
 
-            if !self.multicast_enabled || !self.joined {
-                #[allow(unreachable_code)]
-                {
-                    let _ = pending::<QuicResult<()>>().await;
-                    Ok(())
-                }
-            } else {
-                loop {
-                    match self.integrity_receiver.recv().await {
-                        Ok(integrity) => {
-                            self.pending_integrities.push_back(integrity);
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        self.shared.metrics.on_integrity_receiver_lagged(skipped);
+                        continue;
+                    },
+
+                    Err(broadcast::error::RecvError::Closed) => {
+                        #[allow(unreachable_code)]
+                        {
+                            let _ = pending::<QuicResult<()>>().await;
                             return Ok(());
-                        },
-
-                        Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                            self.shared
-                                .metrics
-                                .on_integrity_receiver_lagged(skipped);
-                            continue;
-                        },
-
-                        Err(broadcast::error::RecvError::Closed) => {
-                            #[allow(unreachable_code)]
-                            {
-                                let _ = pending::<QuicResult<()>>().await;
-                                return Ok(());
-                            }
-                        },
-                    }
+                        }
+                    },
                 }
             }
         }
@@ -963,16 +957,19 @@ async fn run() -> anyhow::Result<()> {
 
     let publisher_shared = Arc::clone(&shared);
     let publisher_transfer = Arc::clone(&transfer);
+    let publish_config = PublishLoopConfig {
+        publish_interval,
+        metrics_interval_secs: args.metrics_interval_secs,
+        manifest_interval_packets: args.manifest_interval_packets,
+        integrity_hashes_per_frame: args.integrity_hashes_per_frame,
+    };
     tokio::spawn(async move {
         if let Err(err) = publish_loop(
             publication,
             send_state,
             publisher_shared,
             publisher_transfer,
-            publish_interval,
-            args.metrics_interval_secs,
-            args.manifest_interval_packets,
-            args.integrity_hashes_per_frame,
+            publish_config,
         )
         .await
         {
@@ -1014,23 +1011,32 @@ async fn run() -> anyhow::Result<()> {
 }
 
 #[cfg(feature = "multicast")]
+struct PublishLoopConfig {
+    publish_interval: Duration,
+    metrics_interval_secs: u64,
+    manifest_interval_packets: u32,
+    integrity_hashes_per_frame: usize,
+}
+
+#[cfg(feature = "multicast")]
 async fn publish_loop(
     publication: Publication,
     mut send_state: quiche::multicast::ChannelSendState,
     shared: Arc<SharedControlChannel>, transfer: Arc<PreparedTransfer>,
-    publish_interval: Duration, metrics_interval_secs: u64,
-    manifest_interval_packets: u32, integrity_hashes_per_frame: usize,
+    config: PublishLoopConfig,
 ) -> anyhow::Result<()> {
-    let mut looping =
-        LoopingTransfer::new((*transfer).clone(), manifest_interval_packets)?;
+    let mut looping = LoopingTransfer::new(
+        (*transfer).clone(),
+        config.manifest_interval_packets,
+    )?;
     let mut integrity_batcher = IntegrityFrameBatcher::new(
         shared.integrity_hash_len,
-        integrity_hashes_per_frame,
+        config.integrity_hashes_per_frame,
     )?;
-    let mut ticker = interval(publish_interval);
+    let mut ticker = interval(config.publish_interval);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let metrics_interval = (metrics_interval_secs != 0)
-        .then(|| Duration::from_secs(metrics_interval_secs));
+    let metrics_interval = (config.metrics_interval_secs != 0)
+        .then(|| Duration::from_secs(config.metrics_interval_secs));
     let mut last_metrics_at = Instant::now();
     let mut previous_publication_metrics = publication.metrics_snapshot();
     let mut previous_send_metrics = send_state.metrics_snapshot();
