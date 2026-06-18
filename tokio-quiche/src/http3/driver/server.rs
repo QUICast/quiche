@@ -271,7 +271,7 @@ impl ServerHooks {
                 .hooks
                 .webtransport_session_stream_ids
                 .insert(stream_id);
-            log::debug!(
+            log::info!(
                 "WebTransport CONNECT session registered";
                 "stream_id" => stream_id
             );
@@ -457,7 +457,7 @@ impl DriverHooks for ServerHooks {
             decode_webtransport_prefix(&pending.prefix)
         else {
             if pending.prefix.len() > MAX_WEBTRANSPORT_PREFIX_LEN || fin {
-                log::debug!(
+                log::info!(
                     "WebTransport stream ended before prefix";
                     "stream_id" => stream_id,
                     "bytes" => pending.prefix.len(),
@@ -478,7 +478,7 @@ impl DriverHooks for ServerHooks {
                 .webtransport_session_stream_ids
                 .contains(&session_id)
         {
-            log::debug!(
+            log::info!(
                 "raw stream did not match registered WebTransport session";
                 "stream_id" => stream_id,
                 "stream_type" => stream_type,
@@ -499,7 +499,7 @@ impl DriverHooks for ServerHooks {
             },
         );
 
-        log::debug!(
+        log::info!(
             "WebTransport stream prefix accepted";
             "stream_id" => stream_id,
             "session_id" => session_id,
