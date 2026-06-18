@@ -100,6 +100,15 @@ pub use self::server::ServerH3Controller;
 pub use self::server::ServerH3Driver;
 pub use self::server::ServerH3Event;
 
+/// Direction of a WebTransport stream carried over HTTP/3.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WebTransportStreamDirection {
+    /// A bidirectional WebTransport stream.
+    Bidi,
+    /// A unidirectional WebTransport stream.
+    Uni,
+}
+
 // The default priority for HTTP/3 responses if the application didn't provide
 // one.
 const DEFAULT_PRIO: h3::Priority = h3::Priority::new(3, true);
@@ -261,8 +270,24 @@ pub enum H3Event {
     /// Raw QUIC stream data was received on a stream that the driver is not
     /// treating as HTTP/3.
     RawStreamData {
+        /// QUIC stream ID carrying raw bytes.
         stream_id: u64,
+        /// Bytes read from the QUIC stream.
         data: Bytes,
+        /// Whether the stream is finished and won't yield any more data.
+        fin: bool,
+    },
+    /// WebTransport stream data received after a successful CONNECT session.
+    WebTransportStreamData {
+        /// CONNECT request stream ID that identifies the WebTransport session.
+        session_id: u64,
+        /// QUIC stream ID carrying WebTransport data.
+        stream_id: u64,
+        /// Whether this is a bidirectional or unidirectional WT stream.
+        direction: WebTransportStreamDirection,
+        /// WebTransport payload bytes after the stream prefix.
+        data: Bytes,
+        /// Whether the stream is finished and won't yield any more data.
         fin: bool,
     },
     /// The stream has been closed. This is used to signal stream closures that
@@ -743,6 +768,7 @@ impl<H: DriverHooks> H3Driver<H> {
         match frame {
             OutboundFrame::Headers(headers, priority) => {
                 let prio = priority.as_ref().unwrap_or(&DEFAULT_PRIO);
+                let initial_headers = !ctx.initial_headers_sent;
 
                 let res = if ctx.initial_headers_sent {
                     // Initial headers were already sent, send additional
@@ -764,6 +790,13 @@ impl<H: DriverHooks> H3Driver<H> {
                 }
 
                 if res.is_ok() {
+                    log::debug!(
+                        "H3 headers flushed to QUIC";
+                        "stream_id" => stream_id,
+                        "initial_headers" => initial_headers,
+                        "header_count" => headers.len()
+                    );
+
                     if let Some(first) =
                         ctx.first_full_headers_flush_fail_time.take()
                     {
@@ -1108,14 +1141,13 @@ impl<H: DriverHooks> H3Driver<H> {
                             let data = Bytes::copy_from_slice(
                                 &self.raw_stream_recv_buf[..read],
                             );
-                            let event = H3Event::RawStreamData {
-                                stream_id,
-                                data,
-                                fin,
-                            };
-                            self.h3_event_sender.send(event.into()).map_err(
-                                |_| H3ConnectionError::ControllerWentAway,
-                            )?;
+                            for event in H::raw_stream_data_received(
+                                self, stream_id, data, fin,
+                            )? {
+                                self.h3_event_sender.send(event.into()).map_err(
+                                    |_| H3ConnectionError::ControllerWentAway,
+                                )?;
+                            }
                         }
 
                         if read == 0 || fin {

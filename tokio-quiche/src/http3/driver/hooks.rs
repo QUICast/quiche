@@ -24,8 +24,10 @@
 // NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 // SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-use quiche::h3;
 use std::future::Future;
+
+use bytes::Bytes;
+use quiche::h3;
 
 use super::H3Command;
 use super::H3ConnectionResult;
@@ -81,6 +83,18 @@ pub trait DriverHooks: Sized + Send + 'static {
         _driver: &H3Driver<Self>, _stream_id: u64,
     ) -> bool {
         false
+    }
+
+    /// Converts received raw stream bytes into one or more user-facing
+    /// [`H3Event`]s.
+    fn raw_stream_data_received(
+        _driver: &mut H3Driver<Self>, stream_id: u64, data: Bytes, fin: bool,
+    ) -> H3ConnectionResult<Vec<H3Event>> {
+        Ok(vec![H3Event::RawStreamData {
+            stream_id,
+            data,
+            fin,
+        }])
     }
 
     /// Processes any command received from the

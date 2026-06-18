@@ -572,6 +572,164 @@ mod server_side_driver {
 
     use super::*;
 
+    const WEBTRANSPORT_BIDI_STREAM_TYPE: u64 = 0x41;
+    const WEBTRANSPORT_UNI_STREAM_TYPE: u64 = 0x54;
+
+    fn make_webtransport_request_headers() -> Vec<h3::Header> {
+        vec![
+            h3::Header::new(b":method", b"CONNECT"),
+            h3::Header::new(b":scheme", b"https"),
+            h3::Header::new(b":authority", b"quic.tech"),
+            h3::Header::new(b":path", b"/wt"),
+            h3::Header::new(b":protocol", b"webtransport"),
+        ]
+    }
+
+    fn webtransport_settings() -> Http3Settings {
+        Http3Settings {
+            enable_webtransport: true,
+            ..Default::default()
+        }
+    }
+
+    fn encode_varint(value: u64, out: &mut Vec<u8>) {
+        let mut buf = [0; 8];
+        let off = {
+            let mut b = octets::OctetsMut::with_slice(&mut buf);
+            b.put_varint(value).unwrap();
+            b.off()
+        };
+        out.extend_from_slice(&buf[..off]);
+    }
+
+    fn webtransport_stream_data(
+        stream_type: u64, session_id: u64, payload: &[u8],
+    ) -> Vec<u8> {
+        let mut data = Vec::new();
+        encode_varint(stream_type, &mut data);
+        encode_varint(session_id, &mut data);
+        data.extend_from_slice(payload);
+        data
+    }
+
+    fn accept_webtransport_session(
+        helper: &mut DriverTestHelper<ServerHooks>,
+    ) -> (tokio::sync::mpsc::Sender<OutboundFrame>, InboundFrameStream) {
+        helper.complete_handshake().unwrap();
+        helper.advance_and_run_loop().unwrap();
+
+        let stream_id = helper
+            .peer_client_send_request(make_webtransport_request_headers(), false)
+            .unwrap();
+
+        helper.advance_and_run_loop().unwrap();
+        let req = loop {
+            match helper.driver_recv_server_event().unwrap() {
+                ServerH3Event::Headers {
+                    incoming_headers, ..
+                } => break incoming_headers,
+
+                ServerH3Event::Core(H3Event::NewFlow { .. }) => continue,
+
+                other => panic!("unexpected event: {other:?}"),
+            }
+        };
+        assert_eq!(req.stream_id, stream_id);
+        assert_eq!(stream_id, 0);
+
+        let to_client = req.send.get_ref().unwrap().clone();
+        let from_client = req.recv;
+
+        to_client
+            .try_send(OutboundFrame::Headers(make_response_headers(), None))
+            .unwrap();
+        helper.advance_and_run_loop().unwrap();
+        assert_matches!(
+            helper.peer_client_poll(),
+            Ok((0, h3::Event::Headers { .. }))
+        );
+
+        (to_client, from_client)
+    }
+
+    #[test]
+    fn webtransport_connect_registers_session_and_bidi_stream_event() {
+        let mut helper =
+            DriverTestHelper::<ServerHooks>::new_with_http3_settings(
+                webtransport_settings(),
+            )
+            .unwrap();
+        let (_to_client, _from_client) = accept_webtransport_session(&mut helper);
+
+        let payload = b"quicast setup";
+        let data =
+            webtransport_stream_data(WEBTRANSPORT_BIDI_STREAM_TYPE, 0, payload);
+        helper.pipe.client.stream_send(4, &data, true).unwrap();
+        helper.advance_and_run_loop().unwrap();
+
+        assert_matches!(
+            helper.driver_recv_core_event().unwrap(),
+            H3Event::WebTransportStreamData {
+                session_id: 0,
+                stream_id: 4,
+                direction: WebTransportStreamDirection::Bidi,
+                data,
+                fin: true,
+            } => {
+                assert_eq!(data.as_ref(), payload);
+            }
+        );
+        assert_matches!(
+            helper.driver_recv_core_event().unwrap(),
+            H3Event::RawStreamData {
+                stream_id: 4,
+                data: raw,
+                fin: true,
+            } => {
+                assert_eq!(raw.as_ref(), data.as_slice());
+            }
+        );
+    }
+
+    #[test]
+    fn webtransport_uni_stream_prefix_emits_event() {
+        let mut helper =
+            DriverTestHelper::<ServerHooks>::new_with_http3_settings(
+                webtransport_settings(),
+            )
+            .unwrap();
+        let (_to_client, _from_client) = accept_webtransport_session(&mut helper);
+
+        let payload = b"uni setup";
+        let data =
+            webtransport_stream_data(WEBTRANSPORT_UNI_STREAM_TYPE, 0, payload);
+        helper.pipe.client.stream_send(18, &data, true).unwrap();
+        helper.advance_and_run_loop().unwrap();
+
+        assert_matches!(
+            helper.driver_recv_core_event().unwrap(),
+            H3Event::WebTransportStreamData {
+                session_id: 0,
+                stream_id: 18,
+                direction: WebTransportStreamDirection::Uni,
+                data,
+                fin: true,
+            } => {
+                assert_eq!(data.as_ref(), payload);
+            }
+        );
+        assert_matches!(
+            helper.driver_recv_core_event().unwrap(),
+            H3Event::RawStreamData {
+                stream_id: 18,
+                data: raw,
+                fin: true,
+            } => {
+                assert_eq!(raw.as_ref(), data.as_slice());
+            }
+        );
+    }
+
     #[test]
     fn client_fin_before_server_body() {
         let mut helper = DriverTestHelper::<ServerHooks>::new().unwrap();

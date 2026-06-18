@@ -124,6 +124,15 @@ impl<H: DriverHooks + GetConnectionForHook> DriverTestHelper<H> {
         )
     }
 
+    pub fn new_with_http3_settings(
+        h3_settings: Http3Settings,
+    ) -> anyhow::Result<Self> {
+        Self::with_pipe_and_http3_settings(
+            Pipe::with_config_and_buf(&mut default_quiche_config())?,
+            h3_settings,
+        )
+    }
+
     pub fn with_pipe(pipe: Pipe) -> anyhow::Result<Self> {
         Self::with_pipe_and_http3_settings(pipe, Http3Settings::default())
     }

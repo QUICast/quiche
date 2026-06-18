@@ -24,10 +24,13 @@
 // NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 // SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::ops::Deref;
 use std::sync::Arc;
 
+use bytes::Bytes;
+use foundations::telemetry::log;
 use quiche::h3::NameValue as _;
 use tokio::sync::mpsc;
 
@@ -42,6 +45,7 @@ use super::H3Event;
 use super::InboundHeaders;
 use super::IncomingH3Headers;
 use super::StreamCtx;
+use super::WebTransportStreamDirection;
 use super::STREAM_CAPACITY;
 use crate::http3::settings::Http3Settings;
 use crate::http3::settings::Http3SettingsEnforcer;
@@ -169,6 +173,50 @@ fn is_webtransport_connect_headers(headers: &[quiche::h3::Header]) -> bool {
         matches!(protocol, Some(b"webtransport") | Some(b"webtransport-h3"))
 }
 
+const WEBTRANSPORT_BIDI_STREAM_TYPE: u64 = 0x41;
+const WEBTRANSPORT_UNI_STREAM_TYPE: u64 = 0x54;
+const WEBTRANSPORT_PREFIX_VARINTS: usize = 2;
+const MAX_WEBTRANSPORT_PREFIX_LEN: usize = 16;
+
+#[derive(Clone, Copy, Debug)]
+struct WebTransportStreamState {
+    session_id: u64,
+    direction: WebTransportStreamDirection,
+}
+
+#[derive(Debug, Default)]
+struct PendingWebTransportStream {
+    prefix: Vec<u8>,
+}
+
+fn stream_direction(stream_id: u64) -> WebTransportStreamDirection {
+    if stream_id & 0x2 == 0 {
+        WebTransportStreamDirection::Bidi
+    } else {
+        WebTransportStreamDirection::Uni
+    }
+}
+
+fn expected_webtransport_stream_type(
+    direction: WebTransportStreamDirection,
+) -> u64 {
+    match direction {
+        WebTransportStreamDirection::Bidi => WEBTRANSPORT_BIDI_STREAM_TYPE,
+        WebTransportStreamDirection::Uni => WEBTRANSPORT_UNI_STREAM_TYPE,
+    }
+}
+
+fn decode_webtransport_prefix(buf: &[u8]) -> Option<(u64, u64, usize)> {
+    let mut b = octets::Octets::with_slice(buf);
+    let mut values = [0; WEBTRANSPORT_PREFIX_VARINTS];
+
+    for value in &mut values {
+        *value = b.get_varint().ok()?;
+    }
+
+    Some((values[0], values[1], b.off()))
+}
+
 // Quiche urgency is an 8-bit space. Internally, quiche reserves 0 for HTTP/3
 // control streams and request are shifted up by 124. Any value in that range is
 // suitable here.
@@ -184,6 +232,10 @@ pub struct ServerHooks {
     raw_quic_stream_ids: BTreeSet<u64>,
     /// Request stream IDs that opened WebTransport sessions.
     webtransport_session_stream_ids: BTreeSet<u64>,
+    /// Streams that have been classified as WebTransport payload streams.
+    webtransport_streams: BTreeMap<u64, WebTransportStreamState>,
+    /// Partially-read WebTransport stream prefixes keyed by QUIC stream ID.
+    pending_webtransport_streams: BTreeMap<u64, PendingWebTransportStream>,
     /// Tracks the number of requests that have been handled by this driver.
     requests: u64,
 
@@ -219,6 +271,10 @@ impl ServerHooks {
                 .hooks
                 .webtransport_session_stream_ids
                 .insert(stream_id);
+            log::debug!(
+                "WebTransport CONNECT session registered";
+                "stream_id" => stream_id
+            );
         }
 
         let (mut stream_ctx, send, recv) =
@@ -290,6 +346,8 @@ impl DriverHooks for ServerHooks {
                 .copied()
                 .collect(),
             webtransport_session_stream_ids: BTreeSet::new(),
+            webtransport_streams: BTreeMap::new(),
+            pending_webtransport_streams: BTreeMap::new(),
             requests: 0,
             post_accept_timeout: None,
         }
@@ -353,6 +411,115 @@ impl DriverHooks for ServerHooks {
                 // WebTransport session that this driver intentionally exposes
                 // as raw QUIC bytes instead of parsing as HTTP/3.
                 !driver.hooks.webtransport_session_stream_ids.is_empty())
+    }
+
+    fn raw_stream_data_received(
+        driver: &mut H3Driver<Self>, stream_id: u64, data: Bytes, fin: bool,
+    ) -> H3ConnectionResult<Vec<H3Event>> {
+        let raw = H3Event::RawStreamData {
+            stream_id,
+            data: data.clone(),
+            fin,
+        };
+
+        if driver.hooks.raw_quic_stream_ids.contains(&stream_id) {
+            return Ok(vec![raw]);
+        }
+
+        if let Some(stream) = driver.hooks.webtransport_streams.get(&stream_id) {
+            let wt = H3Event::WebTransportStreamData {
+                session_id: stream.session_id,
+                stream_id,
+                direction: stream.direction,
+                data,
+                fin,
+            };
+
+            if fin {
+                driver.hooks.webtransport_streams.remove(&stream_id);
+            }
+
+            return Ok(vec![wt, raw]);
+        }
+
+        if driver.hooks.webtransport_session_stream_ids.is_empty() {
+            return Ok(vec![raw]);
+        }
+
+        let pending = driver
+            .hooks
+            .pending_webtransport_streams
+            .entry(stream_id)
+            .or_default();
+        pending.prefix.extend_from_slice(&data);
+
+        let Some((stream_type, session_id, prefix_len)) =
+            decode_webtransport_prefix(&pending.prefix)
+        else {
+            if pending.prefix.len() > MAX_WEBTRANSPORT_PREFIX_LEN || fin {
+                log::debug!(
+                    "WebTransport stream ended before prefix";
+                    "stream_id" => stream_id,
+                    "bytes" => pending.prefix.len(),
+                    "fin" => fin
+                );
+                driver.hooks.pending_webtransport_streams.remove(&stream_id);
+            }
+
+            return Ok(vec![raw]);
+        };
+
+        let direction = stream_direction(stream_id);
+        let expected_stream_type = expected_webtransport_stream_type(direction);
+
+        if stream_type != expected_stream_type ||
+            !driver
+                .hooks
+                .webtransport_session_stream_ids
+                .contains(&session_id)
+        {
+            log::debug!(
+                "raw stream did not match registered WebTransport session";
+                "stream_id" => stream_id,
+                "stream_type" => stream_type,
+                "expected_stream_type" => expected_stream_type,
+                "session_id" => session_id
+            );
+            driver.hooks.pending_webtransport_streams.remove(&stream_id);
+            return Ok(vec![raw]);
+        }
+
+        let payload = Bytes::copy_from_slice(&pending.prefix[prefix_len..]);
+        driver.hooks.pending_webtransport_streams.remove(&stream_id);
+        driver.hooks.webtransport_streams.insert(
+            stream_id,
+            WebTransportStreamState {
+                session_id,
+                direction,
+            },
+        );
+
+        log::debug!(
+            "WebTransport stream prefix accepted";
+            "stream_id" => stream_id,
+            "session_id" => session_id,
+            "direction" => ?direction,
+            "payload_bytes" => payload.len()
+        );
+
+        let wt = H3Event::WebTransportStreamData {
+            session_id,
+            stream_id,
+            direction,
+            data: payload,
+            fin,
+        };
+
+        if fin {
+            driver.hooks.webtransport_streams.remove(&stream_id);
+        }
+
+        Ok(vec![wt, raw])
     }
 
     fn conn_command(

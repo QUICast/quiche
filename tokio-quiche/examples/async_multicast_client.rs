@@ -408,6 +408,20 @@ fn handle_core_h3_event(event: H3Event) -> bool {
             false
         },
 
+        H3Event::WebTransportStreamData {
+            session_id,
+            stream_id,
+            direction,
+            data,
+            fin,
+        } => {
+            println!(
+                "http3 webtransport stream data: session={session_id} stream={stream_id} direction={direction:?} bytes={} fin={fin}",
+                data.len()
+            );
+            false
+        },
+
         H3Event::ConnectionError(err) => {
             println!("http3 connection error: {err:?}");
             true
