@@ -422,6 +422,11 @@ fn handle_core_h3_event(event: H3Event) -> bool {
             false
         },
 
+        H3Event::WebTransportDiagnostic(diagnostic) => {
+            println!("http3 webtransport diagnostic: {diagnostic:?}");
+            false
+        },
+
         H3Event::ConnectionError(err) => {
             println!("http3 connection error: {err:?}");
             true

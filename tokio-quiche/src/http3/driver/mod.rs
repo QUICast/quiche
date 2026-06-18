@@ -109,6 +109,64 @@ pub enum WebTransportStreamDirection {
     Uni,
 }
 
+/// Rare WebTransport/H3 handshake diagnostic event kind.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WebTransportDiagnosticKind {
+    /// A WebTransport CONNECT stream was registered as a session.
+    ConnectSessionRegistered,
+    /// H3 response headers were successfully handed to QUIC for flushing.
+    H3HeadersFlushedToQuic,
+    /// A candidate WebTransport stream ended before a full prefix was read.
+    StreamEndedBeforePrefix,
+    /// A candidate stream prefix did not match a registered WebTransport
+    /// session.
+    StreamPrefixMismatch,
+    /// A WebTransport stream prefix was accepted and classified.
+    StreamPrefixAccepted,
+}
+
+/// Diagnostic details for rare WebTransport/H3 handshake events.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WebTransportDiagnostic {
+    /// Diagnostic event kind.
+    pub kind: WebTransportDiagnosticKind,
+    /// QUIC stream ID associated with the diagnostic, when applicable.
+    pub stream_id: Option<u64>,
+    /// WebTransport session ID associated with the diagnostic, when known.
+    pub session_id: Option<u64>,
+    /// WebTransport stream direction, when known.
+    pub direction: Option<WebTransportStreamDirection>,
+    /// Byte count associated with the diagnostic, when applicable.
+    pub bytes: Option<usize>,
+    /// FIN flag associated with the diagnostic, when applicable.
+    pub fin: Option<bool>,
+    /// Whether flushed H3 headers were initial headers, when applicable.
+    pub initial_headers: Option<bool>,
+    /// Number of flushed H3 headers, when applicable.
+    pub header_count: Option<usize>,
+    /// WebTransport stream type parsed from the prefix, when known.
+    pub stream_type: Option<u64>,
+    /// Expected WebTransport stream type for the stream direction, when known.
+    pub expected_stream_type: Option<u64>,
+}
+
+impl WebTransportDiagnostic {
+    pub(crate) const fn new(kind: WebTransportDiagnosticKind) -> Self {
+        Self {
+            kind,
+            stream_id: None,
+            session_id: None,
+            direction: None,
+            bytes: None,
+            fin: None,
+            initial_headers: None,
+            header_count: None,
+            stream_type: None,
+            expected_stream_type: None,
+        }
+    }
+}
+
 // The default priority for HTTP/3 responses if the application didn't provide
 // one.
 const DEFAULT_PRIO: h3::Priority = h3::Priority::new(3, true);
@@ -311,6 +369,8 @@ pub enum H3Event {
         /// Whether the stream is finished and won't yield any more data.
         fin: bool,
     },
+    /// Rare WebTransport/H3 handshake diagnostic.
+    WebTransportDiagnostic(WebTransportDiagnostic),
     /// The stream has been closed. This is used to signal stream closures that
     /// don't result from RST_STREAM frames, unlike the
     /// [`H3Event::ResetStream`] variant.
@@ -810,7 +870,8 @@ impl<H: DriverHooks> H3Driver<H> {
     /// this method in a loop for each stream to send all writable packets.
     fn process_write_frame(
         conn: &mut h3::Connection, qconn: &mut QuicheConnection,
-        ctx: &mut StreamCtx,
+        ctx: &mut StreamCtx, h3_event_sender: &UnboundedSender<H::Event>,
+        emit_h3_headers_flushed: bool,
     ) -> h3::Result<()> {
         let Some(frame) = &mut ctx.queued_frame else {
             return Ok(());
@@ -844,12 +905,25 @@ impl<H: DriverHooks> H3Driver<H> {
                 }
 
                 if res.is_ok() {
-                    log::info!(
-                        "H3 headers flushed to QUIC";
-                        "stream_id" => stream_id,
-                        "initial_headers" => initial_headers,
-                        "header_count" => headers.len()
-                    );
+                    if emit_h3_headers_flushed {
+                        log::info!(
+                            "H3 headers flushed to QUIC";
+                            "stream_id" => stream_id,
+                            "initial_headers" => initial_headers,
+                            "header_count" => headers.len()
+                        );
+
+                        let mut diagnostic = WebTransportDiagnostic::new(
+                            WebTransportDiagnosticKind::H3HeadersFlushedToQuic,
+                        );
+                        diagnostic.stream_id = Some(stream_id);
+                        diagnostic.initial_headers = Some(initial_headers);
+                        diagnostic.header_count = Some(headers.len());
+
+                        let _ = h3_event_sender.send(
+                            H3Event::WebTransportDiagnostic(diagnostic).into(),
+                        );
+                    }
 
                     if let Some(first) =
                         ctx.first_full_headers_flush_fail_time.take()
@@ -1272,6 +1346,9 @@ impl<H: DriverHooks> H3Driver<H> {
     fn process_writable_stream(
         &mut self, qconn: &mut QuicheConnection, stream_id: u64,
     ) -> H3ConnectionResult<()> {
+        let emit_h3_headers_flushed =
+            H::should_emit_h3_headers_flushed(self, stream_id);
+        let h3_event_sender = self.h3_event_sender.clone();
         // Split self borrow between conn and stream_map
         let conn = self.conn.as_mut().ok_or(Self::connection_not_present())?;
         let Some(ctx) = self.stream_map.get_mut(&stream_id) else {
@@ -1281,7 +1358,13 @@ impl<H: DriverHooks> H3Driver<H> {
         loop {
             // Process each writable frame, queue the next frame for processing
             // and shut down any errored streams.
-            match Self::process_write_frame(conn, qconn, ctx) {
+            match Self::process_write_frame(
+                conn,
+                qconn,
+                ctx,
+                &h3_event_sender,
+                emit_h3_headers_flushed,
+            ) {
                 Ok(()) => ctx.queued_frame = None,
                 Err(h3::Error::StreamBlocked | h3::Error::Done) => break,
                 Err(h3::Error::MessageError) => {

@@ -45,6 +45,8 @@ use super::H3Event;
 use super::InboundHeaders;
 use super::IncomingH3Headers;
 use super::StreamCtx;
+use super::WebTransportDiagnostic;
+use super::WebTransportDiagnosticKind;
 use super::WebTransportStreamDirection;
 use super::STREAM_CAPACITY;
 use crate::http3::settings::Http3Settings;
@@ -278,6 +280,16 @@ impl ServerHooks {
                 "WebTransport CONNECT session registered";
                 "stream_id" => stream_id
             );
+            let mut diagnostic = WebTransportDiagnostic::new(
+                WebTransportDiagnosticKind::ConnectSessionRegistered,
+            );
+            diagnostic.stream_id = Some(stream_id);
+            diagnostic.session_id = Some(stream_id);
+
+            driver
+                .h3_event_sender
+                .send(H3Event::WebTransportDiagnostic(diagnostic).into())
+                .map_err(|_| H3ConnectionError::ControllerWentAway)?;
         }
 
         let (mut stream_ctx, send, recv) =
@@ -429,6 +441,15 @@ impl DriverHooks for ServerHooks {
                 !driver.hooks.webtransport_session_stream_ids.is_empty())
     }
 
+    fn should_emit_h3_headers_flushed(
+        driver: &H3Driver<Self>, stream_id: u64,
+    ) -> bool {
+        driver
+            .hooks
+            .webtransport_session_stream_ids
+            .contains(&stream_id)
+    }
+
     fn raw_stream_data_received(
         driver: &mut H3Driver<Self>, stream_id: u64, data: Bytes, fin: bool,
     ) -> H3ConnectionResult<Vec<H3Event>> {
@@ -479,7 +500,19 @@ impl DriverHooks for ServerHooks {
                     "bytes" => pending.prefix.len(),
                     "fin" => fin
                 );
+                let mut diagnostic = WebTransportDiagnostic::new(
+                    WebTransportDiagnosticKind::StreamEndedBeforePrefix,
+                );
+                diagnostic.stream_id = Some(stream_id);
+                diagnostic.direction = Some(stream_direction(stream_id));
+                diagnostic.bytes = Some(pending.prefix.len());
+                diagnostic.fin = Some(fin);
+
                 driver.hooks.pending_webtransport_streams.remove(&stream_id);
+                return Ok(vec![
+                    H3Event::WebTransportDiagnostic(diagnostic),
+                    raw,
+                ]);
             }
 
             return Ok(vec![raw]);
@@ -501,8 +534,19 @@ impl DriverHooks for ServerHooks {
                 "expected_stream_type" => expected_stream_type,
                 "session_id" => session_id
             );
+            let mut diagnostic = WebTransportDiagnostic::new(
+                WebTransportDiagnosticKind::StreamPrefixMismatch,
+            );
+            diagnostic.stream_id = Some(stream_id);
+            diagnostic.session_id = Some(session_id);
+            diagnostic.direction = Some(direction);
+            diagnostic.bytes = Some(pending.prefix.len());
+            diagnostic.fin = Some(fin);
+            diagnostic.stream_type = Some(stream_type);
+            diagnostic.expected_stream_type = Some(expected_stream_type);
+
             driver.hooks.pending_webtransport_streams.remove(&stream_id);
-            return Ok(vec![raw]);
+            return Ok(vec![H3Event::WebTransportDiagnostic(diagnostic), raw]);
         }
 
         let payload = Bytes::copy_from_slice(&pending.prefix[prefix_len..]);
@@ -523,6 +567,17 @@ impl DriverHooks for ServerHooks {
             "payload_bytes" => payload.len()
         );
 
+        let mut diagnostic = WebTransportDiagnostic::new(
+            WebTransportDiagnosticKind::StreamPrefixAccepted,
+        );
+        diagnostic.stream_id = Some(stream_id);
+        diagnostic.session_id = Some(session_id);
+        diagnostic.direction = Some(direction);
+        diagnostic.bytes = Some(payload.len());
+        diagnostic.fin = Some(fin);
+        diagnostic.stream_type = Some(stream_type);
+        diagnostic.expected_stream_type = Some(expected_stream_type);
+
         let wt = H3Event::WebTransportStreamData {
             session_id,
             stream_id,
@@ -535,7 +590,7 @@ impl DriverHooks for ServerHooks {
             driver.hooks.webtransport_streams.remove(&stream_id);
         }
 
-        Ok(vec![wt, raw])
+        Ok(vec![H3Event::WebTransportDiagnostic(diagnostic), wt, raw])
     }
 
     fn conn_command(

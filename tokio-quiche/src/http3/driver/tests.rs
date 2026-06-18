@@ -1027,6 +1027,42 @@ mod server_side_driver {
         data
     }
 
+    fn assert_diagnostic(
+        event: H3Event, kind: WebTransportDiagnosticKind,
+    ) -> WebTransportDiagnostic {
+        assert_matches!(
+            event,
+            H3Event::WebTransportDiagnostic(diagnostic) => {
+                assert_eq!(diagnostic.kind, kind);
+                diagnostic
+            }
+        )
+    }
+
+    fn expect_connect_session_registered(
+        helper: &mut DriverTestHelper<ServerHooks>, stream_id: u64,
+    ) {
+        let diagnostic = assert_diagnostic(
+            helper.driver_recv_core_event().unwrap(),
+            WebTransportDiagnosticKind::ConnectSessionRegistered,
+        );
+        assert_eq!(diagnostic.stream_id, Some(stream_id));
+        assert_eq!(diagnostic.session_id, Some(stream_id));
+    }
+
+    fn expect_headers_flushed(
+        helper: &mut DriverTestHelper<ServerHooks>, stream_id: u64,
+        initial_headers: bool, header_count: usize,
+    ) {
+        let diagnostic = assert_diagnostic(
+            helper.driver_recv_core_event().unwrap(),
+            WebTransportDiagnosticKind::H3HeadersFlushedToQuic,
+        );
+        assert_eq!(diagnostic.stream_id, Some(stream_id));
+        assert_eq!(diagnostic.initial_headers, Some(initial_headers));
+        assert_eq!(diagnostic.header_count, Some(header_count));
+    }
+
     fn accept_webtransport_session(
         helper: &mut DriverTestHelper<ServerHooks>,
     ) -> (tokio::sync::mpsc::Sender<OutboundFrame>, InboundFrameStream) {
@@ -1038,6 +1074,7 @@ mod server_side_driver {
             .unwrap();
 
         helper.advance_and_run_loop().unwrap();
+        expect_connect_session_registered(helper, stream_id);
         let req = loop {
             match helper.driver_recv_server_event().unwrap() {
                 ServerH3Event::Headers {
@@ -1055,10 +1092,13 @@ mod server_side_driver {
         let to_client = req.send.get_ref().unwrap().clone();
         let from_client = req.recv;
 
+        let response_headers = make_response_headers();
+        let header_count = response_headers.len();
         to_client
-            .try_send(OutboundFrame::Headers(make_response_headers(), None))
+            .try_send(OutboundFrame::Headers(response_headers, None))
             .unwrap();
         helper.advance_and_run_loop().unwrap();
+        expect_headers_flushed(helper, stream_id, true, header_count);
         assert_matches!(
             helper.peer_client_poll(),
             Ok((0, h3::Event::Headers { .. }))
@@ -1068,7 +1108,35 @@ mod server_side_driver {
     }
 
     #[test]
-    fn webtransport_connect_registers_session_and_bidi_stream_event() {
+    fn webtransport_connect_registration_emits_diagnostic() {
+        let mut helper =
+            DriverTestHelper::<ServerHooks>::new_with_http3_settings(
+                webtransport_settings(),
+            )
+            .unwrap();
+        helper.complete_handshake().unwrap();
+        helper.advance_and_run_loop().unwrap();
+
+        let stream_id = helper
+            .peer_client_send_request(make_webtransport_request_headers(), false)
+            .unwrap();
+        helper.advance_and_run_loop().unwrap();
+
+        expect_connect_session_registered(&mut helper, stream_id);
+    }
+
+    #[test]
+    fn webtransport_response_header_flush_emits_diagnostic() {
+        let mut helper =
+            DriverTestHelper::<ServerHooks>::new_with_http3_settings(
+                webtransport_settings(),
+            )
+            .unwrap();
+        let (_to_client, _from_client) = accept_webtransport_session(&mut helper);
+    }
+
+    #[test]
+    fn webtransport_bidi_prefix_accepted_preserves_stream_events() {
         let mut helper =
             DriverTestHelper::<ServerHooks>::new_with_http3_settings(
                 webtransport_settings(),
@@ -1081,6 +1149,24 @@ mod server_side_driver {
             webtransport_stream_data(WEBTRANSPORT_BIDI_STREAM_TYPE, 0, payload);
         helper.pipe.client.stream_send(4, &data, true).unwrap();
         helper.advance_and_run_loop().unwrap();
+
+        let diagnostic = assert_diagnostic(
+            helper.driver_recv_core_event().unwrap(),
+            WebTransportDiagnosticKind::StreamPrefixAccepted,
+        );
+        assert_eq!(diagnostic.stream_id, Some(4));
+        assert_eq!(diagnostic.session_id, Some(0));
+        assert_eq!(
+            diagnostic.direction,
+            Some(WebTransportStreamDirection::Bidi)
+        );
+        assert_eq!(diagnostic.bytes, Some(payload.len()));
+        assert_eq!(diagnostic.fin, Some(true));
+        assert_eq!(diagnostic.stream_type, Some(WEBTRANSPORT_BIDI_STREAM_TYPE));
+        assert_eq!(
+            diagnostic.expected_stream_type,
+            Some(WEBTRANSPORT_BIDI_STREAM_TYPE)
+        );
 
         assert_matches!(
             helper.driver_recv_core_event().unwrap(),
@@ -1107,7 +1193,7 @@ mod server_side_driver {
     }
 
     #[test]
-    fn webtransport_uni_stream_prefix_emits_event() {
+    fn webtransport_uni_prefix_accepted_preserves_stream_events() {
         let mut helper =
             DriverTestHelper::<ServerHooks>::new_with_http3_settings(
                 webtransport_settings(),
@@ -1120,6 +1206,21 @@ mod server_side_driver {
             webtransport_stream_data(WEBTRANSPORT_UNI_STREAM_TYPE, 0, payload);
         helper.pipe.client.stream_send(18, &data, true).unwrap();
         helper.advance_and_run_loop().unwrap();
+
+        let diagnostic = assert_diagnostic(
+            helper.driver_recv_core_event().unwrap(),
+            WebTransportDiagnosticKind::StreamPrefixAccepted,
+        );
+        assert_eq!(diagnostic.stream_id, Some(18));
+        assert_eq!(diagnostic.session_id, Some(0));
+        assert_eq!(diagnostic.direction, Some(WebTransportStreamDirection::Uni));
+        assert_eq!(diagnostic.bytes, Some(payload.len()));
+        assert_eq!(diagnostic.fin, Some(true));
+        assert_eq!(diagnostic.stream_type, Some(WEBTRANSPORT_UNI_STREAM_TYPE));
+        assert_eq!(
+            diagnostic.expected_stream_type,
+            Some(WEBTRANSPORT_UNI_STREAM_TYPE)
+        );
 
         assert_matches!(
             helper.driver_recv_core_event().unwrap(),
@@ -1137,6 +1238,88 @@ mod server_side_driver {
             helper.driver_recv_core_event().unwrap(),
             H3Event::RawStreamData {
                 stream_id: 18,
+                data: raw,
+                fin: true,
+            } => {
+                assert_eq!(raw.as_ref(), data.as_slice());
+            }
+        );
+    }
+
+    #[test]
+    fn webtransport_prefix_mismatch_emits_diagnostic_and_raw_data() {
+        let mut helper =
+            DriverTestHelper::<ServerHooks>::new_with_http3_settings(
+                webtransport_settings(),
+            )
+            .unwrap();
+        let (_to_client, _from_client) = accept_webtransport_session(&mut helper);
+
+        let payload = b"not this session";
+        let data =
+            webtransport_stream_data(WEBTRANSPORT_BIDI_STREAM_TYPE, 99, payload);
+        helper.pipe.client.stream_send(4, &data, true).unwrap();
+        helper.advance_and_run_loop().unwrap();
+
+        let diagnostic = assert_diagnostic(
+            helper.driver_recv_core_event().unwrap(),
+            WebTransportDiagnosticKind::StreamPrefixMismatch,
+        );
+        assert_eq!(diagnostic.stream_id, Some(4));
+        assert_eq!(diagnostic.session_id, Some(99));
+        assert_eq!(
+            diagnostic.direction,
+            Some(WebTransportStreamDirection::Bidi)
+        );
+        assert_eq!(diagnostic.bytes, Some(data.len()));
+        assert_eq!(diagnostic.fin, Some(true));
+        assert_eq!(diagnostic.stream_type, Some(WEBTRANSPORT_BIDI_STREAM_TYPE));
+        assert_eq!(
+            diagnostic.expected_stream_type,
+            Some(WEBTRANSPORT_BIDI_STREAM_TYPE)
+        );
+
+        assert_matches!(
+            helper.driver_recv_core_event().unwrap(),
+            H3Event::RawStreamData {
+                stream_id: 4,
+                data: raw,
+                fin: true,
+            } => {
+                assert_eq!(raw.as_ref(), data.as_slice());
+            }
+        );
+    }
+
+    #[test]
+    fn webtransport_fin_before_full_prefix_emits_diagnostic_and_raw_data() {
+        let mut helper =
+            DriverTestHelper::<ServerHooks>::new_with_http3_settings(
+                webtransport_settings(),
+            )
+            .unwrap();
+        let (_to_client, _from_client) = accept_webtransport_session(&mut helper);
+
+        let data = [0x40];
+        helper.pipe.client.stream_send(4, &data, true).unwrap();
+        helper.advance_and_run_loop().unwrap();
+
+        let diagnostic = assert_diagnostic(
+            helper.driver_recv_core_event().unwrap(),
+            WebTransportDiagnosticKind::StreamEndedBeforePrefix,
+        );
+        assert_eq!(diagnostic.stream_id, Some(4));
+        assert_eq!(
+            diagnostic.direction,
+            Some(WebTransportStreamDirection::Bidi)
+        );
+        assert_eq!(diagnostic.bytes, Some(data.len()));
+        assert_eq!(diagnostic.fin, Some(true));
+
+        assert_matches!(
+            helper.driver_recv_core_event().unwrap(),
+            H3Event::RawStreamData {
+                stream_id: 4,
                 data: raw,
                 fin: true,
             } => {
