@@ -844,7 +844,7 @@ impl<H: DriverHooks> H3Driver<H> {
                 }
 
                 if res.is_ok() {
-                    log::debug!(
+                    log::info!(
                         "H3 headers flushed to QUIC";
                         "stream_id" => stream_id,
                         "initial_headers" => initial_headers,
