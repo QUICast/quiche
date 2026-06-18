@@ -97,6 +97,14 @@ pub trait DriverHooks: Sized + Send + 'static {
         }])
     }
 
+    /// Determines whether a successful H3 header flush should emit a
+    /// WebTransport diagnostic event.
+    fn should_emit_h3_headers_flushed(
+        _driver: &H3Driver<Self>, _stream_id: u64,
+    ) -> bool {
+        false
+    }
+
     /// Processes any command received from the
     /// [`H3Controller`](super::H3Controller). May use
     /// `H3Driver::handle_core_command` to handle regular [`H3Command`]s.
