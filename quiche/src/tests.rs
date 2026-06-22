@@ -755,6 +755,46 @@ fn multicast_dgram_fallback_resumes_after_channel_leaves() {
 }
 
 #[test]
+fn multicast_default_dgram_channel_routes_plain_datagrams_to_fallback() {
+    let mut pipe = multicast_dgram_negotiated_pipe();
+    let channel_id = vec![1, 2, 3, 4];
+    let data = b"plain-datagram-fallback";
+
+    pipe.server
+        .multicast_set_default_dgram_channel(Some(channel_id.clone()))
+        .unwrap();
+    pipe.server
+        .multicast_probe_start(&channel_id, Duration::from_secs(1))
+        .unwrap();
+
+    assert_eq!(
+        pipe.server.multicast_default_dgram_channel(),
+        Some(&channel_id[..])
+    );
+    assert_eq!(pipe.server.dgram_send(data), Ok(()));
+
+    assert_client_receives_unicast_dgram(&mut pipe, data);
+}
+
+#[test]
+fn multicast_default_dgram_channel_stops_plain_datagrams_after_ack() {
+    let mut pipe = multicast_dgram_negotiated_pipe();
+    let channel_id = vec![1, 2, 3, 4];
+
+    pipe.server
+        .multicast_set_default_dgram_channel(Some(channel_id.clone()))
+        .unwrap();
+    pipe.server
+        .multicast_process_peer_ack(multicast_test_ack(&channel_id))
+        .unwrap();
+
+    assert_eq!(pipe.server.dgram_send(b"do-not-duplicate"), Ok(()));
+    assert_eq!(pipe.server.dgram_send_queue_len(), 0);
+
+    assert_client_receives_no_unicast_dgram(&mut pipe);
+}
+
+#[test]
 fn transport_params_forbid_duplicates() {
     // Given an encoded param.
     let initial_source_connection_id = b"id";

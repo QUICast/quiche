@@ -1851,6 +1851,10 @@ impl ServerControlRuntime {
                 },
 
                 ServerControlCommand::SendAnnounce { frame } => {
+                    Self::set_default_dgram_channel_if_unset(
+                        qconn,
+                        &frame.channel_id,
+                    )?;
                     let channel = self
                         .channels
                         .entry(frame.channel_id.clone())
@@ -1863,6 +1867,10 @@ impl ServerControlRuntime {
                 },
 
                 ServerControlCommand::SendKey { frame } => {
+                    Self::set_default_dgram_channel_if_unset(
+                        qconn,
+                        &frame.channel_id,
+                    )?;
                     let channel = self
                         .channels
                         .entry(frame.channel_id.clone())
@@ -1872,6 +1880,10 @@ impl ServerControlRuntime {
                 },
 
                 ServerControlCommand::SendJoin { frame } => {
+                    Self::set_default_dgram_channel_if_unset(
+                        qconn,
+                        &frame.channel_id,
+                    )?;
                     let channel = self
                         .channels
                         .entry(frame.channel_id.clone())
@@ -1897,6 +1909,7 @@ impl ServerControlRuntime {
         config.validate()?;
 
         let channel_id = config.announce.channel_id.clone();
+        Self::set_default_dgram_channel_if_unset(qconn, &channel_id)?;
         let channel = self.channels.entry(channel_id.clone()).or_default();
         channel.announce = Some(config.announce.clone());
         channel.key = Some(config.key.clone());
@@ -1966,6 +1979,17 @@ impl ServerControlRuntime {
             .peer_transport_params()
             .and_then(|params| params.multicast_client_params.as_ref())
             .is_some()
+    }
+
+    fn set_default_dgram_channel_if_unset(
+        qconn: &mut QuicheConnection, channel_id: &[u8],
+    ) -> QuicResult<()> {
+        if qconn.multicast_default_dgram_channel().is_none() {
+            qconn
+                .multicast_set_default_dgram_channel(Some(channel_id.to_vec()))?;
+        }
+
+        Ok(())
     }
 }
 
@@ -2135,6 +2159,12 @@ impl<B: PublishBackend> ServerRuntime<B> {
         }
 
         for config in &self.settings.channels {
+            if qconn.multicast_default_dgram_channel().is_none() {
+                qconn.multicast_set_default_dgram_channel(Some(
+                    config.channel_id.clone(),
+                ))?;
+            }
+
             let publication = self.backend.open(&config.publication)?;
             let (source, group, udp_port) =
                 self.backend.announce_tuple(&publication)?;
@@ -2536,11 +2566,13 @@ mod tests {
     fn test_pipe(settings: &ClientSettings) -> Pipe {
         let mut client_config =
             quiche::test_utils::Pipe::default_config("cubic").unwrap();
+        client_config.enable_dgram(true, 10, 10);
         client_config
             .set_multicast_client_params(Some(settings.transport_params.clone()));
 
         let mut server_config =
             quiche::test_utils::Pipe::default_config("cubic").unwrap();
+        server_config.enable_dgram(true, 10, 10);
         server_config.enable_multicast_server_support(true);
 
         let mut pipe = Pipe::with_client_and_server_config_and_buf(
@@ -2648,6 +2680,16 @@ mod tests {
                 other => panic!("expected local state, got {other:?}"),
             }
         }
+    }
+
+    fn assert_client_receives_dgram(pipe: &mut Pipe, expected: &[u8]) {
+        let flight = quiche::test_utils::emit_flight(&mut pipe.server).unwrap();
+        quiche::test_utils::process_flight(&mut pipe.client, flight).unwrap();
+
+        let mut out = [0; 128];
+        assert_eq!(pipe.client.dgram_recv(&mut out), Ok(expected.len()));
+        assert_eq!(&out[..expected.len()], expected);
+        assert_eq!(pipe.client.dgram_recv(&mut out), Err(quiche::Error::Done));
     }
 
     #[test]
@@ -2989,6 +3031,44 @@ mod tests {
     }
 
     #[test]
+    fn server_control_runtime_installs_default_dgram_fallback_channel() {
+        let settings = test_settings();
+        let server_settings = test_server_control_settings();
+        let channel_id = server_settings.channels[0].announce.channel_id.clone();
+        let mut pipe = test_pipe(&settings);
+        let (_command_sender, command_receiver) = mpsc::unbounded_channel();
+        let (event_sender, _event_receiver) = mpsc::unbounded_channel();
+        let mut runtime = ServerControlRuntime::new(
+            server_settings,
+            event_sender,
+            command_receiver,
+        );
+
+        runtime.on_conn_established(&mut pipe.server).unwrap();
+
+        assert_eq!(
+            pipe.server.multicast_default_dgram_channel(),
+            Some(channel_id.as_slice())
+        );
+
+        pipe.server.dgram_send(b"default-fallback").unwrap();
+        assert_client_receives_dgram(&mut pipe, b"default-fallback");
+
+        pipe.server
+            .multicast_process_peer_ack(quiche::multicast::Ack {
+                channel_id,
+                largest_acknowledged: 1,
+                ack_delay: 0,
+                first_ack_range: 0,
+                ack_ranges: Vec::new(),
+                ecn_counts: None,
+            })
+            .unwrap();
+        pipe.server.dgram_send(b"do-not-duplicate").unwrap();
+        assert_eq!(pipe.server.dgram_send_queue_len(), 0);
+    }
+
+    #[test]
     fn server_runtime_emits_client_ack() {
         let settings = test_settings();
         let server_settings = test_server_settings();
@@ -3153,8 +3233,13 @@ mod tests {
         controller.upsert_channel(config).unwrap();
         runtime.process_writes(&mut pipe.server).unwrap();
 
-        let flight = quiche::test_utils::emit_flight(&mut pipe.server).unwrap();
-        quiche::test_utils::process_flight(&mut pipe.client, flight).unwrap();
+        assert_eq!(
+            pipe.server.multicast_default_dgram_channel(),
+            Some(&[1, 2, 3, 4][..])
+        );
+
+        pipe.server.dgram_send(b"upsert-fallback").unwrap();
+        assert_client_receives_dgram(&mut pipe, b"upsert-fallback");
 
         let announce = match pipe.client.multicast_recv() {
             Ok(quiche::multicast::Frame::Announce(frame)) => frame,

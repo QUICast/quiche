@@ -1253,6 +1253,49 @@ mod server_side_driver {
     }
 
     #[test]
+    fn h3_datagram_uses_quic_default_multicast_channel() {
+        let channel_id = vec![1, 2, 3, 4];
+        let mut helper =
+            DriverTestHelper::<ServerHooks>::with_pipe_and_http3_settings(
+                dgram_enabled_pipe(),
+                webtransport_settings(),
+            )
+            .unwrap();
+        let (_to_client, _from_client, flow_sender) =
+            accept_webtransport_session_with_flow(&mut helper);
+
+        helper
+            .pipe
+            .server
+            .multicast_set_default_dgram_channel(Some(channel_id.clone()))
+            .unwrap();
+
+        flow_sender
+            .get_ref()
+            .unwrap()
+            .try_send(OutboundFrame::Datagram(dgram_buf(b"default-fallback"), 0))
+            .unwrap();
+        helper.work_loop_iter().unwrap();
+        helper.pipe.advance().unwrap();
+        assert_client_raw_h3_dgram(&mut helper, 0, b"default-fallback");
+
+        helper
+            .pipe
+            .server
+            .multicast_process_peer_ack(multicast_ack(&channel_id))
+            .unwrap();
+
+        flow_sender
+            .get_ref()
+            .unwrap()
+            .try_send(OutboundFrame::Datagram(dgram_buf(b"after-ack"), 0))
+            .unwrap();
+        helper.work_loop_iter().unwrap();
+        helper.pipe.advance().unwrap();
+        assert_client_no_raw_h3_dgram(&mut helper);
+    }
+
+    #[test]
     fn webtransport_bidi_prefix_accepted_preserves_stream_events() {
         let mut helper =
             DriverTestHelper::<ServerHooks>::new_with_http3_settings(
