@@ -1607,6 +1607,7 @@ where
     multicast_dgram_recv_queue: multicast::ChannelDatagramQueue,
     multicast_probe_event_queue: multicast::ProbeEventQueue,
     multicast_probe_states: BTreeMap<Vec<u8>, multicast::ProbeState>,
+    multicast_default_dgram_channel_id: Option<Vec<u8>>,
 
     /// Whether to emit DATAGRAM frames in the next packet.
     emit_dgram: bool,
@@ -2306,6 +2307,7 @@ impl<F: BufFactory> Connection<F> {
                 config.multicast_recv_max_queue_len,
             ),
             multicast_probe_states: BTreeMap::new(),
+            multicast_default_dgram_channel_id: None,
 
             emit_dgram: true,
 
@@ -6999,6 +7001,15 @@ impl<F: BufFactory> Connection<F> {
     ///
     /// [`dgram_send()`]: struct.Connection.html#method.dgram_send
     pub fn dgram_send_buf(&mut self, buf: F::DgramBuf) -> Result<()> {
+        if let Some(channel_id) = self.multicast_default_dgram_channel_id.clone()
+        {
+            return self.multicast_dgram_send_buf(&channel_id, buf);
+        }
+
+        self.dgram_send_buf_direct(buf)
+    }
+
+    fn dgram_send_buf_direct(&mut self, buf: F::DgramBuf) -> Result<()> {
         let max_payload_len = match self.dgram_max_writable_len() {
             Some(v) => v,
 
@@ -7225,6 +7236,38 @@ impl<F: BufFactory> Connection<F> {
         self.multicast_dgram_recv_queue.len()
     }
 
+    /// Sets the default multicast channel used by ordinary outgoing DATAGRAMs.
+    ///
+    /// When this is set on a server connection, calls to [`dgram_send()`] and
+    /// [`dgram_send_buf()`] are treated as MCQUIC channel data for the provided
+    /// channel. The payload is sent on the unicast QUIC path while the channel
+    /// needs fallback, and suppressed once the channel is viable through
+    /// `MC_ACK`.
+    ///
+    /// This is intended for transport integrations where the application writes
+    /// the same HTTP/3/QUIC DATAGRAM payload regardless of whether multicast or
+    /// unicast fallback is currently selected.
+    ///
+    /// [`dgram_send()`]: struct.Connection.html#method.dgram_send
+    /// [`dgram_send_buf()`]: struct.Connection.html#method.dgram_send_buf
+    pub fn multicast_set_default_dgram_channel(
+        &mut self, channel_id: Option<Vec<u8>>,
+    ) -> Result<()> {
+        if channel_id.is_some() && !self.is_server {
+            return Err(Error::InvalidState);
+        }
+
+        self.multicast_default_dgram_channel_id = channel_id;
+
+        Ok(())
+    }
+
+    /// Returns the default multicast channel used by ordinary outgoing
+    /// DATAGRAMs, if one has been configured.
+    pub fn multicast_default_dgram_channel(&self) -> Option<&[u8]> {
+        self.multicast_default_dgram_channel_id.as_deref()
+    }
+
     /// Returns whether channel data for `channel_id` should also be sent on
     /// the ordinary unicast QUIC path.
     ///
@@ -7263,7 +7306,7 @@ impl<F: BufFactory> Connection<F> {
         }
 
         if self.multicast_channel_needs_unicast_fallback(channel_id) {
-            self.dgram_send_buf(buf)?;
+            self.dgram_send_buf_direct(buf)?;
         }
 
         Ok(())
