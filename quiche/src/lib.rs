@@ -7223,6 +7223,36 @@ impl<F: BufFactory> Connection<F> {
         self.multicast_on_state_frame(&frame)
     }
 
+    /// Sets how long a viable multicast channel can go without a fresh
+    /// `MC_ACK` before it re-enters fallback.
+    ///
+    /// When a timeout is configured, each valid peer `MC_ACK` refreshes the
+    /// channel's viability deadline. If the deadline expires, [`on_timeout()`]
+    /// marks the channel as timed out and ordinary DATAGRAM fallback resumes.
+    ///
+    /// [`on_timeout()`]: struct.Connection.html#method.on_timeout
+    pub fn multicast_set_ack_timeout(
+        &mut self, channel_id: &[u8], timeout: Option<Duration>,
+    ) -> Result<()> {
+        if !self.is_server {
+            return Err(Error::InvalidState);
+        }
+
+        let state = self
+            .multicast_probe_states
+            .entry(channel_id.to_vec())
+            .or_insert_with(|| {
+                multicast::ProbeState::new(multicast::ProbeStatus::Probing, None)
+            });
+        state.ack_timeout = timeout;
+
+        if state.status == multicast::ProbeStatus::Viable {
+            state.deadline = timeout.map(|timeout| Instant::now() + timeout);
+        }
+
+        Ok(())
+    }
+
     /// Updates connection-local multicast probe state using one validated peer
     /// `MC_ACK`.
     pub fn multicast_process_peer_ack(
@@ -7514,16 +7544,31 @@ impl<F: BufFactory> Connection<F> {
     }
 
     fn multicast_on_peer_ack(&mut self, frame: &multicast::Ack) -> Result<()> {
-        self.multicast_set_probe_state(MulticastProbeStateUpdate::new(
-            frame.channel_id.clone(),
-            multicast::ProbeStatus::Viable,
-        ))
+        let deadline = self
+            .multicast_probe_states
+            .get(frame.channel_id.as_slice())
+            .and_then(|state| state.ack_timeout)
+            .map(|timeout| Instant::now() + timeout);
+
+        self.multicast_set_probe_state(MulticastProbeStateUpdate {
+            deadline,
+            ..MulticastProbeStateUpdate::new(
+                frame.channel_id.clone(),
+                multicast::ProbeStatus::Viable,
+            )
+        })
     }
 
     fn multicast_probe_deadline(&self) -> Option<Instant> {
         self.multicast_probe_states
             .values()
-            .filter(|state| state.status == multicast::ProbeStatus::Probing)
+            .filter(|state| {
+                matches!(
+                    state.status,
+                    multicast::ProbeStatus::Probing |
+                        multicast::ProbeStatus::Viable
+                )
+            })
             .filter_map(|state| state.deadline)
             .min()
     }
@@ -7533,7 +7578,11 @@ impl<F: BufFactory> Connection<F> {
             .multicast_probe_states
             .iter_mut()
             .filter_map(|(channel_id, state)| {
-                if state.status != multicast::ProbeStatus::Probing {
+                if !matches!(
+                    state.status,
+                    multicast::ProbeStatus::Probing |
+                        multicast::ProbeStatus::Viable
+                ) {
                     return None;
                 }
 

@@ -795,6 +795,40 @@ fn multicast_default_dgram_channel_stops_plain_datagrams_after_ack() {
 }
 
 #[test]
+fn multicast_default_dgram_channel_resumes_after_ack_timeout() {
+    let mut pipe = multicast_dgram_negotiated_pipe();
+    let channel_id = vec![1, 2, 3, 4];
+    let data = b"fallback-after-ack-timeout";
+
+    pipe.server
+        .multicast_set_default_dgram_channel(Some(channel_id.clone()))
+        .unwrap();
+    pipe.server
+        .multicast_set_ack_timeout(&channel_id, Some(Duration::ZERO))
+        .unwrap();
+    pipe.server
+        .multicast_process_peer_ack(multicast_test_ack(&channel_id))
+        .unwrap();
+
+    assert_eq!(
+        pipe.server.multicast_probe_status(&channel_id),
+        Some(multicast::ProbeStatus::Viable)
+    );
+    assert_eq!(pipe.server.dgram_send(b"still-green"), Ok(()));
+    assert_eq!(pipe.server.dgram_send_queue_len(), 0);
+
+    pipe.server.on_timeout();
+
+    assert_eq!(
+        pipe.server.multicast_probe_status(&channel_id),
+        Some(multicast::ProbeStatus::TimedOut)
+    );
+    assert_eq!(pipe.server.dgram_send(data), Ok(()));
+
+    assert_client_receives_unicast_dgram(&mut pipe, data);
+}
+
+#[test]
 fn transport_params_forbid_duplicates() {
     // Given an encoded param.
     let initial_source_connection_id = b"id";
