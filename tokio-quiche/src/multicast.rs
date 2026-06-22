@@ -64,6 +64,7 @@ pub use crate::settings::MulticastClientSettings as ClientSettings;
 
 const STATE_REASON_UNSPECIFIED_OTHER: u64 = 0x0;
 const STATE_REASON_UNSYNCHRONIZED_PROPERTIES: u64 = 0x5;
+const SERVER_ACK_FRESHNESS_TIMEOUT_MULTIPLIER: u64 = 4;
 const PUBLISH_RETRY_DELAY: Duration = Duration::from_millis(10);
 
 /// A point-in-time multicast receive metrics snapshot for one joined channel.
@@ -1855,6 +1856,11 @@ impl ServerControlRuntime {
                         qconn,
                         &frame.channel_id,
                     )?;
+                    Self::set_ack_timeout(
+                        qconn,
+                        &frame.channel_id,
+                        frame.max_ack_delay_ms,
+                    )?;
                     let channel = self
                         .channels
                         .entry(frame.channel_id.clone())
@@ -1910,6 +1916,11 @@ impl ServerControlRuntime {
 
         let channel_id = config.announce.channel_id.clone();
         Self::set_default_dgram_channel_if_unset(qconn, &channel_id)?;
+        Self::set_ack_timeout(
+            qconn,
+            &channel_id,
+            config.announce.max_ack_delay_ms,
+        )?;
         let channel = self.channels.entry(channel_id.clone()).or_default();
         channel.announce = Some(config.announce.clone());
         channel.key = Some(config.key.clone());
@@ -1988,6 +1999,17 @@ impl ServerControlRuntime {
             qconn
                 .multicast_set_default_dgram_channel(Some(channel_id.to_vec()))?;
         }
+
+        Ok(())
+    }
+
+    fn set_ack_timeout(
+        qconn: &mut QuicheConnection, channel_id: &[u8], max_ack_delay_ms: u64,
+    ) -> QuicResult<()> {
+        qconn.multicast_set_ack_timeout(
+            channel_id,
+            Some(server_ack_freshness_timeout(max_ack_delay_ms)),
+        )?;
 
         Ok(())
     }
@@ -2164,6 +2186,10 @@ impl<B: PublishBackend> ServerRuntime<B> {
                     config.channel_id.clone(),
                 ))?;
             }
+            qconn.multicast_set_ack_timeout(
+                &config.channel_id,
+                Some(server_ack_freshness_timeout(config.max_ack_delay_ms)),
+            )?;
 
             let publication = self.backend.open(&config.publication)?;
             let (source, group, udp_port) =
@@ -2420,6 +2446,12 @@ impl PublishBackend for MctxPublishBackend {
 
 fn publish_would_block(error: &MctxError) -> bool {
     matches!(error, MctxError::SendFailed(err) if err.kind() == std::io::ErrorKind::WouldBlock)
+}
+
+fn server_ack_freshness_timeout(max_ack_delay_ms: u64) -> Duration {
+    Duration::from_millis(
+        max_ack_delay_ms.saturating_mul(SERVER_ACK_FRESHNESS_TIMEOUT_MULTIPLIER),
+    )
 }
 
 #[cfg(test)]
@@ -3066,6 +3098,55 @@ mod tests {
             .unwrap();
         pipe.server.dgram_send(b"do-not-duplicate").unwrap();
         assert_eq!(pipe.server.dgram_send_queue_len(), 0);
+    }
+
+    #[test]
+    fn server_control_runtime_ack_timeout_reenters_dgram_fallback() {
+        let settings = test_settings();
+        let mut server_settings = test_server_control_settings();
+        server_settings.channels[0].announce.max_ack_delay_ms = 0;
+        let channel_id = server_settings.channels[0].announce.channel_id.clone();
+        let mut pipe = test_pipe(&settings);
+        let (_command_sender, command_receiver) = mpsc::unbounded_channel();
+        let (event_sender, _event_receiver) = mpsc::unbounded_channel();
+        let mut runtime = ServerControlRuntime::new(
+            server_settings,
+            event_sender,
+            command_receiver,
+        );
+
+        runtime.on_conn_established(&mut pipe.server).unwrap();
+
+        pipe.client
+            .multicast_send(quiche::multicast::Frame::Ack(
+                quiche::multicast::Ack {
+                    channel_id: channel_id.clone(),
+                    largest_acknowledged: 1,
+                    ack_delay: 0,
+                    first_ack_range: 0,
+                    ack_ranges: Vec::new(),
+                    ecn_counts: None,
+                },
+            ))
+            .unwrap();
+        let flight = quiche::test_utils::emit_flight(&mut pipe.client).unwrap();
+        quiche::test_utils::process_flight(&mut pipe.server, flight).unwrap();
+        runtime.process_reads(&mut pipe.server).unwrap();
+
+        assert_eq!(
+            pipe.server.multicast_probe_status(&channel_id),
+            Some(quiche::multicast::ProbeStatus::Viable)
+        );
+
+        pipe.server.on_timeout();
+
+        assert_eq!(
+            pipe.server.multicast_probe_status(&channel_id),
+            Some(quiche::multicast::ProbeStatus::TimedOut)
+        );
+
+        pipe.server.dgram_send(b"fallback-after-stall").unwrap();
+        assert_client_receives_dgram(&mut pipe, b"fallback-after-stall");
     }
 
     #[test]

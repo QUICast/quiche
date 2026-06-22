@@ -42,6 +42,7 @@ use std::collections::VecDeque;
 use std::net::IpAddr;
 use std::net::Ipv4Addr;
 use std::net::Ipv6Addr;
+use std::time::Duration;
 use std::time::Instant;
 
 use ring::digest;
@@ -532,11 +533,16 @@ pub struct ChannelDatagram {
 pub(crate) struct ProbeState {
     pub(crate) status: ProbeStatus,
     pub(crate) deadline: Option<Instant>,
+    pub(crate) ack_timeout: Option<Duration>,
 }
 
 impl ProbeState {
     pub(crate) fn new(status: ProbeStatus, deadline: Option<Instant>) -> Self {
-        Self { status, deadline }
+        Self {
+            status,
+            deadline,
+            ack_timeout: None,
+        }
     }
 }
 
