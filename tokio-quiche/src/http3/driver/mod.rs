@@ -414,6 +414,8 @@ pub struct H3Driver<H: DriverHooks> {
     /// Configuration used to initialize `conn`. Created from [`Http3Settings`]
     /// in the constructor.
     h3_config: h3::Config,
+    /// Optional MCQUIC channel ID used for HTTP/3 DATAGRAM unicast fallback.
+    multicast_datagram_channel_id: Option<Vec<u8>>,
     /// The underlying HTTP/3 connection. Initialized in
     /// `ApplicationOverQuic::on_conn_established`.
     conn: Option<h3::Connection>,
@@ -471,10 +473,13 @@ impl<H: DriverHooks> H3Driver<H> {
         let (dgram_send, dgram_recv) = mpsc::channel(FLOW_CAPACITY);
         let (cmd_sender, cmd_recv) = mpsc::unbounded_channel();
         let (h3_event_sender, h3_event_recv) = mpsc::unbounded_channel();
+        let multicast_datagram_channel_id =
+            http3_settings.multicast_datagram_channel_id.clone();
 
         (
             H3Driver {
                 h3_config: (&http3_settings).into(),
+                multicast_datagram_channel_id,
                 conn: None,
                 hooks: H::new(&http3_settings),
                 h3_event_sender,
@@ -1024,7 +1029,15 @@ impl<H: DriverHooks> H3Driver<H> {
             match frame {
                 Ok(OutboundFrame::Datagram(dgram, flow_id)) => {
                     // Drop datagrams if there is no capacity
-                    let _ = datagram::send_h3_dgram(qconn, flow_id, dgram);
+                    let _ = if let Some(channel_id) =
+                        self.multicast_datagram_channel_id.as_deref()
+                    {
+                        datagram::send_h3_dgram_on_multicast_channel(
+                            qconn, channel_id, flow_id, dgram,
+                        )
+                    } else {
+                        datagram::send_h3_dgram(qconn, flow_id, dgram)
+                    };
                 },
                 Ok(OutboundFrame::FlowShutdown { flow_id, stream_id }) => {
                     self.shutdown_stream(

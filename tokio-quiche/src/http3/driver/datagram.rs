@@ -84,6 +84,19 @@ pub(crate) fn send_h3_dgram(
     conn.dgram_send_buf(h3_dgram_add_quarter_stream_id(quarter_stream_id, dgram)?)
 }
 
+/// Sends an HTTP/3 DATAGRAM as MCQUIC channel data, using unicast fallback
+/// until the channel is proven viable by `MC_ACK`.
+#[inline]
+pub(crate) fn send_h3_dgram_on_multicast_channel(
+    conn: &mut QuicheConnection, channel_id: &[u8], quarter_stream_id: u64,
+    dgram: DgramBuffer,
+) -> quiche::Result<()> {
+    conn.multicast_dgram_send_buf(
+        channel_id,
+        h3_dgram_add_quarter_stream_id(quarter_stream_id, dgram)?,
+    )
+}
+
 /// Prepend the `quarter_stream_id` to `dgram`
 fn h3_dgram_add_quarter_stream_id(
     quarter_stream_id: u64, mut dgram: DgramBuffer,

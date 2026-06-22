@@ -575,6 +575,8 @@ mod server_side_driver {
     const WEBTRANSPORT_BIDI_STREAM_TYPE: u64 = 0x41;
     const WEBTRANSPORT_UNI_STREAM_TYPE: u64 = 0x54;
 
+    type DriverPipe = quiche::test_utils::Pipe<crate::buf_factory::BufFactory>;
+
     fn make_webtransport_request_headers() -> Vec<h3::Header> {
         vec![
             h3::Header::new(b":method", b"CONNECT"),
@@ -590,6 +592,63 @@ mod server_side_driver {
             enable_webtransport: true,
             ..Default::default()
         }
+    }
+
+    fn webtransport_multicast_settings(channel_id: Vec<u8>) -> Http3Settings {
+        Http3Settings {
+            multicast_datagram_channel_id: Some(channel_id),
+            ..webtransport_settings()
+        }
+    }
+
+    fn dgram_enabled_pipe() -> DriverPipe {
+        let mut config = default_quiche_config();
+        config.enable_dgram(true, 10, 10);
+        quiche::test_utils::Pipe::with_config_and_buf(&mut config).unwrap()
+    }
+
+    fn dgram_buf(data: &[u8]) -> datagram_socket::DgramBuffer {
+        <crate::buf_factory::BufFactory as quiche::BufFactory>::dgram_buf_from_slice(
+            data,
+        )
+    }
+
+    fn multicast_ack(channel_id: &[u8]) -> quiche::multicast::Ack {
+        quiche::multicast::Ack {
+            channel_id: channel_id.to_vec(),
+            largest_acknowledged: 0,
+            ack_delay: 0,
+            first_ack_range: 0,
+            ack_ranges: Vec::new(),
+            ecn_counts: None,
+        }
+    }
+
+    fn assert_client_raw_h3_dgram(
+        helper: &mut DriverTestHelper<ServerHooks>, expected_flow_id: u64,
+        expected_payload: &[u8],
+    ) {
+        let mut buf = [0; 128];
+        let len = helper.pipe.client.dgram_recv(&mut buf).unwrap();
+        let mut dgram = octets::Octets::with_slice(&buf[..len]);
+
+        assert_eq!(dgram.get_varint().unwrap(), expected_flow_id);
+        assert_eq!(
+            dgram.get_bytes(dgram.cap()).unwrap().to_vec(),
+            expected_payload
+        );
+        assert_eq!(
+            helper.pipe.client.dgram_recv(&mut buf),
+            Err(quiche::Error::Done)
+        );
+    }
+
+    fn assert_client_no_raw_h3_dgram(helper: &mut DriverTestHelper<ServerHooks>) {
+        let mut buf = [0; 128];
+        assert_eq!(
+            helper.pipe.client.dgram_recv(&mut buf),
+            Err(quiche::Error::Done)
+        );
     }
 
     fn encode_varint(value: u64, out: &mut Vec<u8>) {
@@ -651,6 +710,19 @@ mod server_side_driver {
     fn accept_webtransport_session(
         helper: &mut DriverTestHelper<ServerHooks>,
     ) -> (tokio::sync::mpsc::Sender<OutboundFrame>, InboundFrameStream) {
+        let (to_client, from_client, _) =
+            accept_webtransport_session_with_flow(helper);
+
+        (to_client, from_client)
+    }
+
+    fn accept_webtransport_session_with_flow(
+        helper: &mut DriverTestHelper<ServerHooks>,
+    ) -> (
+        tokio::sync::mpsc::Sender<OutboundFrame>,
+        InboundFrameStream,
+        OutboundFrameSender,
+    ) {
         helper.complete_handshake().unwrap();
         helper.advance_and_run_loop().unwrap();
 
@@ -660,13 +732,17 @@ mod server_side_driver {
 
         helper.advance_and_run_loop().unwrap();
         expect_connect_session_registered(helper, stream_id);
+        let mut flow_sender = None;
         let req = loop {
             match helper.driver_recv_server_event().unwrap() {
                 ServerH3Event::Headers {
                     incoming_headers, ..
                 } => break incoming_headers,
 
-                ServerH3Event::Core(H3Event::NewFlow { .. }) => continue,
+                ServerH3Event::Core(H3Event::NewFlow { send, .. }) => {
+                    flow_sender = Some(send);
+                    continue;
+                },
 
                 other => panic!("unexpected event: {other:?}"),
             }
@@ -689,7 +765,11 @@ mod server_side_driver {
             Ok((0, h3::Event::Headers { .. }))
         );
 
-        (to_client, from_client)
+        (
+            to_client,
+            from_client,
+            flow_sender.expect("CONNECT request must create an H3 DATAGRAM flow"),
+        )
     }
 
     #[test]
@@ -718,6 +798,43 @@ mod server_side_driver {
             )
             .unwrap();
         let (_to_client, _from_client) = accept_webtransport_session(&mut helper);
+    }
+
+    #[test]
+    fn h3_datagram_multicast_channel_uses_quic_fallback_state() {
+        let channel_id = vec![1, 2, 3, 4];
+        let mut helper =
+            DriverTestHelper::<ServerHooks>::with_pipe_and_http3_settings(
+                dgram_enabled_pipe(),
+                webtransport_multicast_settings(channel_id.clone()),
+            )
+            .unwrap();
+        let (_to_client, _from_client, flow_sender) =
+            accept_webtransport_session_with_flow(&mut helper);
+
+        flow_sender
+            .get_ref()
+            .unwrap()
+            .try_send(OutboundFrame::Datagram(dgram_buf(b"fallback"), 0))
+            .unwrap();
+        helper.work_loop_iter().unwrap();
+        helper.pipe.advance().unwrap();
+        assert_client_raw_h3_dgram(&mut helper, 0, b"fallback");
+
+        helper
+            .pipe
+            .server
+            .multicast_process_peer_ack(multicast_ack(&channel_id))
+            .unwrap();
+
+        flow_sender
+            .get_ref()
+            .unwrap()
+            .try_send(OutboundFrame::Datagram(dgram_buf(b"multicast-green"), 0))
+            .unwrap();
+        helper.work_loop_iter().unwrap();
+        helper.pipe.advance().unwrap();
+        assert_client_no_raw_h3_dgram(&mut helper);
     }
 
     #[test]
