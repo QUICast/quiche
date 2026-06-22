@@ -79,6 +79,13 @@ pub struct Http3Settings {
     /// Chrome requires this in addition to extended CONNECT before it considers
     /// WebTransport sessions negotiated.
     pub enable_webtransport: bool,
+    /// QUIC multicast channel ID used for HTTP/3 DATAGRAM unicast fallback.
+    ///
+    /// When set, outbound HTTP/3 DATAGRAMs are tagged as data for this MCQUIC
+    /// channel. quiche sends them over ordinary unicast QUIC packets until the
+    /// channel is proven viable by `MC_ACK`, and suppresses duplicate unicast
+    /// delivery while multicast is green.
+    pub multicast_datagram_channel_id: Option<Vec<u8>>,
     /// Experimental escape hatch for interop harnesses that need to read
     /// selected raw QUIC streams on an HTTP/3 connection.
     ///

@@ -7265,6 +7265,50 @@ impl<F: BufFactory> Connection<F> {
         self.multicast_dgram_recv_queue.len()
     }
 
+    /// Returns whether channel data for `channel_id` should also be sent on
+    /// the ordinary unicast QUIC path.
+    ///
+    /// `MC_STATE(JOINED)` only moves a channel into probing. The server keeps
+    /// using unicast fallback until a validated `MC_ACK` marks the channel as
+    /// viable. Any later non-viable state resumes fallback.
+    pub fn multicast_channel_needs_unicast_fallback(
+        &self, channel_id: &[u8],
+    ) -> bool {
+        self.multicast_probe_status(channel_id) !=
+            Some(multicast::ProbeStatus::Viable)
+    }
+
+    /// Queues a channel DATAGRAM payload for unicast fallback when multicast
+    /// delivery for `channel_id` has not been proven viable.
+    ///
+    /// If the channel is already viable, this returns `Ok(())` without queuing
+    /// a duplicate unicast DATAGRAM. This helper is intentionally server-side:
+    /// multicast channels carry server-to-client data in the draft.
+    pub fn multicast_dgram_send(
+        &mut self, channel_id: &[u8], buf: &[u8],
+    ) -> Result<()> {
+        self.multicast_dgram_send_buf(channel_id, F::dgram_buf_from_slice(buf))
+    }
+
+    /// Queues an owned channel DATAGRAM payload for unicast fallback when
+    /// multicast delivery for `channel_id` has not been proven viable.
+    ///
+    /// This is the owned-buffer variant of
+    /// [`Connection::multicast_dgram_send`].
+    pub fn multicast_dgram_send_buf(
+        &mut self, channel_id: &[u8], buf: F::DgramBuf,
+    ) -> Result<()> {
+        if !self.is_server {
+            return Err(Error::InvalidState);
+        }
+
+        if self.multicast_channel_needs_unicast_fallback(channel_id) {
+            self.dgram_send_buf(buf)?;
+        }
+
+        Ok(())
+    }
+
     /// Queues a multicast control frame for transmission on the unicast
     /// connection.
     ///

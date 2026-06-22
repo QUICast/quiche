@@ -301,6 +301,56 @@ fn multicast_negotiated_pipe() -> test_utils::Pipe {
     pipe
 }
 
+fn multicast_dgram_negotiated_pipe() -> test_utils::Pipe {
+    let mut client_config = test_utils::Pipe::default_config("cubic").unwrap();
+    client_config
+        .set_multicast_client_params(Some(multicast_test_client_params()));
+    client_config.enable_dgram(true, 10, 10);
+
+    let mut server_config = test_utils::Pipe::default_config("cubic").unwrap();
+    server_config.enable_multicast_server_support(true);
+    server_config.enable_dgram(true, 10, 10);
+
+    let mut pipe = test_utils::Pipe::with_client_and_server_config(
+        &mut client_config,
+        &mut server_config,
+    )
+    .unwrap();
+
+    assert_eq!(pipe.handshake(), Ok(()));
+
+    pipe
+}
+
+fn multicast_test_ack(channel_id: &[u8]) -> multicast::Ack {
+    multicast::Ack {
+        channel_id: channel_id.to_vec(),
+        largest_acknowledged: 0,
+        ack_delay: 0,
+        first_ack_range: 0,
+        ack_ranges: Vec::new(),
+        ecn_counts: None,
+    }
+}
+
+fn assert_client_receives_unicast_dgram(
+    pipe: &mut test_utils::Pipe, expected: &[u8],
+) {
+    pipe.advance().unwrap();
+
+    let mut buf = [0; 128];
+    let len = pipe.client.dgram_recv(&mut buf).unwrap();
+    assert_eq!(&buf[..len], expected);
+    assert_eq!(pipe.client.dgram_recv(&mut buf), Err(Error::Done));
+}
+
+fn assert_client_receives_no_unicast_dgram(pipe: &mut test_utils::Pipe) {
+    pipe.advance().unwrap();
+
+    let mut buf = [0; 128];
+    assert_eq!(pipe.client.dgram_recv(&mut buf), Err(Error::Done));
+}
+
 #[test]
 fn multicast_control_frame_server_to_client_roundtrip() {
     let mut pipe = multicast_negotiated_pipe();
@@ -592,6 +642,116 @@ fn multicast_process_channel_packet_queues_datagram() {
         })
     );
     assert_eq!(pipe.client.multicast_dgram_recv(), Err(Error::Done));
+}
+
+#[test]
+fn multicast_dgram_fallback_emits_while_probe_is_pending() {
+    let mut pipe = multicast_dgram_negotiated_pipe();
+    let channel_id = vec![1, 2, 3, 4];
+    let data = b"fallback-before-ack";
+
+    pipe.server
+        .multicast_probe_start(&channel_id, Duration::from_secs(1))
+        .unwrap();
+
+    assert!(pipe
+        .server
+        .multicast_channel_needs_unicast_fallback(&channel_id));
+    assert_eq!(pipe.server.multicast_dgram_send(&channel_id, data), Ok(()));
+
+    assert_client_receives_unicast_dgram(&mut pipe, data);
+}
+
+#[test]
+fn multicast_dgram_fallback_is_not_suppressed_by_joined_state() {
+    let mut pipe = multicast_dgram_negotiated_pipe();
+    let channel_id = vec![1, 2, 3, 4];
+    let data = b"joined-is-not-green";
+
+    pipe.client
+        .multicast_send(multicast::Frame::State(multicast::State {
+            channel_id: channel_id.clone(),
+            sequence: 1,
+            state: multicast::ChannelState::Joined,
+            reason_scope: multicast::StateReasonScope::Transport,
+            reason_code: multicast::STATE_REASON_REQUESTED_BY_SERVER,
+            reason_phrase: Vec::new(),
+        }))
+        .unwrap();
+    pipe.advance().unwrap();
+
+    assert_eq!(
+        pipe.server.multicast_probe_status(&channel_id),
+        Some(multicast::ProbeStatus::Probing)
+    );
+    assert!(pipe
+        .server
+        .multicast_channel_needs_unicast_fallback(&channel_id));
+    assert_eq!(pipe.server.multicast_dgram_send(&channel_id, data), Ok(()));
+
+    assert_client_receives_unicast_dgram(&mut pipe, data);
+}
+
+#[test]
+fn multicast_dgram_fallback_stops_after_ack_makes_channel_viable() {
+    let mut pipe = multicast_dgram_negotiated_pipe();
+    let channel_id = vec![1, 2, 3, 4];
+
+    pipe.server
+        .multicast_process_peer_ack(multicast_test_ack(&channel_id))
+        .unwrap();
+
+    assert_eq!(
+        pipe.server.multicast_probe_status(&channel_id),
+        Some(multicast::ProbeStatus::Viable)
+    );
+    assert!(!pipe
+        .server
+        .multicast_channel_needs_unicast_fallback(&channel_id));
+    assert_eq!(
+        pipe.server
+            .multicast_dgram_send(&channel_id, b"do-not-duplicate"),
+        Ok(())
+    );
+    assert_eq!(pipe.server.dgram_send_queue_len(), 0);
+
+    assert_client_receives_no_unicast_dgram(&mut pipe);
+}
+
+#[test]
+fn multicast_dgram_fallback_resumes_after_channel_leaves() {
+    let mut pipe = multicast_dgram_negotiated_pipe();
+    let channel_id = vec![1, 2, 3, 4];
+    let data = b"fallback-after-leave";
+
+    pipe.server
+        .multicast_process_peer_ack(multicast_test_ack(&channel_id))
+        .unwrap();
+    assert!(!pipe
+        .server
+        .multicast_channel_needs_unicast_fallback(&channel_id));
+
+    pipe.server
+        .multicast_process_local_state(multicast::State {
+            channel_id: channel_id.clone(),
+            sequence: 2,
+            state: multicast::ChannelState::Left,
+            reason_scope: multicast::StateReasonScope::Transport,
+            reason_code: multicast::STATE_REASON_REQUESTED_BY_SERVER,
+            reason_phrase: Vec::new(),
+        })
+        .unwrap();
+
+    assert_eq!(
+        pipe.server.multicast_probe_status(&channel_id),
+        Some(multicast::ProbeStatus::Left)
+    );
+    assert!(pipe
+        .server
+        .multicast_channel_needs_unicast_fallback(&channel_id));
+    assert_eq!(pipe.server.multicast_dgram_send(&channel_id, data), Ok(()));
+
+    assert_client_receives_unicast_dgram(&mut pipe, data);
 }
 
 #[test]

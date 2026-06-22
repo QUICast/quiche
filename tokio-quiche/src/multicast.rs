@@ -2120,7 +2120,7 @@ impl<B: PublishBackend> ServerRuntime<B> {
             self.pending_commands.push_back(command);
         }
 
-        self.encode_pending_commands();
+        self.encode_pending_commands(qconn);
         self.flush_pending_publications()?;
         self.flush_pending_integrities(qconn)?;
 
@@ -2218,20 +2218,37 @@ impl<B: PublishBackend> ServerRuntime<B> {
         Ok(())
     }
 
-    fn encode_pending_commands(&mut self) {
+    fn encode_pending_commands(&mut self, qconn: &mut QuicheConnection) {
         while let Some(command) = self.pending_commands.pop_front() {
             match command {
                 ServerCommand::Send { channel_id, frames } => {
-                    let Some(channel) = self.channels.get_mut(&channel_id) else {
+                    if !self.channels.contains_key(&channel_id) {
                         let _ =
                             self.event_sender.send(ServerEvent::EncodeError {
                                 channel_id,
                                 error: quiche::Error::InvalidState,
                             });
                         continue;
-                    };
+                    }
+
+                    for frame in &frames {
+                        let quiche::multicast::ChannelFrame::Datagram { data } =
+                            frame
+                        else {
+                            continue;
+                        };
+
+                        // DATAGRAM fallback is best-effort, matching the QUIC
+                        // DATAGRAM API. Multicast publication and integrity
+                        // relay still proceed even if the unicast queue is full.
+                        let _ = qconn.multicast_dgram_send(&channel_id, data);
+                    }
 
                     let mut packet = vec![0; 64 * 1024];
+                    let channel = self
+                        .channels
+                        .get_mut(&channel_id)
+                        .expect("channel existence checked above");
 
                     match channel.send_state.write_packet(&frames, &mut packet) {
                         Ok(output) => {
