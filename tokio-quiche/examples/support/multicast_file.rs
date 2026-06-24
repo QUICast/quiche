@@ -479,6 +479,10 @@ pub fn decode_file_packet(data: &[u8]) -> Result<Option<FilePacket>, String> {
             let file_name = String::from_utf8(file_name_bytes.to_vec())
                 .map_err(|_| "manifest file name was not valid UTF-8")?;
 
+            if cursor != data.len() {
+                return Err("manifest packet had trailing bytes".to_string());
+            }
+
             Ok(Some(FilePacket::Manifest(FileManifest {
                 transfer_id,
                 file_name,
@@ -617,6 +621,23 @@ mod tests {
             .unwrap();
 
         assert_eq!(decoded, FilePacket::Manifest(manifest));
+    }
+
+    #[test]
+    fn manifest_rejects_trailing_bytes() {
+        let manifest = FileManifest {
+            transfer_id: 7,
+            file_name: "hello.txt".to_string(),
+            file_len: 13,
+            chunk_payload_len: 4,
+            total_chunks: 4,
+        };
+        let mut packet = encode_manifest(&manifest);
+        packet.push(0);
+
+        let err = decode_file_packet(&packet).unwrap_err();
+
+        assert_eq!(err, "manifest packet had trailing bytes");
     }
 
     #[test]

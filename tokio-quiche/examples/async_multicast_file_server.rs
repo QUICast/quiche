@@ -142,6 +142,8 @@ const DEFAULT_MAX_ACK_DELAY_MS: u64 = 25;
 const INTEGRITY_BROADCAST_CAPACITY: usize = 2048;
 #[cfg(feature = "multicast")]
 const PACKET_LOG_INTERVAL: u64 = 128;
+#[cfg(feature = "multicast")]
+const CHANNEL_PACKET_BUFFER_LEN: usize = 64 * 1024;
 
 #[cfg(feature = "multicast")]
 #[derive(Parser, Debug)]
@@ -536,13 +538,17 @@ impl IntegrityFrameBatcher {
                     Some((pending_hashes + incoming_hashes) as u64);
 
                 if pending_hashes + incoming_hashes == self.max_hashes_per_frame {
-                    ready.push(self.pending.take().unwrap());
+                    if let Some(pending) = self.pending.take() {
+                        ready.push(pending);
+                    }
                 }
 
                 return Ok(ready);
             }
 
-            ready.push(self.pending.take().unwrap());
+            if let Some(pending) = self.pending.take() {
+                ready.push(pending);
+            }
         }
 
         if incoming_hashes >= self.max_hashes_per_frame {
@@ -578,7 +584,7 @@ impl FileControlApp {
             multicast_enabled: false,
             join_sent: false,
             joined: false,
-            out: vec![0; 64 * 1024],
+            out: vec![0; CHANNEL_PACKET_BUFFER_LEN],
         }
     }
 
@@ -1042,7 +1048,7 @@ async fn publish_loop(
     let mut previous_send_metrics = send_state.metrics_snapshot();
     let mut previous_control_metrics = shared.metrics.snapshot();
 
-    let mut packet_buf = vec![0; 64 * 1024];
+    let mut packet_buf = vec![0; CHANNEL_PACKET_BUFFER_LEN];
     let mut sent_packets = 0u64;
 
     loop {
