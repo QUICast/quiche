@@ -66,6 +66,7 @@ const STATE_REASON_UNSPECIFIED_OTHER: u64 = 0x0;
 const STATE_REASON_UNSYNCHRONIZED_PROPERTIES: u64 = 0x5;
 const SERVER_ACK_FRESHNESS_TIMEOUT_MULTIPLIER: u64 = 4;
 const PUBLISH_RETRY_DELAY: Duration = Duration::from_millis(10);
+const CHANNEL_PACKET_BUFFER_LEN: usize = 64 * 1024;
 
 /// A point-in-time multicast receive metrics snapshot for one joined channel.
 #[derive(Clone, Debug)]
@@ -269,6 +270,10 @@ enum ClientError {
 struct ClientRuntime<B: JoinBackend> {
     settings: ClientSettings,
     event_sender: UnboundedSender<ClientEvent>,
+    // Subscription tasks run outside the QUIC driver's immediate poll point,
+    // so they hand off validated socket ingress through this channel. The
+    // queue is drained on each driver tick and bounded in practice by the
+    // number and lifetime of joined channels.
     ingress_sender: UnboundedSender<IngressEvent>,
     ingress_receiver: UnboundedReceiver<IngressEvent>,
     pending_ingress: VecDeque<IngressEvent>,
@@ -2231,9 +2236,8 @@ impl<B: PublishBackend> ServerRuntime<B> {
             quiche::multicast::Frame::Ack(frame) => {
                 if let Some(channel) = self.channels.get_mut(&frame.channel_id) {
                     channel.send_state.on_ack(&frame)?;
+                    qconn.multicast_process_peer_ack(frame.clone())?;
                 }
-
-                qconn.multicast_process_peer_ack(frame.clone())?;
 
                 let _ = self.event_sender.send(ServerEvent::ClientAck(frame));
             },
@@ -2278,14 +2282,14 @@ impl<B: PublishBackend> ServerRuntime<B> {
         while let Some(command) = self.pending_commands.pop_front() {
             match command {
                 ServerCommand::Send { channel_id, frames } => {
-                    if !self.channels.contains_key(&channel_id) {
+                    let Some(channel) = self.channels.get_mut(&channel_id) else {
                         let _ =
                             self.event_sender.send(ServerEvent::EncodeError {
                                 channel_id,
                                 error: quiche::Error::InvalidState,
                             });
                         continue;
-                    }
+                    };
 
                     for frame in &frames {
                         let quiche::multicast::ChannelFrame::Datagram { data } =
@@ -2300,11 +2304,7 @@ impl<B: PublishBackend> ServerRuntime<B> {
                         let _ = qconn.multicast_dgram_send(&channel_id, data);
                     }
 
-                    let mut packet = vec![0; 64 * 1024];
-                    let channel = self
-                        .channels
-                        .get_mut(&channel_id)
-                        .expect("channel existence checked above");
+                    let mut packet = vec![0; CHANNEL_PACKET_BUFFER_LEN];
 
                     match channel.send_state.write_packet(&frames, &mut packet) {
                         Ok(output) => {
@@ -3224,6 +3224,48 @@ mod tests {
         assert_eq!(metrics.acked_packets_reported, 3);
         assert_eq!(metrics.ack_errors, 0);
         assert_eq!(metrics.largest_acknowledged, Some(7));
+    }
+
+    #[test]
+    fn server_runtime_does_not_probe_unknown_ack() {
+        let settings = test_settings();
+        let server_settings = test_server_settings();
+        let mut pipe = test_pipe(&settings);
+        let backend = FakePublishBackend::default();
+        let (_command_sender, command_receiver) = mpsc::unbounded_channel();
+        let (event_sender, mut event_receiver) = mpsc::unbounded_channel();
+        let mut runtime = ServerRuntime::with_backend(
+            server_settings,
+            event_sender,
+            command_receiver,
+            backend,
+        );
+        let ack = quiche::multicast::Ack {
+            channel_id: vec![9, 9, 9, 9],
+            largest_acknowledged: 3,
+            ack_delay: 0,
+            first_ack_range: 0,
+            ack_ranges: Vec::new(),
+            ecn_counts: None,
+        };
+
+        runtime.on_conn_established(&mut pipe.server).unwrap();
+
+        pipe.client
+            .multicast_send(quiche::multicast::Frame::Ack(ack.clone()))
+            .unwrap();
+
+        let flight = quiche::test_utils::emit_flight(&mut pipe.client).unwrap();
+        quiche::test_utils::process_flight(&mut pipe.server, flight).unwrap();
+
+        runtime.process_reads(&mut pipe.server).unwrap();
+
+        assert!(matches!(
+            event_receiver.try_recv(),
+            Ok(ServerEvent::ClientAck(frame)) if frame == ack
+        ));
+        assert_eq!(pipe.server.multicast_probe_status(&ack.channel_id), None);
+        assert_eq!(pipe.server.multicast_probe_recv(), Err(quiche::Error::Done));
     }
 
     #[test]

@@ -75,8 +75,7 @@ pub(crate) fn extract_quarter_stream_id(
     }
 }
 
-/// Sends an HTTP/3 datagram over the QUIC connection with the given
-/// `quarter_stream_id`.
+/// Sends an HTTP/3 DATAGRAM over the QUIC connection with the given flow ID.
 #[inline]
 pub(crate) fn send_h3_dgram(
     conn: &mut QuicheConnection, quarter_stream_id: u64, dgram: DgramBuffer,
@@ -97,7 +96,7 @@ pub(crate) fn send_h3_dgram_on_multicast_channel(
     )
 }
 
-/// Prepend the `quarter_stream_id` to `dgram`
+/// Prepends the HTTP/3 DATAGRAM flow ID to `dgram`.
 fn h3_dgram_add_quarter_stream_id(
     quarter_stream_id: u64, mut dgram: DgramBuffer,
 ) -> quiche::Result<DgramBuffer> {
@@ -119,15 +118,14 @@ fn h3_dgram_add_quarter_stream_id(
     Ok(dgram)
 }
 
-/// Strips the varint-encoded quarter stream ID from the front of `dgram` and
-/// returns `(quarter_stream_id, dgram)` with the cursor advanced past the
-/// prefix.
+/// Strips the varint-encoded HTTP/3 DATAGRAM flow ID from the front of `dgram`
+/// and returns `(flow_id, dgram)` with the cursor advanced past the prefix.
 fn h3_dgram_remove_quarter_stream_id(
     mut dgram: DgramBuffer,
 ) -> quiche::Result<(u64, DgramBuffer)> {
-    let quarter_stream_id =
-        octets::Octets::with_slice(dgram.as_slice()).get_varint()?;
-    let advance = octets::varint_len(quarter_stream_id);
+    let mut prefix = octets::Octets::with_slice(dgram.as_slice());
+    let quarter_stream_id = prefix.get_varint()?;
+    let advance = prefix.off();
     // Advance the cursor past the varint prefix — zero copy.
     dgram.advance(advance);
     Ok((quarter_stream_id, dgram))
@@ -181,6 +179,16 @@ mod tests {
 
         assert_eq!(quarter_stream_id, 67);
         assert_eq!(rest.as_slice(), &[1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn h3_dgram_remove_quarter_stream_id_uses_encoded_len() {
+        let dgram = DgramBuffer::from_slice(&[0x40, 0x01, 0xaa, 0xbb]);
+        let (quarter_stream_id, rest) =
+            h3_dgram_remove_quarter_stream_id(dgram).unwrap();
+
+        assert_eq!(quarter_stream_id, 1);
+        assert_eq!(rest.as_slice(), &[0xaa, 0xbb]);
     }
 
     /// remove_quarter_stream_id on an empty buffer returns an error (buffer too

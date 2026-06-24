@@ -1622,9 +1622,17 @@ pub enum ChannelReceiveEvent<M> {
 /// received [`Key`] and [`Integrity`] metadata, and encrypted datagrams that
 /// are waiting on either of those before they can be released.
 ///
+/// Packet buffering is intentionally owned by the caller: this state keeps
+/// packets for the lifetime of the channel so that late keys, late integrity
+/// frames, and duplicate suppression can all use the same packet-number view.
+/// Callers that need memory limits should bound channel lifetime, retire stale
+/// channels, or drop datagrams before calling [`recv()`].
+///
 /// The `M` type parameter allows callers to attach arbitrary metadata to each
 /// received datagram and receive it back once the packet is decoded, or when
 /// the buffered datagram ultimately fails validation.
+///
+/// [`recv()`]: Self::recv
 pub struct ChannelReceiveState<M = ()> {
     announce: Announce,
     header_open: crypto::Open,
@@ -1727,6 +1735,11 @@ impl<M> ChannelReceiveState<M> {
 
     /// Stores packet hashes from an `MC_INTEGRITY` frame and releases any
     /// buffered packets that now have matching integrity metadata.
+    ///
+    /// Counted integrity frames must carry exactly `packet_hash_count` hashes
+    /// of the announced algorithm's output length. Uncounted frames infer that
+    /// count from the payload length and are rejected if the length is not an
+    /// exact multiple.
     pub fn insert_integrity(
         &mut self, integrity: Integrity,
     ) -> Result<Vec<ChannelReceiveEvent<M>>> {
@@ -1784,6 +1797,10 @@ impl<M> ChannelReceiveState<M> {
     /// If the datagram has the required `MC_KEY` and `MC_INTEGRITY` metadata
     /// available, it is decoded immediately. Otherwise it is buffered until
     /// those prerequisites arrive in later control frames.
+    ///
+    /// Successfully decoded packet numbers are retained for duplicate
+    /// suppression until the receiver is dropped or the channel is otherwise
+    /// retired.
     pub fn recv(
         &mut self, buf: &[u8], metadata: M,
     ) -> Result<Vec<ChannelReceiveEvent<M>>> {
@@ -2520,30 +2537,38 @@ pub(crate) enum Sender {
 }
 
 #[derive(Default)]
-pub(crate) struct ControlFrameQueue {
-    queue: VecDeque<Frame>,
+pub(crate) struct BoundedQueue<T> {
+    queue: VecDeque<T>,
     queue_max_len: usize,
 }
 
-impl ControlFrameQueue {
+impl<T> BoundedQueue<T> {
     pub(crate) fn new(queue_max_len: usize) -> Self {
-        ControlFrameQueue {
+        Self {
             queue: VecDeque::new(),
             queue_max_len,
         }
     }
 
-    pub(crate) fn push(&mut self, frame: Frame) -> Result<()> {
+    pub(crate) fn push(&mut self, item: T) -> Result<()> {
         if self.is_full() {
             return Err(Error::Done);
         }
 
-        self.queue.push_back(frame);
+        self.queue.push_back(item);
 
         Ok(())
     }
 
-    pub(crate) fn pop(&mut self) -> Option<Frame> {
+    pub(crate) fn push_drop_oldest(&mut self, item: T) -> Result<()> {
+        if self.is_full() {
+            self.queue.pop_front();
+        }
+
+        self.push(item)
+    }
+
+    pub(crate) fn pop(&mut self) -> Option<T> {
         self.queue.pop_front()
     }
 
@@ -2560,87 +2585,9 @@ impl ControlFrameQueue {
     }
 }
 
-#[derive(Default)]
-pub(crate) struct ProbeEventQueue {
-    queue: VecDeque<ProbeEvent>,
-    queue_max_len: usize,
-}
-
-impl ProbeEventQueue {
-    pub(crate) fn new(queue_max_len: usize) -> Self {
-        ProbeEventQueue {
-            queue: VecDeque::new(),
-            queue_max_len,
-        }
-    }
-
-    pub(crate) fn push(&mut self, event: ProbeEvent) -> Result<()> {
-        if self.is_full() {
-            return Err(Error::Done);
-        }
-
-        self.queue.push_back(event);
-
-        Ok(())
-    }
-
-    pub(crate) fn pop(&mut self) -> Option<ProbeEvent> {
-        self.queue.pop_front()
-    }
-
-    pub(crate) fn has_pending(&self) -> bool {
-        !self.queue.is_empty()
-    }
-
-    pub(crate) fn is_full(&self) -> bool {
-        self.queue.len() == self.queue_max_len
-    }
-
-    pub(crate) fn len(&self) -> usize {
-        self.queue.len()
-    }
-}
-
-#[derive(Default)]
-pub(crate) struct ChannelDatagramQueue {
-    queue: VecDeque<ChannelDatagram>,
-    queue_max_len: usize,
-}
-
-impl ChannelDatagramQueue {
-    pub(crate) fn new(queue_max_len: usize) -> Self {
-        ChannelDatagramQueue {
-            queue: VecDeque::new(),
-            queue_max_len,
-        }
-    }
-
-    pub(crate) fn push(&mut self, dgram: ChannelDatagram) -> Result<()> {
-        if self.is_full() {
-            return Err(Error::Done);
-        }
-
-        self.queue.push_back(dgram);
-
-        Ok(())
-    }
-
-    pub(crate) fn pop(&mut self) -> Option<ChannelDatagram> {
-        self.queue.pop_front()
-    }
-
-    pub(crate) fn has_pending(&self) -> bool {
-        !self.queue.is_empty()
-    }
-
-    pub(crate) fn is_full(&self) -> bool {
-        self.queue.len() == self.queue_max_len
-    }
-
-    pub(crate) fn len(&self) -> usize {
-        self.queue.len()
-    }
-}
+pub(crate) type ControlFrameQueue = BoundedQueue<Frame>;
+pub(crate) type ProbeEventQueue = BoundedQueue<ProbeEvent>;
+pub(crate) type ChannelDatagramQueue = BoundedQueue<ChannelDatagram>;
 
 pub(crate) fn is_frame_type(ty: u64) -> bool {
     matches!(

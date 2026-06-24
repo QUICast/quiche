@@ -1214,7 +1214,8 @@ impl Config {
     /// Configures whether this endpoint advertises server-side multicast
     /// support using the experimental draft-08 transport parameter.
     ///
-    /// This controls the `multicast_server_support` transport parameter.
+    /// This controls the `multicast_server_support` transport parameter. It is
+    /// only encoded by server connections.
     ///
     /// The default is `false`.
     pub fn enable_multicast_server_support(&mut self, enabled: bool) {
@@ -1224,7 +1225,8 @@ impl Config {
     /// Sets the experimental draft-08 multicast client capabilities transport
     /// parameter for this endpoint.
     ///
-    /// Pass `None` to stop advertising multicast client capabilities.
+    /// This parameter is only encoded by client connections. Pass `None` to
+    /// stop advertising multicast client capabilities.
     pub fn set_multicast_client_params(
         &mut self, params: Option<multicast::ClientTransportParams>,
     ) {
@@ -7186,10 +7188,14 @@ impl<F: BufFactory> Connection<F> {
     /// Sets how long a viable multicast channel can go without a fresh
     /// `MC_ACK` before it re-enters fallback.
     ///
+    /// This is a server-side control-plane helper. Clients return
+    /// [`InvalidState`].
+    ///
     /// When a timeout is configured, each valid peer `MC_ACK` refreshes the
     /// channel's viability deadline. If the deadline expires, [`on_timeout()`]
     /// marks the channel as timed out and ordinary DATAGRAM fallback resumes.
     ///
+    /// [`InvalidState`]: enum.Error.html#variant.InvalidState
     /// [`on_timeout()`]: struct.Connection.html#method.on_timeout
     pub fn multicast_set_ack_timeout(
         &mut self, channel_id: &[u8], timeout: Option<Duration>,
@@ -7215,6 +7221,11 @@ impl<F: BufFactory> Connection<F> {
 
     /// Updates connection-local multicast probe state using one validated peer
     /// `MC_ACK`.
+    ///
+    /// This method only updates probe/fallback state. The caller is
+    /// responsible for first validating that the acknowledgment applies to a
+    /// channel packet it sent and that its acknowledged ranges are well-formed
+    /// for that channel.
     pub fn multicast_process_peer_ack(
         &mut self, frame: multicast::Ack,
     ) -> Result<()> {
@@ -7233,16 +7244,13 @@ impl<F: BufFactory> Connection<F> {
                 continue;
             };
 
-            if self.multicast_dgram_recv_queue.is_full() {
-                self.multicast_dgram_recv_queue.pop();
-            }
-
-            self.multicast_dgram_recv_queue
-                .push(multicast::ChannelDatagram {
+            self.multicast_dgram_recv_queue.push_drop_oldest(
+                multicast::ChannelDatagram {
                     channel_id: channel_id.clone(),
                     packet_number,
                     data,
-                })?;
+                },
+            )?;
         }
 
         Ok(())
@@ -7459,18 +7467,15 @@ impl<F: BufFactory> Connection<F> {
             return Ok(());
         }
 
-        if self.multicast_probe_event_queue.is_full() {
-            self.multicast_probe_event_queue.pop();
-        }
-
-        self.multicast_probe_event_queue
-            .push(multicast::ProbeEvent {
+        self.multicast_probe_event_queue.push_drop_oldest(
+            multicast::ProbeEvent {
                 channel_id,
                 status,
                 reason_scope,
                 reason_code,
                 reason_phrase,
-            })?;
+            },
+        )?;
 
         Ok(())
     }
@@ -7586,6 +7591,9 @@ impl<F: BufFactory> Connection<F> {
         let _ = b.get_varint()?;
 
         let frame = if frame_type == multicast::FRAME_TYPE_INTEGRITY_WITH_LENGTH {
+            // The counted form names how many hashes follow, but decoding it
+            // still needs the earlier MC_ANNOUNCE to recover each hash's
+            // negotiated length.
             let channel_id = multicast::decode_channel_id(&mut peek, true)?;
             let hash_len = self
                 .multicast_integrity_hash_len(&channel_id)
@@ -9412,11 +9420,7 @@ impl<F: BufFactory> Connection<F> {
                     self.multicast_on_state_frame(state)?;
                 }
 
-                if self.multicast_recv_queue.is_full() {
-                    self.multicast_recv_queue.pop();
-                }
-
-                self.multicast_recv_queue.push(frame)?;
+                self.multicast_recv_queue.push_drop_oldest(frame)?;
             },
 
             frame::Frame::ConnectionClose {
