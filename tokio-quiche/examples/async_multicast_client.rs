@@ -591,6 +591,16 @@ fn describe_channel_frame(frame: &quiche::multicast::ChannelFrame) -> String {
              final_size={final_size}"
         ),
 
+        quiche::multicast::ChannelFrame::ResetStreamAt {
+            stream_id,
+            error_code,
+            final_size,
+            reliable_size,
+        } => format!(
+            "RESET_STREAM_AT stream_id={stream_id} error_code={error_code} \
+             final_size={final_size} reliable_size={reliable_size}"
+        ),
+
         quiche::multicast::ChannelFrame::Stream {
             stream_id,
             offset,

@@ -1594,6 +1594,9 @@ where
     multicast_probe_event_queue: multicast::ProbeEventQueue,
     multicast_probe_states: BTreeMap<Vec<u8>, multicast::ProbeState>,
     multicast_default_dgram_channel_id: Option<Vec<u8>>,
+    multicast_stream_recovery: BTreeMap<Vec<u8>, MulticastStreamRecovery>,
+    multicast_stream_withheld_bytes: usize,
+    multicast_stream_deliveries: BTreeMap<u64, MulticastStreamDelivery>,
 
     /// Whether to emit DATAGRAM frames in the next packet.
     emit_dgram: bool,
@@ -1658,6 +1661,63 @@ struct MulticastProbeStateUpdate {
     reason_code: Option<u64>,
     reason_phrase: Vec<u8>,
     emit_if_unchanged: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MulticastStreamRange {
+    stream_id: u64,
+    offset: u64,
+    len: usize,
+    fin: bool,
+}
+
+#[derive(Debug)]
+struct MulticastStreamRecovery {
+    largest_published: Option<u64>,
+    largest_acknowledged: Option<u64>,
+    reordering_threshold: u64,
+    pending: BTreeMap<u64, MulticastStreamRange>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct MulticastStreamDelivery {
+    ranges: ranges::RangeSet,
+    max_offset: u64,
+}
+
+impl MulticastStreamDelivery {
+    fn insert(&mut self, range: MulticastStreamRange) {
+        let end = range.offset.saturating_add(range.len as u64);
+        self.max_offset = self.max_offset.max(end);
+
+        if range.len > 0 {
+            self.ranges.insert(range.offset..end);
+        }
+    }
+
+    fn overlap_len(&self, range: &std::ops::Range<u64>) -> usize {
+        self.ranges.iter().fold(0, |total, delivered| {
+            let overlap = delivered
+                .end
+                .min(range.end)
+                .saturating_sub(delivered.start.max(range.start));
+            let overlap = usize::try_from(overlap).unwrap_or(usize::MAX);
+
+            total.saturating_add(overlap)
+        })
+    }
+}
+
+impl Default for MulticastStreamRecovery {
+    fn default() -> Self {
+        Self {
+            largest_published: None,
+            largest_acknowledged: None,
+            reordering_threshold:
+                multicast::DEFAULT_STREAM_RECOVERY_REORDERING_THRESHOLD,
+            pending: BTreeMap::new(),
+        }
+    }
 }
 
 impl MulticastProbeStateUpdate {
@@ -2286,6 +2346,9 @@ impl<F: BufFactory> Connection<F> {
             ),
             multicast_probe_states: BTreeMap::new(),
             multicast_default_dgram_channel_id: None,
+            multicast_stream_recovery: BTreeMap::new(),
+            multicast_stream_withheld_bytes: 0,
+            multicast_stream_deliveries: BTreeMap::new(),
 
             emit_dgram: true,
 
@@ -3753,6 +3816,7 @@ impl<F: BufFactory> Connection<F> {
                         if is_complete && !is_readable && !is_writable {
                             let local = stream.local;
                             self.streams.collect(stream_id, local);
+                            self.multicast_stream_deliveries.remove(&stream_id);
                         }
 
                         // Update tx_bufferd to reflect any data that was dropped
@@ -4329,15 +4393,23 @@ impl<F: BufFactory> Connection<F> {
                         stream_id,
                         error_code,
                         final_size,
-                    } |
+                    } => {
+                        self.streams
+                            .insert_reset(stream_id, error_code, final_size);
+                    },
+
                     frame::Frame::ResetStreamAt {
                         stream_id,
                         error_code,
                         final_size,
-                        ..
+                        reliable_size,
                     } => {
-                        self.streams
-                            .insert_reset(stream_id, error_code, final_size);
+                        self.streams.insert_reset_at(
+                            stream_id,
+                            error_code,
+                            final_size,
+                            reliable_size,
+                        );
                     },
 
                     frame::Frame::StopSending {
@@ -5014,17 +5086,33 @@ impl<F: BufFactory> Connection<F> {
                 }
             }
 
-            // Create RESET_STREAM frames as needed.
-            for (stream_id, (error_code, final_size)) in self
+            // Create stream reset frames as needed.
+            for (stream_id, reset) in self
                 .streams
                 .reset()
                 .map(|(&k, &v)| (k, v))
-                .collect::<Vec<(u64, (u64, u64))>>()
+                .collect::<Vec<_>>()
             {
-                let frame = frame::Frame::ResetStream {
-                    stream_id,
-                    error_code,
-                    final_size,
+                let frame = match reset {
+                    stream::StreamReset::Reset {
+                        error_code,
+                        final_size,
+                    } => frame::Frame::ResetStream {
+                        stream_id,
+                        error_code,
+                        final_size,
+                    },
+
+                    stream::StreamReset::ResetAt {
+                        error_code,
+                        final_size,
+                        reliable_size,
+                    } => frame::Frame::ResetStreamAt {
+                        stream_id,
+                        error_code,
+                        final_size,
+                        reliable_size,
+                    },
                 };
 
                 if push_frame_to_pkt!(b, frames, frame, left) {
@@ -6369,10 +6457,18 @@ impl<F: BufFactory> Connection<F> {
             return Err(Error::InvalidStreamState(stream_id));
         }
 
+        let multicast_delivery = match direction {
+            Shutdown::Write =>
+                self.multicast_stream_deliveries.get(&stream_id).cloned(),
+
+            Shutdown::Read => None,
+        };
+
         // Get existing stream.
         let stream = self.streams.get_mut(stream_id).ok_or(Error::Done)?;
 
         let priority_key = Arc::clone(&stream.priority_key);
+        let mut reset_drop_range = None;
 
         match direction {
             Shutdown::Read => {
@@ -6395,11 +6491,33 @@ impl<F: BufFactory> Connection<F> {
                 // buffer).
                 let buffered_len = stream.send.buffered_bytes() as usize;
 
-                let (final_size, unsent) = stream.send.shutdown()?;
+                let drop_range = stream.send.reset_drop_range();
+                let delivered_overlap = multicast_delivery
+                    .as_ref()
+                    .map_or(0, |delivery| delivery.overlap_len(&drop_range));
+                let tx_data_before_reset = self.tx_data;
+                let (mut final_size, unsent) = stream.send.shutdown()?;
+                reset_drop_range = Some(drop_range);
 
                 // Claw back some flow control allowance from data that was
                 // buffered but not actually sent before the stream was reset.
                 self.tx_data = self.tx_data.saturating_sub(unsent);
+
+                let _dropped = usize::try_from(unsent)
+                    .unwrap_or(usize::MAX)
+                    .saturating_sub(delivered_overlap);
+
+                if let Some(delivery) = &multicast_delivery {
+                    if delivery.max_offset > final_size {
+                        let restored = delivery.max_offset - final_size;
+                        self.tx_data = self
+                            .tx_data
+                            .saturating_add(restored)
+                            .min(tx_data_before_reset);
+                        stream.send.raise_reset_final_size(delivery.max_offset);
+                        final_size = delivery.max_offset;
+                    }
+                }
 
                 // Update tx_buffered: subtract only the buffered data, not
                 // inflight data.
@@ -6417,7 +6535,7 @@ impl<F: BufFactory> Connection<F> {
                             stream_id: Some(stream_id),
                             offset: Some(final_size),
                             raw: Some(RawInfo {
-                                length: Some(unsent),
+                                length: Some(_dropped as u64),
                                 ..Default::default()
                             }),
                             from: Some(DataRecipient::Transport),
@@ -6440,6 +6558,14 @@ impl<F: BufFactory> Connection<F> {
                 self.reset_stream_local_count =
                     self.reset_stream_local_count.saturating_add(1);
             },
+        }
+
+        if let Some(reset_drop_range) = reset_drop_range {
+            self.multicast_stream_forget_stream(
+                stream_id,
+                Some(reset_drop_range),
+            );
+            self.multicast_stream_deliveries.remove(&stream_id);
         }
 
         Ok(())
@@ -6729,6 +6855,15 @@ impl<F: BufFactory> Connection<F> {
     #[inline]
     pub fn peer_streams_left_uni(&self) -> u64 {
         self.streams.peer_streams_left_uni()
+    }
+
+    /// Returns the peer's current server-initiated unidirectional stream count
+    /// limit.
+    ///
+    /// A server-initiated unidirectional stream ID is permitted when its stream
+    /// sequence (`stream_id >> 2`) is lower than this value.
+    pub fn peer_max_streams_uni(&self) -> u64 {
+        self.streams.peer_max_streams_uni()
     }
 
     /// Returns an iterator over streams that have outstanding data to read.
@@ -7231,9 +7366,10 @@ impl<F: BufFactory> Connection<F> {
     /// This is a server-side control-plane helper. Clients return
     /// [`InvalidState`].
     ///
-    /// When a timeout is configured, each valid peer `MC_ACK` refreshes the
-    /// channel's viability deadline. If the deadline expires, [`on_timeout()`]
-    /// marks the channel as timed out and ordinary DATAGRAM fallback resumes.
+    /// When a timeout is configured, each fresh valid peer `MC_ACK` refreshes
+    /// the channel's viability deadline. If the deadline expires,
+    /// [`on_timeout()`] marks the channel as timed out and ordinary fallback
+    /// resumes.
     ///
     /// [`InvalidState`]: enum.Error.html#variant.InvalidState
     /// [`on_timeout()`]: struct.Connection.html#method.on_timeout
@@ -7259,17 +7395,23 @@ impl<F: BufFactory> Connection<F> {
         Ok(())
     }
 
-    /// Updates connection-local multicast probe state using one validated peer
-    /// `MC_ACK`.
+    /// Applies one validated peer `MC_ACK` to multicast STREAM recovery and
+    /// connection-local probe state.
     ///
-    /// This method only updates probe/fallback state. The caller is
-    /// responsible for first validating that the acknowledgment applies to a
-    /// channel packet it sent and that its acknowledged ranges are well-formed
-    /// for that channel.
+    /// Registered STREAM channels validate the largest acknowledged packet and
+    /// recover sufficiently old gaps over unicast. Duplicate or regressive
+    /// ACKs do not refresh the channel's viability deadline. For channels
+    /// without registered STREAM publication state, the caller remains
+    /// responsible for validating that the acknowledgment applies to a channel
+    /// packet it sent.
     pub fn multicast_process_peer_ack(
         &mut self, frame: multicast::Ack,
     ) -> Result<()> {
-        self.multicast_on_peer_ack(&frame)
+        if self.multicast_stream_on_peer_ack(&frame)? {
+            return self.multicast_on_peer_ack(&frame);
+        }
+
+        Ok(())
     }
 
     /// Queues decoded multicast DATAGRAM payloads from one channel packet.
@@ -7390,6 +7532,117 @@ impl<F: BufFactory> Connection<F> {
         Ok(())
     }
 
+    /// Sets the packet-reordering threshold used for multicast STREAM
+    /// recovery on one channel.
+    ///
+    /// Once a channel is viable, an unacknowledged channel packet is recovered
+    /// over the ordinary unicast QUIC stream after this many newer packets have
+    /// been acknowledged by `MC_ACK`. The threshold must be greater than zero.
+    pub fn multicast_set_stream_recovery_reordering_threshold(
+        &mut self, channel_id: &[u8], threshold: u64,
+    ) -> Result<()> {
+        if !self.is_server || channel_id.is_empty() || threshold == 0 {
+            return Err(Error::InvalidState);
+        }
+
+        self.multicast_stream_recovery
+            .entry(channel_id.to_vec())
+            .or_default()
+            .reordering_threshold = threshold;
+
+        Ok(())
+    }
+
+    /// Registers one multicast STREAM frame and transparently schedules its
+    /// ordinary unicast fallback when needed.
+    ///
+    /// The stream must be a server-initiated unidirectional stream. Data is
+    /// appended at the exact supplied offset, which must equal the connection's
+    /// current send offset for the stream. Applications therefore need to write
+    /// any connection-specific prefix before registering shared multicast data.
+    ///
+    /// Before multicast is proven viable by `MC_ACK`, the range is queued for
+    /// normal unicast QUIC transmission immediately. While multicast is viable,
+    /// it is retained without being emitted and is released over unicast if the
+    /// channel packet is reported lost or the channel re-enters fallback.
+    pub fn multicast_stream_send(
+        &mut self, channel_id: &[u8], packet_number: u64, stream_id: u64,
+        offset: u64, buf: &[u8], fin: bool,
+    ) -> Result<()> {
+        self.multicast_stream_send_buf(
+            channel_id,
+            packet_number,
+            stream_id,
+            offset,
+            F::buf_from_slice(buf),
+            fin,
+        )
+    }
+
+    /// Registers an owned multicast STREAM frame for transparent unicast
+    /// fallback and recovery.
+    ///
+    /// This is the owned-buffer variant of
+    /// [`Connection::multicast_stream_send`]. Cloneable buffer factories can
+    /// share the retained bytes across multiple connections without copying.
+    pub fn multicast_stream_send_buf(
+        &mut self, channel_id: &[u8], packet_number: u64, stream_id: u64,
+        offset: u64, buf: F::Buf, fin: bool,
+    ) -> Result<()> {
+        if !self.is_server ||
+            channel_id.is_empty() ||
+            stream::is_bidi(stream_id) ||
+            !stream::is_local(stream_id, self.is_server)
+        {
+            return Err(Error::InvalidState);
+        }
+
+        if self
+            .multicast_stream_recovery
+            .get(channel_id)
+            .and_then(|state| state.largest_published)
+            .is_some_and(|largest| packet_number <= largest)
+        {
+            return Err(Error::InvalidState);
+        }
+
+        let fallback = self.multicast_channel_needs_unicast_fallback(channel_id);
+        let len = buf.as_ref().len();
+
+        self.multicast_stream_do_send_buf(stream_id, offset, buf, fin, fallback)?;
+
+        let state = self
+            .multicast_stream_recovery
+            .entry(channel_id.to_vec())
+            .or_default();
+        state.largest_published = Some(packet_number);
+
+        if !fallback {
+            state.pending.insert(packet_number, MulticastStreamRange {
+                stream_id,
+                offset,
+                len,
+                fin,
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Returns the number of viable-channel STREAM packets still awaiting an
+    /// `MC_ACK` or unicast recovery decision.
+    pub fn multicast_stream_recovery_pending(&self, channel_id: &[u8]) -> usize {
+        self.multicast_stream_recovery
+            .get(channel_id)
+            .map_or(0, |state| state.pending.len())
+    }
+
+    /// Returns the bytes retained for multicast STREAM recovery across all
+    /// channels on this connection.
+    pub fn multicast_stream_recovery_withheld_bytes(&self) -> usize {
+        self.multicast_stream_withheld_bytes
+    }
+
     /// Queues a multicast control frame for transmission on the unicast
     /// connection.
     ///
@@ -7479,6 +7732,250 @@ impl<F: BufFactory> Connection<F> {
             .copied()
     }
 
+    fn multicast_stream_do_send_buf(
+        &mut self, stream_id: u64, offset: u64, buf: F::Buf, fin: bool,
+        transmit: bool,
+    ) -> Result<()> {
+        let len = buf.as_ref().len();
+
+        if offset > 0 && self.streams.get(stream_id).is_none() {
+            return Err(Error::InvalidStreamState(stream_id));
+        }
+
+        if self.max_tx_data - self.tx_data < len as u64 {
+            self.blocked_limit = Some(self.max_tx_data);
+            return Err(Error::Done);
+        }
+
+        let (priority_key, was_flushable, flushable, writable) = {
+            let stream = match self.get_or_create_stream(stream_id, true) {
+                Ok(stream) => stream,
+
+                Err(Error::StreamLimit) => {
+                    if self.enable_send_streams_blocked {
+                        let limit = self.streams.peer_max_streams_uni();
+                        self.streams_blocked_uni_state.update_at(limit);
+                    }
+
+                    return Err(Error::StreamLimit);
+                },
+
+                Err(error) => return Err(error),
+            };
+
+            let send_cap = stream.send.cap()?;
+
+            if stream.send.off_back() < offset {
+                return Err(Error::Done);
+            }
+
+            if stream.send.off_back() != offset {
+                return Err(Error::InvalidState);
+            }
+
+            if send_cap < len {
+                let max_off = stream.send.max_off();
+                if stream.send.blocked_at() != Some(max_off) {
+                    stream.send.update_blocked_at(Some(max_off));
+                    self.streams.insert_blocked(stream_id, max_off);
+                }
+
+                return Err(Error::Done);
+            }
+
+            let was_flushable = stream.is_flushable();
+            let priority_key = Arc::clone(&stream.priority_key);
+
+            stream.send.write_at(buf, offset, fin, transmit)?;
+            stream.send.update_blocked_at(None);
+
+            (
+                priority_key,
+                was_flushable,
+                stream.is_flushable(),
+                stream.is_writable(),
+            )
+        };
+
+        self.streams.remove_blocked(stream_id);
+
+        if transmit && (flushable || (len == 0 && fin)) && !was_flushable {
+            self.streams.insert_flushable(&priority_key);
+        }
+
+        if !writable {
+            self.streams.remove_writable(&priority_key);
+        }
+
+        if transmit {
+            self.tx_cap = self.tx_cap.saturating_sub(len);
+            self.streams.add_tx_buffered(len);
+        } else {
+            self.multicast_stream_withheld_bytes =
+                self.multicast_stream_withheld_bytes.saturating_add(len);
+        }
+
+        self.tx_data += len as u64;
+
+        Ok(())
+    }
+
+    fn multicast_stream_schedule_range(
+        &mut self, range: MulticastStreamRange,
+    ) -> bool {
+        let Some(stream) = self.streams.get_mut(range.stream_id) else {
+            return false;
+        };
+
+        if stream.send.is_shutdown() || stream.send.is_stopped() {
+            return false;
+        }
+
+        let retransmitted = stream.send.retransmit(range.offset, range.len);
+        self.tx_cap = self.tx_cap.saturating_sub(range.len);
+
+        let priority_key = Arc::clone(&stream.priority_key);
+        let flushable = stream.is_flushable() || (range.len == 0 && range.fin);
+
+        self.streams.add_tx_buffered(retransmitted);
+
+        if flushable {
+            self.streams.insert_flushable(&priority_key);
+        }
+
+        true
+    }
+
+    fn multicast_stream_mark_delivered(&mut self, range: MulticastStreamRange) {
+        self.multicast_stream_withheld_bytes = self
+            .multicast_stream_withheld_bytes
+            .saturating_sub(range.len);
+        self.multicast_stream_deliveries
+            .entry(range.stream_id)
+            .or_default()
+            .insert(range);
+
+        let Some(stream) = self.streams.get_mut(range.stream_id) else {
+            return;
+        };
+
+        stream.send.ack_and_drop(range.offset, range.len);
+
+        if stream.is_complete() && !stream.is_readable() {
+            let local = stream.local;
+            self.streams.collect(range.stream_id, local);
+            self.multicast_stream_deliveries.remove(&range.stream_id);
+        }
+    }
+
+    fn multicast_stream_release_range(&mut self, range: MulticastStreamRange) {
+        self.multicast_stream_withheld_bytes = self
+            .multicast_stream_withheld_bytes
+            .saturating_sub(range.len);
+
+        self.multicast_stream_schedule_range(range);
+    }
+
+    fn multicast_stream_release_channel(&mut self, channel_id: &[u8]) {
+        let pending = self
+            .multicast_stream_recovery
+            .get_mut(channel_id)
+            .map(|state| {
+                std::mem::take(&mut state.pending)
+                    .into_values()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        for range in pending {
+            self.multicast_stream_release_range(range);
+        }
+    }
+
+    fn multicast_stream_forget_stream(
+        &mut self, stream_id: u64,
+        _reset_drop_range: Option<std::ops::Range<u64>>,
+    ) {
+        let mut forgotten_withheld = 0_usize;
+
+        for state in self.multicast_stream_recovery.values_mut() {
+            state.pending.retain(|_, range| {
+                if range.stream_id != stream_id {
+                    return true;
+                }
+
+                forgotten_withheld = forgotten_withheld.saturating_add(range.len);
+                false
+            });
+        }
+
+        self.multicast_stream_withheld_bytes = self
+            .multicast_stream_withheld_bytes
+            .saturating_sub(forgotten_withheld);
+    }
+
+    fn multicast_stream_on_peer_ack(
+        &mut self, frame: &multicast::Ack,
+    ) -> Result<bool> {
+        let Some(state) = self.multicast_stream_recovery.get(&frame.channel_id)
+        else {
+            return Ok(true);
+        };
+
+        let Some(largest_published) = state.largest_published else {
+            return Err(Error::InvalidAckRange);
+        };
+
+        if frame.largest_acknowledged > largest_published {
+            return Err(Error::InvalidAckRange);
+        }
+
+        let spans = multicast::ack_spans(frame)?;
+        let fresh = state
+            .largest_acknowledged
+            .is_none_or(|largest| frame.largest_acknowledged > largest);
+        let threshold = state.reordering_threshold;
+        let actions = state
+            .pending
+            .iter()
+            .filter_map(|(&packet_number, &range)| {
+                let delivered = spans.iter().any(|span| {
+                    span.start <= packet_number && packet_number <= span.end
+                });
+                let lost = packet_number.saturating_add(threshold) <=
+                    frame.largest_acknowledged;
+
+                (delivered || lost).then_some((packet_number, range, delivered))
+            })
+            .collect::<Vec<_>>();
+
+        if let Some(state) =
+            self.multicast_stream_recovery.get_mut(&frame.channel_id)
+        {
+            state.largest_acknowledged = Some(
+                state
+                    .largest_acknowledged
+                    .map_or(frame.largest_acknowledged, |largest| {
+                        largest.max(frame.largest_acknowledged)
+                    }),
+            );
+
+            for (packet_number, ..) in &actions {
+                state.pending.remove(packet_number);
+            }
+        }
+
+        for (_, range, delivered) in actions {
+            if delivered {
+                self.multicast_stream_mark_delivered(range);
+            } else {
+                self.multicast_stream_release_range(range);
+            }
+        }
+
+        Ok(fresh)
+    }
+
     fn multicast_set_probe_state(
         &mut self, update: MulticastProbeStateUpdate,
     ) -> Result<()> {
@@ -7493,15 +7990,22 @@ impl<F: BufFactory> Connection<F> {
         } = update;
 
         let existed = self.multicast_probe_states.contains_key(&channel_id);
-        let state = self
-            .multicast_probe_states
-            .entry(channel_id.clone())
-            .or_insert_with(|| multicast::ProbeState::new(status, deadline));
+        let changed = {
+            let state = self
+                .multicast_probe_states
+                .entry(channel_id.clone())
+                .or_insert_with(|| multicast::ProbeState::new(status, deadline));
 
-        let changed =
-            !existed || state.status != status || state.deadline != deadline;
-        state.status = status;
-        state.deadline = deadline;
+            let changed =
+                !existed || state.status != status || state.deadline != deadline;
+            state.status = status;
+            state.deadline = deadline;
+            changed
+        };
+
+        if status != multicast::ProbeStatus::Viable {
+            self.multicast_stream_release_channel(&channel_id);
+        }
 
         if !changed && !emit_if_unchanged {
             return Ok(());
@@ -7581,7 +8085,7 @@ impl<F: BufFactory> Connection<F> {
     fn multicast_on_timeout(&mut self, now: Instant) {
         let timed_out = self
             .multicast_probe_states
-            .iter_mut()
+            .iter()
             .filter_map(|(channel_id, state)| {
                 if !matches!(
                     state.status,
@@ -7597,8 +8101,6 @@ impl<F: BufFactory> Connection<F> {
                     return None;
                 }
 
-                state.status = multicast::ProbeStatus::TimedOut;
-                state.deadline = None;
                 Some(channel_id.clone())
             })
             .collect::<Vec<_>>();
@@ -9082,6 +9584,10 @@ impl<F: BufFactory> Connection<F> {
                     return Err(Error::InvalidStreamState(stream_id));
                 }
 
+                let multicast_delivery =
+                    self.multicast_stream_deliveries.get(&stream_id).cloned();
+                let tx_data_before_reset = self.tx_data;
+
                 // Get existing stream or create a new one, but if the stream
                 // has already been closed and collected, ignore the frame.
                 //
@@ -9103,20 +9609,44 @@ impl<F: BufFactory> Connection<F> {
                 let was_writable = stream.is_writable();
 
                 let priority_key = Arc::clone(&stream.priority_key);
+                let reset_drop_range = stream.send.reset_drop_range();
+                let delivered_overlap =
+                    multicast_delivery.as_ref().map_or(0, |delivery| {
+                        delivery.overlap_len(&reset_drop_range)
+                    });
 
                 // Save the buffered length before stopping (stop clears the
                 // buffer).
                 let buffered_len = stream.send.buffered_bytes() as usize;
 
                 // Try stopping the stream.
-                if let Ok((final_size, unsent)) = stream.send.stop(error_code) {
+                if let Ok((mut final_size, unsent)) = stream.send.stop(error_code)
+                {
                     // Claw back some flow control allowance from data that was
                     // buffered but not actually sent before the stream was
                     // reset.
                     //
                     // Note that `tx_cap` will be updated later on, so no need
                     // to touch it here.
-                    self.tx_data = self.tx_data.saturating_sub(unsent);
+                    let _dropped = usize::try_from(unsent)
+                        .unwrap_or(usize::MAX)
+                        .saturating_sub(delivered_overlap);
+                    let mut tx_data = tx_data_before_reset.saturating_sub(unsent);
+
+                    if let Some(delivery) = &multicast_delivery {
+                        if delivery.max_offset > final_size {
+                            let restored = delivery.max_offset - final_size;
+                            tx_data = tx_data
+                                .saturating_add(restored)
+                                .min(tx_data_before_reset);
+                            stream
+                                .send
+                                .raise_reset_final_size(delivery.max_offset);
+                            final_size = delivery.max_offset;
+                        }
+                    }
+
+                    self.tx_data = tx_data;
 
                     // Update tx_buffered: subtract only the buffered data, not
                     // inflight data.
@@ -9134,7 +9664,7 @@ impl<F: BufFactory> Connection<F> {
                                 stream_id: Some(stream_id),
                                 offset: Some(final_size),
                                 raw: Some(RawInfo {
-                                    length: Some(unsent),
+                                    length: Some(_dropped as u64),
                                     ..Default::default()
                                 }),
                                 from: Some(DataRecipient::Transport),
@@ -9156,6 +9686,12 @@ impl<F: BufFactory> Connection<F> {
                         self.stopped_stream_remote_count.saturating_add(1);
                     self.reset_stream_local_count =
                         self.reset_stream_local_count.saturating_add(1);
+
+                    self.multicast_stream_forget_stream(
+                        stream_id,
+                        Some(reset_drop_range),
+                    );
+                    self.multicast_stream_deliveries.remove(&stream_id);
                 }
             },
 
@@ -9634,7 +10170,9 @@ impl<F: BufFactory> Connection<F> {
             .map(|(_, p)| p.recovery.cwnd_available())
             .sum();
 
-        ((self.streams.tx_buffered() + self.dgram_send_queue_byte_size()) <
+        ((self.streams.tx_buffered() +
+            self.multicast_stream_withheld_bytes +
+            self.dgram_send_queue_byte_size()) <
             cwin_available) &&
             (self.tx_data.saturating_sub(self.last_tx_data)) <
                 cwin_available as u64 &&

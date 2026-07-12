@@ -111,6 +111,20 @@ type BuildStreamIdHasher = std::hash::BuildHasherDefault<StreamIdHasher>;
 pub type StreamIdHashMap<V> = HashMap<u64, V, BuildStreamIdHasher>;
 pub type StreamIdHashSet = HashSet<u64, BuildStreamIdHasher>;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StreamReset {
+    Reset {
+        error_code: u64,
+        final_size: u64,
+    },
+
+    ResetAt {
+        error_code: u64,
+        final_size: u64,
+        reliable_size: u64,
+    },
+}
+
 /// Keeps track of QUIC streams and enforces stream limits.
 #[derive(Default)]
 pub struct StreamMap<F: BufFactory = DefaultBufFactory> {
@@ -183,10 +197,8 @@ pub struct StreamMap<F: BufFactory = DefaultBufFactory> {
     /// blocking occurred.
     blocked: StreamIdHashMap<u64>,
 
-    /// Set of stream IDs corresponding to streams that are reset. The value
-    /// of the map elements is a tuple of the error code and final size values
-    /// to include in the RESET_STREAM frame.
-    reset: StreamIdHashMap<(u64, u64)>,
+    /// Set of stream IDs corresponding to streams that are reset.
+    reset: StreamIdHashMap<StreamReset>,
 
     /// Set of stream IDs corresponding to streams that are shutdown on the
     /// receive side, and need to send a STOP_SENDING frame. The value of the
@@ -495,7 +507,22 @@ impl<F: BufFactory> StreamMap<F> {
     pub fn insert_reset(
         &mut self, stream_id: u64, error_code: u64, final_size: u64,
     ) {
-        self.reset.insert(stream_id, (error_code, final_size));
+        self.reset.insert(stream_id, StreamReset::Reset {
+            error_code,
+            final_size,
+        });
+    }
+
+    /// Adds a reliable stream reset while preserving its reliable size.
+    pub fn insert_reset_at(
+        &mut self, stream_id: u64, error_code: u64, final_size: u64,
+        reliable_size: u64,
+    ) {
+        self.reset.insert(stream_id, StreamReset::ResetAt {
+            error_code,
+            final_size,
+            reliable_size,
+        });
     }
 
     /// Removes the stream ID from the reset streams set.
@@ -635,7 +662,7 @@ impl<F: BufFactory> StreamMap<F> {
     }
 
     /// Creates an iterator over streams that need to send RESET_STREAM.
-    pub fn reset(&self) -> hash_map::Iter<'_, u64, (u64, u64)> {
+    pub fn reset(&self) -> hash_map::Iter<'_, u64, StreamReset> {
         self.reset.iter()
     }
 
@@ -1027,6 +1054,22 @@ mod tests {
 
     /// The default size of the receiver stream flow control window.
     const DEFAULT_STREAM_WINDOW: u64 = 32 * 1024;
+
+    #[test]
+    fn reset_at_queue_preserves_reliable_size() {
+        let mut streams =
+            StreamMap::<DefaultBufFactory>::new(1, 1, DEFAULT_STREAM_WINDOW);
+        streams.insert_reset_at(3, 42, 128, 64);
+
+        assert_eq!(
+            streams.reset().next(),
+            Some((&3, &StreamReset::ResetAt {
+                error_code: 42,
+                final_size: 128,
+                reliable_size: 64,
+            }))
+        );
+    }
 
     #[test]
     fn recv_flow_control() {

@@ -237,6 +237,68 @@ impl<F: BufFactory> SendBuf<F> {
         Ok((ret, remainder))
     }
 
+    /// Retains data at the current stream offset for multicast delivery.
+    ///
+    /// When `transmit` is false, the bytes remain available for later
+    /// retransmission but are initially treated as already emitted. This lets a
+    /// multicast sender release the exact range over unicast if channel
+    /// delivery later fails.
+    pub(crate) fn write_at(
+        &mut self, data: F::Buf, offset: u64, fin: bool, transmit: bool,
+    ) -> Result<usize> {
+        if self.shutdown {
+            return Err(Error::Done);
+        }
+
+        if let Some(error) = self.error {
+            return Err(Error::StreamStopped(error));
+        }
+
+        if offset != self.off {
+            return Err(Error::InvalidState);
+        }
+
+        let len = data.as_ref().len();
+        let max_off =
+            offset.checked_add(len as u64).ok_or(Error::InvalidState)?;
+
+        if max_off > self.max_data {
+            return Err(Error::Done);
+        }
+
+        if let Some(fin_off) = self.fin_off {
+            if max_off > fin_off || (fin && max_off != fin_off) {
+                return Err(Error::FinalSize);
+            }
+
+            if max_off == fin_off && !fin {
+                return Err(Error::FinalSize);
+            }
+        }
+
+        if fin {
+            self.fin_off = Some(max_off);
+        }
+
+        if len > 0 {
+            let mut buf = RangeBuf::from_raw(data, offset, fin);
+
+            if !transmit {
+                buf.consume(len);
+            }
+
+            self.data.push_back(buf);
+        }
+
+        self.off = max_off;
+
+        if transmit {
+            self.buffered_bytes += len as u64;
+        }
+
+        Ok(len)
+    }
+
     /// Writes data from the send buffer into the given output buffer.
     pub fn emit(&mut self, out: &mut [u8]) -> Result<(usize, bool)> {
         let mut out_len = out.len();
@@ -377,6 +439,11 @@ impl<F: BufFactory> SendBuf<F> {
         }
     }
 
+    /// Returns the offset range accounted as unsent by [`SendBuf::reset()`].
+    pub(crate) fn reset_drop_range(&self) -> std::ops::Range<u64> {
+        self.emit_off..self.off_back()
+    }
+
     pub fn retransmit(&mut self, off: u64, len: usize) -> usize {
         let max_off = off + len as u64;
         let ack_off = self.ack_off();
@@ -436,22 +503,30 @@ impl<F: BufFactory> SendBuf<F> {
 
     /// Resets the stream at the current offset and clears all buffered data.
     pub fn reset(&mut self) -> (u64, u64) {
-        let unsent_off = cmp::max(self.off_front(), self.emit_off);
-        let unsent_len = self.off_back().saturating_sub(unsent_off);
+        let unsent = self.reset_drop_range();
+        let unsent_len = unsent.end.saturating_sub(unsent.start);
 
-        self.fin_off = Some(unsent_off);
+        self.fin_off = Some(unsent.start);
 
         // Drop all buffered data.
         self.data.clear();
 
         // Mark relevant data as acked.
-        self.off = unsent_off;
+        self.off = unsent.start;
         self.ack(0, self.off as usize);
 
         self.pos = 0;
         self.buffered_bytes = 0;
 
         (self.emit_off, unsent_len)
+    }
+
+    /// Raises the final size after reset to include multicast-delivered data.
+    pub(crate) fn raise_reset_final_size(&mut self, final_size: u64) {
+        self.off = cmp::max(self.off, final_size);
+        self.emit_off = cmp::max(self.emit_off, final_size);
+        self.fin_off = Some(cmp::max(self.fin_off.unwrap_or(0), final_size));
+        self.ack(0, final_size as usize);
     }
 
     /// Resets the streams and records the received error code.
