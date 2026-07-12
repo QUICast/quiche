@@ -1,0 +1,612 @@
+// Copyright (C) 2026, Cloudflare, Inc.
+// All rights reserved.
+//
+// Redistribution and use in source and binary forms, with or without
+// modification, are permitted provided that the following conditions are
+// met:
+//
+//     * Redistributions of source code must retain the above copyright notice,
+//       this list of conditions and the following disclaimer.
+//
+//     * Redistributions in binary form must reproduce the above copyright
+//       notice, this list of conditions and the following disclaimer in the
+//       documentation and/or other materials provided with the distribution.
+//
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS
+// IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO,
+// THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+// PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR
+// CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+// EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+// PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+// PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
+// LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+// NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+// SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+use std::collections::BTreeMap;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::Weak;
+
+use bytes::Bytes;
+use tokio::sync::mpsc::UnboundedSender;
+
+use super::ServerControlChannelConfig;
+use super::ServerControlCommand;
+use super::ServerControlController;
+
+const CHANNEL_PACKET_BUFFER_LEN: usize = 64 * 1024;
+const MAX_STREAM_OFFSET: u64 = 1 << 62;
+
+static NEXT_PUBLISHER_ID: AtomicU64 = AtomicU64::new(1);
+
+/// One shared STREAM frame carried by an MCQUIC channel packet.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServerStreamFrame {
+    /// The server-initiated unidirectional QUIC stream ID.
+    pub stream_id: u64,
+
+    /// The absolute byte offset of this range within the QUIC stream.
+    pub offset: u64,
+
+    /// Whether this range carries the stream's FIN marker.
+    pub fin: bool,
+
+    /// The shared stream bytes.
+    pub data: Bytes,
+}
+
+/// One encrypted channel packet prepared for publication by the application.
+///
+/// The application sends [`ServerStreamPublication::packet()`] through its own
+/// multicast publisher, then passes this value to
+/// [`ServerStreamPublisher::commit()`]. Committing relays integrity and the
+/// retained recovery range to every attached connection.
+#[derive(Clone, Debug)]
+#[must_use = "a prepared multicast packet must be published and committed"]
+pub struct ServerStreamPublication {
+    publisher_id: u64,
+    token: u64,
+    packet_number: u64,
+    key_sequence: u64,
+    key_phase: bool,
+    packet: Bytes,
+    integrity: quiche::multicast::Integrity,
+    frame: ServerStreamFrame,
+}
+
+impl ServerStreamPublication {
+    /// Returns the multicast channel packet number.
+    pub fn packet_number(&self) -> u64 {
+        self.packet_number
+    }
+
+    /// Returns the key sequence used to encrypt the channel packet.
+    pub fn key_sequence(&self) -> u64 {
+        self.key_sequence
+    }
+
+    /// Returns the channel packet's key phase bit.
+    pub fn key_phase(&self) -> bool {
+        self.key_phase
+    }
+
+    /// Returns the encrypted channel packet bytes to publish over multicast.
+    pub fn packet(&self) -> &[u8] {
+        &self.packet
+    }
+
+    /// Returns the matching integrity frame.
+    pub fn integrity(&self) -> &quiche::multicast::Integrity {
+        &self.integrity
+    }
+
+    /// Returns the STREAM frame represented by this publication.
+    pub fn frame(&self) -> &ServerStreamFrame {
+        &self.frame
+    }
+}
+
+/// Errors produced by [`ServerStreamPublisher`].
+#[derive(Debug, thiserror::Error)]
+pub enum ServerStreamPublisherError {
+    /// The channel configuration or requested operation is invalid.
+    #[error("invalid multicast stream publisher state")]
+    InvalidState,
+
+    /// The stream ID is not a server-initiated unidirectional stream.
+    #[error("stream {stream_id} is not server-initiated unidirectional")]
+    InvalidStreamId {
+        /// The rejected QUIC stream ID.
+        stream_id: u64,
+    },
+
+    /// The new frame does not begin at the stream's next shared offset.
+    #[error(
+        "non-contiguous multicast stream offset for stream {stream_id}: expected {expected}, got {actual}"
+    )]
+    NonContiguousOffset {
+        /// The affected QUIC stream ID.
+        stream_id: u64,
+
+        /// The next expected stream offset.
+        expected: u64,
+
+        /// The supplied stream offset.
+        actual: u64,
+    },
+
+    /// The stream already carried FIN.
+    #[error("multicast stream {stream_id} is already finished")]
+    StreamFinished {
+        /// The affected QUIC stream ID.
+        stream_id: u64,
+    },
+
+    /// A prepared publication must be committed before another is encoded.
+    #[error("a multicast stream publication is still awaiting commit")]
+    PublicationPending,
+
+    /// The publication did not originate from this publisher or is stale.
+    #[error("unknown or stale multicast stream publication")]
+    UnknownPublication,
+
+    /// The channel has been retired and cannot publish more packets.
+    #[error("the multicast stream channel is retired")]
+    Retired,
+
+    /// The target control driver is already closed.
+    #[error("the multicast control driver is closed")]
+    ControllerClosed,
+
+    /// Shared publisher state was poisoned by a panic while locked.
+    #[error("multicast stream publisher state is poisoned")]
+    StatePoisoned,
+
+    /// Core channel-packet encoding failed.
+    #[error("multicast stream packet encoding failed: {0}")]
+    Encode(#[from] quiche::Error),
+}
+
+/// A shared, socket-free MCQUIC STREAM packet publisher.
+///
+/// One publisher owns the channel packet number and key state shared by all
+/// receivers. Each attached [`super::ServerControlDriver`] retains independent
+/// `MC_LIMITS`, `MC_STATE`, `MC_ACK`, fallback, and ordinary QUIC stream state.
+/// The publisher only encodes packets and fans out committed metadata; the
+/// application remains responsible for multicast socket I/O.
+#[derive(Clone)]
+pub struct ServerStreamPublisher {
+    inner: Arc<Mutex<ServerStreamPublisherInner>>,
+}
+
+impl ServerStreamPublisher {
+    /// Creates a shared publisher for one multicast channel.
+    pub fn new(
+        channel: ServerControlChannelConfig,
+    ) -> Result<Self, ServerStreamPublisherError> {
+        channel
+            .validate()
+            .map_err(|_| ServerStreamPublisherError::InvalidState)?;
+        let send_state = quiche::multicast::ChannelSendState::new(
+            channel.announce.clone(),
+            channel.key.clone(),
+        )?;
+
+        Ok(Self {
+            inner: Arc::new(Mutex::new(ServerStreamPublisherInner {
+                publisher_id: NEXT_PUBLISHER_ID.fetch_add(1, Ordering::Relaxed),
+                channel,
+                send_state,
+                streams: BTreeMap::new(),
+                subscribers: BTreeMap::new(),
+                next_subscriber_id: 0,
+                pending_token: None,
+                max_stream_id: None,
+                reordering_threshold:
+                    quiche::multicast::DEFAULT_STREAM_RECOVERY_REORDERING_THRESHOLD,
+                retired: false,
+            })),
+        })
+    }
+
+    /// Sets the ACK reordering threshold copied to subsequently attached
+    /// connections.
+    pub fn set_reordering_threshold(
+        &self, threshold: u64,
+    ) -> Result<(), ServerStreamPublisherError> {
+        if threshold == 0 {
+            return Err(ServerStreamPublisherError::InvalidState);
+        }
+
+        let mut inner = self.lock()?;
+        if !inner.subscribers.is_empty() {
+            return Err(ServerStreamPublisherError::InvalidState);
+        }
+        inner.reordering_threshold = threshold;
+
+        Ok(())
+    }
+
+    /// Attaches one client-facing control driver to this shared publisher.
+    ///
+    /// The returned guard detaches the connection when dropped. In automatic
+    /// control mode, attachment upserts the channel and allows the existing
+    /// `MC_ANNOUNCE` / `MC_KEY` / `MC_JOIN` sequence to run for that client.
+    pub fn attach(
+        &self, controller: &ServerControlController,
+    ) -> Result<ServerStreamAttachment, ServerStreamPublisherError> {
+        let mut inner = self.lock()?;
+
+        if inner.retired {
+            return Err(ServerStreamPublisherError::Retired);
+        }
+
+        if inner
+            .subscribers
+            .values()
+            .any(|sender| sender.same_channel(&controller.command_sender))
+        {
+            return Err(ServerStreamPublisherError::InvalidState);
+        }
+
+        let subscriber_id = inner.next_subscriber_id;
+        inner.next_subscriber_id = inner.next_subscriber_id.saturating_add(1);
+
+        controller
+            .command_sender
+            .send(ServerControlCommand::AttachStreamPublisher {
+                config: inner.channel.clone(),
+                reordering_threshold: inner.reordering_threshold,
+                max_stream_id: inner.max_stream_id,
+            })
+            .map_err(|_| ServerStreamPublisherError::ControllerClosed)?;
+
+        inner
+            .subscribers
+            .insert(subscriber_id, controller.command_sender.clone());
+
+        Ok(ServerStreamAttachment {
+            publisher: Arc::downgrade(&self.inner),
+            subscriber_id,
+        })
+    }
+
+    /// Declares a server-initiated unidirectional stream carried by this
+    /// channel.
+    ///
+    /// Applications should declare each stream before publishing its first
+    /// packet. Attached automatic control drivers use the largest declared
+    /// stream ID to avoid sending `MC_JOIN` beyond a client's QUIC
+    /// `MAX_STREAMS_UNI` limit.
+    pub fn declare_stream(
+        &self, stream_id: u64,
+    ) -> Result<(), ServerStreamPublisherError> {
+        if stream_id & 0x3 != 0x3 {
+            return Err(ServerStreamPublisherError::InvalidStreamId {
+                stream_id,
+            });
+        }
+
+        let mut inner = self.lock()?;
+        if inner.retired {
+            return Err(ServerStreamPublisherError::Retired);
+        }
+
+        if inner
+            .max_stream_id
+            .is_some_and(|current| current >= stream_id)
+        {
+            return Ok(());
+        }
+
+        inner.max_stream_id = Some(stream_id);
+        let channel_id = inner.channel.announce.channel_id.clone();
+        inner.subscribers.retain(|_, sender| {
+            sender
+                .send(ServerControlCommand::StreamPublisherMaxStreamId {
+                    channel_id: channel_id.clone(),
+                    max_stream_id: stream_id,
+                })
+                .is_ok()
+        });
+
+        Ok(())
+    }
+
+    /// Returns the next shared offset expected for `stream_id`.
+    ///
+    /// A newly attached connection can use this to finish any connection-local
+    /// unicast catch-up before it begins consuming committed shared ranges.
+    pub fn next_stream_offset(
+        &self, stream_id: u64,
+    ) -> Result<Option<u64>, ServerStreamPublisherError> {
+        Ok(self
+            .lock()?
+            .streams
+            .get(&stream_id)
+            .map(|stream| stream.next_offset))
+    }
+
+    /// Encodes one STREAM frame and returns a packet ready for external
+    /// multicast publication.
+    ///
+    /// This slice-based helper copies `data` once into shared storage. Use
+    /// [`ServerStreamPublisher::prepare_stream_buf()`] when the application
+    /// already owns a [`Bytes`] value.
+    pub fn prepare_stream(
+        &self, stream_id: u64, offset: u64, fin: bool, data: &[u8],
+    ) -> Result<ServerStreamPublication, ServerStreamPublisherError> {
+        self.prepare_stream_buf(
+            stream_id,
+            offset,
+            fin,
+            Bytes::copy_from_slice(data),
+        )
+    }
+
+    /// Encodes one owned STREAM frame and returns a packet ready for external
+    /// multicast publication.
+    pub fn prepare_stream_buf(
+        &self, stream_id: u64, offset: u64, fin: bool, data: Bytes,
+    ) -> Result<ServerStreamPublication, ServerStreamPublisherError> {
+        if stream_id & 0x3 != 0x3 {
+            return Err(ServerStreamPublisherError::InvalidStreamId {
+                stream_id,
+            });
+        }
+
+        let end = offset
+            .checked_add(data.len() as u64)
+            .filter(|end| *end < MAX_STREAM_OFFSET)
+            .ok_or(ServerStreamPublisherError::InvalidState)?;
+        let mut inner = self.lock()?;
+
+        if inner.retired {
+            return Err(ServerStreamPublisherError::Retired);
+        }
+
+        if inner.pending_token.is_some() {
+            return Err(ServerStreamPublisherError::PublicationPending);
+        }
+
+        if let Some(stream) = inner.streams.get(&stream_id) {
+            if stream.finished {
+                return Err(ServerStreamPublisherError::StreamFinished {
+                    stream_id,
+                });
+            }
+
+            if stream.next_offset != offset {
+                return Err(ServerStreamPublisherError::NonContiguousOffset {
+                    stream_id,
+                    expected: stream.next_offset,
+                    actual: offset,
+                });
+            }
+        }
+
+        let frame = ServerStreamFrame {
+            stream_id,
+            offset,
+            fin,
+            data,
+        };
+        let mut packet = vec![0; CHANNEL_PACKET_BUFFER_LEN];
+        let output = inner.send_state.write_packet(
+            &[quiche::multicast::ChannelFrame::Stream {
+                stream_id,
+                offset,
+                fin,
+                data: frame.data.to_vec(),
+            }],
+            &mut packet,
+        )?;
+        packet.truncate(output.packet_len);
+
+        inner.streams.insert(stream_id, PublisherStreamState {
+            next_offset: end,
+            finished: fin,
+        });
+        inner.max_stream_id = Some(
+            inner
+                .max_stream_id
+                .map_or(stream_id, |current| current.max(stream_id)),
+        );
+        let token = output.packet_number;
+        inner.pending_token = Some(token);
+
+        Ok(ServerStreamPublication {
+            publisher_id: inner.publisher_id,
+            token,
+            packet_number: output.packet_number,
+            key_sequence: output.key_sequence,
+            key_phase: output.key_phase,
+            packet: Bytes::from(packet),
+            integrity: output.integrity,
+            frame,
+        })
+    }
+
+    /// Commits a packet after the application has published its encrypted
+    /// bytes.
+    ///
+    /// Commit relays the matching `MC_INTEGRITY` frame and retained STREAM
+    /// range to every attached connection. A prepared packet must be
+    /// retried until it is published and committed; preparing another
+    /// packet first is rejected so the channel packet number space cannot
+    /// develop a silent gap.
+    pub fn commit(
+        &self, publication: ServerStreamPublication,
+    ) -> Result<(), ServerStreamPublisherError> {
+        let mut inner = self.lock()?;
+
+        if publication.publisher_id != inner.publisher_id ||
+            inner.pending_token != Some(publication.token)
+        {
+            return Err(ServerStreamPublisherError::UnknownPublication);
+        }
+
+        inner.pending_token = None;
+        let publication = Arc::new(CommittedServerStreamPublication {
+            packet_number: publication.packet_number,
+            integrity: publication.integrity,
+            frame: publication.frame,
+        });
+
+        inner.subscribers.retain(|_, sender| {
+            sender
+                .send(ServerControlCommand::StreamPublication {
+                    publication: Arc::clone(&publication),
+                })
+                .is_ok()
+        });
+
+        Ok(())
+    }
+
+    /// Rotates the multicast payload key and relays the new `MC_KEY` to every
+    /// attached connection.
+    pub fn update_key(
+        &self, key: quiche::multicast::Key,
+    ) -> Result<(), ServerStreamPublisherError> {
+        let mut inner = self.lock()?;
+
+        if inner.retired {
+            return Err(ServerStreamPublisherError::Retired);
+        }
+
+        if inner.pending_token.is_some() {
+            return Err(ServerStreamPublisherError::PublicationPending);
+        }
+
+        if key.from_packet_number != inner.send_state.next_packet_number() &&
+            &key != inner.send_state.key()
+        {
+            return Err(ServerStreamPublisherError::InvalidState);
+        }
+
+        inner.send_state.update_key(key.clone())?;
+        inner.channel.key = key.clone();
+        inner.subscribers.retain(|_, sender| {
+            sender
+                .send(ServerControlCommand::StreamPublisherKey {
+                    frame: key.clone(),
+                })
+                .is_ok()
+        });
+
+        Ok(())
+    }
+
+    /// Retires the channel and relays `MC_RETIRE` to every attached connection.
+    pub fn retire(
+        &self, frame: quiche::multicast::Retire,
+    ) -> Result<(), ServerStreamPublisherError> {
+        let mut inner = self.lock()?;
+
+        if inner.retired {
+            return Err(ServerStreamPublisherError::Retired);
+        }
+
+        if frame.channel_id != inner.channel.announce.channel_id ||
+            (frame.after_packet_number != 0 &&
+                frame.after_packet_number >=
+                    inner.send_state.next_packet_number()) ||
+            inner.pending_token.is_some()
+        {
+            return Err(ServerStreamPublisherError::InvalidState);
+        }
+
+        inner.retired = true;
+        inner.subscribers.retain(|_, sender| {
+            sender
+                .send(ServerControlCommand::StreamPublisherRetire {
+                    frame: frame.clone(),
+                })
+                .is_ok()
+        });
+
+        Ok(())
+    }
+
+    /// Returns the current channel send metrics.
+    pub fn metrics_snapshot(
+        &self,
+    ) -> Result<
+        quiche::multicast::ChannelSendMetricsSnapshot,
+        ServerStreamPublisherError,
+    > {
+        Ok(self.lock()?.send_state.metrics_snapshot())
+    }
+
+    /// Returns the number of currently attached client connections.
+    pub fn attached_connections(
+        &self,
+    ) -> Result<usize, ServerStreamPublisherError> {
+        Ok(self.lock()?.subscribers.len())
+    }
+
+    fn lock(
+        &self,
+    ) -> Result<
+        std::sync::MutexGuard<'_, ServerStreamPublisherInner>,
+        ServerStreamPublisherError,
+    > {
+        self.inner
+            .lock()
+            .map_err(|_| ServerStreamPublisherError::StatePoisoned)
+    }
+}
+
+/// Guard representing one connection attached to a shared stream publisher.
+///
+/// Dropping the guard stops future publications from being fanned out to that
+/// connection. Already committed ranges remain owned by the connection until
+/// they are acknowledged, recovered, reset, or torn down.
+#[must_use = "dropping the attachment immediately detaches the connection"]
+pub struct ServerStreamAttachment {
+    publisher: Weak<Mutex<ServerStreamPublisherInner>>,
+    subscriber_id: u64,
+}
+
+impl Drop for ServerStreamAttachment {
+    fn drop(&mut self) {
+        let Some(publisher) = self.publisher.upgrade() else {
+            return;
+        };
+
+        if let Ok(mut inner) = publisher.lock() {
+            inner.subscribers.remove(&self.subscriber_id);
+        };
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PublisherStreamState {
+    next_offset: u64,
+    finished: bool,
+}
+
+struct ServerStreamPublisherInner {
+    publisher_id: u64,
+    channel: ServerControlChannelConfig,
+    send_state: quiche::multicast::ChannelSendState,
+    streams: BTreeMap<u64, PublisherStreamState>,
+    subscribers: BTreeMap<u64, UnboundedSender<ServerControlCommand>>,
+    next_subscriber_id: u64,
+    pending_token: Option<u64>,
+    max_stream_id: Option<u64>,
+    reordering_threshold: u64,
+    retired: bool,
+}
+
+#[derive(Debug)]
+pub(super) struct CommittedServerStreamPublication {
+    pub(super) packet_number: u64,
+    pub(super) integrity: quiche::multicast::Integrity,
+    pub(super) frame: ServerStreamFrame,
+}

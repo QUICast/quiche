@@ -113,6 +113,10 @@ pub const FRAME_TYPE_ANNOUNCE_V6: u64 = 0xff3e812;
 /// requested by the server.
 pub const STATE_REASON_REQUESTED_BY_SERVER: u64 = 0x1;
 
+/// Default number of newer acknowledged channel packets required before an
+/// unacknowledged packet is recovered over unicast.
+pub const DEFAULT_STREAM_RECOVERY_REORDERING_THRESHOLD: u64 = 3;
+
 /// The subset of client-advertised multicast limits shared by the transport
 /// parameter and `MC_LIMITS`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -1039,6 +1043,21 @@ pub enum ChannelFrame {
         final_size: u64,
     },
 
+    /// `RESET_STREAM_AT`
+    ResetStreamAt {
+        /// The stream ID being reset.
+        stream_id: u64,
+
+        /// The application error code.
+        error_code: u64,
+
+        /// The stream's final size.
+        final_size: u64,
+
+        /// The prefix that still requires reliable delivery.
+        reliable_size: u64,
+    },
+
     /// `STREAM`
     Stream {
         /// The stream ID carried by the frame.
@@ -1459,9 +1478,9 @@ impl ChannelSendState {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct AckSpan {
-    start: u64,
-    end: u64,
+pub(crate) struct AckSpan {
+    pub(crate) start: u64,
+    pub(crate) end: u64,
 }
 
 /// Tracks cumulative multicast packet acknowledgments for a channel.
@@ -1554,43 +1573,56 @@ fn summarize_ack(
         return Err(Error::InvalidAckRange);
     }
 
-    let mut ack_blocks = 1_u64;
-    let mut acked_packets = ack
-        .first_ack_range
-        .checked_add(1)
-        .ok_or(Error::InvalidAckRange)?;
-    let mut smallest_acknowledged = ack
-        .largest_acknowledged
-        .checked_sub(ack.first_ack_range)
-        .ok_or(Error::InvalidAckRange)?;
+    let spans = ack_spans(ack)?;
+    let acked_packets = spans.iter().try_fold(0_u64, |total, span| {
+        total
+            .checked_add(span.end - span.start + 1)
+            .ok_or(Error::InvalidAckRange)
+    })?;
 
-    for range in &ack.ack_ranges {
-        let largest = smallest_acknowledged
-            .checked_sub(range.gap)
-            .and_then(|value| value.checked_sub(2))
-            .ok_or(Error::InvalidAckRange)?;
-        let smallest = largest
-            .checked_sub(range.ack_range_length)
-            .ok_or(Error::InvalidAckRange)?;
-
-        ack_blocks = ack_blocks.checked_add(1).ok_or(Error::InvalidAckRange)?;
-        acked_packets = acked_packets
-            .checked_add(
-                range
-                    .ack_range_length
-                    .checked_add(1)
-                    .ok_or(Error::InvalidAckRange)?,
-            )
-            .ok_or(Error::InvalidAckRange)?;
-        smallest_acknowledged = smallest;
-    }
+    let smallest_acknowledged = spans
+        .last()
+        .map(|span| span.start)
+        .ok_or(Error::InvalidAckRange)?;
 
     Ok(ChannelSendAckSummary {
-        ack_blocks,
+        ack_blocks: spans.len() as u64,
         acked_packets,
         largest_acknowledged: ack.largest_acknowledged,
         smallest_acknowledged,
     })
+}
+
+pub(crate) fn ack_spans(ack: &Ack) -> Result<Vec<AckSpan>> {
+    let first_start = ack
+        .largest_acknowledged
+        .checked_sub(ack.first_ack_range)
+        .ok_or(Error::InvalidAckRange)?;
+    let mut spans = Vec::with_capacity(ack.ack_ranges.len() + 1);
+    spans.push(AckSpan {
+        start: first_start,
+        end: ack.largest_acknowledged,
+    });
+
+    let mut previous_smallest = first_start;
+
+    for range in &ack.ack_ranges {
+        let largest = previous_smallest
+            .checked_sub(range.gap)
+            .and_then(|value| value.checked_sub(2))
+            .ok_or(Error::InvalidAckRange)?;
+        let start = largest
+            .checked_sub(range.ack_range_length)
+            .ok_or(Error::InvalidAckRange)?;
+
+        spans.push(AckSpan {
+            start,
+            end: largest,
+        });
+        previous_smallest = start;
+    }
+
+    Ok(spans)
 }
 
 /// An outcome emitted by [`ChannelReceiveState`] when a packet becomes ready.
@@ -2047,16 +2079,34 @@ impl<M> ChannelReceiveState<M> {
                 stream_id,
                 error_code,
                 final_size,
-            } => Ok(ChannelFrame::ResetStream {
+            } => {
+                validate_channel_stream_id(stream_id)?;
+
+                Ok(ChannelFrame::ResetStream {
+                    stream_id,
+                    error_code,
+                    final_size,
+                })
+            },
+
+            frame::Frame::ResetStreamAt {
                 stream_id,
                 error_code,
                 final_size,
-            }),
+                reliable_size,
+            } => {
+                validate_channel_stream_id(stream_id)?;
+
+                Ok(ChannelFrame::ResetStreamAt {
+                    stream_id,
+                    error_code,
+                    final_size,
+                    reliable_size,
+                })
+            },
 
             frame::Frame::Stream { stream_id, data } => {
-                if stream::is_bidi(stream_id) || stream_id & 0x3 != 0x3 {
-                    return Err(Error::InvalidFrame);
-                }
+                validate_channel_stream_id(stream_id)?;
 
                 Ok(ChannelFrame::Stream {
                     stream_id,
@@ -2945,21 +2995,45 @@ fn encode_channel_frame(frame: &ChannelFrame) -> Result<frame::Frame> {
             stream_id,
             error_code,
             final_size,
-        } => Ok(frame::Frame::ResetStream {
-            stream_id: *stream_id,
-            error_code: *error_code,
-            final_size: *final_size,
-        }),
+        } => {
+            validate_channel_stream_id(*stream_id)?;
+
+            Ok(frame::Frame::ResetStream {
+                stream_id: *stream_id,
+                error_code: *error_code,
+                final_size: *final_size,
+            })
+        },
+
+        ChannelFrame::ResetStreamAt {
+            stream_id,
+            error_code,
+            final_size,
+            reliable_size,
+        } => {
+            validate_channel_stream_id(*stream_id)?;
+
+            Ok(frame::Frame::ResetStreamAt {
+                stream_id: *stream_id,
+                error_code: *error_code,
+                final_size: *final_size,
+                reliable_size: *reliable_size,
+            })
+        },
 
         ChannelFrame::Stream {
             stream_id,
             offset,
             fin,
             data,
-        } => Ok(frame::Frame::Stream {
-            stream_id: *stream_id,
-            data: RangeBuf::from(data.as_ref(), *offset, *fin),
-        }),
+        } => {
+            validate_channel_stream_id(*stream_id)?;
+
+            Ok(frame::Frame::Stream {
+                stream_id: *stream_id,
+                data: RangeBuf::from(data.as_ref(), *offset, *fin),
+            })
+        },
 
         ChannelFrame::Datagram { data } =>
             Ok(frame::Frame::Datagram { data: data.clone() }),
@@ -2973,6 +3047,14 @@ fn encode_channel_frame(frame: &ChannelFrame) -> Result<frame::Frame> {
             _ => Err(Error::InvalidFrame),
         },
     }
+}
+
+fn validate_channel_stream_id(stream_id: u64) -> Result<()> {
+    if stream::is_bidi(stream_id) || stream_id & 0x3 != 0x3 {
+        return Err(Error::InvalidFrame);
+    }
+
+    Ok(())
 }
 
 fn tls_cipher_to_algorithm(id: u16) -> Result<crypto::Algorithm> {
@@ -3434,6 +3516,65 @@ mod tests {
         assert_eq!(recv_metrics.pending_packets, 0);
         assert_eq!(recv_metrics.waiting_for_key_packets, 0);
         assert_eq!(recv_metrics.waiting_for_integrity_packets, 0);
+    }
+
+    #[test]
+    fn channel_stream_frames_roundtrip() {
+        let announce = test_announce();
+        let key = test_key(&announce.channel_id);
+        let mut sender =
+            ChannelSendState::new(announce.clone(), key.clone()).unwrap();
+        let mut receiver = ChannelReceiveState::new(announce).unwrap();
+        let mut out = [0; 256];
+        let frames = vec![
+            ChannelFrame::Stream {
+                stream_id: 3,
+                offset: 10,
+                fin: true,
+                data: b"shared body".to_vec(),
+            },
+            ChannelFrame::ResetStreamAt {
+                stream_id: 7,
+                error_code: 42,
+                final_size: 128,
+                reliable_size: 10,
+            },
+        ];
+
+        receiver.insert_key(key).unwrap();
+        let sent = sender.write_packet(&frames, &mut out).unwrap();
+        assert!(receiver
+            .insert_integrity(sent.integrity.clone())
+            .unwrap()
+            .is_empty());
+
+        let events = receiver.recv(&out[..sent.packet_len], ()).unwrap();
+        let ChannelReceiveEvent::Packet { packet, .. } = &events[0] else {
+            panic!("expected decoded channel packet");
+        };
+
+        assert_eq!(packet.frames, frames);
+    }
+
+    #[test]
+    fn channel_stream_frames_reject_non_server_unidirectional_streams() {
+        let announce = test_announce();
+        let key = test_key(&announce.channel_id);
+        let mut sender = ChannelSendState::new(announce, key).unwrap();
+        let mut out = [0; 256];
+
+        assert_eq!(
+            sender.write_packet(
+                &[ChannelFrame::Stream {
+                    stream_id: 0,
+                    offset: 0,
+                    fin: false,
+                    data: b"invalid".to_vec(),
+                }],
+                &mut out,
+            ),
+            Err(Error::InvalidFrame)
+        );
     }
 
     #[test]

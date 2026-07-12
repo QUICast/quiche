@@ -322,6 +322,29 @@ fn multicast_dgram_negotiated_pipe() -> test_utils::Pipe {
     pipe
 }
 
+fn multicast_stream_negotiated_pipe() -> test_utils::Pipe {
+    let mut client_config = test_utils::Pipe::default_config("cubic").unwrap();
+    client_config
+        .set_multicast_client_params(Some(multicast_test_client_params()));
+    client_config.set_initial_max_data(4096);
+    client_config.set_initial_max_stream_data_uni(4096);
+
+    let mut server_config = test_utils::Pipe::default_config("cubic").unwrap();
+    server_config.enable_multicast_server_support(true);
+    server_config.set_initial_max_data(4096);
+    server_config.set_initial_max_stream_data_uni(4096);
+
+    let mut pipe = test_utils::Pipe::with_client_and_server_config(
+        &mut client_config,
+        &mut server_config,
+    )
+    .unwrap();
+
+    assert_eq!(pipe.handshake(), Ok(()));
+
+    pipe
+}
+
 fn multicast_test_ack(channel_id: &[u8]) -> multicast::Ack {
     multicast::Ack {
         channel_id: channel_id.to_vec(),
@@ -342,6 +365,30 @@ fn assert_client_receives_unicast_dgram(
     let len = pipe.client.dgram_recv(&mut buf).unwrap();
     assert_eq!(&buf[..len], expected);
     assert_eq!(pipe.client.dgram_recv(&mut buf), Err(Error::Done));
+}
+
+fn multicast_stream_prefix(pipe: &mut test_utils::Pipe, stream_id: u64) {
+    let prefix = b"0123456789";
+    pipe.server.stream_send(stream_id, prefix, false).unwrap();
+    pipe.advance().unwrap();
+
+    let mut out = [0; 32];
+    assert_eq!(
+        pipe.client.stream_recv(stream_id, &mut out),
+        Ok((10, false))
+    );
+    assert_eq!(&out[..10], prefix);
+}
+
+fn multicast_ack_for(channel_id: &[u8], packet_number: u64) -> multicast::Ack {
+    multicast::Ack {
+        channel_id: channel_id.to_vec(),
+        largest_acknowledged: packet_number,
+        ack_delay: 0,
+        first_ack_range: 0,
+        ack_ranges: Vec::new(),
+        ecn_counts: None,
+    }
 }
 
 fn assert_client_receives_no_unicast_dgram(pipe: &mut test_utils::Pipe) {
@@ -826,6 +873,485 @@ fn multicast_default_dgram_channel_resumes_after_ack_timeout() {
     assert_eq!(pipe.server.dgram_send(data), Ok(()));
 
     assert_client_receives_unicast_dgram(&mut pipe, data);
+}
+
+#[test]
+fn multicast_stream_fallback_emits_before_viability() {
+    let mut pipe = multicast_stream_negotiated_pipe();
+    let channel_id = vec![1, 2, 3, 4];
+    let stream_id = 3;
+    multicast_stream_prefix(&mut pipe, stream_id);
+
+    pipe.server
+        .multicast_stream_send(&channel_id, 0, stream_id, 10, b"fallback", true)
+        .unwrap();
+    pipe.advance().unwrap();
+
+    let mut out = [0; 32];
+    assert_eq!(pipe.client.stream_recv(stream_id, &mut out), Ok((8, true)));
+    assert_eq!(&out[..8], b"fallback");
+    assert_eq!(
+        pipe.server.multicast_stream_recovery_pending(&channel_id),
+        0
+    );
+}
+
+#[test]
+fn multicast_stream_ack_before_publication_is_rejected() {
+    let mut pipe = multicast_stream_negotiated_pipe();
+    let channel_id = vec![1, 2, 3, 4];
+    pipe.server
+        .multicast_set_stream_recovery_reordering_threshold(&channel_id, 3)
+        .unwrap();
+
+    assert_eq!(
+        pipe.server
+            .multicast_process_peer_ack(multicast_ack_for(&channel_id, 0)),
+        Err(Error::InvalidAckRange)
+    );
+    assert_ne!(
+        pipe.server.multicast_probe_status(&channel_id),
+        Some(multicast::ProbeStatus::Viable)
+    );
+}
+
+#[test]
+fn multicast_stream_joined_state_keeps_fallback_enabled() {
+    let mut pipe = multicast_stream_negotiated_pipe();
+    let channel_id = vec![1, 2, 3, 4];
+    let stream_id = 3;
+    multicast_stream_prefix(&mut pipe, stream_id);
+
+    pipe.server
+        .multicast_process_local_state(multicast::State {
+            channel_id: channel_id.clone(),
+            sequence: 1,
+            state: multicast::ChannelState::Joined,
+            reason_scope: multicast::StateReasonScope::Transport,
+            reason_code: multicast::STATE_REASON_REQUESTED_BY_SERVER,
+            reason_phrase: Vec::new(),
+        })
+        .unwrap();
+    pipe.server
+        .multicast_stream_send(
+            &channel_id,
+            0,
+            stream_id,
+            10,
+            b"still-fallback",
+            true,
+        )
+        .unwrap();
+    pipe.advance().unwrap();
+
+    let mut out = [0; 32];
+    assert_eq!(pipe.client.stream_recv(stream_id, &mut out), Ok((14, true)));
+    assert_eq!(&out[..14], b"still-fallback");
+}
+
+#[test]
+fn multicast_stream_ack_suppresses_unicast_and_releases_retention() {
+    let mut pipe = multicast_stream_negotiated_pipe();
+    let channel_id = vec![1, 2, 3, 4];
+    let stream_id = 3;
+    multicast_stream_prefix(&mut pipe, stream_id);
+
+    pipe.server
+        .multicast_stream_send(&channel_id, 0, stream_id, 10, b"warmup", false)
+        .unwrap();
+    pipe.advance().unwrap();
+    let mut out = [0; 32];
+    assert_eq!(pipe.client.stream_recv(stream_id, &mut out), Ok((6, false)));
+
+    pipe.server
+        .multicast_process_peer_ack(multicast_ack_for(&channel_id, 0))
+        .unwrap();
+    pipe.server
+        .multicast_stream_send(&channel_id, 1, stream_id, 16, b"green", true)
+        .unwrap();
+
+    assert_eq!(
+        pipe.server.multicast_stream_recovery_pending(&channel_id),
+        1
+    );
+    assert_eq!(pipe.server.multicast_stream_recovery_withheld_bytes(), 5);
+    assert_eq!(test_utils::emit_flight(&mut pipe.server), Err(Error::Done));
+
+    pipe.server
+        .multicast_process_peer_ack(multicast_ack_for(&channel_id, 1))
+        .unwrap();
+
+    assert_eq!(
+        pipe.server.multicast_stream_recovery_pending(&channel_id),
+        0
+    );
+    assert_eq!(pipe.server.multicast_stream_recovery_withheld_bytes(), 0);
+    assert_eq!(test_utils::emit_flight(&mut pipe.server), Err(Error::Done));
+}
+
+#[test]
+fn multicast_stream_ack_progression_does_not_refresh_on_duplicates() {
+    let mut pipe = multicast_stream_negotiated_pipe();
+    let channel_id = vec![1, 2, 3, 4];
+    let stream_id = 3;
+    multicast_stream_prefix(&mut pipe, stream_id);
+    pipe.server
+        .multicast_set_ack_timeout(&channel_id, Some(Duration::from_secs(30)))
+        .unwrap();
+    pipe.server
+        .multicast_stream_send(&channel_id, 0, stream_id, 10, b"a", false)
+        .unwrap();
+
+    let first_ack = multicast_ack_for(&channel_id, 0);
+    pipe.server
+        .multicast_process_peer_ack(first_ack.clone())
+        .unwrap();
+    let first_deadline = pipe.server.multicast_probe_states[&channel_id].deadline;
+    assert_eq!(
+        pipe.server.multicast_stream_recovery[&channel_id].largest_acknowledged,
+        Some(0)
+    );
+
+    pipe.server.multicast_process_peer_ack(first_ack).unwrap();
+    assert_eq!(
+        pipe.server.multicast_probe_states[&channel_id].deadline,
+        first_deadline
+    );
+
+    pipe.server
+        .multicast_stream_send(&channel_id, 1, stream_id, 11, b"b", true)
+        .unwrap();
+    pipe.server
+        .multicast_process_peer_ack(multicast_ack_for(&channel_id, 1))
+        .unwrap();
+    assert_eq!(
+        pipe.server.multicast_stream_recovery[&channel_id].largest_acknowledged,
+        Some(1)
+    );
+}
+
+#[test]
+fn multicast_stream_ack_gap_recovers_exact_missing_ranges() {
+    let mut pipe = multicast_stream_negotiated_pipe();
+    let channel_id = vec![1, 2, 3, 4];
+    let stream_id = 3;
+    multicast_stream_prefix(&mut pipe, stream_id);
+
+    pipe.server
+        .multicast_stream_send(&channel_id, 0, stream_id, 10, b"a", false)
+        .unwrap();
+    pipe.advance().unwrap();
+    let mut out = [0; 32];
+    assert_eq!(pipe.client.stream_recv(stream_id, &mut out), Ok((1, false)));
+
+    pipe.server
+        .multicast_process_peer_ack(multicast_ack_for(&channel_id, 0))
+        .unwrap();
+    pipe.server
+        .multicast_set_stream_recovery_reordering_threshold(&channel_id, 1)
+        .unwrap();
+    pipe.server
+        .multicast_stream_send(&channel_id, 1, stream_id, 11, b"one", false)
+        .unwrap();
+    pipe.server
+        .multicast_stream_send(&channel_id, 2, stream_id, 14, b"two", false)
+        .unwrap();
+    pipe.server
+        .multicast_stream_send(&channel_id, 3, stream_id, 17, b"three", true)
+        .unwrap();
+
+    pipe.server
+        .multicast_process_peer_ack(multicast_ack_for(&channel_id, 3))
+        .unwrap();
+    pipe.advance().unwrap();
+
+    assert_eq!(pipe.client.stream_recv(stream_id, &mut out), Ok((6, false)));
+    assert_eq!(&out[..6], b"onetwo");
+    assert_eq!(
+        pipe.server.multicast_stream_recovery_pending(&channel_id),
+        0
+    );
+    assert_eq!(pipe.server.multicast_stream_recovery_withheld_bytes(), 0);
+}
+
+#[test]
+fn multicast_stream_fallback_reentry_releases_pending_ranges() {
+    let mut pipe = multicast_stream_negotiated_pipe();
+    let channel_id = vec![1, 2, 3, 4];
+    let stream_id = 3;
+    multicast_stream_prefix(&mut pipe, stream_id);
+
+    pipe.server
+        .multicast_stream_send(&channel_id, 0, stream_id, 10, b"a", false)
+        .unwrap();
+    pipe.advance().unwrap();
+    let mut out = [0; 32];
+    assert_eq!(pipe.client.stream_recv(stream_id, &mut out), Ok((1, false)));
+    pipe.server
+        .multicast_process_peer_ack(multicast_ack_for(&channel_id, 0))
+        .unwrap();
+
+    pipe.server
+        .multicast_stream_send(&channel_id, 1, stream_id, 11, b"resume", true)
+        .unwrap();
+    pipe.server
+        .multicast_process_local_state(multicast::State {
+            channel_id: channel_id.clone(),
+            sequence: 2,
+            state: multicast::ChannelState::Left,
+            reason_scope: multicast::StateReasonScope::Transport,
+            reason_code: multicast::STATE_REASON_REQUESTED_BY_SERVER,
+            reason_phrase: Vec::new(),
+        })
+        .unwrap();
+    pipe.advance().unwrap();
+
+    assert_eq!(pipe.client.stream_recv(stream_id, &mut out), Ok((6, true)));
+    assert_eq!(&out[..6], b"resume");
+    assert_eq!(
+        pipe.server.multicast_stream_recovery_pending(&channel_id),
+        0
+    );
+}
+
+#[test]
+fn multicast_stream_ack_timeout_releases_pending_ranges() {
+    let mut pipe = multicast_stream_negotiated_pipe();
+    let channel_id = vec![1, 2, 3, 4];
+    let stream_id = 3;
+    multicast_stream_prefix(&mut pipe, stream_id);
+
+    pipe.server
+        .multicast_stream_send(&channel_id, 0, stream_id, 10, b"a", false)
+        .unwrap();
+    pipe.advance().unwrap();
+    let mut out = [0; 16];
+    assert_eq!(pipe.client.stream_recv(stream_id, &mut out), Ok((1, false)));
+    pipe.server
+        .multicast_set_ack_timeout(&channel_id, Some(Duration::ZERO))
+        .unwrap();
+    pipe.server
+        .multicast_process_peer_ack(multicast_ack_for(&channel_id, 0))
+        .unwrap();
+    pipe.server
+        .multicast_stream_send(&channel_id, 1, stream_id, 11, b"timeout", true)
+        .unwrap();
+
+    pipe.server.on_timeout();
+    pipe.advance().unwrap();
+
+    assert_eq!(
+        pipe.server.multicast_probe_status(&channel_id),
+        Some(multicast::ProbeStatus::TimedOut)
+    );
+    assert_eq!(pipe.client.stream_recv(stream_id, &mut out), Ok((7, true)));
+    assert_eq!(&out[..7], b"timeout");
+    assert_eq!(
+        pipe.server.multicast_stream_recovery_pending(&channel_id),
+        0
+    );
+}
+
+#[test]
+fn multicast_stream_reset_drops_withheld_recovery() {
+    let mut pipe = multicast_stream_negotiated_pipe();
+    let channel_id = vec![1, 2, 3, 4];
+    let stream_id = 3;
+    multicast_stream_prefix(&mut pipe, stream_id);
+
+    pipe.server
+        .multicast_stream_send(&channel_id, 0, stream_id, 10, b"a", false)
+        .unwrap();
+    pipe.advance().unwrap();
+    let mut out = [0; 32];
+    assert_eq!(pipe.client.stream_recv(stream_id, &mut out), Ok((1, false)));
+    pipe.server
+        .multicast_process_peer_ack(multicast_ack_for(&channel_id, 0))
+        .unwrap();
+    pipe.server
+        .multicast_stream_send(&channel_id, 1, stream_id, 11, b"discarded", false)
+        .unwrap();
+
+    pipe.server
+        .stream_shutdown(stream_id, Shutdown::Write, 42)
+        .unwrap();
+    assert_eq!(
+        pipe.server.multicast_stream_recovery_pending(&channel_id),
+        0
+    );
+    assert_eq!(pipe.server.multicast_stream_recovery_withheld_bytes(), 0);
+    pipe.server
+        .multicast_process_local_state(multicast::State {
+            channel_id: channel_id.clone(),
+            sequence: 2,
+            state: multicast::ChannelState::Left,
+            reason_scope: multicast::StateReasonScope::Transport,
+            reason_code: multicast::STATE_REASON_REQUESTED_BY_SERVER,
+            reason_phrase: Vec::new(),
+        })
+        .unwrap();
+    pipe.advance().unwrap();
+
+    assert_eq!(
+        pipe.client.stream_recv(stream_id, &mut out),
+        Err(Error::StreamReset(42))
+    );
+    assert_eq!(
+        pipe.server.multicast_stream_recovery_pending(&channel_id),
+        0
+    );
+    assert_eq!(pipe.server.multicast_stream_recovery_withheld_bytes(), 0);
+}
+
+#[test]
+fn multicast_stream_stop_sending_drops_withheld_recovery() {
+    let mut pipe = multicast_stream_negotiated_pipe();
+    let channel_id = vec![1, 2, 3, 4];
+    let stream_id = 3;
+    multicast_stream_prefix(&mut pipe, stream_id);
+
+    pipe.server
+        .multicast_stream_send(&channel_id, 0, stream_id, 10, b"a", false)
+        .unwrap();
+    pipe.advance().unwrap();
+    let mut out = [0; 8];
+    assert_eq!(pipe.client.stream_recv(stream_id, &mut out), Ok((1, false)));
+    pipe.server
+        .multicast_process_peer_ack(multicast_ack_for(&channel_id, 0))
+        .unwrap();
+    pipe.server
+        .multicast_stream_send(&channel_id, 1, stream_id, 11, b"held", false)
+        .unwrap();
+
+    pipe.client
+        .stream_shutdown(stream_id, Shutdown::Read, 55)
+        .unwrap();
+    pipe.advance().unwrap();
+
+    assert_eq!(
+        pipe.server.multicast_stream_recovery_pending(&channel_id),
+        0
+    );
+    assert_eq!(pipe.server.multicast_stream_recovery_withheld_bytes(), 0);
+    assert_eq!(
+        pipe.server.multicast_stream_send(
+            &channel_id,
+            2,
+            stream_id,
+            15,
+            b"stopped",
+            true
+        ),
+        Err(Error::StreamStopped(55))
+    );
+}
+
+#[test]
+fn multicast_stream_reset_preserves_unrelated_buffer_accounting() {
+    let mut pipe = multicast_stream_negotiated_pipe();
+    let channel_id = vec![1, 2, 3, 4];
+    let stream_id = 3;
+    multicast_stream_prefix(&mut pipe, stream_id);
+
+    pipe.server
+        .multicast_stream_send(&channel_id, 0, stream_id, 10, b"a", false)
+        .unwrap();
+    pipe.advance().unwrap();
+    let mut out = [0; 8];
+    assert_eq!(pipe.client.stream_recv(stream_id, &mut out), Ok((1, false)));
+    pipe.server
+        .multicast_process_peer_ack(multicast_ack_for(&channel_id, 0))
+        .unwrap();
+    pipe.server
+        .multicast_set_stream_recovery_reordering_threshold(&channel_id, 2)
+        .unwrap();
+    pipe.server
+        .multicast_stream_send(&channel_id, 1, stream_id, 11, b"one", false)
+        .unwrap();
+    pipe.server
+        .multicast_stream_send(&channel_id, 2, stream_id, 14, b"two", false)
+        .unwrap();
+    pipe.server
+        .multicast_stream_send(&channel_id, 3, stream_id, 17, b"", false)
+        .unwrap();
+    pipe.server
+        .multicast_process_peer_ack(multicast_ack_for(&channel_id, 3))
+        .unwrap();
+
+    assert_eq!(
+        pipe.server.multicast_stream_recovery_pending(&channel_id),
+        1
+    );
+    assert_eq!(pipe.server.stream_send(7, b"other", false), Ok(5));
+    assert_eq!(pipe.server.tx_buffered, 11);
+
+    pipe.server
+        .stream_shutdown(stream_id, Shutdown::Write, 42)
+        .unwrap();
+
+    assert_eq!(pipe.server.tx_buffered, 5);
+    assert_eq!(
+        pipe.server.multicast_stream_recovery_pending(&channel_id),
+        0
+    );
+}
+
+#[test]
+fn multicast_stream_reset_tracks_out_of_order_delivered_ranges() {
+    let mut pipe = multicast_stream_negotiated_pipe();
+    let channel_id = vec![1, 2, 3, 4];
+    let stream_id = 3;
+    multicast_stream_prefix(&mut pipe, stream_id);
+
+    pipe.server
+        .multicast_stream_send(&channel_id, 0, stream_id, 10, b"a", false)
+        .unwrap();
+    pipe.advance().unwrap();
+    let mut out = [0; 8];
+    assert_eq!(pipe.client.stream_recv(stream_id, &mut out), Ok((1, false)));
+    pipe.server
+        .multicast_process_peer_ack(multicast_ack_for(&channel_id, 0))
+        .unwrap();
+    pipe.server
+        .multicast_set_stream_recovery_reordering_threshold(&channel_id, 10)
+        .unwrap();
+    pipe.server
+        .multicast_stream_send(&channel_id, 1, stream_id, 11, b"one", false)
+        .unwrap();
+    pipe.server
+        .multicast_stream_send(&channel_id, 2, stream_id, 14, b"two", false)
+        .unwrap();
+    pipe.server
+        .multicast_stream_send(&channel_id, 3, stream_id, 17, b"tri", false)
+        .unwrap();
+    pipe.server
+        .multicast_process_peer_ack(multicast_ack_for(&channel_id, 2))
+        .unwrap();
+
+    assert_eq!(pipe.server.stream_send(7, b"other", false), Ok(5));
+    assert_eq!(pipe.server.tx_buffered, 11);
+    assert_eq!(pipe.server.tx_data, 25);
+
+    pipe.server
+        .stream_shutdown(stream_id, Shutdown::Write, 42)
+        .unwrap();
+
+    assert_eq!(pipe.server.tx_buffered, 5);
+    assert_eq!(pipe.server.tx_data, 22);
+    assert_eq!(
+        pipe.server
+            .streams
+            .reset()
+            .find(|(id, _)| **id == stream_id),
+        Some((&stream_id, &stream::StreamReset::Reset {
+            error_code: 42,
+            final_size: 17,
+        }))
+    );
+    assert_eq!(
+        pipe.server.multicast_stream_recovery_pending(&channel_id),
+        0
+    );
 }
 
 #[test]

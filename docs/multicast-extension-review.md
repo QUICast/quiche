@@ -32,6 +32,28 @@ This is also not IETF Multipath QUIC. The draft itself notes a possible
 relationship between `MC_ACK` and multipath ACK_MP, but the current code uses
 the multicast draft's separate channel packet number spaces and `MC_ACK` frames.
 
+## 2026-07-12 STREAM Server Update
+
+The server-side assessment below predates the production STREAM publisher added
+after this review. Core quiche now retains exact multicast STREAM ranges per
+connection, keeps ordinary unicast fallback active until validated `MC_ACK`,
+recovers ACK gaps over the normal QUIC stream, and resumes fallback on leave,
+retirement, reset, or ACK-freshness timeout. Tokio-quiche now exposes one
+socket-free shared `ServerStreamPublisher` that can attach to multiple
+`ServerControlDriver` connections. See `docs/multicast-stream-server.md`.
+
+`ServerControlRuntime` now also gates automatic announce/join by negotiated
+address family and algorithms, current `MC_LIMITS`, aggregate rate, channel
+counts, and `MAX_STREAMS_UNI`; join/rate reductions trigger `MC_LEAVE`, while a
+reduced channel-ID limit retires excess channels. The older publication-owning
+`ServerRuntime` has intentionally retained its DATAGRAM behavior and does not
+yet share all of these admission checks.
+
+The remaining transparent-delivery gap is client-side: decoded multicast STREAM
+frames are not yet injected into core quiche's ordinary receive stream state.
+The native browser implementation supplies that receive-side integration for
+the current Yggdrasil deployment.
+
 ## Changes Made During This Review
 
 1. Hardened attacker-controlled list decoding in `quiche/src/multicast.rs`.
@@ -65,7 +87,7 @@ Validation:
 
 ## Priority Findings
 
-### P0: Transparent Delivery Is Not Implemented
+### P0: Client-Side Transparent STREAM Delivery Is Not Implemented
 
 Draft expectation:
 
@@ -76,6 +98,8 @@ Draft expectation:
 
 Current implementation:
 
+- Server-side STREAM publication, ACK cutover, retained loss recovery, and
+  ordinary unicast fallback are implemented.
 - Core quiche exposes multicast channel payloads through
   `multicast_dgram_recv()` only for decoded `ChannelFrame::Datagram` frames.
 - STREAM frames can be decoded into `ChannelFrame::Stream`, but they are not fed
@@ -92,9 +116,8 @@ Impact:
 
 Recommendation:
 
-- Keep the current DATAGRAM-first API for QUICast media experiments.
-- Treat transparent STREAM integration as a separate design project, not a
-  small extension of the current queue.
+- Keep the server publisher generic and complete the corresponding receive-side
+  stream injection separately from the mcrx socket integration.
 
 ### P0: Congestion Control, Circuit Breakers, and Recovery Are Mostly Missing
 
@@ -112,9 +135,9 @@ Current implementation:
 - `MC_ACK` frames are generated and processed.
 - Send-side metrics count acknowledged packet ranges.
 - Probe state can become viable on first ACK or time out.
-- There is no multicast congestion controller, no rate adaptation, no circuit
-  breaker policy, no unicast repair integration, and no loss-driven recovery
-  behavior beyond exposing ACK information.
+- STREAM ranges now have ACK-gap unicast repair and fallback re-entry. There is
+  still no multicast congestion controller, rate adaptation, or circuit-breaker
+  policy.
 
 Impact:
 
@@ -143,10 +166,10 @@ Current implementation:
 
 - Core negotiation exposes client transport parameters.
 - The client enforces some local limits before joining.
-- `ServerRuntime` and `ServerControlRuntime` primarily check whether
-  `multicast_client_params` exists, then announce/join configured channels.
-- Automatic join generation does not currently enforce client `MC_LIMITS` beyond
-  copying the sequence number into `MC_JOIN`.
+- `ServerControlRuntime` enforces announce capabilities and current join limits,
+  including dynamic reductions.
+- The older publication-owning `ServerRuntime` still primarily checks whether
+  `multicast_client_params` exists before announcing and joining channels.
 
 Impact:
 
@@ -156,10 +179,8 @@ Impact:
 
 Recommendation:
 
-- Add a shared server-side admission helper used by both `ServerRuntime` and
-  `ServerControlRuntime`.
-- Validate IP family, hash algorithm, AEAD/header algorithm, aggregate rate,
-  channel ID count, and joined count before sending `MC_ANNOUNCE` or `MC_JOIN`.
+- Reuse the control runtime's admission policy in the older `ServerRuntime`
+  without changing its established DATAGRAM publication behavior.
 
 ### P1: Client Channel State Machine Sequencing Is Partial
 

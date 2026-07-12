@@ -31,11 +31,20 @@
 //! currently IPv4-only on the multicast data path and emits explicit
 //! placeholders for IPv6-specific behavior.
 
+mod server_stream;
+
+pub use server_stream::ServerStreamAttachment;
+pub use server_stream::ServerStreamFrame;
+pub use server_stream::ServerStreamPublication;
+pub use server_stream::ServerStreamPublisher;
+pub use server_stream::ServerStreamPublisherError;
+
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::future::pending;
 use std::net::IpAddr;
 use std::net::Ipv4Addr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use mcrx_core::Context as MulticastContext;
@@ -1499,13 +1508,14 @@ impl<A: ApplicationOverQuic> ApplicationOverQuic for ServerControlDriver<A> {
     }
 
     fn process_writes(&mut self, qconn: &mut QuicheConnection) -> QuicResult<()> {
-        self.runtime.process_writes(qconn)?;
-
         if self.inner.should_act() {
             self.inner.process_writes(qconn)?;
         }
 
-        Ok(())
+        // The application owns any connection-specific stream prefix. Let it
+        // create that prefix before shared publisher ranges are registered at
+        // their exact offsets.
+        self.runtime.process_writes(qconn)
     }
 
     fn on_conn_close<M: crate::metrics::Metrics>(
@@ -1677,18 +1687,53 @@ enum ServerError {
 
 #[derive(Debug)]
 enum ServerControlCommand {
-    UpsertChannel { config: ServerControlChannelConfig },
-    SendAnnounce { frame: quiche::multicast::Announce },
-    SendKey { frame: quiche::multicast::Key },
-    SendJoin { frame: quiche::multicast::Join },
-    RelayIntegrity { frame: quiche::multicast::Integrity },
+    UpsertChannel {
+        config: ServerControlChannelConfig,
+    },
+    SendAnnounce {
+        frame: quiche::multicast::Announce,
+    },
+    SendKey {
+        frame: quiche::multicast::Key,
+    },
+    SendJoin {
+        frame: quiche::multicast::Join,
+    },
+    RelayIntegrity {
+        frame: quiche::multicast::Integrity,
+    },
+    AttachStreamPublisher {
+        config: ServerControlChannelConfig,
+        reordering_threshold: u64,
+        max_stream_id: Option<u64>,
+    },
+    StreamPublication {
+        publication: Arc<server_stream::CommittedServerStreamPublication>,
+    },
+    StreamPublisherKey {
+        frame: quiche::multicast::Key,
+    },
+    StreamPublisherMaxStreamId {
+        channel_id: Vec<u8>,
+        max_stream_id: u64,
+    },
+    StreamPublisherRetire {
+        frame: quiche::multicast::Retire,
+    },
 }
 
 #[derive(Default)]
 struct ServerControlChannel {
     announce: Option<quiche::multicast::Announce>,
     key: Option<quiche::multicast::Key>,
+    announce_sent: bool,
     join_sent: bool,
+    join_blocked_by_client: bool,
+    stream_publisher: bool,
+    max_stream_id: Option<u64>,
+    largest_stream_packet_number: Option<u64>,
+    last_client_state_sequence: u64,
+    retired: bool,
 }
 
 struct ServerControlRuntime {
@@ -1696,9 +1741,12 @@ struct ServerControlRuntime {
     event_sender: UnboundedSender<ServerEvent>,
     command_receiver: UnboundedReceiver<ServerControlCommand>,
     pending_commands: VecDeque<ServerControlCommand>,
+    pending_stream_publications:
+        VecDeque<Arc<server_stream::CommittedServerStreamPublication>>,
+    stream_retry_blocked: bool,
     pending_integrities: VecDeque<quiche::multicast::Integrity>,
     channels: BTreeMap<Vec<u8>, ServerControlChannel>,
-    last_client_limits_sequence: Option<u64>,
+    last_client_limits: Option<quiche::multicast::Limits>,
 }
 
 impl ServerControlRuntime {
@@ -1712,23 +1760,30 @@ impl ServerControlRuntime {
             event_sender,
             command_receiver,
             pending_commands: VecDeque::new(),
+            pending_stream_publications: VecDeque::new(),
+            stream_retry_blocked: false,
             pending_integrities: VecDeque::new(),
             channels: BTreeMap::new(),
-            last_client_limits_sequence: None,
+            last_client_limits: None,
         }
     }
 
     fn clear(&mut self) {
         self.pending_commands.clear();
+        self.pending_stream_publications.clear();
+        self.stream_retry_blocked = false;
         self.pending_integrities.clear();
         self.channels.clear();
-        self.last_client_limits_sequence = None;
+        self.last_client_limits = None;
 
         while self.command_receiver.try_recv().is_ok() {}
     }
 
     fn has_pending_work(&self) -> bool {
-        !self.pending_commands.is_empty() || !self.pending_integrities.is_empty()
+        (!self.pending_commands.is_empty() ||
+            !self.pending_stream_publications.is_empty()) &&
+            !self.stream_retry_blocked ||
+            !self.pending_integrities.is_empty()
     }
 
     async fn wait_for_work(&mut self) -> QuicResult<()> {
@@ -1777,7 +1832,11 @@ impl ServerControlRuntime {
             self.pending_commands.push_back(command);
         }
 
+        self.stream_retry_blocked = false;
         self.handle_pending_commands(qconn)?;
+        if !self.stream_retry_blocked {
+            self.flush_pending_stream_publications(qconn)?;
+        }
         self.flush_pending_integrities(qconn)
     }
 
@@ -1789,7 +1848,7 @@ impl ServerControlRuntime {
         let channels = self.settings.channels.clone();
 
         for config in channels {
-            self.upsert_channel_config(qconn, config, auto_send)?;
+            self.upsert_channel_config(qconn, config, auto_send, true)?;
         }
 
         Ok(())
@@ -1804,6 +1863,27 @@ impl ServerControlRuntime {
             },
 
             quiche::multicast::Frame::State(frame) => {
+                if let Some(channel) = self.channels.get_mut(&frame.channel_id) {
+                    channel.last_client_state_sequence = frame.sequence;
+                    match frame.state {
+                        quiche::multicast::ChannelState::Joined => {
+                            channel.join_blocked_by_client = false;
+                        },
+
+                        quiche::multicast::ChannelState::DeclinedJoin |
+                        quiche::multicast::ChannelState::Left => {
+                            channel.join_sent = false;
+                            channel.join_blocked_by_client = true;
+                        },
+
+                        quiche::multicast::ChannelState::Retired => {
+                            channel.announce_sent = false;
+                            channel.join_sent = false;
+                            channel.join_blocked_by_client = true;
+                            channel.retired = true;
+                        },
+                    }
+                }
                 let _ = self.event_sender.send(ServerEvent::ClientState(frame));
             },
 
@@ -1828,17 +1908,143 @@ impl ServerControlRuntime {
     fn handle_limits(
         &mut self, qconn: &mut QuicheConnection, frame: quiche::multicast::Limits,
     ) -> QuicResult<()> {
-        self.last_client_limits_sequence = Some(frame.sequence);
+        if self
+            .last_client_limits
+            .as_ref()
+            .is_some_and(|current| frame.sequence <= current.sequence)
+        {
+            return Ok(());
+        }
+
+        self.last_client_limits = Some(frame.clone());
         let _ = self.event_sender.send(ServerEvent::ClientLimits(frame));
 
         if self.settings.mode != ServerControlMode::Automatic {
             return Ok(());
         }
 
+        for channel in self.channels.values_mut() {
+            if !channel.retired {
+                channel.join_blocked_by_client = false;
+            }
+        }
+
+        self.enforce_client_channel_id_limit(qconn)?;
+        self.enforce_client_join_limits(qconn)?;
+
         let channel_ids = self.channels.keys().cloned().collect::<Vec<_>>();
 
         for channel_id in channel_ids {
+            self.maybe_auto_announce_channel(qconn, &channel_id)?;
             self.maybe_auto_join_channel(qconn, &channel_id)?;
+        }
+
+        Ok(())
+    }
+
+    fn enforce_client_channel_id_limit(
+        &mut self, qconn: &mut QuicheConnection,
+    ) -> QuicResult<()> {
+        let Some(max_channel_ids) = self
+            .last_client_limits
+            .as_ref()
+            .map(|limits| limits.limits.max_channel_ids)
+        else {
+            return Ok(());
+        };
+        let announced = self
+            .channels
+            .iter()
+            .filter(|(_, channel)| channel.announce_sent)
+            .map(|(channel_id, _)| channel_id.clone())
+            .collect::<Vec<_>>();
+        let retained_count =
+            usize::try_from(max_channel_ids).unwrap_or(usize::MAX);
+
+        for channel_id in announced.into_iter().skip(retained_count) {
+            self.retire_channel_for_limits(qconn, &channel_id)?;
+        }
+
+        Ok(())
+    }
+
+    fn retire_channel_for_limits(
+        &mut self, qconn: &mut QuicheConnection, channel_id: &[u8],
+    ) -> QuicResult<()> {
+        let Some(channel) = self.channels.get_mut(channel_id) else {
+            return Ok(());
+        };
+        channel.announce_sent = false;
+        channel.join_sent = false;
+        channel.join_blocked_by_client = true;
+        channel.retired = true;
+        let after_packet_number =
+            channel.largest_stream_packet_number.unwrap_or(0);
+
+        qconn.multicast_process_local_state(quiche::multicast::State {
+            channel_id: channel_id.to_vec(),
+            sequence: channel.last_client_state_sequence,
+            state: quiche::multicast::ChannelState::Retired,
+            reason_scope: quiche::multicast::StateReasonScope::Transport,
+            reason_code: quiche::multicast::STATE_REASON_REQUESTED_BY_SERVER,
+            reason_phrase: Vec::new(),
+        })?;
+        qconn.multicast_send(quiche::multicast::Frame::Retire(
+            quiche::multicast::Retire {
+                channel_id: channel_id.to_vec(),
+                after_packet_number,
+            },
+        ))?;
+
+        Ok(())
+    }
+
+    fn enforce_client_join_limits(
+        &mut self, qconn: &mut QuicheConnection,
+    ) -> QuicResult<()> {
+        let Some(limits) = self.last_client_limits.clone() else {
+            return Ok(());
+        };
+        let joined = self
+            .channels
+            .iter()
+            .filter(|(_, channel)| channel.join_sent)
+            .map(|(channel_id, _)| channel_id.clone())
+            .collect::<Vec<_>>();
+        let mut retained_count = 0_u64;
+        let mut retained_rate = 0_u64;
+
+        for channel_id in joined {
+            let Some(channel) = self.channels.get(&channel_id) else {
+                continue;
+            };
+            let Some(announce) = channel.announce.as_ref() else {
+                continue;
+            };
+            let stream_limit_ok = !channel.stream_publisher ||
+                channel.max_stream_id.is_some_and(|stream_id| {
+                    Self::stream_id_within_peer_limit(qconn, stream_id)
+                });
+            let permitted = Self::announce_matches_client_capabilities(
+                qconn,
+                &limits.limits,
+                announce,
+            ) && stream_limit_ok &&
+                retained_count < limits.max_joined_count &&
+                retained_count < limits.limits.max_channel_ids &&
+                retained_rate.saturating_add(announce.max_rate_kibps) <=
+                    limits.limits.max_aggregate_rate_kibps;
+
+            if permitted {
+                retained_count = retained_count.saturating_add(1);
+                retained_rate =
+                    retained_rate.saturating_add(announce.max_rate_kibps);
+                continue;
+            }
+
+            let after_packet_number =
+                channel.largest_stream_packet_number.unwrap_or(0);
+            self.leave_channel(qconn, &channel_id, after_packet_number)?;
         }
 
         Ok(())
@@ -1853,7 +2059,7 @@ impl ServerControlRuntime {
                     let auto_send = self.settings.mode ==
                         ServerControlMode::Automatic &&
                         self.peer_supports_multicast(qconn);
-                    self.upsert_channel_config(qconn, config, auto_send)?;
+                    self.upsert_channel_config(qconn, config, auto_send, true)?;
                 },
 
                 ServerControlCommand::SendAnnounce { frame } => {
@@ -1871,6 +2077,7 @@ impl ServerControlRuntime {
                         .entry(frame.channel_id.clone())
                         .or_default();
                     channel.announce = Some(frame.clone());
+                    channel.announce_sent = true;
                     channel.join_sent = false;
                     qconn.multicast_send(quiche::multicast::Frame::Announce(
                         frame,
@@ -1900,12 +2107,175 @@ impl ServerControlRuntime {
                         .entry(frame.channel_id.clone())
                         .or_default();
                     channel.join_sent = true;
+                    channel.join_blocked_by_client = false;
                     qconn
                         .multicast_send(quiche::multicast::Frame::Join(frame))?;
                 },
 
                 ServerControlCommand::RelayIntegrity { frame } => {
                     self.pending_integrities.push_back(frame);
+                },
+
+                ServerControlCommand::AttachStreamPublisher {
+                    config,
+                    reordering_threshold,
+                    max_stream_id,
+                } => {
+                    let channel_id = config.announce.channel_id.clone();
+                    qconn.multicast_set_stream_recovery_reordering_threshold(
+                        &channel_id,
+                        reordering_threshold,
+                    )?;
+
+                    let auto_send = self.settings.mode ==
+                        ServerControlMode::Automatic &&
+                        self.peer_supports_multicast(qconn);
+                    self.upsert_channel_config(qconn, config, false, false)?;
+
+                    let channel = self
+                        .channels
+                        .get_mut(&channel_id)
+                        .ok_or(Box::new(quiche::Error::InvalidState)
+                            as Box<dyn std::error::Error + Send + Sync>)?;
+                    channel.stream_publisher = true;
+                    channel.max_stream_id = max_stream_id;
+
+                    if auto_send {
+                        self.maybe_auto_announce_channel(qconn, &channel_id)?;
+                        self.maybe_auto_join_channel(qconn, &channel_id)?;
+                    }
+                },
+
+                ServerControlCommand::StreamPublication { publication } => {
+                    let channel_id = publication.integrity.channel_id.clone();
+                    let exceeds_stream_limit = {
+                        let Some(channel) = self.channels.get_mut(&channel_id)
+                        else {
+                            return Err(quiche::Error::InvalidState.into());
+                        };
+
+                        channel.max_stream_id =
+                            Some(channel.max_stream_id.map_or(
+                                publication.frame.stream_id,
+                                |current| {
+                                    current.max(publication.frame.stream_id)
+                                },
+                            ));
+                        channel.largest_stream_packet_number =
+                            Some(publication.packet_number);
+                        channel.join_sent &&
+                            !Self::stream_id_within_peer_limit(
+                                qconn,
+                                publication.frame.stream_id,
+                            )
+                    };
+
+                    if exceeds_stream_limit {
+                        self.leave_channel(
+                            qconn,
+                            &channel_id,
+                            publication.packet_number.saturating_sub(1),
+                        )?;
+                    }
+
+                    self.pending_stream_publications.push_back(publication);
+
+                    if self.settings.mode == ServerControlMode::Automatic {
+                        self.maybe_auto_join_channel(qconn, &channel_id)?;
+                    }
+                },
+
+                ServerControlCommand::StreamPublisherKey { frame } => {
+                    let Some(channel) = self.channels.get_mut(&frame.channel_id)
+                    else {
+                        return Err(quiche::Error::InvalidState.into());
+                    };
+                    channel.key = Some(frame.clone());
+
+                    if channel.announce_sent &&
+                        !channel.retired &&
+                        self.peer_supports_multicast(qconn)
+                    {
+                        qconn.multicast_send(quiche::multicast::Frame::Key(
+                            frame,
+                        ))?;
+                    }
+                },
+
+                ServerControlCommand::StreamPublisherMaxStreamId {
+                    channel_id,
+                    max_stream_id,
+                } => {
+                    let (exceeds_stream_limit, after_packet_number) = {
+                        let Some(channel) = self.channels.get_mut(&channel_id)
+                        else {
+                            return Err(quiche::Error::InvalidState.into());
+                        };
+                        channel.max_stream_id = Some(
+                            channel
+                                .max_stream_id
+                                .map_or(max_stream_id, |current| {
+                                    current.max(max_stream_id)
+                                }),
+                        );
+                        (
+                            channel.join_sent &&
+                                !Self::stream_id_within_peer_limit(
+                                    qconn,
+                                    max_stream_id,
+                                ),
+                            channel.largest_stream_packet_number.unwrap_or(0),
+                        )
+                    };
+
+                    if exceeds_stream_limit {
+                        self.leave_channel(
+                            qconn,
+                            &channel_id,
+                            after_packet_number,
+                        )?;
+                    } else if self.settings.mode == ServerControlMode::Automatic {
+                        self.maybe_auto_join_channel(qconn, &channel_id)?;
+                    }
+                },
+
+                ServerControlCommand::StreamPublisherRetire { frame } => {
+                    self.flush_pending_stream_publications(qconn)?;
+                    if !self.pending_stream_publications.is_empty() {
+                        self.pending_commands.push_front(
+                            ServerControlCommand::StreamPublisherRetire { frame },
+                        );
+                        self.stream_retry_blocked = true;
+                        return Ok(());
+                    }
+                    self.flush_pending_integrities(qconn)?;
+
+                    let Some(channel) = self.channels.get_mut(&frame.channel_id)
+                    else {
+                        return Err(quiche::Error::InvalidState.into());
+                    };
+                    channel.retired = true;
+                    channel.announce_sent = false;
+                    channel.join_sent = false;
+                    channel.join_blocked_by_client = true;
+
+                    qconn
+                        .multicast_process_local_state(quiche::multicast::State {
+                        channel_id: frame.channel_id.clone(),
+                        sequence: 0,
+                        state: quiche::multicast::ChannelState::Retired,
+                        reason_scope:
+                            quiche::multicast::StateReasonScope::Transport,
+                        reason_code:
+                            quiche::multicast::STATE_REASON_REQUESTED_BY_SERVER,
+                        reason_phrase: Vec::new(),
+                    })?;
+
+                    if self.peer_supports_multicast(qconn) {
+                        qconn.multicast_send(
+                            quiche::multicast::Frame::Retire(frame),
+                        )?;
+                    }
                 },
             }
         }
@@ -1916,11 +2286,14 @@ impl ServerControlRuntime {
     fn upsert_channel_config(
         &mut self, qconn: &mut QuicheConnection,
         config: ServerControlChannelConfig, auto_send: bool,
+        set_default_dgram_channel: bool,
     ) -> QuicResult<()> {
         config.validate()?;
 
         let channel_id = config.announce.channel_id.clone();
-        Self::set_default_dgram_channel_if_unset(qconn, &channel_id)?;
+        if set_default_dgram_channel {
+            Self::set_default_dgram_channel_if_unset(qconn, &channel_id)?;
+        }
         Self::set_ack_timeout(
             qconn,
             &channel_id,
@@ -1929,17 +2302,53 @@ impl ServerControlRuntime {
         let channel = self.channels.entry(channel_id.clone()).or_default();
         channel.announce = Some(config.announce.clone());
         channel.key = Some(config.key.clone());
+        channel.announce_sent = false;
         channel.join_sent = false;
+        channel.join_blocked_by_client = false;
+        channel.retired = false;
 
         if !auto_send {
             return Ok(());
         }
 
-        qconn.multicast_send(quiche::multicast::Frame::Announce(
-            config.announce,
-        ))?;
-        qconn.multicast_send(quiche::multicast::Frame::Key(config.key))?;
+        self.maybe_auto_announce_channel(qconn, &channel_id)?;
         self.maybe_auto_join_channel(qconn, &channel_id)
+    }
+
+    fn maybe_auto_announce_channel(
+        &mut self, qconn: &mut QuicheConnection, channel_id: &[u8],
+    ) -> QuicResult<()> {
+        if self.settings.mode != ServerControlMode::Automatic ||
+            !self.peer_supports_multicast(qconn)
+        {
+            return Ok(());
+        }
+
+        let Some(channel) = self.channels.get(channel_id) else {
+            return Ok(());
+        };
+        if channel.announce_sent || channel.retired {
+            return Ok(());
+        }
+        let (Some(announce), Some(key)) =
+            (channel.announce.as_ref(), channel.key.as_ref())
+        else {
+            return Ok(());
+        };
+        if !self.channel_can_be_announced(qconn, channel_id, announce) {
+            return Ok(());
+        }
+
+        let announce = announce.clone();
+        let key = key.clone();
+        qconn.multicast_send(quiche::multicast::Frame::Announce(announce))?;
+        qconn.multicast_send(quiche::multicast::Frame::Key(key))?;
+        self.channels
+            .get_mut(channel_id)
+            .expect("channel was checked above")
+            .announce_sent = true;
+
+        Ok(())
     }
 
     fn maybe_auto_join_channel(
@@ -1949,15 +2358,21 @@ impl ServerControlRuntime {
             return Ok(());
         }
 
-        let Some(sequence) = self.last_client_limits_sequence else {
+        let Some(limits) = self.last_client_limits.as_ref() else {
             return Ok(());
         };
 
-        let Some(channel) = self.channels.get_mut(channel_id) else {
+        let sequence = limits.sequence;
+
+        let Some(channel) = self.channels.get(channel_id) else {
             return Ok(());
         };
 
-        if channel.join_sent {
+        if !channel.announce_sent ||
+            channel.join_sent ||
+            channel.join_blocked_by_client ||
+            channel.retired
+        {
             return Ok(());
         }
 
@@ -1967,15 +2382,231 @@ impl ServerControlRuntime {
             return Ok(());
         };
 
-        qconn.multicast_send(quiche::multicast::Frame::Join(
-            quiche::multicast::Join {
-                channel_id: announce.channel_id.clone(),
-                mc_limits_sequence: sequence,
-                mc_state_sequence: 0,
-                mc_key_sequence: key.key_sequence,
-            },
-        ))?;
-        channel.join_sent = true;
+        if !self.channel_fits_client_limits(qconn, channel_id, announce) {
+            return Ok(());
+        }
+
+        let join = quiche::multicast::Join {
+            channel_id: announce.channel_id.clone(),
+            mc_limits_sequence: sequence,
+            mc_state_sequence: channel.last_client_state_sequence,
+            mc_key_sequence: key.key_sequence,
+        };
+
+        qconn.multicast_send(quiche::multicast::Frame::Join(join))?;
+        self.channels
+            .get_mut(channel_id)
+            .expect("channel was checked above")
+            .join_sent = true;
+
+        Ok(())
+    }
+
+    fn channel_fits_client_limits(
+        &self, qconn: &QuicheConnection, channel_id: &[u8],
+        announce: &quiche::multicast::Announce,
+    ) -> bool {
+        let Some(limits) = self.last_client_limits.as_ref() else {
+            return false;
+        };
+        if !Self::announce_matches_client_capabilities(
+            qconn,
+            &limits.limits,
+            announce,
+        ) {
+            return false;
+        }
+
+        let joined_count = self
+            .channels
+            .iter()
+            .filter(|(id, channel)| {
+                id.as_slice() != channel_id && channel.join_sent
+            })
+            .count() as u64;
+        if joined_count >= limits.max_joined_count ||
+            joined_count >= limits.limits.max_channel_ids
+        {
+            return false;
+        }
+
+        let joined_rate = self
+            .channels
+            .iter()
+            .filter(|(id, channel)| {
+                id.as_slice() != channel_id && channel.join_sent
+            })
+            .filter_map(|(_, channel)| channel.announce.as_ref())
+            .fold(0_u64, |total, joined| {
+                total.saturating_add(joined.max_rate_kibps)
+            });
+        if joined_rate.saturating_add(announce.max_rate_kibps) >
+            limits.limits.max_aggregate_rate_kibps
+        {
+            return false;
+        }
+
+        let channel = self
+            .channels
+            .get(channel_id)
+            .expect("channel was checked by caller");
+        if channel.stream_publisher {
+            let Some(max_stream_id) = channel.max_stream_id else {
+                return false;
+            };
+
+            if !Self::stream_id_within_peer_limit(qconn, max_stream_id) {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    fn channel_can_be_announced(
+        &self, qconn: &QuicheConnection, channel_id: &[u8],
+        announce: &quiche::multicast::Announce,
+    ) -> bool {
+        let Some(peer) = qconn
+            .peer_transport_params()
+            .and_then(|params| params.multicast_client_params.as_ref())
+        else {
+            return false;
+        };
+        let active_limits = self
+            .last_client_limits
+            .as_ref()
+            .map_or(&peer.limits, |limits| &limits.limits);
+
+        if !Self::announce_matches_client_capabilities(
+            qconn,
+            active_limits,
+            announce,
+        ) {
+            return false;
+        }
+
+        let announced_count = self
+            .channels
+            .iter()
+            .filter(|(id, channel)| {
+                id.as_slice() != channel_id && channel.announce_sent
+            })
+            .count() as u64;
+
+        announced_count < active_limits.max_channel_ids
+    }
+
+    fn announce_matches_client_capabilities(
+        qconn: &QuicheConnection, limits: &quiche::multicast::ClientLimits,
+        announce: &quiche::multicast::Announce,
+    ) -> bool {
+        let Some(peer) = qconn
+            .peer_transport_params()
+            .and_then(|params| params.multicast_client_params.as_ref())
+        else {
+            return false;
+        };
+
+        let family_allowed = match (&announce.source, &announce.group) {
+            (IpAddr::V4(_), IpAddr::V4(_)) => limits.ipv4_channels_allowed,
+            (IpAddr::V6(_), IpAddr::V6(_)) => limits.ipv6_channels_allowed,
+            _ => false,
+        };
+
+        family_allowed &&
+            peer.hash_algorithms
+                .contains(&announce.integrity_hash_algorithm) &&
+            peer.encryption_algorithms
+                .contains(&announce.header_protection_algorithm) &&
+            peer.encryption_algorithms
+                .contains(&announce.aead_algorithm)
+    }
+
+    fn stream_id_within_peer_limit(
+        qconn: &QuicheConnection, stream_id: u64,
+    ) -> bool {
+        stream_id >> 2 < qconn.peer_max_streams_uni()
+    }
+
+    fn leave_channel(
+        &mut self, qconn: &mut QuicheConnection, channel_id: &[u8],
+        after_packet_number: u64,
+    ) -> QuicResult<()> {
+        let Some(channel) = self.channels.get_mut(channel_id) else {
+            return Ok(());
+        };
+        if !channel.join_sent {
+            return Ok(());
+        }
+
+        let state_sequence = channel.last_client_state_sequence;
+        channel.join_sent = false;
+        qconn.multicast_process_local_state(quiche::multicast::State {
+            channel_id: channel_id.to_vec(),
+            sequence: state_sequence,
+            state: quiche::multicast::ChannelState::Left,
+            reason_scope: quiche::multicast::StateReasonScope::Transport,
+            reason_code: quiche::multicast::STATE_REASON_REQUESTED_BY_SERVER,
+            reason_phrase: Vec::new(),
+        })?;
+
+        if self.peer_supports_multicast(qconn) {
+            qconn.multicast_send(quiche::multicast::Frame::Leave(
+                quiche::multicast::Leave {
+                    channel_id: channel_id.to_vec(),
+                    mc_state_sequence: state_sequence,
+                    after_packet_number,
+                },
+            ))?;
+        }
+
+        Ok(())
+    }
+
+    fn flush_pending_stream_publications(
+        &mut self, qconn: &mut QuicheConnection,
+    ) -> QuicResult<()> {
+        while let Some(publication) = self.pending_stream_publications.pop_front()
+        {
+            let channel_id = &publication.integrity.channel_id;
+            let frame = &publication.frame;
+
+            match qconn.multicast_stream_send_buf(
+                channel_id,
+                publication.packet_number,
+                frame.stream_id,
+                frame.offset,
+                frame.data.clone(),
+                frame.fin,
+            ) {
+                Ok(()) =>
+                    if self.peer_supports_multicast(qconn) &&
+                        self.channels.get(channel_id).is_some_and(|channel| {
+                            channel.announce_sent &&
+                                channel.join_sent &&
+                                !channel.retired
+                        })
+                    {
+                        self.pending_integrities
+                            .push_back(publication.integrity.clone());
+                    },
+
+                Err(
+                    quiche::Error::Done |
+                    quiche::Error::StreamLimit |
+                    quiche::Error::InvalidStreamState(_),
+                ) => {
+                    self.pending_stream_publications.push_front(publication);
+                    self.stream_retry_blocked = true;
+                    break;
+                },
+
+                Err(quiche::Error::StreamStopped(_)) => (),
+
+                Err(error) => return Err(error.into()),
+            }
+        }
 
         Ok(())
     }
@@ -2617,6 +3248,32 @@ mod tests {
         pipe
     }
 
+    fn test_stream_pipe(settings: &ClientSettings) -> Pipe {
+        let mut client_config =
+            quiche::test_utils::Pipe::default_config("cubic").unwrap();
+        client_config.enable_dgram(true, 10, 10);
+        client_config.set_initial_max_data(4096);
+        client_config.set_initial_max_stream_data_uni(4096);
+        client_config
+            .set_multicast_client_params(Some(settings.transport_params.clone()));
+
+        let mut server_config =
+            quiche::test_utils::Pipe::default_config("cubic").unwrap();
+        server_config.enable_dgram(true, 10, 10);
+        server_config.enable_multicast_server_support(true);
+        server_config.set_initial_max_data(4096);
+        server_config.set_initial_max_stream_data_uni(4096);
+
+        let mut pipe = Pipe::with_client_and_server_config_and_buf(
+            &mut client_config,
+            &mut server_config,
+        )
+        .unwrap();
+        pipe.handshake().unwrap();
+
+        pipe
+    }
+
     fn test_ipv4_announce() -> quiche::multicast::Announce {
         quiche::multicast::Announce {
             channel_id: vec![1, 2, 3, 4],
@@ -2722,6 +3379,754 @@ mod tests {
         assert_eq!(pipe.client.dgram_recv(&mut out), Ok(expected.len()));
         assert_eq!(&out[..expected.len()], expected);
         assert_eq!(pipe.client.dgram_recv(&mut out), Err(quiche::Error::Done));
+    }
+
+    fn test_stream_control_config() -> ServerControlChannelConfig {
+        ServerControlChannelConfig {
+            announce: test_ipv4_announce(),
+            key: test_key(&[1, 2, 3, 4]),
+        }
+    }
+
+    fn test_stream_control_runtime(
+    ) -> (ServerControlRuntime, ServerControlController) {
+        let (command_sender, command_receiver) = mpsc::unbounded_channel();
+        let (event_sender, event_receiver) = mpsc::unbounded_channel();
+
+        (
+            ServerControlRuntime::new(
+                ServerControlSettings {
+                    mode: ServerControlMode::Automatic,
+                    channels: Vec::new(),
+                },
+                event_sender,
+                command_receiver,
+            ),
+            ServerControlController {
+                command_sender,
+                event_receiver,
+            },
+        )
+    }
+
+    fn send_webtransport_stream_prefix(
+        pipe: &mut Pipe, stream_id: u64, session_id: u64,
+    ) {
+        let mut prefix = [0; 10];
+        prefix[..2].copy_from_slice(&[0x40, 0x54]);
+        prefix[2..].copy_from_slice(&session_id.to_be_bytes());
+
+        assert_eq!(
+            pipe.server.stream_send(stream_id, &prefix, false),
+            Ok(prefix.len())
+        );
+        let flight = quiche::test_utils::emit_flight(&mut pipe.server).unwrap();
+        quiche::test_utils::process_flight(&mut pipe.client, flight).unwrap();
+
+        let mut out = [0; 16];
+        assert_eq!(
+            pipe.client.stream_recv(stream_id, &mut out),
+            Ok((prefix.len(), false))
+        );
+        assert_eq!(&out[..prefix.len()], &prefix);
+    }
+
+    fn deliver_server_flight(pipe: &mut Pipe) {
+        let flight = quiche::test_utils::emit_flight(&mut pipe.server).unwrap();
+        quiche::test_utils::process_flight(&mut pipe.client, flight).unwrap();
+    }
+
+    fn send_client_control(
+        pipe: &mut Pipe, runtime: &mut ServerControlRuntime,
+        frame: quiche::multicast::Frame,
+    ) {
+        pipe.client.multicast_send(frame).unwrap();
+        let flight = quiche::test_utils::emit_flight(&mut pipe.client).unwrap();
+        quiche::test_utils::process_flight(&mut pipe.server, flight).unwrap();
+        runtime.process_reads(&mut pipe.server).unwrap();
+    }
+
+    fn assert_no_queued_join(qconn: &mut QuicheConnection) {
+        loop {
+            match qconn.multicast_recv() {
+                Ok(quiche::multicast::Frame::Join(frame)) => {
+                    panic!("unexpected MC_JOIN: {frame:?}");
+                },
+
+                Ok(_) => (),
+
+                Err(quiche::Error::Done) => return,
+
+                Err(error) =>
+                    panic!("unexpected multicast receive error: {error:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn server_stream_publisher_encodes_shared_stream_packet() {
+        let config = test_stream_control_config();
+        let publisher = ServerStreamPublisher::new(config.clone()).unwrap();
+        publisher.declare_stream(3).unwrap();
+
+        let publication = publisher
+            .prepare_stream(3, 10, true, b"shared stream body")
+            .unwrap();
+        assert_eq!(publication.packet_number(), 0);
+        assert_eq!(publication.frame().offset, 10);
+
+        let mut receiver =
+            quiche::multicast::ChannelReceiveState::new(config.announce).unwrap();
+        receiver.insert_key(config.key).unwrap();
+        assert!(receiver
+            .insert_integrity(publication.integrity().clone())
+            .unwrap()
+            .is_empty());
+
+        let events = receiver.recv(publication.packet(), ()).unwrap();
+        assert!(matches!(
+            &events[0],
+            quiche::multicast::ChannelReceiveEvent::Packet { packet, .. }
+                if packet.frames == vec![quiche::multicast::ChannelFrame::Stream {
+                    stream_id: 3,
+                    offset: 10,
+                    fin: true,
+                    data: b"shared stream body".to_vec(),
+                }]
+        ));
+    }
+
+    #[test]
+    fn server_stream_publisher_fans_out_unicast_fallback_to_two_clients() {
+        let settings = test_settings();
+        let mut first = test_stream_pipe(&settings);
+        let mut second = test_stream_pipe(&settings);
+        let (mut first_runtime, first_controller) = test_stream_control_runtime();
+        let (mut second_runtime, second_controller) =
+            test_stream_control_runtime();
+        first_runtime
+            .on_conn_established(&mut first.server)
+            .unwrap();
+        second_runtime
+            .on_conn_established(&mut second.server)
+            .unwrap();
+        send_webtransport_stream_prefix(&mut first, 3, 11);
+        send_webtransport_stream_prefix(&mut second, 3, 22);
+
+        let publisher =
+            ServerStreamPublisher::new(test_stream_control_config()).unwrap();
+        publisher.declare_stream(3).unwrap();
+        let first_attachment = publisher.attach(&first_controller).unwrap();
+        let second_attachment = publisher.attach(&second_controller).unwrap();
+        first_runtime.process_writes(&mut first.server).unwrap();
+        second_runtime.process_writes(&mut second.server).unwrap();
+
+        let publication = publisher
+            .prepare_stream(3, 10, false, b"one shared body")
+            .unwrap();
+        publisher.commit(publication).unwrap();
+        first_runtime.process_writes(&mut first.server).unwrap();
+        second_runtime.process_writes(&mut second.server).unwrap();
+        deliver_server_flight(&mut first);
+        deliver_server_flight(&mut second);
+
+        let mut out = [0; 32];
+        assert_eq!(first.client.stream_recv(3, &mut out), Ok((15, false)));
+        assert_eq!(&out[..15], b"one shared body");
+        assert_eq!(second.client.stream_recv(3, &mut out), Ok((15, false)));
+        assert_eq!(&out[..15], b"one shared body");
+        assert_eq!(publisher.attached_connections().unwrap(), 2);
+
+        drop(first_attachment);
+        drop(second_attachment);
+        assert_eq!(publisher.attached_connections().unwrap(), 0);
+    }
+
+    #[test]
+    fn server_stream_ack_cuts_over_one_client_and_left_resumes_fallback() {
+        let settings = test_settings();
+        let mut first = test_stream_pipe(&settings);
+        let mut second = test_stream_pipe(&settings);
+        let (mut first_runtime, first_controller) = test_stream_control_runtime();
+        let (mut second_runtime, second_controller) =
+            test_stream_control_runtime();
+        first_runtime
+            .on_conn_established(&mut first.server)
+            .unwrap();
+        second_runtime
+            .on_conn_established(&mut second.server)
+            .unwrap();
+        send_webtransport_stream_prefix(&mut first, 3, 11);
+        send_webtransport_stream_prefix(&mut second, 3, 22);
+
+        let channel_id = vec![1, 2, 3, 4];
+        let publisher =
+            ServerStreamPublisher::new(test_stream_control_config()).unwrap();
+        publisher.declare_stream(3).unwrap();
+        let _first_attachment = publisher.attach(&first_controller).unwrap();
+        let _second_attachment = publisher.attach(&second_controller).unwrap();
+        first_runtime.process_writes(&mut first.server).unwrap();
+        second_runtime.process_writes(&mut second.server).unwrap();
+
+        send_client_control(
+            &mut first,
+            &mut first_runtime,
+            quiche::multicast::Frame::Limits(test_limits()),
+        );
+        deliver_server_flight(&mut first);
+        send_client_control(
+            &mut first,
+            &mut first_runtime,
+            quiche::multicast::Frame::State(quiche::multicast::State {
+                channel_id: channel_id.clone(),
+                sequence: 1,
+                state: quiche::multicast::ChannelState::Joined,
+                reason_scope: quiche::multicast::StateReasonScope::Transport,
+                reason_code: quiche::multicast::STATE_REASON_REQUESTED_BY_SERVER,
+                reason_phrase: Vec::new(),
+            }),
+        );
+
+        let baseline =
+            publisher.prepare_stream(3, 10, false, b"baseline").unwrap();
+        publisher.commit(baseline).unwrap();
+        first_runtime.process_writes(&mut first.server).unwrap();
+        second_runtime.process_writes(&mut second.server).unwrap();
+        deliver_server_flight(&mut first);
+        deliver_server_flight(&mut second);
+
+        let mut out = [0; 64];
+        assert_eq!(first.client.stream_recv(3, &mut out), Ok((8, false)));
+        assert_eq!(&out[..8], b"baseline");
+        assert_eq!(second.client.stream_recv(3, &mut out), Ok((8, false)));
+        assert_eq!(&out[..8], b"baseline");
+
+        send_client_control(
+            &mut first,
+            &mut first_runtime,
+            quiche::multicast::Frame::Ack(quiche::multicast::Ack {
+                channel_id: channel_id.clone(),
+                largest_acknowledged: 0,
+                ack_delay: 0,
+                first_ack_range: 0,
+                ack_ranges: Vec::new(),
+                ecn_counts: None,
+            }),
+        );
+        assert_eq!(
+            first.server.multicast_probe_status(&channel_id),
+            Some(quiche::multicast::ProbeStatus::Viable)
+        );
+
+        let multicast_only = publisher
+            .prepare_stream(3, 18, false, b"green-gap")
+            .unwrap();
+        publisher.commit(multicast_only).unwrap();
+        first_runtime.process_writes(&mut first.server).unwrap();
+        second_runtime.process_writes(&mut second.server).unwrap();
+        deliver_server_flight(&mut first);
+        deliver_server_flight(&mut second);
+
+        assert_eq!(
+            first.client.stream_recv(3, &mut out),
+            Err(quiche::Error::Done)
+        );
+        assert_eq!(second.client.stream_recv(3, &mut out), Ok((9, false)));
+        assert_eq!(&out[..9], b"green-gap");
+        assert_eq!(
+            first.server.multicast_stream_recovery_pending(&channel_id),
+            1
+        );
+
+        send_client_control(
+            &mut first,
+            &mut first_runtime,
+            quiche::multicast::Frame::State(quiche::multicast::State {
+                channel_id: channel_id.clone(),
+                sequence: 2,
+                state: quiche::multicast::ChannelState::Left,
+                reason_scope: quiche::multicast::StateReasonScope::Transport,
+                reason_code: quiche::multicast::STATE_REASON_REQUESTED_BY_SERVER,
+                reason_phrase: Vec::new(),
+            }),
+        );
+
+        let fallback =
+            publisher.prepare_stream(3, 27, true, b"fallback").unwrap();
+        publisher.commit(fallback).unwrap();
+        first_runtime.process_writes(&mut first.server).unwrap();
+        second_runtime.process_writes(&mut second.server).unwrap();
+        deliver_server_flight(&mut first);
+        deliver_server_flight(&mut second);
+
+        assert_eq!(first.client.stream_recv(3, &mut out), Ok((17, true)));
+        assert_eq!(&out[..17], b"green-gapfallback");
+        assert_eq!(second.client.stream_recv(3, &mut out), Ok((8, true)));
+        assert_eq!(&out[..8], b"fallback");
+        assert_eq!(
+            first.server.multicast_stream_recovery_pending(&channel_id),
+            0
+        );
+    }
+
+    #[test]
+    fn server_stream_reset_and_attachment_teardown_are_connection_local() {
+        let settings = test_settings();
+        let mut first = test_stream_pipe(&settings);
+        let mut second = test_stream_pipe(&settings);
+        let (mut first_runtime, first_controller) = test_stream_control_runtime();
+        let (mut second_runtime, second_controller) =
+            test_stream_control_runtime();
+        first_runtime
+            .on_conn_established(&mut first.server)
+            .unwrap();
+        second_runtime
+            .on_conn_established(&mut second.server)
+            .unwrap();
+        send_webtransport_stream_prefix(&mut first, 3, 11);
+        send_webtransport_stream_prefix(&mut second, 3, 22);
+
+        let channel_id = vec![1, 2, 3, 4];
+        let publisher =
+            ServerStreamPublisher::new(test_stream_control_config()).unwrap();
+        publisher.declare_stream(3).unwrap();
+        let first_attachment = publisher.attach(&first_controller).unwrap();
+        let second_attachment = publisher.attach(&second_controller).unwrap();
+        first_runtime.process_writes(&mut first.server).unwrap();
+        second_runtime.process_writes(&mut second.server).unwrap();
+
+        let baseline = publisher.prepare_stream(3, 10, false, b"base").unwrap();
+        publisher.commit(baseline).unwrap();
+        first_runtime.process_writes(&mut first.server).unwrap();
+        second_runtime.process_writes(&mut second.server).unwrap();
+        deliver_server_flight(&mut first);
+        deliver_server_flight(&mut second);
+
+        let mut out = [0; 32];
+        assert_eq!(first.client.stream_recv(3, &mut out), Ok((4, false)));
+        assert_eq!(second.client.stream_recv(3, &mut out), Ok((4, false)));
+
+        send_client_control(
+            &mut first,
+            &mut first_runtime,
+            quiche::multicast::Frame::Ack(quiche::multicast::Ack {
+                channel_id: channel_id.clone(),
+                largest_acknowledged: 0,
+                ack_delay: 0,
+                first_ack_range: 0,
+                ack_ranges: Vec::new(),
+                ecn_counts: None,
+            }),
+        );
+
+        let held = publisher.prepare_stream(3, 14, false, b"held").unwrap();
+        publisher.commit(held).unwrap();
+        first_runtime.process_writes(&mut first.server).unwrap();
+        second_runtime.process_writes(&mut second.server).unwrap();
+        assert_eq!(
+            first.server.multicast_stream_recovery_pending(&channel_id),
+            1
+        );
+
+        first
+            .server
+            .stream_shutdown(3, quiche::Shutdown::Write, 42)
+            .unwrap();
+        assert_eq!(
+            first.server.multicast_stream_recovery_pending(&channel_id),
+            0
+        );
+        deliver_server_flight(&mut first);
+        deliver_server_flight(&mut second);
+        assert_eq!(
+            first.client.stream_recv(3, &mut out),
+            Err(quiche::Error::StreamReset(42))
+        );
+        assert_eq!(second.client.stream_recv(3, &mut out), Ok((4, false)));
+        assert_eq!(&out[..4], b"held");
+
+        drop(first_attachment);
+        assert_eq!(publisher.attached_connections().unwrap(), 1);
+        let remaining = publisher.prepare_stream(3, 18, true, b"other").unwrap();
+        publisher.commit(remaining).unwrap();
+        first_runtime.process_writes(&mut first.server).unwrap();
+        second_runtime.process_writes(&mut second.server).unwrap();
+        deliver_server_flight(&mut second);
+        assert_eq!(second.client.stream_recv(3, &mut out), Ok((5, true)));
+        assert_eq!(&out[..5], b"other");
+
+        drop(second_attachment);
+        assert_eq!(publisher.attached_connections().unwrap(), 0);
+    }
+
+    #[test]
+    fn server_stream_fallback_survives_mc_limits_that_forbid_joining() {
+        let settings = test_settings();
+        let mut pipe = test_stream_pipe(&settings);
+        let (mut runtime, controller) = test_stream_control_runtime();
+        runtime.on_conn_established(&mut pipe.server).unwrap();
+        send_webtransport_stream_prefix(&mut pipe, 3, 11);
+
+        let publisher =
+            ServerStreamPublisher::new(test_stream_control_config()).unwrap();
+        publisher.declare_stream(3).unwrap();
+        let _attachment = publisher.attach(&controller).unwrap();
+        runtime.process_writes(&mut pipe.server).unwrap();
+
+        let mut limits = test_limits();
+        limits.max_joined_count = 0;
+        send_client_control(
+            &mut pipe,
+            &mut runtime,
+            quiche::multicast::Frame::Limits(limits),
+        );
+        deliver_server_flight(&mut pipe);
+        assert_no_queued_join(&mut pipe.client);
+
+        let publication = publisher
+            .prepare_stream(3, 10, true, b"fallback only")
+            .unwrap();
+        publisher.commit(publication).unwrap();
+        runtime.process_writes(&mut pipe.server).unwrap();
+        deliver_server_flight(&mut pipe);
+
+        let mut out = [0; 32];
+        assert_eq!(pipe.client.stream_recv(3, &mut out), Ok((13, true)));
+        assert_eq!(&out[..13], b"fallback only");
+    }
+
+    #[test]
+    fn server_stream_auto_join_waits_for_quic_stream_credit() {
+        let settings = test_settings();
+        let mut pipe = test_stream_pipe(&settings);
+        let (mut runtime, controller) = test_stream_control_runtime();
+        runtime.on_conn_established(&mut pipe.server).unwrap();
+        let max_streams_uni = pipe.server.peer_max_streams_uni();
+        let blocked_stream_id = (max_streams_uni << 2) | 0x3;
+
+        send_client_control(
+            &mut pipe,
+            &mut runtime,
+            quiche::multicast::Frame::Limits(test_limits()),
+        );
+
+        let publisher =
+            ServerStreamPublisher::new(test_stream_control_config()).unwrap();
+        publisher.declare_stream(blocked_stream_id).unwrap();
+        let _attachment = publisher.attach(&controller).unwrap();
+        runtime.process_writes(&mut pipe.server).unwrap();
+        deliver_server_flight(&mut pipe);
+
+        assert_no_queued_join(&mut pipe.client);
+        assert!(!runtime.channels[&[1, 2, 3, 4][..]].join_sent);
+
+        let publication = publisher
+            .prepare_stream(blocked_stream_id, 0, false, b"wait for credit")
+            .unwrap();
+        publisher.commit(publication).unwrap();
+        runtime.process_writes(&mut pipe.server).unwrap();
+
+        assert_eq!(runtime.pending_stream_publications.len(), 1);
+        assert!(runtime.stream_retry_blocked);
+        assert_eq!(pipe.server.multicast_send_queue_len(), 0);
+    }
+
+    #[test]
+    fn server_stream_publisher_relays_key_rotation_and_retirement() {
+        let settings = test_settings();
+        let mut pipe = test_stream_pipe(&settings);
+        let (mut runtime, controller) = test_stream_control_runtime();
+        runtime.on_conn_established(&mut pipe.server).unwrap();
+
+        let channel_id = vec![1, 2, 3, 4];
+        let publisher =
+            ServerStreamPublisher::new(test_stream_control_config()).unwrap();
+        publisher.declare_stream(3).unwrap();
+        let _attachment = publisher.attach(&controller).unwrap();
+        runtime.process_writes(&mut pipe.server).unwrap();
+        deliver_server_flight(&mut pipe);
+        while pipe.client.multicast_recv().is_ok() {}
+
+        assert!(matches!(
+            publisher.update_key(quiche::multicast::Key {
+                channel_id: channel_id.clone(),
+                key_sequence: 2,
+                from_packet_number: 5,
+                secret: vec![0xdd; 16],
+            }),
+            Err(ServerStreamPublisherError::InvalidState)
+        ));
+        let rotated = quiche::multicast::Key {
+            channel_id: channel_id.clone(),
+            key_sequence: 2,
+            from_packet_number: 0,
+            secret: vec![0xdd; 16],
+        };
+        publisher.update_key(rotated.clone()).unwrap();
+        runtime.process_writes(&mut pipe.server).unwrap();
+        deliver_server_flight(&mut pipe);
+        assert_eq!(
+            pipe.client.multicast_recv(),
+            Ok(quiche::multicast::Frame::Key(rotated))
+        );
+
+        let retire = quiche::multicast::Retire {
+            channel_id: channel_id.clone(),
+            after_packet_number: 0,
+        };
+        publisher.retire(retire.clone()).unwrap();
+        runtime.process_writes(&mut pipe.server).unwrap();
+        deliver_server_flight(&mut pipe);
+        assert_eq!(
+            pipe.client.multicast_recv(),
+            Ok(quiche::multicast::Frame::Retire(retire))
+        );
+        assert_eq!(
+            pipe.server.multicast_probe_status(&channel_id),
+            Some(quiche::multicast::ProbeStatus::Retired)
+        );
+        assert!(matches!(
+            publisher.prepare_stream(3, 0, false, b"retired"),
+            Err(ServerStreamPublisherError::Retired)
+        ));
+    }
+
+    #[test]
+    fn server_stream_late_attachment_waits_for_unicast_catch_up() {
+        let publisher =
+            ServerStreamPublisher::new(test_stream_control_config()).unwrap();
+        publisher.declare_stream(3).unwrap();
+        let past = publisher.prepare_stream(3, 10, false, b"past").unwrap();
+        publisher.commit(past).unwrap();
+        assert_eq!(publisher.next_stream_offset(3).unwrap(), Some(14));
+
+        let settings = test_settings();
+        let mut pipe = test_stream_pipe(&settings);
+        let (mut runtime, controller) = test_stream_control_runtime();
+        runtime.on_conn_established(&mut pipe.server).unwrap();
+        send_webtransport_stream_prefix(&mut pipe, 3, 11);
+        let _attachment = publisher.attach(&controller).unwrap();
+
+        let live = publisher.prepare_stream(3, 14, true, b"live").unwrap();
+        publisher.commit(live).unwrap();
+        runtime.process_writes(&mut pipe.server).unwrap();
+        assert_eq!(runtime.pending_stream_publications.len(), 1);
+        assert!(runtime.stream_retry_blocked);
+
+        assert_eq!(pipe.server.stream_send(3, b"past", false), Ok(4));
+        runtime.process_writes(&mut pipe.server).unwrap();
+        assert!(runtime.pending_stream_publications.is_empty());
+        deliver_server_flight(&mut pipe);
+
+        let mut out = [0; 16];
+        assert_eq!(pipe.client.stream_recv(3, &mut out), Ok((8, true)));
+        assert_eq!(&out[..8], b"pastlive");
+    }
+
+    #[test]
+    fn server_stream_retirement_waits_for_prior_recovery_registration() {
+        let publisher =
+            ServerStreamPublisher::new(test_stream_control_config()).unwrap();
+        publisher.declare_stream(3).unwrap();
+        let past = publisher.prepare_stream(3, 10, false, b"past").unwrap();
+        publisher.commit(past).unwrap();
+
+        let settings = test_settings();
+        let mut pipe = test_stream_pipe(&settings);
+        let (mut runtime, controller) = test_stream_control_runtime();
+        runtime.on_conn_established(&mut pipe.server).unwrap();
+        send_webtransport_stream_prefix(&mut pipe, 3, 11);
+        send_client_control(
+            &mut pipe,
+            &mut runtime,
+            quiche::multicast::Frame::Limits(test_limits()),
+        );
+        let _attachment = publisher.attach(&controller).unwrap();
+        runtime.process_writes(&mut pipe.server).unwrap();
+        deliver_server_flight(&mut pipe);
+        while pipe.client.multicast_recv().is_ok() {}
+        send_client_control(
+            &mut pipe,
+            &mut runtime,
+            quiche::multicast::Frame::State(quiche::multicast::State {
+                channel_id: vec![1, 2, 3, 4],
+                sequence: 1,
+                state: quiche::multicast::ChannelState::Joined,
+                reason_scope: quiche::multicast::StateReasonScope::Transport,
+                reason_code: quiche::multicast::STATE_REASON_REQUESTED_BY_SERVER,
+                reason_phrase: Vec::new(),
+            }),
+        );
+
+        let live = publisher.prepare_stream(3, 14, true, b"live").unwrap();
+        publisher.commit(live).unwrap();
+        publisher
+            .retire(quiche::multicast::Retire {
+                channel_id: vec![1, 2, 3, 4],
+                after_packet_number: 1,
+            })
+            .unwrap();
+        runtime.process_writes(&mut pipe.server).unwrap();
+
+        assert_eq!(runtime.pending_stream_publications.len(), 1);
+        assert!(!runtime.channels[&[1, 2, 3, 4][..]].retired);
+        assert!(runtime.stream_retry_blocked);
+
+        assert_eq!(pipe.server.stream_send(3, b"past", false), Ok(4));
+        runtime.process_writes(&mut pipe.server).unwrap();
+        deliver_server_flight(&mut pipe);
+
+        assert!(matches!(
+            pipe.client.multicast_recv(),
+            Ok(quiche::multicast::Frame::Integrity(_))
+        ));
+        assert!(matches!(
+            pipe.client.multicast_recv(),
+            Ok(quiche::multicast::Frame::Retire(_))
+        ));
+        let mut out = [0; 16];
+        assert_eq!(pipe.client.stream_recv(3, &mut out), Ok((8, true)));
+        assert_eq!(&out[..8], b"pastlive");
+    }
+
+    #[test]
+    fn server_control_announce_waits_for_allowed_address_family() {
+        let mut settings = test_settings();
+        settings.transport_params.limits.ipv4_channels_allowed = false;
+        let mut pipe = test_pipe(&settings);
+        let (_command_sender, command_receiver) = mpsc::unbounded_channel();
+        let (event_sender, _event_receiver) = mpsc::unbounded_channel();
+        let mut runtime = ServerControlRuntime::new(
+            test_server_control_settings(),
+            event_sender,
+            command_receiver,
+        );
+        runtime.on_conn_established(&mut pipe.server).unwrap();
+
+        assert_eq!(pipe.server.multicast_send_queue_len(), 0);
+        assert!(!runtime.channels[&[1, 2, 3, 4][..]].announce_sent);
+
+        send_client_control(
+            &mut pipe,
+            &mut runtime,
+            quiche::multicast::Frame::Limits(test_limits()),
+        );
+        deliver_server_flight(&mut pipe);
+
+        assert!(matches!(
+            pipe.client.multicast_recv(),
+            Ok(quiche::multicast::Frame::Announce(_))
+        ));
+        assert!(matches!(
+            pipe.client.multicast_recv(),
+            Ok(quiche::multicast::Frame::Key(_))
+        ));
+        assert!(matches!(
+            pipe.client.multicast_recv(),
+            Ok(quiche::multicast::Frame::Join(_))
+        ));
+    }
+
+    #[test]
+    fn server_control_reduced_limits_leave_joined_channel() {
+        let settings = test_settings();
+        let mut pipe = test_pipe(&settings);
+        let (_command_sender, command_receiver) = mpsc::unbounded_channel();
+        let (event_sender, _event_receiver) = mpsc::unbounded_channel();
+        let mut runtime = ServerControlRuntime::new(
+            test_server_control_settings(),
+            event_sender,
+            command_receiver,
+        );
+        runtime.on_conn_established(&mut pipe.server).unwrap();
+        send_client_control(
+            &mut pipe,
+            &mut runtime,
+            quiche::multicast::Frame::Limits(test_limits()),
+        );
+        deliver_server_flight(&mut pipe);
+        while pipe.client.multicast_recv().is_ok() {}
+
+        let mut reduced = test_limits();
+        reduced.sequence = 2;
+        reduced.max_joined_count = 0;
+        send_client_control(
+            &mut pipe,
+            &mut runtime,
+            quiche::multicast::Frame::Limits(reduced),
+        );
+        deliver_server_flight(&mut pipe);
+
+        assert!(matches!(
+            pipe.client.multicast_recv(),
+            Ok(quiche::multicast::Frame::Leave(quiche::multicast::Leave {
+                channel_id,
+                ..
+            })) if channel_id == vec![1, 2, 3, 4]
+        ));
+        assert!(!runtime.channels[&[1, 2, 3, 4][..]].join_sent);
+        assert_eq!(
+            pipe.server.multicast_probe_status(&[1, 2, 3, 4]),
+            Some(quiche::multicast::ProbeStatus::Left)
+        );
+    }
+
+    #[test]
+    fn server_control_reduced_channel_id_limit_retires_excess_state() {
+        let settings = test_settings();
+        let mut pipe = test_pipe(&settings);
+        let mut second_announce = test_ipv4_announce();
+        second_announce.channel_id = vec![5, 6, 7, 8];
+        let server_settings = ServerControlSettings {
+            mode: ServerControlMode::Automatic,
+            channels: vec![
+                test_stream_control_config(),
+                ServerControlChannelConfig {
+                    announce: second_announce,
+                    key: test_key(&[5, 6, 7, 8]),
+                },
+            ],
+        };
+        let (_command_sender, command_receiver) = mpsc::unbounded_channel();
+        let (event_sender, _event_receiver) = mpsc::unbounded_channel();
+        let mut runtime = ServerControlRuntime::new(
+            server_settings,
+            event_sender,
+            command_receiver,
+        );
+        runtime.on_conn_established(&mut pipe.server).unwrap();
+        send_client_control(
+            &mut pipe,
+            &mut runtime,
+            quiche::multicast::Frame::Limits(test_limits()),
+        );
+        deliver_server_flight(&mut pipe);
+        while pipe.client.multicast_recv().is_ok() {}
+
+        let mut reduced = test_limits();
+        reduced.sequence = 2;
+        reduced.limits.max_channel_ids = 1;
+        send_client_control(
+            &mut pipe,
+            &mut runtime,
+            quiche::multicast::Frame::Limits(reduced),
+        );
+        deliver_server_flight(&mut pipe);
+
+        assert_eq!(
+            pipe.client.multicast_recv(),
+            Ok(quiche::multicast::Frame::Retire(
+                quiche::multicast::Retire {
+                    channel_id: vec![5, 6, 7, 8],
+                    after_packet_number: 0,
+                }
+            ))
+        );
+        assert!(runtime.channels[&[5, 6, 7, 8][..]].retired);
+        assert_eq!(
+            pipe.server.multicast_probe_status(&[5, 6, 7, 8]),
+            Some(quiche::multicast::ProbeStatus::Retired)
+        );
     }
 
     #[test]
