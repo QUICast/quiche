@@ -7336,10 +7336,10 @@ impl<F: BufFactory> Connection<F> {
     /// This is a server-side control-plane helper. Clients return
     /// [`InvalidState`].
     ///
-    /// When a timeout is configured, each fresh valid peer `MC_ACK` refreshes
-    /// the channel's viability deadline. If the deadline expires,
-    /// [`on_timeout()`] marks the channel as timed out and ordinary fallback
-    /// resumes.
+    /// When a timeout is configured, a peer `MC_STATE(Joined)` starts the
+    /// deadline for the first valid `MC_ACK`, and each fresh valid peer
+    /// `MC_ACK` refreshes it. If the deadline expires, [`on_timeout()`] marks
+    /// the channel as timed out and ordinary fallback resumes.
     ///
     /// [`InvalidState`]: enum.Error.html#variant.InvalidState
     /// [`on_timeout()`]: struct.Connection.html#method.on_timeout
@@ -8018,7 +8018,11 @@ impl<F: BufFactory> Connection<F> {
         let deadline = if status == multicast::ProbeStatus::Probing {
             self.multicast_probe_states
                 .get(frame.channel_id.as_slice())
-                .and_then(|state| state.deadline)
+                .and_then(|state| {
+                    state.deadline.or_else(|| {
+                        state.ack_timeout.map(|timeout| Instant::now() + timeout)
+                    })
+                })
         } else {
             None
         };

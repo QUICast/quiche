@@ -281,6 +281,10 @@ async fn drive_multicast(
                         log::info!("client multicast ack: {:?}", frame);
                     },
 
+                    ServerEvent::ProbeStatusChanged(event) => {
+                        log::info!("client multicast probe status: {:?}", event);
+                    },
+
                     ServerEvent::Published {
                         channel_id,
                         packet_number,
