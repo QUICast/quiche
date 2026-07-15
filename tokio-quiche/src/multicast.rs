@@ -1306,6 +1306,12 @@ pub enum ServerEvent {
     /// The client acknowledged multicast packet ranges.
     ClientAck(quiche::multicast::Ack),
 
+    /// The connection-local multicast path changed viability state.
+    ///
+    /// This includes probing, successful ACK validation, ACK-freshness
+    /// timeout, join failure, leave, and retirement transitions.
+    ProbeStatusChanged(quiche::multicast::ProbeEvent),
+
     /// A multicast packet was successfully published on a channel.
     Published {
         /// The QUIC multicast channel ID associated with the packet.
@@ -1820,11 +1826,13 @@ impl ServerControlRuntime {
             match qconn.multicast_recv() {
                 Ok(frame) => self.handle_frame(qconn, frame)?,
 
-                Err(quiche::Error::Done) => return Ok(()),
+                Err(quiche::Error::Done) => break,
 
                 Err(err) => return Err(err.into()),
             }
         }
+
+        self.forward_probe_events(qconn)
     }
 
     fn process_writes(&mut self, qconn: &mut QuicheConnection) -> QuicResult<()> {
@@ -1837,7 +1845,26 @@ impl ServerControlRuntime {
         if !self.stream_retry_blocked {
             self.flush_pending_stream_publications(qconn)?;
         }
-        self.flush_pending_integrities(qconn)
+        self.flush_pending_integrities(qconn)?;
+        self.forward_probe_events(qconn)
+    }
+
+    fn forward_probe_events(
+        &self, qconn: &mut QuicheConnection,
+    ) -> QuicResult<()> {
+        loop {
+            match qconn.multicast_probe_recv() {
+                Ok(event) => {
+                    let _ = self
+                        .event_sender
+                        .send(ServerEvent::ProbeStatusChanged(event));
+                },
+
+                Err(quiche::Error::Done) => return Ok(()),
+
+                Err(err) => return Err(err.into()),
+            }
+        }
     }
 
     fn initialize_channels(
@@ -4513,7 +4540,7 @@ mod tests {
         let channel_id = server_settings.channels[0].announce.channel_id.clone();
         let mut pipe = test_pipe(&settings);
         let (_command_sender, command_receiver) = mpsc::unbounded_channel();
-        let (event_sender, _event_receiver) = mpsc::unbounded_channel();
+        let (event_sender, mut event_receiver) = mpsc::unbounded_channel();
         let mut runtime = ServerControlRuntime::new(
             server_settings,
             event_sender,
@@ -4538,20 +4565,105 @@ mod tests {
         quiche::test_utils::process_flight(&mut pipe.server, flight).unwrap();
         runtime.process_reads(&mut pipe.server).unwrap();
 
+        assert!(matches!(
+            event_receiver.try_recv(),
+            Ok(ServerEvent::ClientAck(frame)) if frame.channel_id == channel_id
+        ));
+        assert!(matches!(
+            event_receiver.try_recv(),
+            Ok(ServerEvent::ProbeStatusChanged(quiche::multicast::ProbeEvent {
+                channel_id: event_channel,
+                status: quiche::multicast::ProbeStatus::Viable,
+                ..
+            })) if event_channel == channel_id
+        ));
+
         assert_eq!(
             pipe.server.multicast_probe_status(&channel_id),
             Some(quiche::multicast::ProbeStatus::Viable)
         );
 
         pipe.server.on_timeout();
+        runtime.process_writes(&mut pipe.server).unwrap();
 
         assert_eq!(
             pipe.server.multicast_probe_status(&channel_id),
             Some(quiche::multicast::ProbeStatus::TimedOut)
         );
+        assert!(matches!(
+            event_receiver.try_recv(),
+            Ok(ServerEvent::ProbeStatusChanged(quiche::multicast::ProbeEvent {
+                channel_id: event_channel,
+                status: quiche::multicast::ProbeStatus::TimedOut,
+                ..
+            })) if event_channel == channel_id
+        ));
 
         pipe.server.dgram_send(b"fallback-after-stall").unwrap();
         assert_client_receives_dgram(&mut pipe, b"fallback-after-stall");
+    }
+
+    #[test]
+    fn server_control_runtime_join_without_first_ack_times_out() {
+        let settings = test_settings();
+        let mut server_settings = test_server_control_settings();
+        server_settings.channels[0].announce.max_ack_delay_ms = 0;
+        let channel_id = server_settings.channels[0].announce.channel_id.clone();
+        let mut pipe = test_pipe(&settings);
+        let (_command_sender, command_receiver) = mpsc::unbounded_channel();
+        let (event_sender, mut event_receiver) = mpsc::unbounded_channel();
+        let mut runtime = ServerControlRuntime::new(
+            server_settings,
+            event_sender,
+            command_receiver,
+        );
+
+        runtime.on_conn_established(&mut pipe.server).unwrap();
+        pipe.client
+            .multicast_send(quiche::multicast::Frame::State(
+                quiche::multicast::State {
+                    channel_id: channel_id.clone(),
+                    sequence: 1,
+                    state: quiche::multicast::ChannelState::Joined,
+                    reason_scope: quiche::multicast::StateReasonScope::Transport,
+                    reason_code:
+                        quiche::multicast::STATE_REASON_REQUESTED_BY_SERVER,
+                    reason_phrase: Vec::new(),
+                },
+            ))
+            .unwrap();
+        let flight = quiche::test_utils::emit_flight(&mut pipe.client).unwrap();
+        quiche::test_utils::process_flight(&mut pipe.server, flight).unwrap();
+        runtime.process_reads(&mut pipe.server).unwrap();
+
+        assert!(matches!(
+            event_receiver.try_recv(),
+            Ok(ServerEvent::ClientState(frame)) if frame.channel_id == channel_id
+        ));
+        assert!(matches!(
+            event_receiver.try_recv(),
+            Ok(ServerEvent::ProbeStatusChanged(quiche::multicast::ProbeEvent {
+                channel_id: event_channel,
+                status: quiche::multicast::ProbeStatus::Probing,
+                ..
+            })) if event_channel == channel_id
+        ));
+
+        pipe.server.on_timeout();
+        runtime.process_writes(&mut pipe.server).unwrap();
+
+        assert_eq!(
+            pipe.server.multicast_probe_status(&channel_id),
+            Some(quiche::multicast::ProbeStatus::TimedOut)
+        );
+        assert!(matches!(
+            event_receiver.try_recv(),
+            Ok(ServerEvent::ProbeStatusChanged(quiche::multicast::ProbeEvent {
+                channel_id: event_channel,
+                status: quiche::multicast::ProbeStatus::TimedOut,
+                ..
+            })) if event_channel == channel_id
+        ));
     }
 
     #[test]

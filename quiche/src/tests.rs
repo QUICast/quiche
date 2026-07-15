@@ -631,6 +631,49 @@ fn multicast_probe_times_out() {
 }
 
 #[test]
+fn multicast_join_without_first_ack_times_out() {
+    let mut pipe = multicast_negotiated_pipe();
+    let channel_id = vec![1, 2, 3, 4];
+    let frame = multicast::Frame::State(multicast::State {
+        channel_id: channel_id.clone(),
+        sequence: 1,
+        state: multicast::ChannelState::Joined,
+        reason_scope: multicast::StateReasonScope::Transport,
+        reason_code: multicast::STATE_REASON_REQUESTED_BY_SERVER,
+        reason_phrase: Vec::new(),
+    });
+
+    pipe.server
+        .multicast_set_ack_timeout(&channel_id, Some(Duration::ZERO))
+        .unwrap();
+    pipe.client.multicast_send(frame).unwrap();
+    let flight = test_utils::emit_flight(&mut pipe.client).unwrap();
+    test_utils::process_flight(&mut pipe.server, flight).unwrap();
+
+    assert!(matches!(
+        pipe.server.multicast_probe_recv(),
+        Ok(multicast::ProbeEvent {
+            status: multicast::ProbeStatus::Probing,
+            ..
+        })
+    ));
+
+    pipe.server.on_timeout();
+
+    assert_eq!(
+        pipe.server.multicast_probe_status(&channel_id),
+        Some(multicast::ProbeStatus::TimedOut)
+    );
+    assert!(matches!(
+        pipe.server.multicast_probe_recv(),
+        Ok(multicast::ProbeEvent {
+            status: multicast::ProbeStatus::TimedOut,
+            ..
+        })
+    ));
+}
+
+#[test]
 fn multicast_process_local_state_reports_join_failed() {
     let mut pipe = multicast_negotiated_pipe();
     let state = multicast::State {
