@@ -1862,6 +1862,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn sparse_high_server_uni_stream_creates_one_entry_and_consumes_ordinal_credit(
+    ) {
+        let local_tp = crate::TransportParams::default();
+        let peer_tp = crate::TransportParams::default();
+        let stream_ordinal = 1_000_003;
+        let stream_id = (stream_ordinal << 2) | 0x3;
+        let mut streams = <StreamMap>::new(5, 5, 5);
+        streams.update_peer_max_streams_uni(stream_ordinal + 1);
+
+        assert!(is_local(stream_id, true));
+        assert!(!is_bidi(stream_id));
+        assert!(streams
+            .get_or_create(stream_id, &local_tp, &peer_tp, true, true)
+            .is_ok());
+        assert_eq!(streams.len(), 1);
+        assert!(streams.get(stream_id - 4).is_none());
+        assert_eq!(streams.local_opened_streams_uni, stream_ordinal + 1);
+        assert_eq!(streams.peer_streams_left_uni(), 0);
+
+        assert_eq!(
+            streams
+                .get_or_create(stream_id + 4, &local_tp, &peer_tp, true, true)
+                .err(),
+            Some(Error::StreamLimit)
+        );
+        assert_eq!(streams.len(), 1);
+    }
+
     /// Stream limit should be satisfied regardless of what order we open
     /// streams
     #[test]

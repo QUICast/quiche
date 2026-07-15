@@ -57,6 +57,8 @@ use crate::Result;
 
 const IP_FLAG_V6_ALLOWED: u8 = 0x02;
 const IP_FLAG_V4_ALLOWED: u8 = 0x01;
+const MAX_TRACKED_ACK_RANGES: usize = 64;
+const ACK_HISTORY_PACKET_WINDOW: u64 = 4 * 1024;
 
 /// Experimental transport parameter ID used by the draft for client multicast
 /// capabilities.
@@ -1492,11 +1494,20 @@ pub(crate) struct AckSpan {
 pub struct AckTracker {
     ranges: Vec<AckSpan>,
     pending: bool,
+    retired_before: u64,
 }
 
 impl AckTracker {
     /// Records a decoded multicast packet number.
     pub fn record_packet(&mut self, packet_number: u64) {
+        if packet_number < self.retired_before ||
+            self.ranges.iter().any(|range| {
+                range.start <= packet_number && packet_number <= range.end
+            })
+        {
+            return;
+        }
+
         let mut start = packet_number;
         let mut end = packet_number;
         let mut insert_at = 0;
@@ -1519,6 +1530,7 @@ impl AckTracker {
         }
 
         self.ranges.insert(insert_at, AckSpan { start, end });
+        self.trim_history();
         self.pending = true;
     }
 
@@ -1563,6 +1575,27 @@ impl AckTracker {
     /// Marks the currently pending `MC_ACK` state as sent.
     pub fn mark_sent(&mut self) {
         self.pending = false;
+    }
+
+    fn trim_history(&mut self) {
+        let Some(largest) = self.ranges.last().map(|range| range.end) else {
+            return;
+        };
+        self.retired_before = self.retired_before.max(
+            largest.saturating_sub(ACK_HISTORY_PACKET_WINDOW.saturating_sub(1)),
+        );
+        self.ranges.retain(|range| range.end >= self.retired_before);
+        if let Some(first) = self.ranges.first_mut() {
+            first.start = first.start.max(self.retired_before);
+        }
+
+        if self.ranges.len() > MAX_TRACKED_ACK_RANGES {
+            let remove = self.ranges.len() - MAX_TRACKED_ACK_RANGES;
+            self.ranges.drain(..remove);
+            if let Some(first) = self.ranges.first() {
+                self.retired_before = self.retired_before.max(first.start);
+            }
+        }
     }
 }
 
@@ -1654,11 +1687,10 @@ pub enum ChannelReceiveEvent<M> {
 /// received [`Key`] and [`Integrity`] metadata, and encrypted datagrams that
 /// are waiting on either of those before they can be released.
 ///
-/// Packet buffering is intentionally owned by the caller: this state keeps
-/// packets for the lifetime of the channel so that late keys, late integrity
-/// frames, and duplicate suppression can all use the same packet-number view.
-/// Callers that need memory limits should bound channel lifetime, retire stale
-/// channels, or drop datagrams before calling [`recv()`].
+/// Packet buffering is intentionally owned by the caller. Accepted packet
+/// history is retained for a bounded packet-number window so duplicate
+/// suppression and late integrity processing cannot grow for the lifetime of
+/// a channel.
 ///
 /// The `M` type parameter allows callers to attach arbitrary metadata to each
 /// received datagram and receive it back once the packet is decoded, or when
@@ -1674,6 +1706,7 @@ pub struct ChannelReceiveState<M = ()> {
     pending_packets: BTreeMap<u64, PendingChannelPacket<M>>,
     accepted_packets: BTreeSet<u64>,
     largest_observed_pkt_num: u64,
+    retired_before: u64,
     metrics: ChannelReceiveMetricsState,
 }
 
@@ -1695,6 +1728,7 @@ impl<M> ChannelReceiveState<M> {
             pending_packets: BTreeMap::new(),
             accepted_packets: BTreeSet::new(),
             largest_observed_pkt_num: 0,
+            retired_before: 0,
             metrics: ChannelReceiveMetricsState::default(),
         })
     }
@@ -1811,6 +1845,10 @@ impl<M> ChannelReceiveState<M> {
                 .ok_or(Error::InvalidFrame)?;
             let end = start.checked_add(hash_len).ok_or(Error::InvalidFrame)?;
 
+            if pn < self.retired_before {
+                continue;
+            }
+
             if self
                 .integrity_packets
                 .insert(pn, integrity.packet_hashes[start..end].to_vec())
@@ -1830,9 +1868,8 @@ impl<M> ChannelReceiveState<M> {
     /// available, it is decoded immediately. Otherwise it is buffered until
     /// those prerequisites arrive in later control frames.
     ///
-    /// Successfully decoded packet numbers are retained for duplicate
-    /// suppression until the receiver is dropped or the channel is otherwise
-    /// retired.
+    /// Successfully decoded packet numbers are retained in a bounded window
+    /// for duplicate suppression.
     pub fn recv(
         &mut self, buf: &[u8], metadata: M,
     ) -> Result<Vec<ChannelReceiveEvent<M>>> {
@@ -1850,6 +1887,12 @@ impl<M> ChannelReceiveState<M> {
 
         self.largest_observed_pkt_num =
             self.largest_observed_pkt_num.max(packet.packet_number);
+
+        if packet.packet_number < self.retired_before {
+            self.metrics.duplicate_packets =
+                self.metrics.duplicate_packets.saturating_add(1);
+            return Ok(Vec::new());
+        }
 
         if self.accepted_packets.contains(&packet.packet_number) ||
             self.pending_packets.contains_key(&packet.packet_number)
@@ -1966,6 +2009,8 @@ impl<M> ChannelReceiveState<M> {
         };
 
         self.accepted_packets.insert(packet_number);
+        self.integrity_packets.remove(&packet_number);
+        self.prune_receive_history();
         self.metrics.packets_delivered =
             self.metrics.packets_delivered.saturating_add(1);
         self.metrics.record_release_success(trigger);
@@ -1974,6 +2019,25 @@ impl<M> ChannelReceiveState<M> {
             packet,
             metadata: pending.metadata,
         }))
+    }
+
+    fn prune_receive_history(&mut self) {
+        let Some(largest) = self.accepted_packets.last().copied() else {
+            return;
+        };
+        self.retired_before = self.retired_before.max(
+            largest.saturating_sub(ACK_HISTORY_PACKET_WINDOW.saturating_sub(1)),
+        );
+        if self.retired_before == 0 {
+            return;
+        }
+
+        self.accepted_packets
+            .retain(|packet_number| *packet_number >= self.retired_before);
+        self.integrity_packets
+            .retain(|packet_number, _| *packet_number >= self.retired_before);
+        self.pending_packets
+            .retain(|packet_number, _| *packet_number >= self.retired_before);
     }
 
     fn select_key_index(
@@ -3193,6 +3257,44 @@ mod tests {
 
         tracker.mark_sent();
         assert_eq!(tracker.pending_ack(&[1, 2, 3, 4]), None);
+    }
+
+    #[test]
+    fn ack_tracker_bounds_ranges_and_packet_history() {
+        let mut tracker = AckTracker::default();
+        for index in 0..(MAX_TRACKED_ACK_RANGES + 16) {
+            tracker.record_packet((index * 2) as u64);
+        }
+
+        assert_eq!(tracker.ranges.len(), MAX_TRACKED_ACK_RANGES);
+        assert!(tracker.retired_before > 0);
+        assert_eq!(
+            tracker.pending_ack(&[1, 2, 3, 4]).unwrap().ack_ranges.len(),
+            MAX_TRACKED_ACK_RANGES - 1
+        );
+
+        let mut contiguous = AckTracker::default();
+        for packet_number in 0..ACK_HISTORY_PACKET_WINDOW + 10 {
+            contiguous.record_packet(packet_number);
+        }
+        assert_eq!(contiguous.retired_before, 10);
+        assert_eq!(contiguous.ranges, vec![AckSpan {
+            start: 10,
+            end: ACK_HISTORY_PACKET_WINDOW + 9,
+        }]);
+    }
+
+    #[test]
+    fn channel_receive_prunes_retired_packet_history() {
+        let mut receiver =
+            ChannelReceiveState::<()>::new(test_announce()).unwrap();
+        for packet_number in 0..ACK_HISTORY_PACKET_WINDOW + 10 {
+            receiver.accepted_packets.insert(packet_number);
+        }
+        receiver.prune_receive_history();
+
+        assert_eq!(receiver.accepted_packets.len(), 4096);
+        assert_eq!(receiver.accepted_packets.first(), Some(&10));
     }
 
     #[test]
