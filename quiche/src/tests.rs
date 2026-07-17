@@ -1196,6 +1196,52 @@ fn multicast_stream_ack_timeout_releases_pending_ranges() {
 }
 
 #[test]
+fn multicast_stream_body_ack_does_not_collect_before_fin_ack() {
+    let mut pipe = multicast_stream_negotiated_pipe();
+    let channel_id = vec![1, 2, 3, 4];
+    let warmup_stream_id = 3;
+    multicast_stream_prefix(&mut pipe, warmup_stream_id);
+
+    pipe.server
+        .multicast_stream_send(
+            &channel_id,
+            0,
+            warmup_stream_id,
+            10,
+            b"warmup",
+            false,
+        )
+        .unwrap();
+    pipe.advance().unwrap();
+    pipe.server
+        .multicast_process_peer_ack(multicast_ack_for(&channel_id, 0))
+        .unwrap();
+
+    let stream_id = 7;
+    multicast_stream_prefix(&mut pipe, stream_id);
+    pipe.server
+        .multicast_stream_send(&channel_id, 1, stream_id, 10, b"body", false)
+        .unwrap();
+    pipe.server
+        .multicast_stream_send(&channel_id, 2, stream_id, 14, b"", true)
+        .unwrap();
+
+    pipe.server
+        .multicast_process_peer_ack(multicast_ack_for(&channel_id, 1))
+        .unwrap();
+
+    assert!(
+        pipe.server.streams.get(stream_id).is_some(),
+        "the stream must remain available while its separately published FIN is pending",
+    );
+
+    pipe.server
+        .multicast_process_peer_ack(multicast_ack_for(&channel_id, 2))
+        .unwrap();
+    assert!(pipe.server.streams.get(stream_id).is_none());
+}
+
+#[test]
 fn multicast_stream_reset_drops_withheld_recovery() {
     let mut pipe = multicast_stream_negotiated_pipe();
     let channel_id = vec![1, 2, 3, 4];

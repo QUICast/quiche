@@ -1495,6 +1495,9 @@ mod tests {
         assert!(!stream.send.is_complete());
 
         stream.send.ack(0, 1);
+        assert!(!stream.send.is_complete());
+
+        stream.send.ack_fin(10);
         assert!(stream.send.is_complete());
 
         assert!(!stream.is_complete());
@@ -1529,6 +1532,22 @@ mod tests {
         assert_eq!(written, 0);
         assert!(fin);
         assert_eq!(&buf[..written], b"");
+    }
+
+    #[test]
+    fn send_data_ack_does_not_complete_before_fin_ack() {
+        let mut buf = [0; 5];
+        let mut stream = <Stream>::new(0, 0, 15, true, 0, DEFAULT_STREAM_WINDOW);
+
+        assert_eq!(stream.send.write(b"hello", false), Ok(5));
+        assert_eq!(stream.send.write(b"", true), Ok(0));
+        assert_eq!(stream.send.emit(&mut buf), Ok((5, true)));
+
+        stream.send.ack_and_drop(0, 5);
+        assert!(!stream.send.is_complete());
+
+        stream.send.ack_fin(5);
+        assert!(stream.send.is_complete());
     }
 
     fn stream_send_ready(stream: &Stream) -> bool {
