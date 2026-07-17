@@ -118,6 +118,13 @@ where
     /// The final stream offset written to the stream, if any.
     fin_off: Option<u64>,
 
+    /// Whether an ordinary STREAM frame conveying the final size was acked.
+    ///
+    /// RESET_STREAM retransmission is tracked separately by `StreamMap`, so a
+    /// reset send buffer doesn't need to remain alive until that frame is
+    /// acked.
+    fin_acked: bool,
+
     /// Whether the stream's send-side has been shut down.
     shutdown: bool,
 
@@ -164,6 +171,7 @@ impl<F: BufFactory> SendBuf<F> {
 
         if fin {
             self.fin_off = Some(max_off);
+            self.fin_acked = false;
         }
 
         // Don't queue data that was already fully acked.
@@ -274,6 +282,7 @@ impl<F: BufFactory> SendBuf<F> {
 
         if fin {
             self.fin_off = Some(max_off);
+            self.fin_acked = false;
         }
 
         if len > 0 {
@@ -425,6 +434,13 @@ impl<F: BufFactory> SendBuf<F> {
         }
     }
 
+    /// Marks the frame carrying the stream's final size as acknowledged.
+    pub(crate) fn ack_fin(&mut self, final_size: u64) {
+        if self.fin_off == Some(final_size) {
+            self.fin_acked = true;
+        }
+    }
+
     /// Returns the offset range accounted as unsent by [`SendBuf::reset()`].
     pub(crate) fn reset_drop_range(&self) -> std::ops::Range<u64> {
         self.emit_off..self.off_back()
@@ -487,6 +503,7 @@ impl<F: BufFactory> SendBuf<F> {
         let unsent_len = unsent.end.saturating_sub(unsent.start);
 
         self.fin_off = Some(unsent.start);
+        self.fin_acked = true;
 
         // Drop all buffered data.
         self.data.clear();
@@ -506,6 +523,7 @@ impl<F: BufFactory> SendBuf<F> {
         self.off = cmp::max(self.off, final_size);
         self.emit_off = cmp::max(self.emit_off, final_size);
         self.fin_off = Some(cmp::max(self.fin_off.unwrap_or(0), final_size));
+        self.fin_acked = true;
         self.ack(0, final_size as usize);
     }
 
@@ -575,11 +593,13 @@ impl<F: BufFactory> SendBuf<F> {
 
     /// Returns true if the send-side of the stream is complete.
     ///
-    /// This happens when the stream's send final size is known, and the peer
-    /// has already acked all stream data up to that point.
+    /// This happens when the stream's send final size is known, the peer has
+    /// acked all stream data up to that point, and the STREAM frame carrying
+    /// FIN has also been acknowledged. Reset final-size delivery is retained
+    /// separately by `StreamMap`.
     pub fn is_complete(&self) -> bool {
         if let Some(fin_off) = self.fin_off {
-            if self.acked == (0..fin_off) {
+            if self.fin_acked && self.acked == (0..fin_off) {
                 return true;
             }
         }

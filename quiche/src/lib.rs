@@ -3801,7 +3801,7 @@ impl<F: BufFactory> Connection<F> {
                         stream_id,
                         offset,
                         length,
-                        ..
+                        fin,
                     } => {
                         // Update tx_buffered and emit qlog before checking if the
                         // stream still exists.  The client does need to ACK
@@ -3835,6 +3835,9 @@ impl<F: BufFactory> Connection<F> {
                         };
 
                         stream.send.ack_and_drop(offset, length);
+                        if fin {
+                            stream.send.ack_fin(offset + length as u64);
+                        }
 
                         let priority_key = Arc::clone(&stream.priority_key);
 
@@ -7830,6 +7833,11 @@ impl<F: BufFactory> Connection<F> {
         };
 
         stream.send.ack_and_drop(range.offset, range.len);
+        if range.fin {
+            stream
+                .send
+                .ack_fin(range.offset.saturating_add(range.len as u64));
+        }
 
         if stream.is_complete() && !stream.is_readable() {
             let local = stream.local;
