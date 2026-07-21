@@ -34,6 +34,7 @@ use qlog::writer::QlogCompression;
 use crate::result::QuicResult;
 use crate::settings::CertificateKind;
 use crate::settings::ConnectionParams;
+use crate::settings::QuicTransportEgressStats;
 use crate::settings::TlsCertificatePaths;
 use crate::socket::SocketCapabilities;
 
@@ -57,6 +58,7 @@ pub(crate) struct Config {
     pub has_ippktinfo: bool,
     pub has_ipv6pktinfo: bool,
     pub pool_send_buffer: bool,
+    pub transport_egress_stats: Option<QuicTransportEgressStats>,
 }
 
 impl AsMut<quiche::Config> for Config {
@@ -112,6 +114,7 @@ impl Config {
             has_ippktinfo,
             has_ipv6pktinfo,
             pool_send_buffer: quic_settings.pool_send_buffer,
+            transport_egress_stats: params.transport_egress_stats.clone(),
         })
     }
 }

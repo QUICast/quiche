@@ -31,11 +31,40 @@ mod hooks;
 mod quic;
 mod tls;
 
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+
 pub(crate) use self::config::*;
 
 pub use self::hooks::*;
 pub use self::quic::*;
 pub use self::tls::*;
+
+/// Cumulative QUIC transport egress for one configured endpoint.
+///
+/// The counter includes UDP payload bytes successfully handed to the socket by
+/// QUIC, including framing, encryption, control traffic, handshakes, and
+/// retransmissions. It excludes UDP/IP and link-layer headers.
+#[derive(Clone, Debug, Default)]
+pub struct QuicTransportEgressStats {
+    udp_payload_bytes_sent_total: Arc<AtomicU64>,
+}
+
+impl QuicTransportEgressStats {
+    /// Returns cumulative QUIC UDP payload bytes sent by the endpoint.
+    #[inline]
+    pub fn udp_payload_bytes_sent_total(&self) -> u64 {
+        self.udp_payload_bytes_sent_total.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub(crate) fn record_udp_payload_bytes_sent(&self, bytes: usize) {
+        let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+        self.udp_payload_bytes_sent_total
+            .fetch_add(bytes, Ordering::Relaxed);
+    }
+}
 
 /// Combined configuration parameters required to establish a QUIC connection.
 ///
@@ -55,6 +84,11 @@ pub struct ConnectionParams<'a> {
     /// This is intended to be configured programmatically.
     #[cfg(feature = "multicast")]
     pub multicast_client: Option<MulticastClientSettings>,
+    /// Optional endpoint-scoped QUIC transport egress accounting.
+    ///
+    /// Clone the handle before assigning it to read the cumulative counter
+    /// while the endpoint is running.
+    pub transport_egress_stats: Option<QuicTransportEgressStats>,
     /// Optional TLS credentials to authenticate with.
     pub tls_cert: Option<TlsCertificatePaths<'a>>,
     /// Hooks to use for the connection.
@@ -83,6 +117,8 @@ impl core::fmt::Debug for ConnectionParams<'_> {
         #[cfg(feature = "multicast")]
         s.field("multicast_client", &self.multicast_client);
 
+        s.field("transport_egress_stats", &self.transport_egress_stats);
+
         s.field("tls_cert", &self.tls_cert)
             .field("hooks", &self.hooks);
 
@@ -104,6 +140,7 @@ impl<'a> ConnectionParams<'a> {
             settings,
             #[cfg(feature = "multicast")]
             multicast_client: None,
+            transport_egress_stats: None,
             tls_cert: Some(tls_cert),
             hooks,
             session: None,
@@ -123,11 +160,30 @@ impl<'a> ConnectionParams<'a> {
             settings,
             #[cfg(feature = "multicast")]
             multicast_client: None,
+            transport_egress_stats: None,
             tls_cert,
             hooks,
             session: None,
             #[cfg(feature = "custom-client-dcid")]
             dcid: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::QuicTransportEgressStats;
+
+    #[test]
+    fn transport_egress_stats_are_shared_and_monotonic() {
+        let first = QuicTransportEgressStats::default();
+        let second = first.clone();
+        let isolated = QuicTransportEgressStats::default();
+
+        first.record_udp_payload_bytes_sent(7);
+        assert_eq!(second.udp_payload_bytes_sent_total(), 7);
+        assert_eq!(isolated.udp_payload_bytes_sent_total(), 0);
+        second.record_udp_payload_bytes_sent(2);
+        assert_eq!(first.udp_payload_bytes_sent_total(), 9);
     }
 }

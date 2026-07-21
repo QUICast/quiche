@@ -50,6 +50,7 @@ use crate::quic::connection::QuicConnectionStats;
 use crate::quic::connection::SharedConnectionIdGenerator;
 use crate::quic::router::ConnectionMapCommand;
 use crate::quic::QuicheConnection;
+use crate::settings::QuicTransportEgressStats;
 use crate::QuicResult;
 
 use boring::ssl::SslRef;
@@ -276,6 +277,7 @@ pub(crate) struct IoWorkerParams<Tx, M> {
     #[cfg(feature = "perf-quic-listener-metrics")]
     pub(crate) init_rx_time: Option<SystemTime>,
     pub(crate) metrics: M,
+    pub(crate) transport_egress_stats: Option<QuicTransportEgressStats>,
 }
 
 pub(crate) struct IoWorker<Tx, M, S> {
@@ -292,6 +294,7 @@ pub(crate) struct IoWorker<Tx, M, S> {
     #[cfg(feature = "perf-quic-listener-metrics")]
     init_rx_time: Option<SystemTime>,
     metrics: M,
+    transport_egress_stats: Option<QuicTransportEgressStats>,
     conn_stage: S,
     bw_estimator: BandwidthReporter,
 }
@@ -319,6 +322,7 @@ where
             #[cfg(feature = "perf-quic-listener-metrics")]
             init_rx_time: params.init_rx_time,
             metrics: params.metrics,
+            transport_egress_stats: params.transport_egress_stats,
             conn_stage,
             bw_estimator,
         }
@@ -865,12 +869,16 @@ where
             self.measure_complete_handshake_time();
 
             match send_res {
-                Ok(n) =>
+                Ok(n) => {
+                    if let Some(stats) = &self.transport_egress_stats {
+                        stats.record_udp_payload_bytes_sent(n);
+                    }
                     if n < self.write_state.bytes_written {
                         self.metrics
                             .write_errors(labels::QuicWriteError::Partial)
                             .inc();
-                    },
+                    }
+                },
 
                 Err(_) => {
                     self.metrics.write_errors(labels::QuicWriteError::Err).inc();
@@ -1144,6 +1152,7 @@ impl<Tx, M, S> From<IoWorker<Tx, M, S>> for IoWorkerParams<Tx, M> {
             #[cfg(feature = "perf-quic-listener-metrics")]
             init_rx_time: value.init_rx_time,
             metrics: value.metrics,
+            transport_egress_stats: value.transport_egress_stats,
         }
     }
 }

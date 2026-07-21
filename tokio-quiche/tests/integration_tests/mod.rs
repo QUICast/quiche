@@ -36,6 +36,7 @@ use tokio::time::timeout;
 use tokio_quiche::listen;
 use tokio_quiche::metrics::DefaultMetrics;
 use tokio_quiche::settings::Hooks;
+use tokio_quiche::settings::QuicTransportEgressStats;
 use tokio_quiche::settings::TlsCertificatePaths;
 use tokio_quiche::ConnectionParams;
 use tokio_quiche::InitialQuicConnection;
@@ -185,6 +186,7 @@ async fn quiche_logs_forwarded_server_side(cx: TestTelemetryContext) {
 
 #[tokio::test]
 async fn test_ioworker_state_machine_pause() {
+    let transport_egress_stats = QuicTransportEgressStats::default();
     let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
     let url = format!("http://127.0.0.1:{}", socket.local_addr().unwrap().port());
 
@@ -198,11 +200,12 @@ async fn test_ioworker_state_machine_pause() {
         connection_hook: Some(TestConnectionHook::new()),
     };
 
-    let params = ConnectionParams::new_server(
+    let mut params = ConnectionParams::new_server(
         QuicSettings::default(),
         tls_cert_settings,
         hooks,
     );
+    params.transport_egress_stats = Some(transport_egress_stats.clone());
     let mut stream = listen(vec![socket], params, DefaultMetrics)
         .unwrap()
         .remove(0);
@@ -233,6 +236,7 @@ async fn test_ioworker_state_machine_pause() {
         .expect("request failed");
 
     assert!(received_status_code_on_stream(&summary, 0, 200));
+    assert!(transport_egress_stats.udp_payload_bytes_sent_total() > 0);
 }
 
 #[tokio::test]
