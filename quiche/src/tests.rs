@@ -937,6 +937,15 @@ fn multicast_stream_fallback_emits_before_viability() {
         pipe.server.multicast_stream_recovery_pending(&channel_id),
         0
     );
+    assert_eq!(
+        pipe.server
+            .multicast_stream_delivery_metrics_snapshot(&channel_id),
+        multicast::StreamDeliveryMetricsSnapshot {
+            direct_fallback_ranges_total: 1,
+            direct_fallback_bytes_total: 8,
+            ..Default::default()
+        }
+    );
 }
 
 #[test]
@@ -990,6 +999,15 @@ fn multicast_stream_joined_state_keeps_fallback_enabled() {
     let mut out = [0; 32];
     assert_eq!(pipe.client.stream_recv(stream_id, &mut out), Ok((14, true)));
     assert_eq!(&out[..14], b"still-fallback");
+    assert_eq!(
+        pipe.server
+            .multicast_stream_delivery_metrics_snapshot(&channel_id),
+        multicast::StreamDeliveryMetricsSnapshot {
+            direct_fallback_ranges_total: 1,
+            direct_fallback_bytes_total: 14,
+            ..Default::default()
+        }
+    );
 }
 
 #[test]
@@ -1030,6 +1048,15 @@ fn multicast_stream_ack_suppresses_unicast_and_releases_retention() {
     );
     assert_eq!(pipe.server.multicast_stream_recovery_withheld_bytes(), 0);
     assert_eq!(test_utils::emit_flight(&mut pipe.server), Err(Error::Done));
+    assert_eq!(
+        pipe.server
+            .multicast_stream_delivery_metrics_snapshot(&channel_id),
+        multicast::StreamDeliveryMetricsSnapshot {
+            direct_fallback_ranges_total: 1,
+            direct_fallback_bytes_total: 6,
+            ..Default::default()
+        }
+    );
 }
 
 #[test]
@@ -1106,6 +1133,28 @@ fn multicast_stream_ack_gap_recovers_exact_missing_ranges() {
     pipe.server
         .multicast_process_peer_ack(multicast_ack_for(&channel_id, 3))
         .unwrap();
+    let after_recovery = pipe
+        .server
+        .multicast_stream_delivery_metrics_snapshot(&channel_id);
+    assert_eq!(after_recovery, multicast::StreamDeliveryMetricsSnapshot {
+        direct_fallback_ranges_total: 1,
+        direct_fallback_bytes_total: 1,
+        ack_gap_recovery_ranges_total: 2,
+        ack_gap_recovery_bytes_total: 6,
+        ..Default::default()
+    });
+
+    pipe.server
+        .multicast_process_peer_ack(multicast_ack_for(&channel_id, 3))
+        .unwrap();
+    pipe.server
+        .multicast_process_peer_ack(multicast_ack_for(&channel_id, 2))
+        .unwrap();
+    assert_eq!(
+        pipe.server
+            .multicast_stream_delivery_metrics_snapshot(&channel_id),
+        after_recovery
+    );
     pipe.advance().unwrap();
 
     assert_eq!(pipe.client.stream_recv(stream_id, &mut out), Ok((6, false)));
@@ -1147,6 +1196,31 @@ fn multicast_stream_fallback_reentry_releases_pending_ranges() {
             reason_phrase: Vec::new(),
         })
         .unwrap();
+    let after_reentry = pipe
+        .server
+        .multicast_stream_delivery_metrics_snapshot(&channel_id);
+    assert_eq!(after_reentry, multicast::StreamDeliveryMetricsSnapshot {
+        direct_fallback_ranges_total: 1,
+        direct_fallback_bytes_total: 1,
+        fallback_reentry_ranges_total: 1,
+        fallback_reentry_bytes_total: 6,
+        ..Default::default()
+    });
+    pipe.server
+        .multicast_process_local_state(multicast::State {
+            channel_id: channel_id.clone(),
+            sequence: 2,
+            state: multicast::ChannelState::Left,
+            reason_scope: multicast::StateReasonScope::Transport,
+            reason_code: multicast::STATE_REASON_REQUESTED_BY_SERVER,
+            reason_phrase: Vec::new(),
+        })
+        .unwrap();
+    assert_eq!(
+        pipe.server
+            .multicast_stream_delivery_metrics_snapshot(&channel_id),
+        after_reentry
+    );
     pipe.advance().unwrap();
 
     assert_eq!(pipe.client.stream_recv(stream_id, &mut out), Ok((6, true)));
@@ -1154,6 +1228,76 @@ fn multicast_stream_fallback_reentry_releases_pending_ranges() {
     assert_eq!(
         pipe.server.multicast_stream_recovery_pending(&channel_id),
         0
+    );
+    assert_eq!(
+        pipe.server
+            .multicast_stream_delivery_metrics_snapshot(&channel_id),
+        multicast::StreamDeliveryMetricsSnapshot {
+            direct_fallback_ranges_total: 1,
+            direct_fallback_bytes_total: 1,
+            fallback_reentry_ranges_total: 1,
+            fallback_reentry_bytes_total: 6,
+            ..Default::default()
+        }
+    );
+}
+
+#[test]
+fn multicast_stream_zero_length_fin_counts_one_fallback_range() {
+    let mut pipe = multicast_stream_negotiated_pipe();
+    let channel_id = vec![1, 2, 3, 4];
+    let stream_id = 3;
+    multicast_stream_prefix(&mut pipe, stream_id);
+
+    pipe.server
+        .multicast_stream_send(&channel_id, 0, stream_id, 10, b"", true)
+        .unwrap();
+
+    assert_eq!(
+        pipe.server
+            .multicast_stream_delivery_metrics_snapshot(&channel_id),
+        multicast::StreamDeliveryMetricsSnapshot {
+            direct_fallback_ranges_total: 1,
+            ..Default::default()
+        }
+    );
+}
+
+#[test]
+fn multicast_stream_failed_and_blocked_sends_are_not_counted() {
+    let mut pipe = multicast_stream_negotiated_pipe();
+    let channel_id = vec![1, 2, 3, 4];
+    let stream_id = 3;
+    multicast_stream_prefix(&mut pipe, stream_id);
+
+    assert_eq!(
+        pipe.server.multicast_stream_send(
+            &channel_id,
+            0,
+            0,
+            0,
+            b"invalid direction",
+            false,
+        ),
+        Err(Error::InvalidState)
+    );
+
+    pipe.server.max_tx_data = pipe.server.tx_data;
+    assert_eq!(
+        pipe.server.multicast_stream_send(
+            &channel_id,
+            0,
+            stream_id,
+            10,
+            b"blocked",
+            false,
+        ),
+        Err(Error::Done)
+    );
+    assert_eq!(
+        pipe.server
+            .multicast_stream_delivery_metrics_snapshot(&channel_id),
+        multicast::StreamDeliveryMetricsSnapshot::default()
     );
 }
 
@@ -1192,6 +1336,17 @@ fn multicast_stream_ack_timeout_releases_pending_ranges() {
     assert_eq!(
         pipe.server.multicast_stream_recovery_pending(&channel_id),
         0
+    );
+    assert_eq!(
+        pipe.server
+            .multicast_stream_delivery_metrics_snapshot(&channel_id),
+        multicast::StreamDeliveryMetricsSnapshot {
+            direct_fallback_ranges_total: 1,
+            direct_fallback_bytes_total: 1,
+            fallback_reentry_ranges_total: 1,
+            fallback_reentry_bytes_total: 7,
+            ..Default::default()
+        }
     );
 }
 
@@ -1290,6 +1445,15 @@ fn multicast_stream_reset_drops_withheld_recovery() {
         0
     );
     assert_eq!(pipe.server.multicast_stream_recovery_withheld_bytes(), 0);
+    assert_eq!(
+        pipe.server
+            .multicast_stream_delivery_metrics_snapshot(&channel_id),
+        multicast::StreamDeliveryMetricsSnapshot {
+            direct_fallback_ranges_total: 1,
+            direct_fallback_bytes_total: 1,
+            ..Default::default()
+        }
+    );
 }
 
 #[test]
@@ -1332,6 +1496,15 @@ fn multicast_stream_stop_sending_drops_withheld_recovery() {
             true
         ),
         Err(Error::StreamStopped(55))
+    );
+    assert_eq!(
+        pipe.server
+            .multicast_stream_delivery_metrics_snapshot(&channel_id),
+        multicast::StreamDeliveryMetricsSnapshot {
+            direct_fallback_ranges_total: 1,
+            direct_fallback_bytes_total: 1,
+            ..Default::default()
+        }
     );
 }
 

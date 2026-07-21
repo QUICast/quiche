@@ -181,6 +181,7 @@ pub enum ServerStreamPublisherError {
 #[derive(Clone)]
 pub struct ServerStreamPublisher {
     inner: Arc<Mutex<ServerStreamPublisherInner>>,
+    delivery_metrics: Arc<ServerStreamDeliveryMetricsAccumulator>,
 }
 
 impl ServerStreamPublisher {
@@ -210,6 +211,9 @@ impl ServerStreamPublisher {
                     quiche::multicast::DEFAULT_STREAM_RECOVERY_REORDERING_THRESHOLD,
                 retired: false,
             })),
+            delivery_metrics: Arc::new(
+                ServerStreamDeliveryMetricsAccumulator::default(),
+            ),
         })
     }
 
@@ -262,6 +266,7 @@ impl ServerStreamPublisher {
                 config: inner.channel.clone(),
                 reordering_threshold: inner.reordering_threshold,
                 max_stream_id: inner.max_stream_id,
+                delivery_metrics: Arc::clone(&self.delivery_metrics),
             })
             .map_err(|_| ServerStreamPublisherError::ControllerClosed)?;
 
@@ -543,6 +548,19 @@ impl ServerStreamPublisher {
         Ok(self.lock()?.send_state.metrics_snapshot())
     }
 
+    /// Returns cumulative ordinary-QUIC delivery metrics aggregated across
+    /// every connection attached during this publisher's lifetime.
+    ///
+    /// These counters measure unique STREAM payload scheduled for direct
+    /// fallback or recovery. They do not measure retransmissions, framing,
+    /// encryption, control traffic, or socket egress. Collection is an O(1),
+    /// allocation-free atomic snapshot.
+    pub fn delivery_metrics_snapshot(
+        &self,
+    ) -> quiche::multicast::StreamDeliveryMetricsSnapshot {
+        self.delivery_metrics.snapshot()
+    }
+
     /// Returns the number of currently attached client connections.
     pub fn attached_connections(
         &self,
@@ -602,6 +620,82 @@ struct ServerStreamPublisherInner {
     max_stream_id: Option<u64>,
     reordering_threshold: u64,
     retired: bool,
+}
+
+#[derive(Debug, Default)]
+pub(super) struct ServerStreamDeliveryMetricsAccumulator {
+    direct_fallback_ranges_total: AtomicU64,
+    direct_fallback_bytes_total: AtomicU64,
+    ack_gap_recovery_ranges_total: AtomicU64,
+    ack_gap_recovery_bytes_total: AtomicU64,
+    fallback_reentry_ranges_total: AtomicU64,
+    fallback_reentry_bytes_total: AtomicU64,
+}
+
+impl ServerStreamDeliveryMetricsAccumulator {
+    pub(super) fn add(
+        &self, delta: quiche::multicast::StreamDeliveryMetricsDelta,
+    ) {
+        atomic_saturating_add(
+            &self.direct_fallback_ranges_total,
+            delta.direct_fallback_ranges_total,
+        );
+        atomic_saturating_add(
+            &self.direct_fallback_bytes_total,
+            delta.direct_fallback_bytes_total,
+        );
+        atomic_saturating_add(
+            &self.ack_gap_recovery_ranges_total,
+            delta.ack_gap_recovery_ranges_total,
+        );
+        atomic_saturating_add(
+            &self.ack_gap_recovery_bytes_total,
+            delta.ack_gap_recovery_bytes_total,
+        );
+        atomic_saturating_add(
+            &self.fallback_reentry_ranges_total,
+            delta.fallback_reentry_ranges_total,
+        );
+        atomic_saturating_add(
+            &self.fallback_reentry_bytes_total,
+            delta.fallback_reentry_bytes_total,
+        );
+    }
+
+    fn snapshot(&self) -> quiche::multicast::StreamDeliveryMetricsSnapshot {
+        quiche::multicast::StreamDeliveryMetricsSnapshot {
+            direct_fallback_ranges_total: self
+                .direct_fallback_ranges_total
+                .load(Ordering::Relaxed),
+            direct_fallback_bytes_total: self
+                .direct_fallback_bytes_total
+                .load(Ordering::Relaxed),
+            ack_gap_recovery_ranges_total: self
+                .ack_gap_recovery_ranges_total
+                .load(Ordering::Relaxed),
+            ack_gap_recovery_bytes_total: self
+                .ack_gap_recovery_bytes_total
+                .load(Ordering::Relaxed),
+            fallback_reentry_ranges_total: self
+                .fallback_reentry_ranges_total
+                .load(Ordering::Relaxed),
+            fallback_reentry_bytes_total: self
+                .fallback_reentry_bytes_total
+                .load(Ordering::Relaxed),
+        }
+    }
+}
+
+fn atomic_saturating_add(counter: &AtomicU64, value: u64) {
+    if value == 0 {
+        return;
+    }
+
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            Some(current.saturating_add(value))
+        })
+        .expect("saturating update always returns a value");
 }
 
 #[derive(Debug)]

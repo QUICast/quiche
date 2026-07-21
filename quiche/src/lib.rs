@@ -1677,6 +1677,7 @@ struct MulticastStreamRecovery {
     largest_acknowledged: Option<u64>,
     reordering_threshold: u64,
     pending: BTreeMap<u64, MulticastStreamRange>,
+    delivery_metrics: multicast::StreamDeliveryMetricsSnapshot,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1716,6 +1717,7 @@ impl Default for MulticastStreamRecovery {
             reordering_threshold:
                 multicast::DEFAULT_STREAM_RECOVERY_REORDERING_THRESHOLD,
             pending: BTreeMap::new(),
+            delivery_metrics: multicast::StreamDeliveryMetricsSnapshot::default(),
         }
     }
 }
@@ -7621,7 +7623,18 @@ impl<F: BufFactory> Connection<F> {
             .or_default();
         state.largest_published = Some(packet_number);
 
-        if !fallback {
+        if fallback {
+            if len > 0 || fin {
+                state.delivery_metrics.direct_fallback_ranges_total = state
+                    .delivery_metrics
+                    .direct_fallback_ranges_total
+                    .saturating_add(1);
+                state.delivery_metrics.direct_fallback_bytes_total = state
+                    .delivery_metrics
+                    .direct_fallback_bytes_total
+                    .saturating_add(len as u64);
+            }
+        } else {
             state.pending.insert(packet_number, MulticastStreamRange {
                 stream_id,
                 offset,
@@ -7645,6 +7658,20 @@ impl<F: BufFactory> Connection<F> {
     /// channels on this connection.
     pub fn multicast_stream_recovery_withheld_bytes(&self) -> usize {
         self.multicast_stream_withheld_bytes
+    }
+
+    /// Returns cumulative ordinary-QUIC delivery metrics for one multicast
+    /// STREAM channel on this connection.
+    ///
+    /// The payload-byte counters include each successfully scheduled range
+    /// once. They do not measure QUIC framing, retransmission, encryption,
+    /// control traffic, or socket egress.
+    pub fn multicast_stream_delivery_metrics_snapshot(
+        &self, channel_id: &[u8],
+    ) -> multicast::StreamDeliveryMetricsSnapshot {
+        self.multicast_stream_recovery
+            .get(channel_id)
+            .map_or_else(Default::default, |state| state.delivery_metrics)
     }
 
     /// Queues a multicast control frame for transmission on the unicast
@@ -7847,7 +7874,7 @@ impl<F: BufFactory> Connection<F> {
             self.streams.insert_flushable(&priority_key);
         }
 
-        true
+        range.len > 0 || range.fin
     }
 
     fn multicast_stream_mark_delivered(&mut self, range: MulticastStreamRange) {
@@ -7877,12 +7904,18 @@ impl<F: BufFactory> Connection<F> {
         }
     }
 
-    fn multicast_stream_release_range(&mut self, range: MulticastStreamRange) {
+    fn multicast_stream_release_range(
+        &mut self, range: MulticastStreamRange,
+    ) -> bool {
         self.multicast_stream_withheld_bytes = self
             .multicast_stream_withheld_bytes
             .saturating_sub(range.len);
 
-        self.multicast_stream_schedule_range(range);
+        if !self.multicast_stream_schedule_range(range) {
+            return false;
+        }
+
+        true
     }
 
     fn multicast_stream_release_channel(&mut self, channel_id: &[u8]) {
@@ -7896,8 +7929,24 @@ impl<F: BufFactory> Connection<F> {
             })
             .unwrap_or_default();
 
+        let mut released_ranges = 0_u64;
+        let mut released_bytes = 0_u64;
         for range in pending {
-            self.multicast_stream_release_range(range);
+            if self.multicast_stream_release_range(range) {
+                released_ranges = released_ranges.saturating_add(1);
+                released_bytes = released_bytes.saturating_add(range.len as u64);
+            }
+        }
+
+        if let Some(state) = self.multicast_stream_recovery.get_mut(channel_id) {
+            state.delivery_metrics.fallback_reentry_ranges_total = state
+                .delivery_metrics
+                .fallback_reentry_ranges_total
+                .saturating_add(released_ranges);
+            state.delivery_metrics.fallback_reentry_bytes_total = state
+                .delivery_metrics
+                .fallback_reentry_bytes_total
+                .saturating_add(released_bytes);
         }
     }
 
@@ -7951,8 +8000,9 @@ impl<F: BufFactory> Connection<F> {
                 let delivered = spans.iter().any(|span| {
                     span.start <= packet_number && packet_number <= span.end
                 });
-                let lost = packet_number.saturating_add(threshold) <=
-                    frame.largest_acknowledged;
+                let lost = fresh &&
+                    packet_number.saturating_add(threshold) <=
+                        frame.largest_acknowledged;
 
                 (delivered || lost).then_some((packet_number, range, delivered))
             })
@@ -7974,12 +8024,29 @@ impl<F: BufFactory> Connection<F> {
             }
         }
 
+        let mut recovered_ranges = 0_u64;
+        let mut recovered_bytes = 0_u64;
         for (_, range, delivered) in actions {
             if delivered {
                 self.multicast_stream_mark_delivered(range);
-            } else {
-                self.multicast_stream_release_range(range);
+            } else if self.multicast_stream_release_range(range) {
+                recovered_ranges = recovered_ranges.saturating_add(1);
+                recovered_bytes =
+                    recovered_bytes.saturating_add(range.len as u64);
             }
+        }
+
+        if let Some(state) =
+            self.multicast_stream_recovery.get_mut(&frame.channel_id)
+        {
+            state.delivery_metrics.ack_gap_recovery_ranges_total = state
+                .delivery_metrics
+                .ack_gap_recovery_ranges_total
+                .saturating_add(recovered_ranges);
+            state.delivery_metrics.ack_gap_recovery_bytes_total = state
+                .delivery_metrics
+                .ack_gap_recovery_bytes_total
+                .saturating_add(recovered_bytes);
         }
 
         Ok(fresh)
