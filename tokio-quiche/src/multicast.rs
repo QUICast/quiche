@@ -1553,7 +1553,7 @@ impl<A: ApplicationOverQuic> ApplicationOverQuic for ServerControlDriver<A> {
         &mut self, qconn: &mut QuicheConnection, metrics: &M,
         connection_result: &QuicResult<()>,
     ) {
-        self.runtime.clear();
+        self.runtime.on_conn_close(qconn);
         self.inner.on_conn_close(qconn, metrics, connection_result);
     }
 }
@@ -1737,6 +1737,8 @@ enum ServerControlCommand {
         config: ServerControlChannelConfig,
         reordering_threshold: u64,
         max_stream_id: Option<u64>,
+        delivery_metrics:
+            Arc<server_stream::ServerStreamDeliveryMetricsAccumulator>,
     },
     StreamPublication {
         publication: Arc<server_stream::CommittedServerStreamPublication>,
@@ -1763,8 +1765,14 @@ struct ServerControlChannel {
     stream_publisher: bool,
     max_stream_id: Option<u64>,
     largest_stream_packet_number: Option<u64>,
+    stream_delivery_metrics: Option<ConnectionStreamDeliveryMetrics>,
     last_client_state_sequence: u64,
     retired: bool,
+}
+
+struct ConnectionStreamDeliveryMetrics {
+    accumulator: Arc<server_stream::ServerStreamDeliveryMetricsAccumulator>,
+    baseline: quiche::multicast::StreamDeliveryMetricsSnapshot,
 }
 
 struct PendingStreamIntegrityBatch {
@@ -1818,6 +1826,11 @@ impl ServerControlRuntime {
         self.last_client_limits = None;
 
         while self.command_receiver.try_recv().is_ok() {}
+    }
+
+    fn on_conn_close(&mut self, qconn: &QuicheConnection) {
+        self.fold_all_stream_delivery_metrics(qconn);
+        self.clear();
     }
 
     fn has_pending_work(&self) -> bool {
@@ -1893,10 +1906,15 @@ impl ServerControlRuntime {
             }
         }
 
+        self.fold_all_stream_delivery_metrics(qconn);
         self.forward_probe_events(qconn)
     }
 
     fn process_writes(&mut self, qconn: &mut QuicheConnection) -> QuicResult<()> {
+        // Connection timers run outside this wrapper. Fold first so timeout
+        // fallback releases are retained before processing new commands.
+        self.fold_all_stream_delivery_metrics(qconn);
+
         while let Ok(command) = self.command_receiver.try_recv() {
             self.pending_commands.push_back(command);
         }
@@ -1908,7 +1926,47 @@ impl ServerControlRuntime {
         }
         self.stage_due_stream_integrities(Instant::now());
         self.flush_pending_integrities(qconn)?;
+        self.fold_all_stream_delivery_metrics(qconn);
         self.forward_probe_events(qconn)
+    }
+
+    fn fold_stream_delivery_metrics(
+        &mut self, qconn: &QuicheConnection, channel_id: &[u8],
+    ) {
+        let snapshot =
+            qconn.multicast_stream_delivery_metrics_snapshot(channel_id);
+        let Some(metrics) = self
+            .channels
+            .get_mut(channel_id)
+            .and_then(|channel| channel.stream_delivery_metrics.as_mut())
+        else {
+            return;
+        };
+
+        metrics.accumulator.add(
+            quiche::multicast::StreamDeliveryMetricsDelta::between(
+                metrics.baseline,
+                snapshot,
+            ),
+        );
+        metrics.baseline = snapshot;
+    }
+
+    fn fold_all_stream_delivery_metrics(&mut self, qconn: &QuicheConnection) {
+        for (channel_id, channel) in &mut self.channels {
+            let Some(metrics) = channel.stream_delivery_metrics.as_mut() else {
+                continue;
+            };
+            let snapshot =
+                qconn.multicast_stream_delivery_metrics_snapshot(channel_id);
+            metrics.accumulator.add(
+                quiche::multicast::StreamDeliveryMetricsDelta::between(
+                    metrics.baseline,
+                    snapshot,
+                ),
+            );
+            metrics.baseline = snapshot;
+        }
     }
 
     fn forward_probe_events(
@@ -1952,6 +2010,7 @@ impl ServerControlRuntime {
             },
 
             quiche::multicast::Frame::State(frame) => {
+                let channel_id = frame.channel_id.clone();
                 if let Some(channel) = self.channels.get_mut(&frame.channel_id) {
                     channel.last_client_state_sequence = frame.sequence;
                     match frame.state {
@@ -1973,12 +2032,14 @@ impl ServerControlRuntime {
                         },
                     }
                 }
+                self.fold_stream_delivery_metrics(qconn, &channel_id);
                 let _ = self.event_sender.send(ServerEvent::ClientState(frame));
             },
 
             quiche::multicast::Frame::Ack(frame) => {
                 if self.channels.contains_key(&frame.channel_id) {
                     qconn.multicast_process_peer_ack(frame.clone())?;
+                    self.fold_stream_delivery_metrics(qconn, &frame.channel_id);
                 }
                 let _ = self.event_sender.send(ServerEvent::ClientAck(frame));
             },
@@ -2078,6 +2139,7 @@ impl ServerControlRuntime {
             reason_code: quiche::multicast::STATE_REASON_REQUESTED_BY_SERVER,
             reason_phrase: Vec::new(),
         })?;
+        self.fold_stream_delivery_metrics(qconn, channel_id);
         qconn.multicast_send(quiche::multicast::Frame::Retire(
             quiche::multicast::Retire {
                 channel_id: channel_id.to_vec(),
@@ -2209,8 +2271,15 @@ impl ServerControlRuntime {
                     config,
                     reordering_threshold,
                     max_stream_id,
+                    delivery_metrics,
                 } => {
                     let channel_id = config.announce.channel_id.clone();
+                    if self.channels.get(&channel_id).is_some_and(|channel| {
+                        channel.stream_delivery_metrics.is_some()
+                    }) {
+                        return Err(quiche::Error::InvalidState.into());
+                    }
+
                     qconn.multicast_set_stream_recovery_reordering_threshold(
                         &channel_id,
                         reordering_threshold,
@@ -2228,6 +2297,14 @@ impl ServerControlRuntime {
                             as Box<dyn std::error::Error + Send + Sync>)?;
                     channel.stream_publisher = true;
                     channel.max_stream_id = max_stream_id;
+                    channel.stream_delivery_metrics =
+                        Some(ConnectionStreamDeliveryMetrics {
+                            accumulator: delivery_metrics,
+                            baseline: qconn
+                                .multicast_stream_delivery_metrics_snapshot(
+                                    &channel_id,
+                                ),
+                        });
 
                     if auto_send {
                         self.maybe_auto_announce_channel(qconn, &channel_id)?;
@@ -2360,6 +2437,7 @@ impl ServerControlRuntime {
                             quiche::multicast::STATE_REASON_REQUESTED_BY_SERVER,
                         reason_phrase: Vec::new(),
                     })?;
+                    self.fold_stream_delivery_metrics(qconn, &frame.channel_id);
 
                     if self.peer_supports_multicast(qconn) {
                         qconn.multicast_send(
@@ -2640,6 +2718,7 @@ impl ServerControlRuntime {
             reason_code: quiche::multicast::STATE_REASON_REQUESTED_BY_SERVER,
             reason_phrase: Vec::new(),
         })?;
+        self.fold_stream_delivery_metrics(qconn, channel_id);
 
         if self.peer_supports_multicast(qconn) {
             qconn.multicast_send(quiche::multicast::Frame::Leave(
@@ -2670,7 +2749,8 @@ impl ServerControlRuntime {
                 frame.data.clone(),
                 frame.fin,
             ) {
-                Ok(()) =>
+                Ok(()) => {
+                    self.fold_stream_delivery_metrics(qconn, channel_id);
                     if self.peer_supports_multicast(qconn) &&
                         self.channels.get(channel_id).is_some_and(|channel| {
                             channel.announce_sent &&
@@ -2682,7 +2762,8 @@ impl ServerControlRuntime {
                             publication.integrity.clone(),
                             Instant::now(),
                         );
-                    },
+                    }
+                },
 
                 Err(
                     quiche::Error::Done |
@@ -3842,6 +3923,16 @@ mod tests {
         publisher.commit(publication).unwrap();
         first_runtime.process_writes(&mut first.server).unwrap();
         second_runtime.process_writes(&mut second.server).unwrap();
+        let channel_metrics = publisher.metrics_snapshot().unwrap();
+        assert_eq!(
+            publisher.delivery_metrics_snapshot(),
+            quiche::multicast::StreamDeliveryMetricsSnapshot {
+                direct_fallback_ranges_total: 2,
+                direct_fallback_bytes_total: 30,
+                ..Default::default()
+            }
+        );
+        assert_eq!(publisher.metrics_snapshot().unwrap(), channel_metrics);
         deliver_server_flight(&mut first);
         deliver_server_flight(&mut second);
 
@@ -3855,6 +3946,14 @@ mod tests {
         drop(first_attachment);
         drop(second_attachment);
         assert_eq!(publisher.attached_connections().unwrap(), 0);
+        assert_eq!(
+            publisher.delivery_metrics_snapshot(),
+            quiche::multicast::StreamDeliveryMetricsSnapshot {
+                direct_fallback_ranges_total: 2,
+                direct_fallback_bytes_total: 30,
+                ..Default::default()
+            }
+        );
     }
 
     #[test]
@@ -3988,6 +4087,14 @@ mod tests {
             first.server.multicast_stream_recovery_pending(&channel_id),
             1
         );
+        assert_eq!(
+            publisher.delivery_metrics_snapshot(),
+            quiche::multicast::StreamDeliveryMetricsSnapshot {
+                direct_fallback_ranges_total: 3,
+                direct_fallback_bytes_total: 25,
+                ..Default::default()
+            }
+        );
 
         send_client_control(
             &mut first,
@@ -4089,6 +4196,256 @@ mod tests {
         );
         assert_eq!(second.client.stream_recv(7, &mut out), Ok((11, true)));
         assert_eq!(&out[..11], b"green-again");
+    }
+
+    #[test]
+    fn server_stream_publisher_aggregates_exact_ack_gap_recovery() {
+        let settings = test_settings();
+        let mut pipe = test_stream_pipe(&settings);
+        let (mut runtime, controller) = test_stream_control_runtime();
+        runtime.on_conn_established(&mut pipe.server).unwrap();
+        send_webtransport_stream_prefix(&mut pipe, 3, 11);
+
+        let channel_id = vec![1, 2, 3, 4];
+        let publisher =
+            ServerStreamPublisher::new(test_stream_control_config()).unwrap();
+        publisher.set_reordering_threshold(1).unwrap();
+        publisher.declare_stream(3).unwrap();
+        let _attachment = publisher.attach(&controller).unwrap();
+        runtime.process_writes(&mut pipe.server).unwrap();
+
+        let baseline = publisher.prepare_stream(3, 10, false, b"a").unwrap();
+        publisher.commit(baseline).unwrap();
+        runtime.process_writes(&mut pipe.server).unwrap();
+        send_client_control(
+            &mut pipe,
+            &mut runtime,
+            quiche::multicast::Frame::Ack(quiche::multicast::Ack {
+                channel_id: channel_id.clone(),
+                largest_acknowledged: 0,
+                ack_delay: 0,
+                first_ack_range: 0,
+                ack_ranges: Vec::new(),
+                ecn_counts: None,
+            }),
+        );
+
+        for (offset, data, fin) in [
+            (11, &b"one"[..], false),
+            (14, &b"two"[..], false),
+            (17, &b"three"[..], true),
+        ] {
+            let publication =
+                publisher.prepare_stream(3, offset, fin, data).unwrap();
+            publisher.commit(publication).unwrap();
+        }
+        runtime.process_writes(&mut pipe.server).unwrap();
+
+        let ack = quiche::multicast::Ack {
+            channel_id: channel_id.clone(),
+            largest_acknowledged: 3,
+            ack_delay: 0,
+            first_ack_range: 0,
+            ack_ranges: Vec::new(),
+            ecn_counts: None,
+        };
+        send_client_control(
+            &mut pipe,
+            &mut runtime,
+            quiche::multicast::Frame::Ack(ack.clone()),
+        );
+        let after_recovery = publisher.delivery_metrics_snapshot();
+        assert_eq!(
+            after_recovery,
+            quiche::multicast::StreamDeliveryMetricsSnapshot {
+                direct_fallback_ranges_total: 1,
+                direct_fallback_bytes_total: 1,
+                ack_gap_recovery_ranges_total: 2,
+                ack_gap_recovery_bytes_total: 6,
+                ..Default::default()
+            }
+        );
+
+        send_client_control(
+            &mut pipe,
+            &mut runtime,
+            quiche::multicast::Frame::Ack(ack),
+        );
+        send_client_control(
+            &mut pipe,
+            &mut runtime,
+            quiche::multicast::Frame::Ack(quiche::multicast::Ack {
+                channel_id,
+                largest_acknowledged: 2,
+                ack_delay: 0,
+                first_ack_range: 0,
+                ack_ranges: Vec::new(),
+                ecn_counts: None,
+            }),
+        );
+        assert_eq!(publisher.delivery_metrics_snapshot(), after_recovery);
+    }
+
+    #[test]
+    fn server_stream_timeout_and_close_fold_retained_backlog_once() {
+        let settings = test_settings();
+        let mut pipe = test_stream_pipe(&settings);
+        let (mut runtime, controller) = test_stream_control_runtime();
+        runtime.on_conn_established(&mut pipe.server).unwrap();
+        send_webtransport_stream_prefix(&mut pipe, 3, 11);
+
+        let channel_id = vec![1, 2, 3, 4];
+        let mut config = test_stream_control_config();
+        config.announce.max_ack_delay_ms = 0;
+        let publisher = ServerStreamPublisher::new(config).unwrap();
+        publisher.declare_stream(3).unwrap();
+        let attachment = publisher.attach(&controller).unwrap();
+        runtime.process_writes(&mut pipe.server).unwrap();
+
+        let baseline = publisher.prepare_stream(3, 10, false, b"a").unwrap();
+        publisher.commit(baseline).unwrap();
+        runtime.process_writes(&mut pipe.server).unwrap();
+        send_client_control(
+            &mut pipe,
+            &mut runtime,
+            quiche::multicast::Frame::Ack(quiche::multicast::Ack {
+                channel_id: channel_id.clone(),
+                largest_acknowledged: 0,
+                ack_delay: 0,
+                first_ack_range: 0,
+                ack_ranges: Vec::new(),
+                ecn_counts: None,
+            }),
+        );
+
+        let held = publisher.prepare_stream(3, 11, true, b"timeout").unwrap();
+        publisher.commit(held).unwrap();
+        runtime.process_writes(&mut pipe.server).unwrap();
+        pipe.server.on_timeout();
+        assert_eq!(
+            pipe.server.multicast_probe_status(&channel_id),
+            Some(quiche::multicast::ProbeStatus::TimedOut)
+        );
+
+        runtime.on_conn_close(&pipe.server);
+        let after_close = publisher.delivery_metrics_snapshot();
+        assert_eq!(
+            after_close,
+            quiche::multicast::StreamDeliveryMetricsSnapshot {
+                direct_fallback_ranges_total: 1,
+                direct_fallback_bytes_total: 1,
+                fallback_reentry_ranges_total: 1,
+                fallback_reentry_bytes_total: 7,
+                ..Default::default()
+            }
+        );
+        runtime.on_conn_close(&pipe.server);
+        drop(attachment);
+        assert_eq!(publisher.delivery_metrics_snapshot(), after_close);
+    }
+
+    #[test]
+    fn server_stream_retirement_folds_retained_backlog_once() {
+        let settings = test_settings();
+        let mut pipe = test_stream_pipe(&settings);
+        let (mut runtime, controller) = test_stream_control_runtime();
+        runtime.on_conn_established(&mut pipe.server).unwrap();
+        send_webtransport_stream_prefix(&mut pipe, 3, 11);
+
+        let channel_id = vec![1, 2, 3, 4];
+        let publisher =
+            ServerStreamPublisher::new(test_stream_control_config()).unwrap();
+        publisher.declare_stream(3).unwrap();
+        let _attachment = publisher.attach(&controller).unwrap();
+        runtime.process_writes(&mut pipe.server).unwrap();
+
+        let baseline = publisher.prepare_stream(3, 10, false, b"a").unwrap();
+        publisher.commit(baseline).unwrap();
+        runtime.process_writes(&mut pipe.server).unwrap();
+        send_client_control(
+            &mut pipe,
+            &mut runtime,
+            quiche::multicast::Frame::Ack(quiche::multicast::Ack {
+                channel_id: channel_id.clone(),
+                largest_acknowledged: 0,
+                ack_delay: 0,
+                first_ack_range: 0,
+                ack_ranges: Vec::new(),
+                ecn_counts: None,
+            }),
+        );
+
+        let retained = publisher.prepare_stream(3, 11, true, b"retired").unwrap();
+        publisher.commit(retained).unwrap();
+        publisher
+            .retire(quiche::multicast::Retire {
+                channel_id,
+                after_packet_number: 1,
+            })
+            .unwrap();
+        runtime.process_writes(&mut pipe.server).unwrap();
+
+        let after_retirement = publisher.delivery_metrics_snapshot();
+        assert_eq!(
+            after_retirement,
+            quiche::multicast::StreamDeliveryMetricsSnapshot {
+                direct_fallback_ranges_total: 1,
+                direct_fallback_bytes_total: 1,
+                fallback_reentry_ranges_total: 1,
+                fallback_reentry_bytes_total: 7,
+                ..Default::default()
+            }
+        );
+        runtime.process_writes(&mut pipe.server).unwrap();
+        runtime.on_conn_close(&pipe.server);
+        assert_eq!(publisher.delivery_metrics_snapshot(), after_retirement);
+    }
+
+    #[test]
+    fn server_stream_publishers_keep_channel_metrics_isolated() {
+        let settings = test_settings();
+        let mut pipe = test_stream_pipe(&settings);
+        let (mut runtime, controller) = test_stream_control_runtime();
+        runtime.on_conn_established(&mut pipe.server).unwrap();
+        send_webtransport_stream_prefix(&mut pipe, 3, 11);
+        send_webtransport_stream_prefix(&mut pipe, 7, 22);
+
+        let first =
+            ServerStreamPublisher::new(test_stream_control_config()).unwrap();
+        let mut second_config = test_stream_control_config();
+        second_config.announce.channel_id = vec![5, 6, 7, 8];
+        second_config.key.channel_id = vec![5, 6, 7, 8];
+        let second = ServerStreamPublisher::new(second_config).unwrap();
+        first.declare_stream(3).unwrap();
+        second.declare_stream(7).unwrap();
+        let _first_attachment = first.attach(&controller).unwrap();
+        let _second_attachment = second.attach(&controller).unwrap();
+        runtime.process_writes(&mut pipe.server).unwrap();
+
+        let first_publication =
+            first.prepare_stream(3, 10, true, b"first").unwrap();
+        first.commit(first_publication).unwrap();
+        let second_publication =
+            second.prepare_stream(7, 10, true, b"second").unwrap();
+        second.commit(second_publication).unwrap();
+        runtime.process_writes(&mut pipe.server).unwrap();
+
+        assert_eq!(
+            first.delivery_metrics_snapshot(),
+            quiche::multicast::StreamDeliveryMetricsSnapshot {
+                direct_fallback_ranges_total: 1,
+                direct_fallback_bytes_total: 5,
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            second.delivery_metrics_snapshot(),
+            quiche::multicast::StreamDeliveryMetricsSnapshot {
+                direct_fallback_ranges_total: 1,
+                direct_fallback_bytes_total: 6,
+                ..Default::default()
+            }
+        );
     }
 
     #[test]
@@ -4251,6 +4608,10 @@ mod tests {
         assert_eq!(runtime.pending_stream_publications.len(), 1);
         assert!(runtime.stream_retry_blocked);
         assert_eq!(pipe.server.multicast_send_queue_len(), 0);
+        assert_eq!(
+            publisher.delivery_metrics_snapshot(),
+            quiche::multicast::StreamDeliveryMetricsSnapshot::default()
+        );
     }
 
     #[test]

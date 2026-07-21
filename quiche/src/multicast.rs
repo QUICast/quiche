@@ -1210,6 +1210,90 @@ pub struct ChannelSendMetricsDelta {
     pub next_packet_number: u64,
 }
 
+/// Cumulative per-connection send-path metrics for one multicast STREAM
+/// channel.
+///
+/// These counters measure unique STREAM payload ranges successfully scheduled
+/// through ordinary QUIC. They exclude QUIC framing, encryption,
+/// retransmissions, control frames, and socket overhead.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StreamDeliveryMetricsSnapshot {
+    /// Ranges sent directly over ordinary QUIC while multicast was not viable.
+    pub direct_fallback_ranges_total: u64,
+
+    /// Unique payload bytes in directly scheduled fallback ranges.
+    pub direct_fallback_bytes_total: u64,
+
+    /// Withheld ranges released after an advancing `MC_ACK` exposed a gap.
+    pub ack_gap_recovery_ranges_total: u64,
+
+    /// Unique payload bytes released for ACK-gap recovery.
+    pub ack_gap_recovery_bytes_total: u64,
+
+    /// Withheld ranges released when the channel became non-viable.
+    pub fallback_reentry_ranges_total: u64,
+
+    /// Unique payload bytes released after fallback re-entry.
+    pub fallback_reentry_bytes_total: u64,
+}
+
+/// The saturating difference between two STREAM delivery metrics snapshots.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StreamDeliveryMetricsDelta {
+    /// Change in
+    /// [`StreamDeliveryMetricsSnapshot::direct_fallback_ranges_total`].
+    pub direct_fallback_ranges_total: u64,
+
+    /// Change in
+    /// [`StreamDeliveryMetricsSnapshot::direct_fallback_bytes_total`].
+    pub direct_fallback_bytes_total: u64,
+
+    /// Change in
+    /// [`StreamDeliveryMetricsSnapshot::ack_gap_recovery_ranges_total`].
+    pub ack_gap_recovery_ranges_total: u64,
+
+    /// Change in
+    /// [`StreamDeliveryMetricsSnapshot::ack_gap_recovery_bytes_total`].
+    pub ack_gap_recovery_bytes_total: u64,
+
+    /// Change in
+    /// [`StreamDeliveryMetricsSnapshot::fallback_reentry_ranges_total`].
+    pub fallback_reentry_ranges_total: u64,
+
+    /// Change in
+    /// [`StreamDeliveryMetricsSnapshot::fallback_reentry_bytes_total`].
+    pub fallback_reentry_bytes_total: u64,
+}
+
+impl StreamDeliveryMetricsDelta {
+    /// Computes a saturating delta between two delivery snapshots.
+    pub fn between(
+        before: StreamDeliveryMetricsSnapshot,
+        after: StreamDeliveryMetricsSnapshot,
+    ) -> Self {
+        Self {
+            direct_fallback_ranges_total: after
+                .direct_fallback_ranges_total
+                .saturating_sub(before.direct_fallback_ranges_total),
+            direct_fallback_bytes_total: after
+                .direct_fallback_bytes_total
+                .saturating_sub(before.direct_fallback_bytes_total),
+            ack_gap_recovery_ranges_total: after
+                .ack_gap_recovery_ranges_total
+                .saturating_sub(before.ack_gap_recovery_ranges_total),
+            ack_gap_recovery_bytes_total: after
+                .ack_gap_recovery_bytes_total
+                .saturating_sub(before.ack_gap_recovery_bytes_total),
+            fallback_reentry_ranges_total: after
+                .fallback_reentry_ranges_total
+                .saturating_sub(before.fallback_reentry_ranges_total),
+            fallback_reentry_bytes_total: after
+                .fallback_reentry_bytes_total
+                .saturating_sub(before.fallback_reentry_bytes_total),
+        }
+    }
+}
+
 impl ChannelSendMetricsDelta {
     /// Computes the delta between two send metrics snapshots.
     pub fn between(
@@ -3812,6 +3896,38 @@ mod tests {
             last_packet_number: Some(0),
             next_packet_number: 1,
         });
+    }
+
+    #[test]
+    fn stream_delivery_metrics_delta_is_saturating() {
+        let before = StreamDeliveryMetricsSnapshot {
+            direct_fallback_ranges_total: 9,
+            direct_fallback_bytes_total: 8,
+            ack_gap_recovery_ranges_total: 7,
+            ack_gap_recovery_bytes_total: 6,
+            fallback_reentry_ranges_total: 5,
+            fallback_reentry_bytes_total: 4,
+        };
+        let after = StreamDeliveryMetricsSnapshot {
+            direct_fallback_ranges_total: 10,
+            direct_fallback_bytes_total: 3,
+            ack_gap_recovery_ranges_total: 9,
+            ack_gap_recovery_bytes_total: 12,
+            fallback_reentry_ranges_total: 2,
+            fallback_reentry_bytes_total: 11,
+        };
+
+        assert_eq!(
+            StreamDeliveryMetricsDelta::between(before, after),
+            StreamDeliveryMetricsDelta {
+                direct_fallback_ranges_total: 1,
+                direct_fallback_bytes_total: 0,
+                ack_gap_recovery_ranges_total: 2,
+                ack_gap_recovery_bytes_total: 6,
+                fallback_reentry_ranges_total: 0,
+                fallback_reentry_bytes_total: 7,
+            }
+        );
     }
 
     #[test]

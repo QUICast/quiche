@@ -76,6 +76,47 @@ reported offset. The runtime waits if a committed range is ahead of the current
 connection offset; it rejects an overlap because duplicate offsets must contain
 identical data.
 
+## Delivery metrics
+
+Core quiche exposes one cumulative snapshot per connection and channel through
+`Connection::multicast_stream_delivery_metrics_snapshot(channel_id)`.
+`StreamDeliveryMetricsDelta::between(before, after)` computes a saturating
+difference between snapshots. `ServerStreamPublisher::delivery_metrics_snapshot()`
+aggregates those counters across every connection attached during the
+publisher's lifetime. Its atomic snapshot is O(1), does not enumerate clients,
+and retains totals after detach or connection teardown.
+
+The snapshot contains three range/byte pairs:
+
+- `direct_fallback_*` counts new ranges scheduled directly into ordinary QUIC
+  while the channel is not viable. Initial probing and `MC_STATE(JOINED)` before
+  the first valid `MC_ACK` are included.
+- `ack_gap_recovery_*` counts retained viable-channel ranges released after an
+  advancing `MC_ACK` proves them missing beyond the reordering threshold.
+- `fallback_reentry_*` counts retained ranges released when timeout, probing
+  re-entry, failed join, leave, or retirement makes the channel non-viable.
+
+A range is counted only after it successfully enters the ordinary QUIC stream
+send or retransmit machinery. Bytes are unique STREAM payload bytes; a
+zero-length FIN can add one range and zero bytes. The counters exclude QUIC
+framing, encryption, retransmissions, control frames, and socket overhead, so
+they must not be interpreted as wire egress. Reset, `STOP_SENDING`, blocked,
+missing, or otherwise unschedulable ranges are not counted.
+
+`ServerStreamPublisher::metrics_snapshot()` remains the independent multicast
+channel packet-encoding snapshot. For Yggdrasil, account for logical unicast
+payload as:
+
+```text
+logical unicast payload =
+  ordinary WebTransport bytes counted by Yggdrasil
+  + shared prefix/late-catch-up bytes counted by Yggdrasil
+  + ServerStreamPublisher direct fallback bytes
+  + ServerStreamPublisher ACK-gap recovery bytes
+  + ServerStreamPublisher fallback-reentry bytes
+  + native DATAGRAM fallback bytes counted by Yggdrasil
+```
+
 ## Controls
 
 Automatic `ServerControlMode` sends admitted `MC_ANNOUNCE` and `MC_KEY` frames,
