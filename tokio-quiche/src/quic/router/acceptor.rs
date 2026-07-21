@@ -45,6 +45,7 @@ use crate::quic::connection::SharedConnectionIdGenerator;
 use crate::quic::make_qlog_writer;
 use crate::quic::router::NewConnection;
 use crate::quic::Incoming;
+use crate::settings::QuicTransportEgressStats;
 use crate::QuicResultExt;
 
 use super::InitialPacketHandler;
@@ -65,6 +66,7 @@ pub(crate) struct ConnectionAcceptorConfig {
     pub(crate) keylog_file: Option<File>,
     #[cfg(target_os = "linux")]
     pub(crate) with_pktinfo: bool,
+    pub(crate) transport_egress_stats: Option<QuicTransportEgressStats>,
 }
 
 impl<S, M> ConnectionAcceptor<S, M>
@@ -154,6 +156,7 @@ where
         #[cfg(target_os = "linux")]
         let send_to_wouldblock_duration_s =
             self.metrics.send_to_wouldblock_duration_s();
+        let transport_egress_stats = self.config.transport_egress_stats.clone();
 
         spawn_with_killswitch(async move {
             let send_buf = &send_buf[..written];
@@ -161,14 +164,18 @@ where
 
             #[allow(unused_variables)]
             let Some(udp) = socket.as_udp_socket() else {
-                let _ = socket.send_to(send_buf, to).await;
+                if let Ok(bytes_sent) = socket.send_to(send_buf, to).await {
+                    if let Some(stats) = &transport_egress_stats {
+                        stats.record_udp_payload_bytes_sent(bytes_sent);
+                    }
+                }
                 return;
             };
 
             #[cfg(target_os = "linux")]
             {
                 let from = Some(incoming.local_addr).filter(|_| with_pktinfo);
-                let _ = crate::quic::io::gso::send_to(
+                if let Ok(bytes_sent) = crate::quic::io::gso::send_to(
                     udp,
                     to,
                     from,
@@ -178,11 +185,20 @@ where
                     would_block_metric,
                     send_to_wouldblock_duration_s,
                 )
-                .await;
+                .await
+                {
+                    if let Some(stats) = &transport_egress_stats {
+                        stats.record_udp_payload_bytes_sent(bytes_sent);
+                    }
+                }
             }
 
             #[cfg(not(target_os = "linux"))]
-            let _ = socket.send_to(send_buf, to).await;
+            if let Ok(bytes_sent) = socket.send_to(send_buf, to).await {
+                if let Some(stats) = &transport_egress_stats {
+                    stats.record_udp_payload_bytes_sent(bytes_sent);
+                }
+            }
         });
 
         Ok(None)

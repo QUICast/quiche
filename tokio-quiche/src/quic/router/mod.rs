@@ -340,6 +340,7 @@ where
             scid: scid.clone(),
             cid_generator,
             metrics: self.metrics.clone(),
+            transport_egress_stats: self.config.transport_egress_stats.clone(),
             #[cfg(feature = "perf-quic-listener-metrics")]
             init_rx_time,
             handshake_info,
@@ -930,6 +931,7 @@ mod tests {
                     .and_then(|f| f.try_clone().ok()),
                 #[cfg(target_os = "linux")]
                 with_pktinfo: false,
+                transport_egress_stats: config.transport_egress_stats.clone(),
             },
             Arc::clone(&socket_tx),
             Default::default(),

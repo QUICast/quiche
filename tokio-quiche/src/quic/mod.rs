@@ -320,6 +320,7 @@ where
             } else {
                 config.has_ipv6pktinfo
             },
+            transport_egress_stats: config.transport_egress_stats.clone(),
         },
         Arc::clone(&socket_tx),
         Default::default(),

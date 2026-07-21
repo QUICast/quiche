@@ -73,6 +73,7 @@ use crate::quic::io::worker::IoWorker;
 use crate::quic::io::worker::WriterConfig;
 use crate::quic::io::worker::INCOMING_QUEUE_SIZE;
 use crate::quic::router::ConnectionMapCommand;
+use crate::settings::QuicTransportEgressStats;
 use crate::QuicResult;
 
 /// Wrapper for connection statistics recorded by [quiche].
@@ -343,6 +344,7 @@ where
             #[cfg(feature = "perf-quic-listener-metrics")]
             init_rx_time: self.params.init_rx_time,
             metrics: self.params.metrics.clone(),
+            transport_egress_stats: self.params.transport_egress_stats,
         };
 
         let handshake_fut = async move {
@@ -470,6 +472,7 @@ where
     pub scid: ConnectionId<'static>,
     pub cid_generator: Option<SharedConnectionIdGenerator>,
     pub metrics: M,
+    pub transport_egress_stats: Option<QuicTransportEgressStats>,
     #[cfg(feature = "perf-quic-listener-metrics")]
     pub init_rx_time: Option<SystemTime>,
     pub handshake_info: HandshakeInfo,
