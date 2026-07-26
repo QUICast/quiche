@@ -3040,17 +3040,19 @@ impl ServerControlRuntime {
                     }
                 },
 
-                Err(
-                    quiche::Error::Done |
-                    quiche::Error::StreamLimit |
-                    quiche::Error::InvalidStreamState(_),
-                ) => {
+                Err(quiche::Error::Done | quiche::Error::StreamLimit) => {
                     self.pending_stream_publications.push_front(publication);
                     self.stream_retry_blocked = true;
                     break;
                 },
 
-                Err(quiche::Error::StreamStopped(_)) => (),
+                // A terminal stream cannot accept this connection's
+                // registration. Other publisher attachments retain and process
+                // their own copy, so discarding it here lets detach finish.
+                Err(
+                    quiche::Error::InvalidStreamState(_) |
+                    quiche::Error::StreamStopped(_),
+                ) => (),
 
                 Err(error) => return Err(error.into()),
             }
@@ -4370,6 +4372,89 @@ mod tests {
         let mut out = [0; 16];
         assert_eq!(pipe.client.stream_recv(3, &mut out), Ok((8, true)));
         assert_eq!(&out[..8], b"pastlive");
+    }
+
+    #[test]
+    fn server_stream_detach_waits_for_missing_webtransport_prefix() {
+        let settings = test_settings();
+        let mut pipe = test_stream_pipe(&settings);
+        let (mut runtime, controller) = test_stream_control_runtime();
+        runtime.on_conn_established(&mut pipe.server).unwrap();
+
+        let channel_id = [1, 2, 3, 4];
+        let publisher =
+            ServerStreamPublisher::new(test_stream_control_config()).unwrap();
+        publisher.declare_stream(3).unwrap();
+        let attachment = publisher.attach(&controller).unwrap();
+        runtime.process_writes(&mut pipe.server).unwrap();
+
+        let publication = publisher
+            .prepare_stream(3, 10, true, b"after prefix")
+            .unwrap();
+        publisher.commit(publication).unwrap();
+        drop(attachment);
+        runtime.process_writes(&mut pipe.server).unwrap();
+
+        assert_eq!(runtime.pending_stream_publications.len(), 1);
+        assert!(runtime.stream_retry_blocked);
+        assert!(runtime.channels[&channel_id[..]].stream_publisher);
+
+        send_webtransport_stream_prefix(&mut pipe, 3, 11);
+        runtime.process_writes(&mut pipe.server).unwrap();
+
+        assert!(runtime.pending_stream_publications.is_empty());
+        assert!(!runtime.stream_retry_blocked);
+        assert!(!runtime.channels[&channel_id[..]].stream_publisher);
+        deliver_server_flight(&mut pipe);
+
+        let mut out = [0; 16];
+        assert_eq!(pipe.client.stream_recv(3, &mut out), Ok((12, true)));
+        assert_eq!(&out[..12], b"after prefix");
+    }
+
+    #[test]
+    fn server_stream_detach_discards_collected_stream_publication() {
+        let settings = test_settings();
+        let mut pipe = test_stream_pipe(&settings);
+        let (mut runtime, controller) = test_stream_control_runtime();
+        runtime.on_conn_established(&mut pipe.server).unwrap();
+        send_webtransport_stream_prefix(&mut pipe, 3, 11);
+
+        let channel_id = [1, 2, 3, 4];
+        let publisher =
+            ServerStreamPublisher::new(test_stream_control_config()).unwrap();
+        publisher.declare_stream(3).unwrap();
+        let attachment = publisher.attach(&controller).unwrap();
+        runtime.process_writes(&mut pipe.server).unwrap();
+
+        let publication =
+            publisher.prepare_stream(3, 10, true, b"stale").unwrap();
+        publisher.commit(publication).unwrap();
+
+        assert_eq!(
+            pipe.server.stream_send(3, b"ordinary", true),
+            Ok(b"ordinary".len())
+        );
+        pipe.advance().unwrap();
+
+        let mut out = [0; 16];
+        assert_eq!(pipe.client.stream_recv(3, &mut out), Ok((8, true)));
+        assert_eq!(&out[..8], b"ordinary");
+        assert_eq!(
+            pipe.server.stream_capacity(3),
+            Err(quiche::Error::InvalidStreamState(3))
+        );
+
+        drop(attachment);
+        runtime.process_writes(&mut pipe.server).unwrap();
+
+        assert!(runtime.pending_stream_publications.is_empty());
+        assert!(!runtime.stream_retry_blocked);
+        assert!(!runtime.channels[&channel_id[..]].stream_publisher);
+        assert_eq!(
+            pipe.server.multicast_stream_recovery_pending(&channel_id),
+            0
+        );
     }
 
     #[test]
