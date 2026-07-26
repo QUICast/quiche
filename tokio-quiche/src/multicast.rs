@@ -1801,6 +1801,13 @@ enum ServerControlCommand {
         max_stream_id: Option<u64>,
         delivery_metrics:
             Arc<server_stream::ServerStreamDeliveryMetricsAccumulator>,
+        publication_queue: Arc<server_stream::ServerStreamPublisherQueue>,
+    },
+    StreamPublisherQueueReady {
+        publication_queue: Arc<server_stream::ServerStreamPublisherQueue>,
+    },
+    DetachStreamPublisher {
+        publication_queue: Arc<server_stream::ServerStreamPublisherQueue>,
     },
     StreamPublication {
         publication: Arc<server_stream::CommittedServerStreamPublication>,
@@ -1828,6 +1835,8 @@ struct ServerControlChannel {
     max_stream_id: Option<u64>,
     largest_stream_packet_number: Option<u64>,
     stream_delivery_metrics: Option<ConnectionStreamDeliveryMetrics>,
+    stream_publication_queue:
+        Option<Arc<server_stream::ServerStreamPublisherQueue>>,
     last_client_state_sequence: u64,
     retired: bool,
 }
@@ -1885,6 +1894,11 @@ impl ServerControlRuntime {
     }
 
     fn clear(&mut self) {
+        for channel in self.channels.values_mut() {
+            if let Some(queue) = channel.stream_publication_queue.take() {
+                queue.close();
+            }
+        }
         self.pending_commands.clear();
         self.pending_stream_publications.clear();
         self.stream_retry_blocked = false;
@@ -2360,6 +2374,7 @@ impl ServerControlRuntime {
                     reordering_threshold,
                     max_stream_id,
                     delivery_metrics,
+                    publication_queue,
                 } => {
                     let channel_id = config.announce.channel_id.clone();
                     if self.channels.get(&channel_id).is_some_and(|channel| {
@@ -2393,11 +2408,91 @@ impl ServerControlRuntime {
                                     &channel_id,
                                 ),
                         });
+                    channel.stream_publication_queue =
+                        Some(Arc::clone(&publication_queue));
 
                     if auto_send {
                         self.maybe_auto_announce_channel(qconn, &channel_id)?;
                         self.maybe_auto_join_channel(qconn, &channel_id)?;
                     }
+                },
+
+                ServerControlCommand::StreamPublisherQueueReady {
+                    publication_queue,
+                } => {
+                    let channel_id = publication_queue.channel_id();
+                    let is_current = self
+                        .channels
+                        .get(channel_id)
+                        .and_then(|channel| {
+                            channel.stream_publication_queue.as_ref()
+                        })
+                        .is_some_and(|current| {
+                            Arc::ptr_eq(current, &publication_queue)
+                        });
+                    if !is_current {
+                        continue;
+                    }
+
+                    let mut items = publication_queue.drain();
+                    while let Some(item) = items.pop_back() {
+                        let command = match item {
+                            server_stream::ServerStreamPublisherQueueItem::Publication(
+                                publication,
+                            ) => ServerControlCommand::StreamPublication {
+                                publication,
+                            },
+
+                            server_stream::ServerStreamPublisherQueueItem::Key(
+                                frame,
+                            ) => ServerControlCommand::StreamPublisherKey {
+                                frame,
+                            },
+
+                            server_stream::ServerStreamPublisherQueueItem::MaxStreamId(
+                                max_stream_id,
+                            ) => ServerControlCommand::StreamPublisherMaxStreamId {
+                                channel_id: channel_id.to_vec(),
+                                max_stream_id,
+                            },
+
+                            server_stream::ServerStreamPublisherQueueItem::Retire(
+                                frame,
+                            ) => ServerControlCommand::StreamPublisherRetire {
+                                frame,
+                            },
+                        };
+                        self.pending_commands.push_front(command);
+                    }
+                },
+
+                ServerControlCommand::DetachStreamPublisher {
+                    publication_queue,
+                } => {
+                    let channel_id = publication_queue.channel_id();
+                    let is_current = self
+                        .channels
+                        .get(channel_id)
+                        .and_then(|channel| {
+                            channel.stream_publication_queue.as_ref()
+                        })
+                        .is_some_and(|current| {
+                            Arc::ptr_eq(current, &publication_queue)
+                        });
+                    if !is_current {
+                        continue;
+                    }
+
+                    self.fold_stream_delivery_metrics(qconn, channel_id);
+                    self.pending_stream_publications.retain(|publication| {
+                        publication.integrity.channel_id != channel_id
+                    });
+                    if let Some(channel) = self.channels.get_mut(channel_id) {
+                        channel.stream_publisher = false;
+                        channel.stream_delivery_metrics = None;
+                        channel.stream_publication_queue = None;
+                    }
+                    self.stream_retry_blocked = false;
                 },
 
                 ServerControlCommand::StreamPublication { publication } => {
@@ -3980,6 +4075,97 @@ mod tests {
                     data: b"shared stream body".to_vec(),
                 }]
         ));
+    }
+
+    #[test]
+    fn server_stream_publisher_queue_is_edge_triggered_and_ordered() {
+        let settings = test_settings();
+        let mut pipe = test_stream_pipe(&settings);
+        let (mut runtime, controller) = test_stream_control_runtime();
+        runtime.on_conn_established(&mut pipe.server).unwrap();
+
+        let channel_id = vec![1, 2, 3, 4];
+        let publisher =
+            ServerStreamPublisher::new(test_stream_control_config()).unwrap();
+        publisher.declare_stream(3).unwrap();
+        let _attachment = publisher.attach(&controller).unwrap();
+        runtime.process_writes(&mut pipe.server).unwrap();
+        let queue = Arc::clone(
+            runtime.channels[&channel_id]
+                .stream_publication_queue
+                .as_ref()
+                .unwrap(),
+        );
+
+        let first = publisher.prepare_stream(3, 0, false, b"first").unwrap();
+        publisher.commit(first).unwrap();
+        let rotated = quiche::multicast::Key {
+            channel_id: channel_id.clone(),
+            key_sequence: 2,
+            from_packet_number: 1,
+            secret: vec![0xdd; 16],
+        };
+        publisher.update_key(rotated.clone()).unwrap();
+        let second = publisher.prepare_stream(3, 5, false, b"second").unwrap();
+        publisher.commit(second).unwrap();
+
+        let profile = publisher.test_profile().unwrap();
+        assert_eq!(profile.publication_commands_sent, 1);
+        let items = queue.drain().into_iter().collect::<Vec<_>>();
+        assert!(matches!(
+            &items[..],
+            [
+                server_stream::ServerStreamPublisherQueueItem::Publication(
+                    first
+                ),
+                server_stream::ServerStreamPublisherQueueItem::Key(key),
+                server_stream::ServerStreamPublisherQueueItem::Publication(
+                    second
+                ),
+            ] if first.packet_number == 0 &&
+                key == &rotated &&
+                second.packet_number == 1
+        ));
+    }
+
+    #[test]
+    fn server_stream_detach_releases_undrained_publications() {
+        let settings = test_settings();
+        let mut pipe = test_stream_pipe(&settings);
+        let (mut runtime, controller) = test_stream_control_runtime();
+        runtime.on_conn_established(&mut pipe.server).unwrap();
+        send_webtransport_stream_prefix(&mut pipe, 3, 11);
+
+        let channel_id = vec![1, 2, 3, 4];
+        let publisher =
+            ServerStreamPublisher::new(test_stream_control_config()).unwrap();
+        publisher.declare_stream(3).unwrap();
+        let attachment = publisher.attach(&controller).unwrap();
+        runtime.process_writes(&mut pipe.server).unwrap();
+
+        for (offset, data) in [(10, b"one".as_slice()), (13, b"two")] {
+            let publication =
+                publisher.prepare_stream(3, offset, false, data).unwrap();
+            publisher.commit(publication).unwrap();
+        }
+        assert_eq!(
+            publisher.test_profile().unwrap().publication_commands_sent,
+            1
+        );
+
+        drop(attachment);
+        assert_eq!(publisher.attached_connections().unwrap(), 0);
+        runtime.process_writes(&mut pipe.server).unwrap();
+
+        assert!(runtime.pending_stream_publications.is_empty());
+        assert_eq!(
+            pipe.server.multicast_stream_recovery_pending(&channel_id),
+            0
+        );
+        assert_eq!(
+            publisher.delivery_metrics_snapshot(),
+            quiche::multicast::StreamDeliveryMetricsSnapshot::default()
+        );
     }
 
     #[test]

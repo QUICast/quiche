@@ -25,6 +25,7 @@
 // SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 use std::collections::BTreeMap;
+use std::collections::VecDeque;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -251,16 +252,19 @@ impl ServerStreamPublisher {
             return Err(ServerStreamPublisherError::Retired);
         }
 
-        if inner
-            .subscribers
-            .values()
-            .any(|sender| sender.same_channel(&controller.command_sender))
-        {
+        if inner.subscribers.values().any(|subscriber| {
+            subscriber
+                .command_sender
+                .same_channel(&controller.command_sender)
+        }) {
             return Err(ServerStreamPublisherError::InvalidState);
         }
 
         let subscriber_id = inner.next_subscriber_id;
         inner.next_subscriber_id = inner.next_subscriber_id.saturating_add(1);
+        let publication_queue = Arc::new(ServerStreamPublisherQueue::new(
+            inner.channel.announce.channel_id.clone(),
+        ));
 
         controller
             .command_sender
@@ -269,16 +273,22 @@ impl ServerStreamPublisher {
                 reordering_threshold: inner.reordering_threshold,
                 max_stream_id: inner.max_stream_id,
                 delivery_metrics: Arc::clone(&self.delivery_metrics),
+                publication_queue: Arc::clone(&publication_queue),
             })
             .map_err(|_| ServerStreamPublisherError::ControllerClosed)?;
 
         inner
             .subscribers
-            .insert(subscriber_id, controller.command_sender.clone());
+            .insert(subscriber_id, PublisherSubscriber {
+                command_sender: controller.command_sender.clone(),
+                publication_queue: Arc::clone(&publication_queue),
+            });
 
         Ok(ServerStreamAttachment {
             publisher: Arc::downgrade(&self.inner),
             subscriber_id,
+            command_sender: controller.command_sender.clone(),
+            publication_queue,
         })
     }
 
@@ -311,15 +321,7 @@ impl ServerStreamPublisher {
         }
 
         inner.max_stream_id = Some(stream_id);
-        let channel_id = inner.channel.announce.channel_id.clone();
-        inner.subscribers.retain(|_, sender| {
-            sender
-                .send(ServerControlCommand::StreamPublisherMaxStreamId {
-                    channel_id: channel_id.clone(),
-                    max_stream_id: stream_id,
-                })
-                .is_ok()
-        });
+        inner.fanout(ServerStreamPublisherQueueItem::MaxStreamId(stream_id));
 
         Ok(())
     }
@@ -471,20 +473,8 @@ impl ServerStreamPublisher {
             frame: publication.frame,
         });
 
-        #[cfg(test)]
-        let mut commands_sent = 0_u64;
-        inner.subscribers.retain(|_, sender| {
-            let sent = sender
-                .send(ServerControlCommand::StreamPublication {
-                    publication: Arc::clone(&publication),
-                })
-                .is_ok();
-            #[cfg(test)]
-            {
-                commands_sent = commands_sent.saturating_add(u64::from(sent));
-            }
-            sent
-        });
+        let commands_sent = inner
+            .fanout(ServerStreamPublisherQueueItem::Publication(publication));
         #[cfg(test)]
         {
             inner.profile.publication_commands_sent = inner
@@ -519,13 +509,7 @@ impl ServerStreamPublisher {
 
         inner.send_state.update_key(key.clone())?;
         inner.channel.key = key.clone();
-        inner.subscribers.retain(|_, sender| {
-            sender
-                .send(ServerControlCommand::StreamPublisherKey {
-                    frame: key.clone(),
-                })
-                .is_ok()
-        });
+        inner.fanout(ServerStreamPublisherQueueItem::Key(key));
 
         Ok(())
     }
@@ -550,13 +534,7 @@ impl ServerStreamPublisher {
         }
 
         inner.retired = true;
-        inner.subscribers.retain(|_, sender| {
-            sender
-                .send(ServerControlCommand::StreamPublisherRetire {
-                    frame: frame.clone(),
-                })
-                .is_ok()
-        });
+        inner.fanout(ServerStreamPublisherQueueItem::Retire(frame));
 
         Ok(())
     }
@@ -588,7 +566,11 @@ impl ServerStreamPublisher {
     pub fn attached_connections(
         &self,
     ) -> Result<usize, ServerStreamPublisherError> {
-        Ok(self.lock()?.subscribers.len())
+        let mut inner = self.lock()?;
+        inner
+            .subscribers
+            .retain(|_, subscriber| !subscriber.publication_queue.is_closed());
+        Ok(inner.subscribers.len())
     }
 
     #[cfg(test)]
@@ -630,17 +612,25 @@ impl ServerStreamPublisher {
 pub struct ServerStreamAttachment {
     publisher: Weak<Mutex<ServerStreamPublisherInner>>,
     subscriber_id: u64,
+    command_sender: UnboundedSender<ServerControlCommand>,
+    publication_queue: Arc<ServerStreamPublisherQueue>,
 }
 
 impl Drop for ServerStreamAttachment {
     fn drop(&mut self) {
-        let Some(publisher) = self.publisher.upgrade() else {
-            return;
-        };
+        self.publication_queue.close();
 
-        if let Ok(mut inner) = publisher.lock() {
-            inner.subscribers.remove(&self.subscriber_id);
-        };
+        if let Some(publisher) = self.publisher.upgrade() {
+            if let Ok(mut inner) = publisher.lock() {
+                inner.subscribers.remove(&self.subscriber_id);
+            };
+        }
+
+        let _ = self.command_sender.send(
+            ServerControlCommand::DetachStreamPublisher {
+                publication_queue: Arc::clone(&self.publication_queue),
+            },
+        );
     }
 }
 
@@ -655,7 +645,7 @@ struct ServerStreamPublisherInner {
     channel: ServerControlChannelConfig,
     send_state: quiche::multicast::ChannelSendState,
     streams: BTreeMap<u64, PublisherStreamState>,
-    subscribers: BTreeMap<u64, UnboundedSender<ServerControlCommand>>,
+    subscribers: BTreeMap<u64, PublisherSubscriber>,
     next_subscriber_id: u64,
     pending_token: Option<u64>,
     max_stream_id: Option<u64>,
@@ -663,6 +653,126 @@ struct ServerStreamPublisherInner {
     retired: bool,
     #[cfg(test)]
     profile: ServerStreamPublisherTestProfile,
+}
+
+impl ServerStreamPublisherInner {
+    fn fanout(&mut self, item: ServerStreamPublisherQueueItem) -> u64 {
+        let mut notifications_sent = 0_u64;
+
+        self.subscribers.retain(|_, subscriber| {
+            match subscriber.publication_queue.push(item.clone()) {
+                QueuePushResult::AlreadyDirty => true,
+
+                QueuePushResult::Notify => {
+                    let sent = subscriber
+                        .command_sender
+                        .send(ServerControlCommand::StreamPublisherQueueReady {
+                            publication_queue: Arc::clone(
+                                &subscriber.publication_queue,
+                            ),
+                        })
+                        .is_ok();
+                    if sent {
+                        notifications_sent = notifications_sent.saturating_add(1);
+                    } else {
+                        subscriber.publication_queue.close();
+                    }
+                    sent
+                },
+
+                QueuePushResult::Closed => false,
+            }
+        });
+
+        notifications_sent
+    }
+}
+
+struct PublisherSubscriber {
+    command_sender: UnboundedSender<ServerControlCommand>,
+    publication_queue: Arc<ServerStreamPublisherQueue>,
+}
+
+#[derive(Clone, Debug)]
+pub(super) enum ServerStreamPublisherQueueItem {
+    Publication(Arc<CommittedServerStreamPublication>),
+    Key(quiche::multicast::Key),
+    MaxStreamId(u64),
+    Retire(quiche::multicast::Retire),
+}
+
+#[derive(Debug)]
+pub(super) struct ServerStreamPublisherQueue {
+    channel_id: Vec<u8>,
+    state: Mutex<ServerStreamPublisherQueueState>,
+}
+
+impl ServerStreamPublisherQueue {
+    fn new(channel_id: Vec<u8>) -> Self {
+        Self {
+            channel_id,
+            state: Mutex::new(ServerStreamPublisherQueueState::default()),
+        }
+    }
+
+    pub(super) fn channel_id(&self) -> &[u8] {
+        &self.channel_id
+    }
+
+    fn push(&self, item: ServerStreamPublisherQueueItem) -> QueuePushResult {
+        let Ok(mut state) = self.state.lock() else {
+            return QueuePushResult::Closed;
+        };
+        if state.closed {
+            return QueuePushResult::Closed;
+        }
+
+        state.items.push_back(item);
+        if state.dirty {
+            QueuePushResult::AlreadyDirty
+        } else {
+            state.dirty = true;
+            QueuePushResult::Notify
+        }
+    }
+
+    pub(super) fn drain(&self) -> VecDeque<ServerStreamPublisherQueueItem> {
+        let Ok(mut state) = self.state.lock() else {
+            return VecDeque::new();
+        };
+        if state.closed {
+            return VecDeque::new();
+        }
+
+        state.dirty = false;
+        std::mem::take(&mut state.items)
+    }
+
+    pub(super) fn close(&self) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        state.items.clear();
+        state.dirty = false;
+        state.closed = true;
+    }
+
+    fn is_closed(&self) -> bool {
+        self.state.lock().map_or(true, |state| state.closed)
+    }
+}
+
+#[derive(Debug, Default)]
+struct ServerStreamPublisherQueueState {
+    items: VecDeque<ServerStreamPublisherQueueItem>,
+    dirty: bool,
+    closed: bool,
+}
+
+enum QueuePushResult {
+    AlreadyDirty,
+    Notify,
+    Closed,
 }
 
 #[cfg(test)]
