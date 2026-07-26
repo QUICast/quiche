@@ -1867,6 +1867,8 @@ struct ServerControlRuntime {
     event_coalescer: ServerEventCoalescer,
     #[cfg(test)]
     stream_delivery_metric_fold_attempts: u64,
+    #[cfg(test)]
+    stream_publication_registrations: u64,
 }
 
 impl ServerControlRuntime {
@@ -1889,6 +1891,8 @@ impl ServerControlRuntime {
             event_coalescer: ServerEventCoalescer::default(),
             #[cfg(test)]
             stream_delivery_metric_fold_attempts: 0,
+            #[cfg(test)]
+            stream_publication_registrations: 0,
         }
     }
 
@@ -2946,6 +2950,12 @@ impl ServerControlRuntime {
                 frame.fin,
             ) {
                 Ok(()) => {
+                    #[cfg(test)]
+                    {
+                        self.stream_publication_registrations = self
+                            .stream_publication_registrations
+                            .saturating_add(1);
+                    }
                     if self.peer_supports_multicast(qconn) &&
                         self.channels.get(channel_id).is_some_and(|channel| {
                             channel.announce_sent &&
@@ -4363,10 +4373,18 @@ mod tests {
                 connection.runtime.stream_delivery_metric_fold_attempts
             })
             .sum::<u64>();
+        let publication_registrations = connections
+            .iter()
+            .map(|connection| connection.runtime.stream_publication_registrations)
+            .sum::<u64>();
         let profile = publisher.test_profile().unwrap();
         let delivery = publisher.delivery_metrics_snapshot();
 
         assert_eq!(client_ack_events, CLIENT_COUNT as u64);
+        assert_eq!(
+            publication_registrations,
+            (CLIENT_COUNT * RANGES_PER_PHASE * 3) as u64
+        );
         assert_eq!(
             delivery.direct_fallback_ranges_total,
             (CLIENT_COUNT * RANGES_PER_PHASE * 2) as u64
@@ -4388,6 +4406,7 @@ mod tests {
             concat!(
                 "MCQUIC_PROFILE clients={} ranges_per_phase={} ",
                 "publication_commands={} task_wakes={} ",
+                "publication_registrations={} ",
                 "preparation_capacity_bytes={} ack_events={} ",
                 "probe_events={} limits_events={} state_events={} ",
                 "metric_fold_attempts={} peak_recovery_ranges={} ",
@@ -4401,6 +4420,7 @@ mod tests {
             RANGES_PER_PHASE,
             profile.publication_commands_sent,
             task_wakes,
+            publication_registrations,
             profile.preparation_capacity_bytes,
             client_ack_events,
             probe_events,
