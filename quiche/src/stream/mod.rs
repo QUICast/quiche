@@ -29,6 +29,7 @@ use std::cmp;
 use std::sync::Arc;
 
 use std::collections::hash_map;
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
 
@@ -125,18 +126,122 @@ pub(crate) enum StreamReset {
     },
 }
 
+#[derive(Default)]
+struct CollectedStreamIds {
+    spaces: [CollectedStreamSpace; 4],
+}
+
+impl CollectedStreamIds {
+    fn contains(&self, stream_id: u64) -> bool {
+        self.spaces[stream_type(stream_id)].contains(stream_id >> 2)
+    }
+
+    fn insert(&mut self, stream_id: u64) {
+        self.spaces[stream_type(stream_id)].insert(stream_id >> 2);
+    }
+
+    #[cfg(test)]
+    fn range_count(&self) -> usize {
+        self.spaces
+            .iter()
+            .map(CollectedStreamSpace::range_count)
+            .sum()
+    }
+}
+
+#[derive(Default)]
+struct CollectedStreamSpace {
+    contiguous_end: Option<u64>,
+    sparse: BTreeMap<u64, u64>,
+}
+
+impl CollectedStreamSpace {
+    fn contains(&self, sequence: u64) -> bool {
+        self.contiguous_end.is_some_and(|end| sequence <= end) ||
+            self.sparse
+                .range(..=sequence)
+                .next_back()
+                .is_some_and(|(_, end)| sequence <= *end)
+    }
+
+    fn insert(&mut self, sequence: u64) {
+        if self.contains(sequence) {
+            return;
+        }
+
+        if self
+            .contiguous_end
+            .map_or(sequence == 0, |end| end.checked_add(1) == Some(sequence))
+        {
+            self.contiguous_end = Some(sequence);
+            self.promote_contiguous();
+            return;
+        }
+
+        let mut start = sequence;
+        let mut end = sequence;
+        if let Some((&previous_start, &previous_end)) =
+            self.sparse.range(..sequence).next_back()
+        {
+            if previous_end.checked_add(1) == Some(sequence) {
+                start = previous_start;
+                self.sparse.remove(&previous_start);
+            }
+        }
+        if let Some((&next_start, &next_end)) =
+            self.sparse.range(sequence.saturating_add(1)..).next()
+        {
+            if sequence.checked_add(1) == Some(next_start) {
+                end = next_end;
+                self.sparse.remove(&next_start);
+            }
+        }
+        self.sparse.insert(start, end);
+        self.promote_contiguous();
+    }
+
+    fn promote_contiguous(&mut self) {
+        loop {
+            let expected = self
+                .contiguous_end
+                .map_or(Some(0), |end| end.checked_add(1));
+            let Some(expected) = expected else {
+                return;
+            };
+            let Some((&start, &end)) = self.sparse.first_key_value() else {
+                return;
+            };
+            if start != expected {
+                return;
+            }
+
+            self.sparse.remove(&start);
+            self.contiguous_end = Some(end);
+        }
+    }
+
+    #[cfg(test)]
+    fn range_count(&self) -> usize {
+        self.sparse.len() + usize::from(self.contiguous_end.is_some())
+    }
+}
+
+fn stream_type(stream_id: u64) -> usize {
+    (stream_id & 0x3) as usize
+}
+
 /// Keeps track of QUIC streams and enforces stream limits.
 #[derive(Default)]
 pub struct StreamMap<F: BufFactory = DefaultBufFactory> {
     /// Map of streams indexed by stream ID.
     streams: StreamIdHashMap<Stream<F>>,
 
-    /// Set of streams that were completed and garbage collected.
+    /// Compact ranges of streams that were completed and garbage collected.
     ///
     /// Instead of keeping the full stream state forever, we collect completed
     /// streams to save memory, but we still need to keep track of previously
     /// created streams, to prevent peers from re-creating them.
-    collected: StreamIdHashSet,
+    collected: CollectedStreamIds,
 
     /// Peer's maximum bidirectional stream count limit.
     peer_max_streams_bidi: u64,
@@ -260,7 +365,7 @@ impl<F: BufFactory> StreamMap<F> {
         let (stream, is_new_and_writable) = match self.streams.entry(id) {
             hash_map::Entry::Vacant(v) => {
                 // Stream has already been closed and garbage collected.
-                if self.collected.contains(&id) {
+                if self.collected.contains(id) {
                     return Err(Error::Done);
                 }
 
@@ -673,7 +778,7 @@ impl<F: BufFactory> StreamMap<F> {
 
     /// Returns true if the stream has been collected.
     pub fn is_collected(&self, stream_id: u64) -> bool {
-        self.collected.contains(&stream_id)
+        self.collected.contains(stream_id)
     }
 
     /// Returns true if there are any streams that have data to write.
@@ -1956,6 +2061,73 @@ mod tests {
             Some(Error::StreamLimit)
         );
         assert_eq!(streams.len(), 1);
+    }
+
+    #[test]
+    fn collected_stream_ids_compact_one_million_server_uni_streams() {
+        let mut collected = CollectedStreamIds::default();
+
+        for sequence in 0..1_000_000 {
+            collected.insert((sequence << 2) | 0x3);
+        }
+
+        assert_eq!(collected.range_count(), 1);
+        assert!(collected.contains(3));
+        assert!(collected.contains((999_999 << 2) | 0x3));
+        assert!(!collected.contains((1_000_000 << 2) | 0x3));
+    }
+
+    #[test]
+    fn collected_stream_ids_keep_all_spaces_and_sparse_ids_independent() {
+        let mut collected = CollectedStreamIds::default();
+
+        for stream_type in 0..4 {
+            collected.insert(stream_type);
+            collected.insert((2 << 2) | stream_type);
+        }
+
+        assert_eq!(collected.range_count(), 8);
+        for stream_type in 0..4 {
+            assert!(collected.contains(stream_type));
+            assert!(!collected.contains((1 << 2) | stream_type));
+            assert!(collected.contains((2 << 2) | stream_type));
+        }
+
+        for stream_type in 0..4 {
+            collected.insert((1 << 2) | stream_type);
+        }
+
+        assert_eq!(collected.range_count(), 4);
+        for stream_type in 0..4 {
+            assert!(collected.contains((1 << 2) | stream_type));
+        }
+
+        let max_sequence = (1_u64 << 60) - 1;
+        let sparse_high_id = (max_sequence << 2) | 0x3;
+        collected.insert(sparse_high_id);
+        assert!(collected.contains(sparse_high_id));
+        assert_eq!(collected.range_count(), 5);
+    }
+
+    #[test]
+    fn collected_stream_map_rejects_recreation() {
+        let local_tp = crate::TransportParams::default();
+        let peer_tp = crate::TransportParams::default();
+        let mut streams = <StreamMap>::new(1, 1, 1);
+        streams.update_peer_max_streams_uni(1);
+
+        assert!(streams
+            .get_or_create(3, &local_tp, &peer_tp, true, true)
+            .is_ok());
+        streams.collect(3, true);
+
+        assert!(streams.is_collected(3));
+        assert_eq!(
+            streams
+                .get_or_create(3, &local_tp, &peer_tp, true, true)
+                .err(),
+            Some(Error::Done)
+        );
     }
 
     /// Stream limit should be satisfied regardless of what order we open
