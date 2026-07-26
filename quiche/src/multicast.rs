@@ -50,7 +50,6 @@ use ring::digest;
 use crate::crypto;
 use crate::frame;
 use crate::packet;
-use crate::range_buf::RangeBuf;
 use crate::stream;
 use crate::Error;
 use crate::Result;
@@ -59,6 +58,7 @@ const IP_FLAG_V6_ALLOWED: u8 = 0x02;
 const IP_FLAG_V4_ALLOWED: u8 = 0x01;
 const MAX_TRACKED_ACK_RANGES: usize = 64;
 const ACK_HISTORY_PACKET_WINDOW: u64 = 4 * 1024;
+const MAX_VARINT: u64 = (1 << 62) - 1;
 
 /// Experimental transport parameter ID used by the draft for client multicast
 /// capabilities.
@@ -1508,6 +1508,27 @@ impl ChannelSendState {
         Ok(summary)
     }
 
+    /// Returns the exact output size required to encode `frames`.
+    pub fn packet_len(&self, frames: &[ChannelFrame]) -> Result<usize> {
+        let payload_len = frames.iter().try_fold(0_usize, |total, frame| {
+            total
+                .checked_add(channel_frame_wire_len(frame)?)
+                .ok_or(Error::InvalidState)
+        })?;
+
+        channel_packet_len(&self.announce, self.seal.alg().tag_len(), payload_len)
+    }
+
+    /// Returns the exact output size required for one borrowed STREAM frame.
+    pub fn stream_packet_len(
+        &self, stream_id: u64, offset: u64, data_len: usize,
+    ) -> Result<usize> {
+        let payload_len =
+            channel_stream_frame_wire_len(stream_id, offset, data_len)?;
+
+        channel_packet_len(&self.announce, self.seal.alg().tag_len(), payload_len)
+    }
+
     /// Encodes one multicast packet carrying the provided channel frames.
     ///
     /// The encoded bytes are written into `out`. On success, the returned
@@ -1516,15 +1537,50 @@ impl ChannelSendState {
     pub fn write_packet(
         &mut self, frames: &[ChannelFrame], out: &mut [u8],
     ) -> Result<ChannelSendOutput> {
+        self.write_packet_inner(
+            out,
+            frames.len(),
+            |announce, seal, pn, phase, out| {
+                encode_channel_packet_bytes(
+                    announce, seal, pn, phase, frames, out,
+                )
+            },
+        )
+    }
+
+    /// Encodes one borrowed STREAM frame without copying its payload.
+    ///
+    /// Use [`ChannelSendState::stream_packet_len()`] to allocate the exact
+    /// output size before calling this method.
+    pub fn write_stream_packet(
+        &mut self, stream_id: u64, offset: u64, fin: bool, data: &[u8],
+        out: &mut [u8],
+    ) -> Result<ChannelSendOutput> {
+        self.write_packet_inner(out, 1, |announce, seal, pn, phase, out| {
+            encode_channel_stream_packet_bytes(
+                announce, seal, pn, phase, stream_id, offset, fin, data, out,
+            )
+        })
+    }
+
+    fn write_packet_inner(
+        &mut self, out: &mut [u8], frame_count: usize,
+        encode: impl FnOnce(
+            &Announce,
+            &mut crypto::Seal,
+            u64,
+            bool,
+            &mut [u8],
+        ) -> Result<usize>,
+    ) -> Result<ChannelSendOutput> {
         self.metrics.write_calls = self.metrics.write_calls.saturating_add(1);
         let packet_number = self.next_packet_number;
         let key_phase = self.key.key_sequence % 2 == 1;
-        let packet_len = match encode_channel_packet_bytes(
+        let packet_len = match encode(
             &self.announce,
             &mut self.seal,
             packet_number,
             key_phase,
-            frames,
             out,
         ) {
             Ok(packet_len) => packet_len,
@@ -1545,7 +1601,7 @@ impl ChannelSendState {
         self.metrics.frames_encoded = self
             .metrics
             .frames_encoded
-            .saturating_add(frames.len() as u64);
+            .saturating_add(frame_count as u64);
         self.metrics.last_packet_number = Some(packet_number);
 
         Ok(ChannelSendOutput {
@@ -3098,11 +3154,59 @@ fn encode_channel_packet_bytes(
     announce: &Announce, seal: &mut crypto::Seal, packet_number: u64,
     key_phase: bool, frames: &[ChannelFrame], out: &mut [u8],
 ) -> Result<usize> {
-    if announce.channel_id.is_empty() ||
-        announce.channel_id.len() > packet::MAX_CID_LEN as usize
-    {
-        return Err(Error::InvalidState);
+    let (mut b, payload_offset) =
+        encode_channel_packet_header(announce, packet_number, key_phase, out)?;
+
+    for frame in frames {
+        encode_channel_frame_bytes(frame, &mut b)?;
     }
+
+    let payload_len = b.off() - payload_offset;
+
+    packet::encrypt_pkt(
+        &mut b,
+        packet_number,
+        4,
+        payload_len,
+        payload_offset,
+        None,
+        seal,
+    )
+}
+
+fn encode_channel_stream_packet_bytes(
+    announce: &Announce, seal: &mut crypto::Seal, packet_number: u64,
+    key_phase: bool, stream_id: u64, offset: u64, fin: bool, data: &[u8],
+    out: &mut [u8],
+) -> Result<usize> {
+    channel_stream_frame_wire_len(stream_id, offset, data.len())?;
+    let (mut b, payload_offset) =
+        encode_channel_packet_header(announce, packet_number, key_phase, out)?;
+    frame::encode_stream_header(
+        stream_id,
+        offset,
+        data.len() as u64,
+        fin,
+        &mut b,
+    )?;
+    b.put_bytes(data)?;
+    let payload_len = b.off() - payload_offset;
+
+    packet::encrypt_pkt(
+        &mut b,
+        packet_number,
+        4,
+        payload_len,
+        payload_offset,
+        None,
+        seal,
+    )
+}
+
+fn encode_channel_packet_header<'a>(
+    announce: &Announce, packet_number: u64, key_phase: bool, out: &'a mut [u8],
+) -> Result<(octets::OctetsMut<'a>, usize)> {
+    validate_channel_id(&announce.channel_id)?;
 
     let mut b = octets::OctetsMut::with_slice(out);
     let packet_number_len = 4;
@@ -3113,28 +3217,55 @@ fn encode_channel_packet_bytes(
     b.put_u8(first)?;
     b.put_bytes(&announce.channel_id)?;
     packet::encode_pkt_num(packet_number, packet_number_len, &mut b)?;
-
     let payload_offset = b.off();
 
-    for frame in frames {
-        encode_channel_frame(frame)?.to_bytes(&mut b)?;
-    }
-
-    let payload_len = b.off() - payload_offset;
-
-    packet::encrypt_pkt(
-        &mut b,
-        packet_number,
-        packet_number_len,
-        payload_len,
-        payload_offset,
-        None,
-        seal,
-    )
+    Ok((b, payload_offset))
 }
 
-fn encode_channel_frame(frame: &ChannelFrame) -> Result<frame::Frame> {
-    match frame {
+fn encode_channel_frame_bytes(
+    channel_frame: &ChannelFrame, b: &mut octets::OctetsMut,
+) -> Result<()> {
+    match channel_frame {
+        ChannelFrame::Stream {
+            stream_id,
+            offset,
+            fin,
+            data,
+        } => {
+            channel_stream_frame_wire_len(*stream_id, *offset, data.len())?;
+            frame::encode_stream_header(
+                *stream_id,
+                *offset,
+                data.len() as u64,
+                *fin,
+                b,
+            )?;
+            b.put_bytes(data)?;
+        },
+
+        ChannelFrame::Datagram { data } => {
+            validate_two_byte_length(data.len())?;
+            frame::encode_dgram_header(data.len() as u64, b)?;
+            b.put_bytes(data)?;
+        },
+
+        ChannelFrame::Multicast(frame) => {
+            validate_channel_control_frame(frame)?;
+            frame.encode(b)?;
+        },
+
+        frame => {
+            encode_non_data_channel_frame(frame)?.to_bytes(b)?;
+        },
+    }
+
+    Ok(())
+}
+
+fn encode_non_data_channel_frame(
+    channel_frame: &ChannelFrame,
+) -> Result<frame::Frame> {
+    match channel_frame {
         ChannelFrame::Padding { len } => Ok(frame::Frame::Padding { len: *len }),
 
         ChannelFrame::Ping => Ok(frame::Frame::Ping { mtu_probe: None }),
@@ -3169,36 +3300,97 @@ fn encode_channel_frame(frame: &ChannelFrame) -> Result<frame::Frame> {
             })
         },
 
+        ChannelFrame::Stream { .. } |
+        ChannelFrame::Datagram { .. } |
+        ChannelFrame::Multicast(..) => Err(Error::InvalidFrame),
+    }
+}
+
+fn channel_packet_len(
+    announce: &Announce, tag_len: usize, payload_len: usize,
+) -> Result<usize> {
+    validate_channel_id(&announce.channel_id)?;
+
+    1_usize
+        .checked_add(announce.channel_id.len())
+        .and_then(|len| len.checked_add(4))
+        .and_then(|len| len.checked_add(payload_len))
+        .and_then(|len| len.checked_add(tag_len))
+        .ok_or(Error::InvalidState)
+}
+
+fn channel_frame_wire_len(channel_frame: &ChannelFrame) -> Result<usize> {
+    match channel_frame {
         ChannelFrame::Stream {
             stream_id,
             offset,
-            fin,
             data,
-        } => {
-            validate_channel_stream_id(*stream_id)?;
+            ..
+        } => channel_stream_frame_wire_len(*stream_id, *offset, data.len()),
 
-            Ok(frame::Frame::Stream {
-                stream_id: *stream_id,
-                data: RangeBuf::from(data.as_ref(), *offset, *fin),
-            })
+        ChannelFrame::Datagram { data } => {
+            validate_two_byte_length(data.len())?;
+            Ok(1 + 2 + data.len())
         },
 
-        ChannelFrame::Datagram { data } =>
-            Ok(frame::Frame::Datagram { data: data.clone() }),
-
-        ChannelFrame::Multicast(frame) => match frame {
-            Frame::Key(..) |
-            Frame::Leave(..) |
-            Frame::Integrity(..) |
-            Frame::Retire(..) => Ok(frame::Frame::Multicast(frame.clone())),
-
-            _ => Err(Error::InvalidFrame),
+        ChannelFrame::Multicast(frame) => {
+            validate_channel_control_frame(frame)?;
+            Ok(frame.wire_len())
         },
+
+        frame => Ok(encode_non_data_channel_frame(frame)?.wire_len()),
+    }
+}
+
+fn channel_stream_frame_wire_len(
+    stream_id: u64, offset: u64, data_len: usize,
+) -> Result<usize> {
+    validate_channel_stream_id(stream_id)?;
+    if offset > MAX_VARINT {
+        return Err(Error::InvalidFrame);
+    }
+    validate_two_byte_length(data_len)?;
+
+    1_usize
+        .checked_add(octets::varint_len(stream_id))
+        .and_then(|len| len.checked_add(octets::varint_len(offset)))
+        .and_then(|len| len.checked_add(2))
+        .and_then(|len| len.checked_add(data_len))
+        .ok_or(Error::InvalidState)
+}
+
+fn validate_channel_id(channel_id: &[u8]) -> Result<()> {
+    if channel_id.is_empty() || channel_id.len() > packet::MAX_CID_LEN as usize {
+        return Err(Error::InvalidState);
+    }
+
+    Ok(())
+}
+
+fn validate_two_byte_length(len: usize) -> Result<()> {
+    if len > 16383 {
+        return Err(Error::InvalidFrame);
+    }
+
+    Ok(())
+}
+
+fn validate_channel_control_frame(frame: &Frame) -> Result<()> {
+    match frame {
+        Frame::Key(..) |
+        Frame::Leave(..) |
+        Frame::Integrity(..) |
+        Frame::Retire(..) => Ok(()),
+
+        _ => Err(Error::InvalidFrame),
     }
 }
 
 fn validate_channel_stream_id(stream_id: u64) -> Result<()> {
-    if stream::is_bidi(stream_id) || stream_id & 0x3 != 0x3 {
+    if stream_id > MAX_VARINT ||
+        stream::is_bidi(stream_id) ||
+        stream_id & 0x3 != 0x3
+    {
         return Err(Error::InvalidFrame);
     }
 
@@ -3740,6 +3932,57 @@ mod tests {
         };
 
         assert_eq!(packet.frames, frames);
+    }
+
+    #[test]
+    fn borrowed_channel_stream_encoding_matches_owned_frame() {
+        let announce = test_announce();
+        let key = test_key(&announce.channel_id);
+        let data = b"shared WebTransport stream body";
+        let frames = [ChannelFrame::Stream {
+            stream_id: 3,
+            offset: 10,
+            fin: true,
+            data: data.to_vec(),
+        }];
+        let mut owned =
+            ChannelSendState::new(announce.clone(), key.clone()).unwrap();
+        let mut borrowed = ChannelSendState::new(announce, key).unwrap();
+
+        let owned_len = owned.packet_len(&frames).unwrap();
+        let borrowed_len = borrowed.stream_packet_len(3, 10, data.len()).unwrap();
+        assert_eq!(owned_len, borrowed_len);
+
+        let mut owned_packet = vec![0; owned_len];
+        let mut borrowed_packet = vec![0; borrowed_len];
+        let owned_output =
+            owned.write_packet(&frames, &mut owned_packet).unwrap();
+        let borrowed_output = borrowed
+            .write_stream_packet(3, 10, true, data, &mut borrowed_packet)
+            .unwrap();
+
+        assert_eq!(owned_output.packet_len, owned_len);
+        assert_eq!(borrowed_output.packet_len, borrowed_len);
+        assert_eq!(owned_packet, borrowed_packet);
+        assert_eq!(owned_output.integrity, borrowed_output.integrity);
+    }
+
+    #[test]
+    fn channel_packet_len_rejects_oversized_two_byte_payload() {
+        let announce = test_announce();
+        let key = test_key(&announce.channel_id);
+        let sender = ChannelSendState::new(announce, key).unwrap();
+
+        assert_eq!(
+            sender.stream_packet_len(3, 0, 16384),
+            Err(Error::InvalidFrame)
+        );
+        assert_eq!(
+            sender.packet_len(&[ChannelFrame::Datagram {
+                data: vec![0; 16384],
+            }]),
+            Err(Error::InvalidFrame)
+        );
     }
 
     #[test]
