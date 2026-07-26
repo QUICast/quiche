@@ -387,6 +387,8 @@ use std::cmp;
 
 use std::collections::BTreeMap;
 
+use std::collections::BTreeSet;
+
 use std::collections::VecDeque;
 
 use debug_panic::debug_panic;
@@ -1611,6 +1613,7 @@ where
     multicast_probe_states: BTreeMap<Vec<u8>, multicast::ProbeState>,
     multicast_default_dgram_channel_id: Option<Vec<u8>>,
     multicast_stream_recovery: BTreeMap<Vec<u8>, MulticastStreamRecovery>,
+    multicast_stream_delivery_metrics_dirty: BTreeSet<Vec<u8>>,
     multicast_stream_withheld_bytes: usize,
     multicast_stream_deliveries: BTreeMap<u64, MulticastStreamDelivery>,
 
@@ -2389,6 +2392,7 @@ impl<F: BufFactory> Connection<F> {
             multicast_probe_states: BTreeMap::new(),
             multicast_default_dgram_channel_id: None,
             multicast_stream_recovery: BTreeMap::new(),
+            multicast_stream_delivery_metrics_dirty: BTreeSet::new(),
             multicast_stream_withheld_bytes: 0,
             multicast_stream_deliveries: BTreeMap::new(),
 
@@ -7596,8 +7600,9 @@ impl<F: BufFactory> Connection<F> {
             .or_default();
         state.largest_published = Some(packet_number);
 
+        let delivery_metrics_changed = fallback && (len > 0 || fin);
         if fallback {
-            if len > 0 || fin {
+            if delivery_metrics_changed {
                 state.delivery_metrics.direct_fallback_ranges_total = state
                     .delivery_metrics
                     .direct_fallback_ranges_total
@@ -7614,6 +7619,10 @@ impl<F: BufFactory> Connection<F> {
                 len,
                 fin,
             });
+        }
+        if delivery_metrics_changed {
+            self.multicast_stream_delivery_metrics_dirty
+                .insert(channel_id.to_vec());
         }
 
         Ok(())
@@ -7645,6 +7654,28 @@ impl<F: BufFactory> Connection<F> {
         self.multicast_stream_recovery
             .get(channel_id)
             .map_or_else(Default::default, |state| state.delivery_metrics)
+    }
+
+    /// Takes cumulative delivery-metric snapshots for channels changed since
+    /// the previous call.
+    ///
+    /// Each changed channel appears at most once, even when several ranges
+    /// changed its counters. Channels without delivery changes are omitted.
+    pub fn multicast_stream_take_delivery_metric_updates(
+        &mut self,
+    ) -> Vec<(Vec<u8>, multicast::StreamDeliveryMetricsSnapshot)> {
+        std::mem::take(&mut self.multicast_stream_delivery_metrics_dirty)
+            .into_iter()
+            .map(|channel_id| {
+                let snapshot = self
+                    .multicast_stream_recovery
+                    .get(&channel_id)
+                    .map_or_else(Default::default, |state| {
+                        state.delivery_metrics
+                    });
+                (channel_id, snapshot)
+            })
+            .collect()
     }
 
     /// Queues a multicast control frame for transmission on the unicast
@@ -7922,6 +7953,10 @@ impl<F: BufFactory> Connection<F> {
                 .fallback_reentry_bytes_total
                 .saturating_add(released_bytes);
         }
+        if released_ranges > 0 {
+            self.multicast_stream_delivery_metrics_dirty
+                .insert(channel_id.to_vec());
+        }
     }
 
     fn multicast_stream_forget_stream(
@@ -8068,6 +8103,10 @@ impl<F: BufFactory> Connection<F> {
                 .delivery_metrics
                 .ack_gap_recovery_bytes_total
                 .saturating_add(recovered_bytes);
+        }
+        if recovered_ranges > 0 {
+            self.multicast_stream_delivery_metrics_dirty
+                .insert(frame.channel_id.clone());
         }
 
         Ok(fresh)

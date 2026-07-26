@@ -1911,7 +1911,7 @@ impl ServerControlRuntime {
     }
 
     fn on_conn_close(&mut self, qconn: &QuicheConnection) {
-        self.fold_all_stream_delivery_metrics(qconn);
+        self.fold_final_stream_delivery_metrics(qconn);
         self.clear();
     }
 
@@ -1993,15 +1993,11 @@ impl ServerControlRuntime {
 
         self.event_coalescer.flush_client_acks(&self.event_sender);
         result?;
-        self.fold_all_stream_delivery_metrics(qconn);
+        self.fold_dirty_stream_delivery_metrics(qconn);
         self.forward_probe_events(qconn)
     }
 
     fn process_writes(&mut self, qconn: &mut QuicheConnection) -> QuicResult<()> {
-        // Connection timers run outside this wrapper. Fold first so timeout
-        // fallback releases are retained before processing new commands.
-        self.fold_all_stream_delivery_metrics(qconn);
-
         while let Ok(command) = self.command_receiver.try_recv() {
             self.pending_commands.push_back(command);
         }
@@ -2013,12 +2009,13 @@ impl ServerControlRuntime {
         }
         self.stage_due_stream_integrities(Instant::now());
         self.flush_pending_integrities(qconn)?;
-        self.fold_all_stream_delivery_metrics(qconn);
+        self.fold_dirty_stream_delivery_metrics(qconn);
         self.forward_probe_events(qconn)
     }
 
-    fn fold_stream_delivery_metrics(
-        &mut self, qconn: &QuicheConnection, channel_id: &[u8],
+    fn fold_stream_delivery_metrics_snapshot(
+        &mut self, channel_id: &[u8],
+        snapshot: quiche::multicast::StreamDeliveryMetricsSnapshot,
     ) {
         #[cfg(test)]
         if self
@@ -2030,8 +2027,6 @@ impl ServerControlRuntime {
                 self.stream_delivery_metric_fold_attempts.saturating_add(1);
         }
 
-        let snapshot =
-            qconn.multicast_stream_delivery_metrics_snapshot(channel_id);
         let Some(metrics) = self
             .channels
             .get_mut(channel_id)
@@ -2049,7 +2044,17 @@ impl ServerControlRuntime {
         metrics.baseline = snapshot;
     }
 
-    fn fold_all_stream_delivery_metrics(&mut self, qconn: &QuicheConnection) {
+    fn fold_dirty_stream_delivery_metrics(
+        &mut self, qconn: &mut QuicheConnection,
+    ) {
+        for (channel_id, snapshot) in
+            qconn.multicast_stream_take_delivery_metric_updates()
+        {
+            self.fold_stream_delivery_metrics_snapshot(&channel_id, snapshot);
+        }
+    }
+
+    fn fold_final_stream_delivery_metrics(&mut self, qconn: &QuicheConnection) {
         for (channel_id, channel) in &mut self.channels {
             let Some(metrics) = channel.stream_delivery_metrics.as_mut() else {
                 continue;
@@ -2111,7 +2116,6 @@ impl ServerControlRuntime {
             },
 
             quiche::multicast::Frame::State(frame) => {
-                let channel_id = frame.channel_id.clone();
                 if let Some(channel) = self.channels.get_mut(&frame.channel_id) {
                     channel.last_client_state_sequence = frame.sequence;
                     match frame.state {
@@ -2133,14 +2137,12 @@ impl ServerControlRuntime {
                         },
                     }
                 }
-                self.fold_stream_delivery_metrics(qconn, &channel_id);
                 let _ = self.event_sender.send(ServerEvent::ClientState(frame));
             },
 
             quiche::multicast::Frame::Ack(frame) => {
                 if self.channels.contains_key(&frame.channel_id) {
                     qconn.multicast_process_peer_ack(frame.clone())?;
-                    self.fold_stream_delivery_metrics(qconn, &frame.channel_id);
                 }
                 self.event_coalescer.queue_client_ack(frame);
             },
@@ -2240,7 +2242,6 @@ impl ServerControlRuntime {
             reason_code: quiche::multicast::STATE_REASON_REQUESTED_BY_SERVER,
             reason_phrase: Vec::new(),
         })?;
-        self.fold_stream_delivery_metrics(qconn, channel_id);
         qconn.multicast_send(quiche::multicast::Frame::Retire(
             quiche::multicast::Retire {
                 channel_id: channel_id.to_vec(),
@@ -2482,7 +2483,7 @@ impl ServerControlRuntime {
                         continue;
                     }
 
-                    self.fold_stream_delivery_metrics(qconn, channel_id);
+                    self.fold_dirty_stream_delivery_metrics(qconn);
                     self.pending_stream_publications.retain(|publication| {
                         publication.integrity.channel_id != channel_id
                     });
@@ -2619,8 +2620,6 @@ impl ServerControlRuntime {
                             quiche::multicast::STATE_REASON_REQUESTED_BY_SERVER,
                         reason_phrase: Vec::new(),
                     })?;
-                    self.fold_stream_delivery_metrics(qconn, &frame.channel_id);
-
                     if self.peer_supports_multicast(qconn) {
                         qconn.multicast_send(
                             quiche::multicast::Frame::Retire(frame),
@@ -2900,8 +2899,6 @@ impl ServerControlRuntime {
             reason_code: quiche::multicast::STATE_REASON_REQUESTED_BY_SERVER,
             reason_phrase: Vec::new(),
         })?;
-        self.fold_stream_delivery_metrics(qconn, channel_id);
-
         if self.peer_supports_multicast(qconn) {
             qconn.multicast_send(quiche::multicast::Frame::Leave(
                 quiche::multicast::Leave {
@@ -2932,7 +2929,6 @@ impl ServerControlRuntime {
                 frame.fin,
             ) {
                 Ok(()) => {
-                    self.fold_stream_delivery_metrics(qconn, channel_id);
                     if self.peer_supports_multicast(qconn) &&
                         self.channels.get(channel_id).is_some_and(|channel| {
                             channel.announce_sent &&
