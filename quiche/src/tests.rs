@@ -1292,6 +1292,65 @@ fn multicast_stream_fallback_reentry_releases_pending_ranges() {
 }
 
 #[test]
+fn multicast_stream_delivery_metric_updates_are_dirty_driven() {
+    let mut pipe = multicast_stream_negotiated_pipe();
+    let channel_id = vec![1, 2, 3, 4];
+    let stream_id = 3;
+    multicast_stream_prefix(&mut pipe, stream_id);
+
+    pipe.server
+        .multicast_stream_send(&channel_id, 0, stream_id, 10, b"a", false)
+        .unwrap();
+    pipe.server
+        .multicast_stream_send(&channel_id, 1, stream_id, 11, b"b", false)
+        .unwrap();
+
+    let direct = multicast::StreamDeliveryMetricsSnapshot {
+        direct_fallback_ranges_total: 2,
+        direct_fallback_bytes_total: 2,
+        ..Default::default()
+    };
+    assert_eq!(
+        pipe.server.multicast_stream_take_delivery_metric_updates(),
+        vec![(channel_id.clone(), direct)]
+    );
+    assert!(pipe
+        .server
+        .multicast_stream_take_delivery_metric_updates()
+        .is_empty());
+
+    pipe.server
+        .multicast_process_peer_ack(multicast_ack_for(&channel_id, 1))
+        .unwrap();
+    pipe.server
+        .multicast_stream_send(&channel_id, 2, stream_id, 12, b"held", true)
+        .unwrap();
+    assert!(pipe
+        .server
+        .multicast_stream_take_delivery_metric_updates()
+        .is_empty());
+
+    pipe.server
+        .multicast_process_local_state(multicast::State {
+            channel_id: channel_id.clone(),
+            sequence: 2,
+            state: multicast::ChannelState::Left,
+            reason_scope: multicast::StateReasonScope::Transport,
+            reason_code: multicast::STATE_REASON_REQUESTED_BY_SERVER,
+            reason_phrase: Vec::new(),
+        })
+        .unwrap();
+    assert_eq!(
+        pipe.server.multicast_stream_take_delivery_metric_updates(),
+        vec![(channel_id, multicast::StreamDeliveryMetricsSnapshot {
+            fallback_reentry_ranges_total: 1,
+            fallback_reentry_bytes_total: 4,
+            ..direct
+        })]
+    );
+}
+
+#[test]
 fn multicast_stream_zero_length_fin_counts_one_fallback_range() {
     let mut pipe = multicast_stream_negotiated_pipe();
     let channel_id = vec![1, 2, 3, 4];
