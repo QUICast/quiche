@@ -1794,6 +1794,8 @@ struct ServerControlRuntime {
         BTreeMap<Vec<u8>, PendingStreamIntegrityBatch>,
     channels: BTreeMap<Vec<u8>, ServerControlChannel>,
     last_client_limits: Option<quiche::multicast::Limits>,
+    #[cfg(test)]
+    stream_delivery_metric_fold_attempts: u64,
 }
 
 impl ServerControlRuntime {
@@ -1813,6 +1815,8 @@ impl ServerControlRuntime {
             pending_stream_integrity_batches: BTreeMap::new(),
             channels: BTreeMap::new(),
             last_client_limits: None,
+            #[cfg(test)]
+            stream_delivery_metric_fold_attempts: 0,
         }
     }
 
@@ -1933,6 +1937,16 @@ impl ServerControlRuntime {
     fn fold_stream_delivery_metrics(
         &mut self, qconn: &QuicheConnection, channel_id: &[u8],
     ) {
+        #[cfg(test)]
+        if self
+            .channels
+            .get(channel_id)
+            .is_some_and(|channel| channel.stream_delivery_metrics.is_some())
+        {
+            self.stream_delivery_metric_fold_attempts =
+                self.stream_delivery_metric_fold_attempts.saturating_add(1);
+        }
+
         let snapshot =
             qconn.multicast_stream_delivery_metrics_snapshot(channel_id);
         let Some(metrics) = self
@@ -1957,6 +1971,11 @@ impl ServerControlRuntime {
             let Some(metrics) = channel.stream_delivery_metrics.as_mut() else {
                 continue;
             };
+            #[cfg(test)]
+            {
+                self.stream_delivery_metric_fold_attempts =
+                    self.stream_delivery_metric_fold_attempts.saturating_add(1);
+            }
             let snapshot =
                 qconn.multicast_stream_delivery_metrics_snapshot(channel_id);
             metrics.accumulator.add(
@@ -3371,8 +3390,17 @@ fn server_ack_freshness_timeout(max_ack_delay_ms: u64) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::future::Future;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::Ordering;
     use std::sync::Arc;
     use std::sync::Mutex;
+    use std::task::Context;
+    use std::task::Poll;
+    use std::task::Wake;
+    use std::task::Waker;
+
+    use bytes::Bytes;
 
     use crate::buf_factory::BufFactory;
 
@@ -3538,11 +3566,17 @@ mod tests {
     fn test_stream_pipe_with_max_streams_uni(
         settings: &ClientSettings, max_streams_uni: u64,
     ) -> Pipe {
+        test_stream_pipe_with_flow_control(settings, max_streams_uni, 4096)
+    }
+
+    fn test_stream_pipe_with_flow_control(
+        settings: &ClientSettings, max_streams_uni: u64, max_data: u64,
+    ) -> Pipe {
         let mut client_config =
             quiche::test_utils::Pipe::default_config("cubic").unwrap();
         client_config.enable_dgram(true, 10, 10);
-        client_config.set_initial_max_data(4096);
-        client_config.set_initial_max_stream_data_uni(4096);
+        client_config.set_initial_max_data(max_data);
+        client_config.set_initial_max_stream_data_uni(max_data);
         client_config.set_initial_max_streams_uni(max_streams_uni);
         client_config
             .set_multicast_client_params(Some(settings.transport_params.clone()));
@@ -3551,8 +3585,8 @@ mod tests {
             quiche::test_utils::Pipe::default_config("cubic").unwrap();
         server_config.enable_dgram(true, 10, 10);
         server_config.enable_multicast_server_support(true);
-        server_config.set_initial_max_data(4096);
-        server_config.set_initial_max_stream_data_uni(4096);
+        server_config.set_initial_max_data(max_data);
+        server_config.set_initial_max_stream_data_uni(max_data);
 
         let mut pipe = Pipe::with_client_and_server_config_and_buf(
             &mut client_config,
@@ -3757,6 +3791,69 @@ mod tests {
         runtime.process_reads(&mut pipe.server).unwrap();
     }
 
+    struct StreamProfileConnection {
+        pipe: Pipe,
+        runtime: ServerControlRuntime,
+        controller: ServerControlController,
+        _attachment: ServerStreamAttachment,
+    }
+
+    #[derive(Default)]
+    struct StreamProfileWakeCounter {
+        wakes: AtomicU64,
+    }
+
+    impl Wake for StreamProfileWakeCounter {
+        fn wake(self: Arc<Self>) {
+            self.wakes.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.wakes.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn publish_profile_burst(
+        publisher: &ServerStreamPublisher,
+        connections: &mut [StreamProfileConnection], stream_id: u64,
+        start_offset: u64, range_count: usize, finish: bool,
+    ) -> (u64, u64) {
+        let wake_counter = Arc::new(StreamProfileWakeCounter::default());
+        let waker = Waker::from(Arc::clone(&wake_counter));
+        let mut context = Context::from_waker(&waker);
+        let mut waiters = connections
+            .iter_mut()
+            .map(|connection| Box::pin(connection.runtime.wait_for_work()))
+            .collect::<Vec<_>>();
+
+        for waiter in &mut waiters {
+            assert!(matches!(waiter.as_mut().poll(&mut context), Poll::Pending));
+        }
+
+        let payload = Bytes::from(vec![0x5a; 1024]);
+        let mut offset = start_offset;
+        for range_index in 0..range_count {
+            let range_fin = finish && range_index + 1 == range_count;
+            let publication = publisher
+                .prepare_stream_buf(stream_id, offset, range_fin, payload.clone())
+                .unwrap();
+            assert!(!publication.packet().is_empty());
+            publisher.commit(publication).unwrap();
+            offset += payload.len() as u64;
+        }
+
+        let wake_count = wake_counter.wakes.load(Ordering::Relaxed);
+        drop(waiters);
+        for connection in connections {
+            connection
+                .runtime
+                .process_writes(&mut connection.pipe.server)
+                .unwrap();
+        }
+
+        (offset, wake_count)
+    }
+
     fn assert_no_queued_join(qconn: &mut QuicheConnection) {
         loop {
             match qconn.multicast_recv() {
@@ -3805,6 +3902,225 @@ mod tests {
                     data: b"shared stream body".to_vec(),
                 }]
         ));
+    }
+
+    #[test]
+    #[ignore = "deterministic performance profile; run explicitly"]
+    fn server_stream_publisher_profiles_eighty_connections() {
+        const CLIENT_COUNT: usize = 80;
+        const RANGES_PER_PHASE: usize = 32;
+        const STREAM_ID: u64 = 3;
+        const WEBTRANSPORT_PREFIX_LEN: u64 = 10;
+
+        let settings = test_settings();
+        let config = test_stream_control_config();
+        let channel_id = config.announce.channel_id.clone();
+        let publisher = ServerStreamPublisher::new(config).unwrap();
+        publisher.declare_stream(STREAM_ID).unwrap();
+
+        let mut connections = Vec::with_capacity(CLIENT_COUNT);
+        for client_id in 0..CLIENT_COUNT {
+            let mut pipe =
+                test_stream_pipe_with_flow_control(&settings, 3, 512 * 1024);
+            let (mut runtime, controller) = test_stream_control_runtime();
+            runtime.on_conn_established(&mut pipe.server).unwrap();
+            send_webtransport_stream_prefix(
+                &mut pipe,
+                STREAM_ID,
+                client_id as u64,
+            );
+            let attachment = publisher.attach(&controller).unwrap();
+            runtime.process_writes(&mut pipe.server).unwrap();
+
+            send_client_control(
+                &mut pipe,
+                &mut runtime,
+                quiche::multicast::Frame::Limits(test_limits()),
+            );
+            send_client_control(
+                &mut pipe,
+                &mut runtime,
+                quiche::multicast::Frame::State(quiche::multicast::State {
+                    channel_id: channel_id.clone(),
+                    sequence: 1,
+                    state: quiche::multicast::ChannelState::Joined,
+                    reason_scope: quiche::multicast::StateReasonScope::Transport,
+                    reason_code:
+                        quiche::multicast::STATE_REASON_REQUESTED_BY_SERVER,
+                    reason_phrase: Vec::new(),
+                }),
+            );
+
+            connections.push(StreamProfileConnection {
+                pipe,
+                runtime,
+                controller,
+                _attachment: attachment,
+            });
+        }
+
+        let mut stream_offset = WEBTRANSPORT_PREFIX_LEN;
+        let mut task_wakes = 0_u64;
+
+        let (next_offset, wakes) = publish_profile_burst(
+            &publisher,
+            &mut connections,
+            STREAM_ID,
+            stream_offset,
+            RANGES_PER_PHASE,
+            false,
+        );
+        stream_offset = next_offset;
+        task_wakes = task_wakes.saturating_add(wakes);
+
+        for connection in &mut connections {
+            send_client_control(
+                &mut connection.pipe,
+                &mut connection.runtime,
+                quiche::multicast::Frame::Ack(quiche::multicast::Ack {
+                    channel_id: channel_id.clone(),
+                    largest_acknowledged: RANGES_PER_PHASE as u64 - 1,
+                    ack_delay: 0,
+                    first_ack_range: 0,
+                    ack_ranges: Vec::new(),
+                    ecn_counts: None,
+                }),
+            );
+        }
+
+        let (next_offset, wakes) = publish_profile_burst(
+            &publisher,
+            &mut connections,
+            STREAM_ID,
+            stream_offset,
+            RANGES_PER_PHASE,
+            false,
+        );
+        stream_offset = next_offset;
+        task_wakes = task_wakes.saturating_add(wakes);
+        let peak_recovery_ranges = connections
+            .iter()
+            .map(|connection| {
+                connection
+                    .pipe
+                    .server
+                    .multicast_stream_recovery_pending(&channel_id)
+            })
+            .sum::<usize>();
+        assert_eq!(peak_recovery_ranges, CLIENT_COUNT * RANGES_PER_PHASE);
+
+        for connection in &mut connections {
+            send_client_control(
+                &mut connection.pipe,
+                &mut connection.runtime,
+                quiche::multicast::Frame::State(quiche::multicast::State {
+                    channel_id: channel_id.clone(),
+                    sequence: 2,
+                    state: quiche::multicast::ChannelState::Left,
+                    reason_scope: quiche::multicast::StateReasonScope::Transport,
+                    reason_code:
+                        quiche::multicast::STATE_REASON_REQUESTED_BY_SERVER,
+                    reason_phrase: Vec::new(),
+                }),
+            );
+        }
+
+        let (_, wakes) = publish_profile_burst(
+            &publisher,
+            &mut connections,
+            STREAM_ID,
+            stream_offset,
+            RANGES_PER_PHASE,
+            true,
+        );
+        task_wakes = task_wakes.saturating_add(wakes);
+
+        let final_recovery_ranges = connections
+            .iter()
+            .map(|connection| {
+                connection
+                    .pipe
+                    .server
+                    .multicast_stream_recovery_pending(&channel_id)
+            })
+            .sum::<usize>();
+        assert_eq!(final_recovery_ranges, 0);
+
+        let mut client_limits_events = 0_u64;
+        let mut client_state_events = 0_u64;
+        let mut client_ack_events = 0_u64;
+        let mut probe_events = 0_u64;
+        for connection in &mut connections {
+            while let Ok(event) = connection.controller.event_receiver.try_recv()
+            {
+                match event {
+                    ServerEvent::ClientLimits(..) => client_limits_events += 1,
+
+                    ServerEvent::ClientState(..) => client_state_events += 1,
+
+                    ServerEvent::ClientAck(..) => client_ack_events += 1,
+
+                    ServerEvent::ProbeStatusChanged(..) => probe_events += 1,
+
+                    ServerEvent::Published { .. } |
+                    ServerEvent::EncodeError { .. } |
+                    ServerEvent::PublishError { .. } => (),
+                }
+            }
+        }
+
+        let metric_fold_attempts = connections
+            .iter()
+            .map(|connection| {
+                connection.runtime.stream_delivery_metric_fold_attempts
+            })
+            .sum::<u64>();
+        let profile = publisher.test_profile().unwrap();
+        let delivery = publisher.delivery_metrics_snapshot();
+
+        assert_eq!(client_ack_events, CLIENT_COUNT as u64);
+        assert_eq!(
+            delivery.direct_fallback_ranges_total,
+            (CLIENT_COUNT * RANGES_PER_PHASE * 2) as u64
+        );
+        assert_eq!(
+            delivery.fallback_reentry_ranges_total,
+            (CLIENT_COUNT * RANGES_PER_PHASE) as u64
+        );
+        assert_eq!(profile.tracked_streams, 1);
+        assert_eq!(profile.finished_streams, 1);
+        assert_eq!(profile.attached_connections, CLIENT_COUNT);
+
+        println!(
+            concat!(
+                "MCQUIC_PROFILE clients={} ranges_per_phase={} ",
+                "publication_commands={} task_wakes={} ",
+                "preparation_capacity_bytes={} ack_events={} ",
+                "probe_events={} limits_events={} state_events={} ",
+                "metric_fold_attempts={} peak_recovery_ranges={} ",
+                "final_recovery_ranges={} direct_ranges={} ",
+                "gap_recovery_ranges={} reentry_ranges={} ",
+                "publisher_tracked_streams={} ",
+                "publisher_finished_streams={}"
+            ),
+            CLIENT_COUNT,
+            RANGES_PER_PHASE,
+            profile.publication_commands_sent,
+            task_wakes,
+            profile.preparation_capacity_bytes,
+            client_ack_events,
+            probe_events,
+            client_limits_events,
+            client_state_events,
+            metric_fold_attempts,
+            peak_recovery_ranges,
+            final_recovery_ranges,
+            delivery.direct_fallback_ranges_total,
+            delivery.ack_gap_recovery_ranges_total,
+            delivery.fallback_reentry_ranges_total,
+            profile.tracked_streams,
+            profile.finished_streams,
+        );
     }
 
     #[test]

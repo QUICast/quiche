@@ -210,6 +210,8 @@ impl ServerStreamPublisher {
                 reordering_threshold:
                     quiche::multicast::DEFAULT_STREAM_RECOVERY_REORDERING_THRESHOLD,
                 retired: false,
+                #[cfg(test)]
+                profile: ServerStreamPublisherTestProfile::default(),
             })),
             delivery_metrics: Arc::new(
                 ServerStreamDeliveryMetricsAccumulator::default(),
@@ -401,6 +403,13 @@ impl ServerStreamPublisher {
             data,
         };
         let mut packet = vec![0; CHANNEL_PACKET_BUFFER_LEN];
+        #[cfg(test)]
+        {
+            inner.profile.preparation_capacity_bytes = inner
+                .profile
+                .preparation_capacity_bytes
+                .saturating_add(packet.capacity() as u64);
+        }
         let output = inner.send_state.write_packet(
             &[quiche::multicast::ChannelFrame::Stream {
                 stream_id,
@@ -462,13 +471,27 @@ impl ServerStreamPublisher {
             frame: publication.frame,
         });
 
+        #[cfg(test)]
+        let mut commands_sent = 0_u64;
         inner.subscribers.retain(|_, sender| {
-            sender
+            let sent = sender
                 .send(ServerControlCommand::StreamPublication {
                     publication: Arc::clone(&publication),
                 })
-                .is_ok()
+                .is_ok();
+            #[cfg(test)]
+            {
+                commands_sent = commands_sent.saturating_add(u64::from(sent));
+            }
+            sent
         });
+        #[cfg(test)]
+        {
+            inner.profile.publication_commands_sent = inner
+                .profile
+                .publication_commands_sent
+                .saturating_add(commands_sent);
+        }
 
         Ok(())
     }
@@ -568,6 +591,24 @@ impl ServerStreamPublisher {
         Ok(self.lock()?.subscribers.len())
     }
 
+    #[cfg(test)]
+    pub(super) fn test_profile(
+        &self,
+    ) -> Result<ServerStreamPublisherTestProfile, ServerStreamPublisherError>
+    {
+        let inner = self.lock()?;
+        let mut profile = inner.profile;
+        profile.tracked_streams = inner.streams.len();
+        profile.finished_streams = inner
+            .streams
+            .values()
+            .filter(|stream| stream.finished)
+            .count();
+        profile.attached_connections = inner.subscribers.len();
+
+        Ok(profile)
+    }
+
     fn lock(
         &self,
     ) -> Result<
@@ -620,6 +661,18 @@ struct ServerStreamPublisherInner {
     max_stream_id: Option<u64>,
     reordering_threshold: u64,
     retired: bool,
+    #[cfg(test)]
+    profile: ServerStreamPublisherTestProfile,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct ServerStreamPublisherTestProfile {
+    pub(super) preparation_capacity_bytes: u64,
+    pub(super) publication_commands_sent: u64,
+    pub(super) tracked_streams: usize,
+    pub(super) finished_streams: usize,
+    pub(super) attached_connections: usize,
 }
 
 #[derive(Debug, Default)]
