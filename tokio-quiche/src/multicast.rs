@@ -1372,40 +1372,52 @@ pub type ServerEventStream = UnboundedReceiver<ServerEvent>;
 
 #[derive(Default)]
 struct ServerEventCoalescer {
-    pending_client_acks: BTreeMap<Vec<u8>, quiche::multicast::Ack>,
-    last_client_ack_largest: BTreeMap<Vec<u8>, u64>,
+    pending_client_acks: BTreeMap<Vec<u8>, VecDeque<quiche::multicast::Ack>>,
+    last_client_acks: BTreeMap<Vec<u8>, quiche::multicast::Ack>,
     last_probe_events: BTreeMap<Vec<u8>, quiche::multicast::ProbeEvent>,
 }
 
 impl ServerEventCoalescer {
     fn queue_client_ack(&mut self, frame: quiche::multicast::Ack) {
         if self
-            .last_client_ack_largest
+            .last_client_acks
             .get(&frame.channel_id)
-            .is_some_and(|largest| frame.largest_acknowledged <= *largest)
+            .is_some_and(|previous| previous == &frame)
         {
             return;
         }
 
-        match self.pending_client_acks.entry(frame.channel_id.clone()) {
-            std::collections::btree_map::Entry::Vacant(entry) => {
-                entry.insert(frame);
-            },
-
-            std::collections::btree_map::Entry::Occupied(mut entry) => {
-                if frame.largest_acknowledged > entry.get().largest_acknowledged {
-                    entry.insert(frame);
-                }
-            },
+        let pending = self
+            .pending_client_acks
+            .entry(frame.channel_id.clone())
+            .or_default();
+        if pending.back().is_some_and(|previous| previous == &frame) {
+            return;
         }
+        pending.push_back(frame);
     }
 
     fn flush_client_acks(&mut self, event_sender: &UnboundedSender<ServerEvent>) {
-        for (channel_id, frame) in std::mem::take(&mut self.pending_client_acks) {
-            self.last_client_ack_largest
-                .insert(channel_id, frame.largest_acknowledged);
-            let _ = event_sender.send(ServerEvent::ClientAck(frame));
+        for (channel_id, frames) in std::mem::take(&mut self.pending_client_acks)
+        {
+            for frame in frames {
+                self.last_client_acks
+                    .insert(channel_id.clone(), frame.clone());
+                let _ = event_sender.send(ServerEvent::ClientAck(frame));
+            }
         }
+    }
+
+    fn reset_channel(
+        &mut self, event_sender: &UnboundedSender<ServerEvent>, channel_id: &[u8],
+    ) {
+        if let Some(frames) = self.pending_client_acks.remove(channel_id) {
+            for frame in frames {
+                let _ = event_sender.send(ServerEvent::ClientAck(frame));
+            }
+        }
+        self.last_client_acks.remove(channel_id);
+        self.last_probe_events.remove(channel_id);
     }
 
     fn forward_probe_event(
@@ -1427,7 +1439,7 @@ impl ServerEventCoalescer {
 
     fn clear(&mut self) {
         self.pending_client_acks.clear();
-        self.last_client_ack_largest.clear();
+        self.last_client_acks.clear();
         self.last_probe_events.clear();
     }
 }
@@ -2138,6 +2150,8 @@ impl ServerControlRuntime {
             },
 
             quiche::multicast::Frame::State(frame) => {
+                let retired =
+                    frame.state == quiche::multicast::ChannelState::Retired;
                 if let Some(channel) = self.channels.get_mut(&frame.channel_id) {
                     channel.last_client_state_sequence = frame.sequence;
                     match frame.state {
@@ -2158,6 +2172,10 @@ impl ServerControlRuntime {
                             channel.retired = true;
                         },
                     }
+                }
+                if retired {
+                    self.event_coalescer
+                        .reset_channel(&self.event_sender, &frame.channel_id);
                 }
                 let _ = self.event_sender.send(ServerEvent::ClientState(frame));
             },
@@ -2246,6 +2264,12 @@ impl ServerControlRuntime {
     fn retire_channel_for_limits(
         &mut self, qconn: &mut QuicheConnection, channel_id: &[u8],
     ) -> QuicResult<()> {
+        if !self.channels.contains_key(channel_id) {
+            return Ok(());
+        }
+        self.event_coalescer
+            .reset_channel(&self.event_sender, channel_id);
+
         let Some(channel) = self.channels.get_mut(channel_id) else {
             return Ok(());
         };
@@ -2338,6 +2362,15 @@ impl ServerControlRuntime {
                 },
 
                 ServerControlCommand::SendAnnounce { frame } => {
+                    if self.channels.contains_key(&frame.channel_id) ||
+                        qconn
+                            .multicast_probe_status(&frame.channel_id)
+                            .is_some()
+                    {
+                        self.event_coalescer
+                            .reset_channel(&self.event_sender, &frame.channel_id);
+                        qconn.multicast_probe_reset(&frame.channel_id)?;
+                    }
                     Self::set_default_dgram_channel_if_unset(
                         qconn,
                         &frame.channel_id,
@@ -2373,6 +2406,9 @@ impl ServerControlRuntime {
                 },
 
                 ServerControlCommand::SendJoin { frame } => {
+                    self.event_coalescer
+                        .reset_channel(&self.event_sender, &frame.channel_id);
+                    qconn.multicast_probe_reset(&frame.channel_id)?;
                     Self::set_default_dgram_channel_if_unset(
                         qconn,
                         &frame.channel_id,
@@ -2456,36 +2492,8 @@ impl ServerControlRuntime {
                         continue;
                     }
 
-                    let mut items = publication_queue.drain();
-                    while let Some(item) = items.pop_back() {
-                        let command = match item {
-                            server_stream::ServerStreamPublisherQueueItem::Publication(
-                                publication,
-                            ) => ServerControlCommand::StreamPublication {
-                                publication,
-                            },
-
-                            server_stream::ServerStreamPublisherQueueItem::Key(
-                                frame,
-                            ) => ServerControlCommand::StreamPublisherKey {
-                                frame,
-                            },
-
-                            server_stream::ServerStreamPublisherQueueItem::MaxStreamId(
-                                max_stream_id,
-                            ) => ServerControlCommand::StreamPublisherMaxStreamId {
-                                channel_id: channel_id.to_vec(),
-                                max_stream_id,
-                            },
-
-                            server_stream::ServerStreamPublisherQueueItem::Retire(
-                                frame,
-                            ) => ServerControlCommand::StreamPublisherRetire {
-                                frame,
-                            },
-                        };
-                        self.pending_commands.push_front(command);
-                    }
+                    let items = publication_queue.drain();
+                    self.prepend_stream_publisher_queue_items(channel_id, items);
                 },
 
                 ServerControlCommand::DetachStreamPublisher {
@@ -2505,14 +2513,40 @@ impl ServerControlRuntime {
                         continue;
                     }
 
-                    self.pending_stream_publications.retain(|publication| {
-                        publication.integrity.channel_id != channel_id
-                    });
-                    self.pending_integrities
-                        .retain(|frame| frame.channel_id != channel_id);
-                    self.pending_stream_integrity_batches.remove(channel_id);
+                    let items = publication_queue.drain();
+                    if !items.is_empty() {
+                        self.pending_commands.push_front(
+                            ServerControlCommand::DetachStreamPublisher {
+                                publication_queue: Arc::clone(&publication_queue),
+                            },
+                        );
+                        self.prepend_stream_publisher_queue_items(
+                            channel_id, items,
+                        );
+                        continue;
+                    }
+
+                    self.flush_pending_stream_publications(qconn)?;
+                    if self.pending_stream_publications.iter().any(
+                        |publication| {
+                            publication.integrity.channel_id == channel_id
+                        },
+                    ) {
+                        self.pending_commands.push_front(
+                            ServerControlCommand::DetachStreamPublisher {
+                                publication_queue,
+                            },
+                        );
+                        self.stream_retry_blocked = true;
+                        return Ok(());
+                    }
+
+                    self.flush_stream_integrity_batch(channel_id);
+                    self.flush_pending_integrities(qconn)?;
+                    self.event_coalescer
+                        .reset_channel(&self.event_sender, channel_id);
+                    qconn.multicast_probe_reset(channel_id)?;
                     self.stop_stream_publisher(qconn, channel_id)?;
-                    self.stream_retry_blocked = false;
                 },
 
                 ServerControlCommand::StreamPublication { publication } => {
@@ -2620,6 +2654,8 @@ impl ServerControlRuntime {
                     self.flush_stream_integrity_batch(&frame.channel_id);
                     self.flush_pending_integrities(qconn)?;
                     let channel_id = frame.channel_id.clone();
+                    self.event_coalescer
+                        .reset_channel(&self.event_sender, &channel_id);
 
                     let Some(channel) = self.channels.get_mut(&channel_id) else {
                         return Err(quiche::Error::InvalidState.into());
@@ -2653,6 +2689,33 @@ impl ServerControlRuntime {
         Ok(())
     }
 
+    fn prepend_stream_publisher_queue_items(
+        &mut self, channel_id: &[u8],
+        mut items: VecDeque<server_stream::ServerStreamPublisherQueueItem>,
+    ) {
+        while let Some(item) = items.pop_back() {
+            let command = match item {
+                server_stream::ServerStreamPublisherQueueItem::Publication(
+                    publication,
+                ) => ServerControlCommand::StreamPublication { publication },
+
+                server_stream::ServerStreamPublisherQueueItem::Key(frame) =>
+                    ServerControlCommand::StreamPublisherKey { frame },
+
+                server_stream::ServerStreamPublisherQueueItem::MaxStreamId(
+                    max_stream_id,
+                ) => ServerControlCommand::StreamPublisherMaxStreamId {
+                    channel_id: channel_id.to_vec(),
+                    max_stream_id,
+                },
+
+                server_stream::ServerStreamPublisherQueueItem::Retire(frame) =>
+                    ServerControlCommand::StreamPublisherRetire { frame },
+            };
+            self.pending_commands.push_front(command);
+        }
+    }
+
     fn upsert_channel_config(
         &mut self, qconn: &mut QuicheConnection,
         config: ServerControlChannelConfig, auto_send: bool,
@@ -2661,6 +2724,13 @@ impl ServerControlRuntime {
         config.validate()?;
 
         let channel_id = config.announce.channel_id.clone();
+        if self.channels.contains_key(&channel_id) ||
+            qconn.multicast_probe_status(&channel_id).is_some()
+        {
+            self.event_coalescer
+                .reset_channel(&self.event_sender, &channel_id);
+            qconn.multicast_probe_reset(&channel_id)?;
+        }
         if set_default_dgram_channel {
             Self::set_default_dgram_channel_if_unset(qconn, &channel_id)?;
         }
@@ -3358,6 +3428,10 @@ impl<B: PublishBackend> ServerRuntime<B> {
             },
 
             quiche::multicast::Frame::State(frame) => {
+                if frame.state == quiche::multicast::ChannelState::Retired {
+                    self.event_coalescer
+                        .reset_channel(&self.event_sender, &frame.channel_id);
+                }
                 let _ = self.event_sender.send(ServerEvent::ClientState(frame));
             },
 
@@ -4020,10 +4094,61 @@ mod tests {
         }
     }
 
+    fn setup_stream_profile_connections(
+        settings: &ClientSettings, publisher: &ServerStreamPublisher,
+        channel_id: &[u8], stream_id: u64, client_count: usize,
+        batching: StreamIntegrityBatchingSettings,
+    ) -> Vec<StreamProfileConnection> {
+        let mut connections = Vec::with_capacity(client_count);
+
+        for client_id in 0..client_count {
+            let mut pipe =
+                test_stream_pipe_with_flow_control(settings, 3, 512 * 1024);
+            let (mut runtime, controller) =
+                test_stream_control_runtime_with_integrity_batching(batching);
+            runtime.on_conn_established(&mut pipe.server).unwrap();
+            send_webtransport_stream_prefix(
+                &mut pipe,
+                stream_id,
+                client_id as u64,
+            );
+            let attachment = publisher.attach(&controller).unwrap();
+            runtime.process_writes(&mut pipe.server).unwrap();
+
+            send_client_control(
+                &mut pipe,
+                &mut runtime,
+                quiche::multicast::Frame::Limits(test_limits()),
+            );
+            send_client_control(
+                &mut pipe,
+                &mut runtime,
+                quiche::multicast::Frame::State(quiche::multicast::State {
+                    channel_id: channel_id.to_vec(),
+                    sequence: 1,
+                    state: quiche::multicast::ChannelState::Joined,
+                    reason_scope: quiche::multicast::StateReasonScope::Transport,
+                    reason_code:
+                        quiche::multicast::STATE_REASON_REQUESTED_BY_SERVER,
+                    reason_phrase: Vec::new(),
+                }),
+            );
+
+            connections.push(StreamProfileConnection {
+                pipe,
+                runtime,
+                controller,
+                _attachment: attachment,
+            });
+        }
+
+        connections
+    }
+
     fn publish_profile_burst(
         publisher: &ServerStreamPublisher,
         connections: &mut [StreamProfileConnection], stream_id: u64,
-        start_offset: u64, range_count: usize, finish: bool,
+        start_offset: u64, range_count: usize, payload: &Bytes, finish: bool,
     ) -> (u64, u64) {
         let wake_counter = Arc::new(StreamProfileWakeCounter::default());
         let waker = Waker::from(Arc::clone(&wake_counter));
@@ -4037,7 +4162,6 @@ mod tests {
             assert!(matches!(waiter.as_mut().poll(&mut context), Poll::Pending));
         }
 
-        let payload = Bytes::from(vec![0x5a; 1024]);
         let mut offset = start_offset;
         for range_index in 0..range_count {
             let range_fin = finish && range_index + 1 == range_count;
@@ -4177,9 +4301,11 @@ mod tests {
         let attachment = publisher.attach(&controller).unwrap();
         runtime.process_writes(&mut pipe.server).unwrap();
 
-        for (offset, data) in [(10, b"one".as_slice()), (13, b"two")] {
+        for (offset, fin, data) in
+            [(10, false, b"one".as_slice()), (13, true, b"two")]
+        {
             let publication =
-                publisher.prepare_stream(3, offset, false, data).unwrap();
+                publisher.prepare_stream(3, offset, fin, data).unwrap();
             publisher.commit(publication).unwrap();
         }
         assert_eq!(
@@ -4196,9 +4322,167 @@ mod tests {
             pipe.server.multicast_stream_recovery_pending(&channel_id),
             0
         );
+        deliver_server_flight(&mut pipe);
+        let mut out = [0; 16];
+        assert_eq!(pipe.client.stream_recv(3, &mut out), Ok((6, true)));
+        assert_eq!(&out[..6], b"onetwo");
         assert_eq!(
             publisher.delivery_metrics_snapshot(),
-            quiche::multicast::StreamDeliveryMetricsSnapshot::default()
+            quiche::multicast::StreamDeliveryMetricsSnapshot {
+                direct_fallback_ranges_total: 2,
+                direct_fallback_bytes_total: 6,
+                ..Default::default()
+            }
+        );
+    }
+
+    #[test]
+    fn server_stream_detach_waits_for_blocked_committed_publication() {
+        let publisher =
+            ServerStreamPublisher::new(test_stream_control_config()).unwrap();
+        publisher.declare_stream(3).unwrap();
+        let past = publisher.prepare_stream(3, 10, false, b"past").unwrap();
+        publisher.commit(past).unwrap();
+
+        let settings = test_settings();
+        let mut pipe = test_stream_pipe(&settings);
+        let (mut runtime, controller) = test_stream_control_runtime();
+        runtime.on_conn_established(&mut pipe.server).unwrap();
+        send_webtransport_stream_prefix(&mut pipe, 3, 11);
+        let attachment = publisher.attach(&controller).unwrap();
+        runtime.process_writes(&mut pipe.server).unwrap();
+
+        let live = publisher.prepare_stream(3, 14, true, b"live").unwrap();
+        publisher.commit(live).unwrap();
+        drop(attachment);
+        runtime.process_writes(&mut pipe.server).unwrap();
+
+        assert_eq!(runtime.pending_stream_publications.len(), 1);
+        assert!(runtime.stream_retry_blocked);
+        assert!(runtime.channels[&[1, 2, 3, 4][..]].stream_publisher);
+
+        assert_eq!(pipe.server.stream_send(3, b"past", false), Ok(4));
+        runtime.process_writes(&mut pipe.server).unwrap();
+        assert!(runtime.pending_stream_publications.is_empty());
+        assert!(!runtime.channels[&[1, 2, 3, 4][..]].stream_publisher);
+        deliver_server_flight(&mut pipe);
+
+        let mut out = [0; 16];
+        assert_eq!(pipe.client.stream_recv(3, &mut out), Ok((8, true)));
+        assert_eq!(&out[..8], b"pastlive");
+    }
+
+    #[test]
+    fn server_stream_reattach_requires_fresh_ack_before_cutover() {
+        let settings = test_settings();
+        let mut pipe = test_stream_pipe(&settings);
+        let (mut runtime, controller) = test_stream_control_runtime();
+        runtime.on_conn_established(&mut pipe.server).unwrap();
+        send_webtransport_stream_prefix(&mut pipe, 3, 11);
+
+        let channel_id = vec![1, 2, 3, 4];
+        let publisher =
+            ServerStreamPublisher::new(test_stream_control_config()).unwrap();
+        publisher.declare_stream(3).unwrap();
+        let attachment = publisher.attach(&controller).unwrap();
+        runtime.process_writes(&mut pipe.server).unwrap();
+
+        let old = publisher.prepare_stream(3, 10, false, b"old").unwrap();
+        publisher.commit(old).unwrap();
+        runtime.process_writes(&mut pipe.server).unwrap();
+        deliver_server_flight(&mut pipe);
+        let mut out = [0; 16];
+        assert_eq!(pipe.client.stream_recv(3, &mut out), Ok((3, false)));
+
+        send_client_control(
+            &mut pipe,
+            &mut runtime,
+            quiche::multicast::Frame::Ack(quiche::multicast::Ack {
+                channel_id: channel_id.clone(),
+                largest_acknowledged: 0,
+                ack_delay: 0,
+                first_ack_range: 0,
+                ack_ranges: Vec::new(),
+                ecn_counts: None,
+            }),
+        );
+        assert_eq!(
+            pipe.server.multicast_probe_status(&channel_id),
+            Some(quiche::multicast::ProbeStatus::Viable)
+        );
+
+        drop(attachment);
+        runtime.process_writes(&mut pipe.server).unwrap();
+        let _attachment = publisher.attach(&controller).unwrap();
+        runtime.process_writes(&mut pipe.server).unwrap();
+        assert_eq!(
+            pipe.server.multicast_probe_status(&channel_id),
+            Some(quiche::multicast::ProbeStatus::Probing)
+        );
+
+        send_client_control(
+            &mut pipe,
+            &mut runtime,
+            quiche::multicast::Frame::Ack(quiche::multicast::Ack {
+                channel_id: channel_id.clone(),
+                largest_acknowledged: 0,
+                ack_delay: 0,
+                first_ack_range: 0,
+                ack_ranges: Vec::new(),
+                ecn_counts: None,
+            }),
+        );
+        assert_eq!(
+            pipe.server.multicast_probe_status(&channel_id),
+            Some(quiche::multicast::ProbeStatus::Probing)
+        );
+
+        let new = publisher.prepare_stream(3, 13, false, b"new").unwrap();
+        publisher.commit(new).unwrap();
+        runtime.process_writes(&mut pipe.server).unwrap();
+        deliver_server_flight(&mut pipe);
+        assert_eq!(pipe.client.stream_recv(3, &mut out), Ok((3, false)));
+        assert_eq!(&out[..3], b"new");
+
+        send_client_control(
+            &mut pipe,
+            &mut runtime,
+            quiche::multicast::Frame::Ack(quiche::multicast::Ack {
+                channel_id: channel_id.clone(),
+                largest_acknowledged: 0,
+                ack_delay: 0,
+                first_ack_range: 0,
+                ack_ranges: Vec::new(),
+                ecn_counts: None,
+            }),
+        );
+        assert_eq!(
+            pipe.server.multicast_probe_status(&channel_id),
+            Some(quiche::multicast::ProbeStatus::Probing)
+        );
+
+        let end = publisher.prepare_stream(3, 16, true, b"end").unwrap();
+        publisher.commit(end).unwrap();
+        runtime.process_writes(&mut pipe.server).unwrap();
+        deliver_server_flight(&mut pipe);
+        assert_eq!(pipe.client.stream_recv(3, &mut out), Ok((3, true)));
+        assert_eq!(&out[..3], b"end");
+
+        send_client_control(
+            &mut pipe,
+            &mut runtime,
+            quiche::multicast::Frame::Ack(quiche::multicast::Ack {
+                channel_id,
+                largest_acknowledged: 2,
+                ack_delay: 0,
+                first_ack_range: 0,
+                ack_ranges: Vec::new(),
+                ecn_counts: None,
+            }),
+        );
+        assert_eq!(
+            pipe.server.multicast_probe_status(&[1, 2, 3, 4]),
+            Some(quiche::multicast::ProbeStatus::Viable)
         );
     }
 
@@ -4216,49 +4500,18 @@ mod tests {
         let publisher = ServerStreamPublisher::new(config).unwrap();
         publisher.declare_stream(STREAM_ID).unwrap();
 
-        let mut connections = Vec::with_capacity(CLIENT_COUNT);
-        for client_id in 0..CLIENT_COUNT {
-            let mut pipe =
-                test_stream_pipe_with_flow_control(&settings, 3, 512 * 1024);
-            let (mut runtime, controller) = test_stream_control_runtime();
-            runtime.on_conn_established(&mut pipe.server).unwrap();
-            send_webtransport_stream_prefix(
-                &mut pipe,
-                STREAM_ID,
-                client_id as u64,
-            );
-            let attachment = publisher.attach(&controller).unwrap();
-            runtime.process_writes(&mut pipe.server).unwrap();
-
-            send_client_control(
-                &mut pipe,
-                &mut runtime,
-                quiche::multicast::Frame::Limits(test_limits()),
-            );
-            send_client_control(
-                &mut pipe,
-                &mut runtime,
-                quiche::multicast::Frame::State(quiche::multicast::State {
-                    channel_id: channel_id.clone(),
-                    sequence: 1,
-                    state: quiche::multicast::ChannelState::Joined,
-                    reason_scope: quiche::multicast::StateReasonScope::Transport,
-                    reason_code:
-                        quiche::multicast::STATE_REASON_REQUESTED_BY_SERVER,
-                    reason_phrase: Vec::new(),
-                }),
-            );
-
-            connections.push(StreamProfileConnection {
-                pipe,
-                runtime,
-                controller,
-                _attachment: attachment,
-            });
-        }
+        let mut connections = setup_stream_profile_connections(
+            &settings,
+            &publisher,
+            &channel_id,
+            STREAM_ID,
+            CLIENT_COUNT,
+            StreamIntegrityBatchingSettings::default(),
+        );
 
         let mut stream_offset = WEBTRANSPORT_PREFIX_LEN;
         let mut task_wakes = 0_u64;
+        let payload = Bytes::from(vec![0x5a; 1024]);
 
         let (next_offset, wakes) = publish_profile_burst(
             &publisher,
@@ -4266,6 +4519,7 @@ mod tests {
             STREAM_ID,
             stream_offset,
             RANGES_PER_PHASE,
+            &payload,
             false,
         );
         stream_offset = next_offset;
@@ -4292,6 +4546,7 @@ mod tests {
             STREAM_ID,
             stream_offset,
             RANGES_PER_PHASE,
+            &payload,
             false,
         );
         stream_offset = next_offset;
@@ -4329,6 +4584,7 @@ mod tests {
             STREAM_ID,
             stream_offset,
             RANGES_PER_PHASE,
+            &payload,
             true,
         );
         task_wakes = task_wakes.saturating_add(wakes);
@@ -4395,7 +4651,7 @@ mod tests {
         );
         assert_eq!(profile.tracked_streams, 0);
         assert_eq!(profile.finished_streams, 1);
-        assert_eq!(profile.finished_stream_ranges, 1);
+        assert_eq!(profile.finished_stream_storage_units, 1);
         assert_eq!(profile.attached_connections, CLIENT_COUNT);
         assert!(
             profile.preparation_capacity_bytes <
@@ -4414,7 +4670,7 @@ mod tests {
                 "gap_recovery_ranges={} reentry_ranges={} ",
                 "publisher_tracked_streams={} ",
                 "publisher_finished_streams={} ",
-                "publisher_finished_stream_ranges={}"
+                "publisher_finished_stream_storage_units={}"
             ),
             CLIENT_COUNT,
             RANGES_PER_PHASE,
@@ -4434,7 +4690,154 @@ mod tests {
             delivery.fallback_reentry_ranges_total,
             profile.tracked_streams,
             profile.finished_streams,
-            profile.finished_stream_ranges,
+            profile.finished_stream_storage_units,
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "long established-connection performance profile"]
+    async fn server_stream_publisher_profiles_established_connections() {
+        const CLIENT_COUNT: usize = 80;
+        const RANGES_PER_ROUND: usize = 4_096;
+        const ROUND_COUNT: usize = 4;
+        const STREAM_ID: u64 = 3;
+        const WEBTRANSPORT_PREFIX_LEN: u64 = 10;
+
+        let settings = test_settings();
+        let config = test_stream_control_config();
+        let channel_id = config.announce.channel_id.clone();
+        let publisher = ServerStreamPublisher::new(config).unwrap();
+        publisher.declare_stream(STREAM_ID).unwrap();
+        let batching = StreamIntegrityBatchingSettings {
+            max_packet_hashes: 16,
+            max_delay: Duration::from_secs(1),
+        };
+
+        let mut connections = setup_stream_profile_connections(
+            &settings,
+            &publisher,
+            &channel_id,
+            STREAM_ID,
+            CLIENT_COUNT,
+            batching,
+        );
+
+        let payload = Bytes::from(vec![0x5a; 24]);
+        let (mut stream_offset, _) = publish_profile_burst(
+            &publisher,
+            &mut connections,
+            STREAM_ID,
+            WEBTRANSPORT_PREFIX_LEN,
+            1,
+            &payload,
+            false,
+        );
+        for connection in &mut connections {
+            send_client_control(
+                &mut connection.pipe,
+                &mut connection.runtime,
+                quiche::multicast::Frame::Ack(quiche::multicast::Ack {
+                    channel_id: channel_id.clone(),
+                    largest_acknowledged: 0,
+                    ack_delay: 0,
+                    first_ack_range: 0,
+                    ack_ranges: Vec::new(),
+                    ecn_counts: None,
+                }),
+            );
+        }
+
+        let baseline_registrations = connections
+            .iter()
+            .map(|connection| connection.runtime.stream_publication_registrations)
+            .sum::<u64>();
+        let started = Instant::now();
+        let mut task_wakes = 0_u64;
+        let mut peak_recovery_ranges = 0_usize;
+
+        for round in 0..ROUND_COUNT {
+            let (next_offset, wakes) = publish_profile_burst(
+                &publisher,
+                &mut connections,
+                STREAM_ID,
+                stream_offset,
+                RANGES_PER_ROUND,
+                &payload,
+                round + 1 == ROUND_COUNT,
+            );
+            stream_offset = next_offset;
+            task_wakes = task_wakes.saturating_add(wakes);
+
+            let recovery_ranges = connections
+                .iter()
+                .map(|connection| {
+                    connection
+                        .pipe
+                        .server
+                        .multicast_stream_recovery_pending(&channel_id)
+                })
+                .sum::<usize>();
+            peak_recovery_ranges = peak_recovery_ranges.max(recovery_ranges);
+            assert_eq!(recovery_ranges, CLIENT_COUNT * RANGES_PER_ROUND);
+
+            let largest_acknowledged = ((round + 1) * RANGES_PER_ROUND) as u64;
+            for connection in &mut connections {
+                send_client_control(
+                    &mut connection.pipe,
+                    &mut connection.runtime,
+                    quiche::multicast::Frame::Ack(quiche::multicast::Ack {
+                        channel_id: channel_id.clone(),
+                        largest_acknowledged,
+                        ack_delay: 0,
+                        first_ack_range: RANGES_PER_ROUND as u64 - 1,
+                        ack_ranges: Vec::new(),
+                        ecn_counts: None,
+                    }),
+                );
+            }
+        }
+
+        let elapsed = started.elapsed();
+        let registrations = connections
+            .iter()
+            .map(|connection| connection.runtime.stream_publication_registrations)
+            .sum::<u64>()
+            .saturating_sub(baseline_registrations);
+        let final_recovery_ranges = connections
+            .iter()
+            .map(|connection| {
+                connection
+                    .pipe
+                    .server
+                    .multicast_stream_recovery_pending(&channel_id)
+            })
+            .sum::<usize>();
+        let profile = publisher.test_profile().unwrap();
+
+        assert_eq!(
+            registrations,
+            (CLIENT_COUNT * RANGES_PER_ROUND * ROUND_COUNT) as u64
+        );
+        assert_eq!(final_recovery_ranges, 0);
+        assert_eq!(profile.tracked_streams, 0);
+        assert_eq!(profile.finished_streams, 1);
+
+        println!(
+            concat!(
+                "MCQUIC_ESTABLISHED_PROFILE clients={} rounds={} ",
+                "ranges_per_round={} registrations={} task_wakes={} ",
+                "peak_recovery_ranges={} final_recovery_ranges={} ",
+                "elapsed_us={} ns_per_registration={}"
+            ),
+            CLIENT_COUNT,
+            ROUND_COUNT,
+            RANGES_PER_ROUND,
+            registrations,
+            task_wakes,
+            peak_recovery_ranges,
+            final_recovery_ranges,
+            elapsed.as_micros(),
+            elapsed.as_nanos() / u128::from(registrations),
         );
     }
 
@@ -5321,7 +5724,7 @@ mod tests {
         let profile = publisher.test_profile().unwrap();
         assert_eq!(profile.tracked_streams, 0);
         assert_eq!(profile.finished_streams, 100);
-        assert_eq!(profile.finished_stream_ranges, 1);
+        assert_eq!(profile.finished_stream_storage_units, 1);
         assert_eq!(publisher.next_stream_offset(3).unwrap(), None);
         assert!(matches!(
             publisher.prepare_stream(3, 10, false, b"reuse"),
@@ -6060,7 +6463,6 @@ mod tests {
                 ..
             })) if event_channel == channel_id
         ));
-
         pipe.server.on_timeout();
         runtime.process_writes(&mut pipe.server).unwrap();
 
@@ -6156,7 +6558,7 @@ mod tests {
     }
 
     #[test]
-    fn server_runtime_processes_all_acks_and_coalesces_notifications() {
+    fn server_runtime_processes_all_acks_and_deduplicates_notifications() {
         let settings = test_settings();
         let server_settings = test_server_settings();
         let mut pipe = test_pipe(&settings);
@@ -6200,6 +6602,11 @@ mod tests {
         assert!(matches!(
             event_receiver.try_recv(),
             Ok(ServerEvent::ClientAck(frame))
+                if frame.largest_acknowledged == 5
+        ));
+        assert!(matches!(
+            event_receiver.try_recv(),
+            Ok(ServerEvent::ClientAck(frame))
                 if frame.largest_acknowledged == 7
         ));
         assert!(event_receiver.try_recv().is_err());
@@ -6220,6 +6627,92 @@ mod tests {
             .metrics_snapshot();
         assert_eq!(metrics.ack_frames_processed, 4);
         assert_eq!(metrics.largest_acknowledged, Some(7));
+    }
+
+    #[test]
+    fn server_event_coalescer_preserves_same_largest_ack_with_new_ranges() {
+        let (event_sender, mut event_receiver) = mpsc::unbounded_channel();
+        let mut coalescer = ServerEventCoalescer::default();
+        let first = quiche::multicast::Ack {
+            channel_id: vec![1, 2, 3, 4],
+            largest_acknowledged: 7,
+            ack_delay: 0,
+            first_ack_range: 0,
+            ack_ranges: Vec::new(),
+            ecn_counts: None,
+        };
+        let mut fills_lower_range = first.clone();
+        fills_lower_range
+            .ack_ranges
+            .push(quiche::multicast::AckRange {
+                gap: 1,
+                ack_range_length: 0,
+            });
+
+        coalescer.queue_client_ack(first.clone());
+        coalescer.queue_client_ack(fills_lower_range.clone());
+        coalescer.flush_client_acks(&event_sender);
+
+        assert!(matches!(
+            event_receiver.try_recv(),
+            Ok(ServerEvent::ClientAck(received)) if received == first
+        ));
+        assert!(matches!(
+            event_receiver.try_recv(),
+            Ok(ServerEvent::ClientAck(received))
+                if received == fills_lower_range
+        ));
+        assert!(event_receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn server_event_coalescer_resets_ack_and_probe_history_per_generation() {
+        let (event_sender, mut event_receiver) = mpsc::unbounded_channel();
+        let mut coalescer = ServerEventCoalescer::default();
+        let ack = quiche::multicast::Ack {
+            channel_id: vec![1, 2, 3, 4],
+            largest_acknowledged: 7,
+            ack_delay: 0,
+            first_ack_range: 0,
+            ack_ranges: Vec::new(),
+            ecn_counts: None,
+        };
+        let probe = quiche::multicast::ProbeEvent {
+            channel_id: ack.channel_id.clone(),
+            status: quiche::multicast::ProbeStatus::Probing,
+            reason_scope: None,
+            reason_code: None,
+            reason_phrase: Vec::new(),
+        };
+
+        coalescer.queue_client_ack(ack.clone());
+        coalescer.flush_client_acks(&event_sender);
+        coalescer.forward_probe_event(&event_sender, probe.clone());
+        assert!(matches!(
+            event_receiver.try_recv(),
+            Ok(ServerEvent::ClientAck(received)) if received == ack
+        ));
+        assert!(matches!(
+            event_receiver.try_recv(),
+            Ok(ServerEvent::ProbeStatusChanged(received)) if received == probe
+        ));
+
+        coalescer.queue_client_ack(ack.clone());
+        coalescer.forward_probe_event(&event_sender, probe.clone());
+        assert!(event_receiver.try_recv().is_err());
+
+        coalescer.reset_channel(&event_sender, &ack.channel_id);
+        coalescer.queue_client_ack(ack.clone());
+        coalescer.flush_client_acks(&event_sender);
+        coalescer.forward_probe_event(&event_sender, probe.clone());
+        assert!(matches!(
+            event_receiver.try_recv(),
+            Ok(ServerEvent::ClientAck(received)) if received == ack
+        ));
+        assert!(matches!(
+            event_receiver.try_recv(),
+            Ok(ServerEvent::ProbeStatusChanged(received)) if received == probe
+        ));
     }
 
     #[test]

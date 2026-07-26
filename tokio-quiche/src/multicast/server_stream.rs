@@ -33,6 +33,7 @@ use std::sync::Mutex;
 use std::sync::Weak;
 
 use bytes::Bytes;
+use smallvec::SmallVec;
 use tokio::sync::mpsc::UnboundedSender;
 
 use super::ServerControlChannelConfig;
@@ -40,6 +41,9 @@ use super::ServerControlCommand;
 use super::ServerControlController;
 
 const MAX_STREAM_OFFSET: u64 = 1 << 62;
+const COMPLETED_STREAM_CHUNK_BITS: u64 = 1024;
+const COMPLETED_STREAM_CHUNK_WORDS: usize = 16;
+const COMPLETED_STREAM_DENSE_THRESHOLD: usize = 32;
 
 static NEXT_PUBLISHER_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -590,7 +594,8 @@ impl ServerStreamPublisher {
         profile.tracked_streams = inner.streams.len();
         profile.finished_streams =
             usize::try_from(inner.finished_streams.len()).unwrap_or(usize::MAX);
-        profile.finished_stream_ranges = inner.finished_streams.range_count();
+        profile.finished_stream_storage_units =
+            inner.finished_streams.storage_units();
         profile.attached_connections = inner.subscribers.len();
 
         Ok(profile)
@@ -623,19 +628,26 @@ pub struct ServerStreamAttachment {
 
 impl Drop for ServerStreamAttachment {
     fn drop(&mut self) {
-        self.publication_queue.close();
-
         if let Some(publisher) = self.publisher.upgrade() {
             if let Ok(mut inner) = publisher.lock() {
                 inner.subscribers.remove(&self.subscriber_id);
-            };
+                self.publication_queue.seal();
+            } else {
+                self.publication_queue.seal();
+            }
+        } else {
+            self.publication_queue.seal();
         }
 
-        let _ = self.command_sender.send(
-            ServerControlCommand::DetachStreamPublisher {
+        if self
+            .command_sender
+            .send(ServerControlCommand::DetachStreamPublisher {
                 publication_queue: Arc::clone(&self.publication_queue),
-            },
-        );
+            })
+            .is_err()
+        {
+            self.publication_queue.close();
+        }
     }
 }
 
@@ -701,7 +713,7 @@ struct PublisherSubscriber {
 #[derive(Debug, Default)]
 struct CompletedStreamSequences {
     contiguous_end: Option<u64>,
-    sparse: BTreeMap<u64, u64>,
+    chunks: BTreeMap<u64, CompletedStreamChunk>,
     len: u64,
 }
 
@@ -709,10 +721,12 @@ impl CompletedStreamSequences {
     fn contains(&self, stream_id: u64) -> bool {
         let sequence = stream_id >> 2;
         self.contiguous_end.is_some_and(|end| sequence <= end) ||
-            self.sparse
-                .range(..=sequence)
-                .next_back()
-                .is_some_and(|(_, end)| sequence <= *end)
+            self.chunks
+                .get(&(sequence / COMPLETED_STREAM_CHUNK_BITS))
+                .is_some_and(|chunk| {
+                    chunk
+                        .contains((sequence % COMPLETED_STREAM_CHUNK_BITS) as u16)
+                })
     }
 
     fn insert(&mut self, stream_id: u64) {
@@ -731,25 +745,16 @@ impl CompletedStreamSequences {
             return;
         }
 
-        let mut start = sequence;
-        let mut end = sequence;
-        if let Some((&previous_start, &previous_end)) =
-            self.sparse.range(..sequence).next_back()
+        let chunk_index = sequence / COMPLETED_STREAM_CHUNK_BITS;
+        let chunk_bit = (sequence % COMPLETED_STREAM_CHUNK_BITS) as u16;
+        if !self
+            .chunks
+            .entry(chunk_index)
+            .or_default()
+            .insert(chunk_bit)
         {
-            if previous_end.checked_add(1) == Some(sequence) {
-                start = previous_start;
-                self.sparse.remove(&previous_start);
-            }
+            return;
         }
-        if let Some((&next_start, &next_end)) =
-            self.sparse.range(sequence.saturating_add(1)..).next()
-        {
-            if sequence.checked_add(1) == Some(next_start) {
-                end = next_end;
-                self.sparse.remove(&next_start);
-            }
-        }
-        self.sparse.insert(start, end);
         self.len = self.len.saturating_add(1);
         self.promote_contiguous();
     }
@@ -762,15 +767,20 @@ impl CompletedStreamSequences {
             let Some(expected) = expected else {
                 return;
             };
-            let Some((&start, &end)) = self.sparse.first_key_value() else {
+            let chunk_index = expected / COMPLETED_STREAM_CHUNK_BITS;
+            let chunk_bit = (expected % COMPLETED_STREAM_CHUNK_BITS) as u16;
+            let Some(chunk) = self.chunks.get_mut(&chunk_index) else {
                 return;
             };
-            if start != expected {
+            if !chunk.remove(chunk_bit) {
                 return;
             }
+            let remove_chunk = chunk.is_empty();
 
-            self.sparse.remove(&start);
-            self.contiguous_end = Some(end);
+            if remove_chunk {
+                self.chunks.remove(&chunk_index);
+            }
+            self.contiguous_end = Some(expected);
         }
     }
 
@@ -780,8 +790,89 @@ impl CompletedStreamSequences {
     }
 
     #[cfg(test)]
-    fn range_count(&self) -> usize {
-        self.sparse.len() + usize::from(self.contiguous_end.is_some())
+    fn storage_units(&self) -> usize {
+        self.chunks.len() + usize::from(self.contiguous_end.is_some())
+    }
+}
+
+#[derive(Debug)]
+enum CompletedStreamChunk {
+    Sparse(SmallVec<[u16; 8]>),
+    Dense(Box<[u64; COMPLETED_STREAM_CHUNK_WORDS]>),
+}
+
+impl Default for CompletedStreamChunk {
+    fn default() -> Self {
+        Self::Sparse(SmallVec::new())
+    }
+}
+
+impl CompletedStreamChunk {
+    fn contains(&self, bit: u16) -> bool {
+        match self {
+            Self::Sparse(bits) => bits.binary_search(&bit).is_ok(),
+
+            Self::Dense(words) => {
+                let word = usize::from(bit / 64);
+                words[word] & (1_u64 << (bit % 64)) != 0
+            },
+        }
+    }
+
+    fn insert(&mut self, bit: u16) -> bool {
+        match self {
+            Self::Sparse(bits) => {
+                let Err(index) = bits.binary_search(&bit) else {
+                    return false;
+                };
+                bits.insert(index, bit);
+
+                if bits.len() >= COMPLETED_STREAM_DENSE_THRESHOLD {
+                    let mut words = Box::new([0; COMPLETED_STREAM_CHUNK_WORDS]);
+                    for bit in bits.iter().copied() {
+                        words[usize::from(bit / 64)] |= 1_u64 << (bit % 64);
+                    }
+                    *self = Self::Dense(words);
+                }
+
+                true
+            },
+
+            Self::Dense(words) => {
+                let word = usize::from(bit / 64);
+                let mask = 1_u64 << (bit % 64);
+                let inserted = words[word] & mask == 0;
+                words[word] |= mask;
+                inserted
+            },
+        }
+    }
+
+    fn remove(&mut self, bit: u16) -> bool {
+        match self {
+            Self::Sparse(bits) => {
+                let Ok(index) = bits.binary_search(&bit) else {
+                    return false;
+                };
+                bits.remove(index);
+                true
+            },
+
+            Self::Dense(words) => {
+                let word = usize::from(bit / 64);
+                let mask = 1_u64 << (bit % 64);
+                let removed = words[word] & mask != 0;
+                words[word] &= !mask;
+                removed
+            },
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        match self {
+            Self::Sparse(bits) => bits.is_empty(),
+            Self::Dense(words) => words.iter().all(|word| *word == 0),
+        }
     }
 }
 
@@ -818,6 +909,9 @@ impl ServerStreamPublisherQueue {
         if state.closed {
             return QueuePushResult::Closed;
         }
+        if state.sealed {
+            return QueuePushResult::Closed;
+        }
 
         state.items.push_back(item);
         if state.dirty {
@@ -849,8 +943,17 @@ impl ServerStreamPublisherQueue {
         state.closed = true;
     }
 
+    fn seal(&self) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        state.sealed = true;
+    }
+
     fn is_closed(&self) -> bool {
-        self.state.lock().map_or(true, |state| state.closed)
+        self.state
+            .lock()
+            .map_or(true, |state| state.sealed || state.closed)
     }
 }
 
@@ -858,6 +961,7 @@ impl ServerStreamPublisherQueue {
 struct ServerStreamPublisherQueueState {
     items: VecDeque<ServerStreamPublisherQueueItem>,
     dirty: bool,
+    sealed: bool,
     closed: bool,
 }
 
@@ -874,7 +978,7 @@ pub(super) struct ServerStreamPublisherTestProfile {
     pub(super) publication_commands_sent: u64,
     pub(super) tracked_streams: usize,
     pub(super) finished_streams: usize,
-    pub(super) finished_stream_ranges: usize,
+    pub(super) finished_stream_storage_units: usize,
     pub(super) attached_connections: usize,
 }
 
@@ -964,6 +1068,7 @@ pub(super) struct CommittedServerStreamPublication {
 #[cfg(test)]
 mod tests {
     use super::CompletedStreamSequences;
+    use super::COMPLETED_STREAM_CHUNK_BITS;
 
     #[test]
     fn completed_stream_sequences_compact_one_million_streams() {
@@ -974,7 +1079,7 @@ mod tests {
         }
 
         assert_eq!(completed.len(), 1_000_000);
-        assert_eq!(completed.range_count(), 1);
+        assert_eq!(completed.storage_units(), 1);
         assert!(completed.contains(3));
         assert!(completed.contains((999_999 << 2) | 0x3));
         assert!(!completed.contains((1_000_000 << 2) | 0x3));
@@ -989,7 +1094,7 @@ mod tests {
         }
 
         assert_eq!(completed.len(), 5);
-        assert_eq!(completed.range_count(), 2);
+        assert_eq!(completed.storage_units(), 2);
         assert!(completed.contains((12 << 2) | 0x3));
         assert!(!completed.contains((9 << 2) | 0x3));
 
@@ -998,7 +1103,38 @@ mod tests {
         }
 
         assert_eq!(completed.len(), 13);
-        assert_eq!(completed.range_count(), 1);
+        assert_eq!(completed.storage_units(), 1);
         assert!(completed.contains((12 << 2) | 0x3));
+    }
+
+    #[test]
+    fn completed_stream_sequences_bound_interleaved_storage() {
+        let mut completed = CompletedStreamSequences::default();
+
+        for sequence in 0..1_000_000 {
+            completed.insert(((sequence * 2) << 2) | 0x3);
+        }
+
+        assert_eq!(completed.len(), 1_000_000);
+        assert!(completed.storage_units() < 2_000);
+        assert!(completed.contains(((999_999 * 2) << 2) | 0x3));
+        assert!(!completed.contains(((999_999 * 2 + 1) << 2) | 0x3));
+    }
+
+    #[test]
+    fn completed_stream_sequences_promote_dense_chunk_into_prefix() {
+        let mut completed = CompletedStreamSequences::default();
+
+        for sequence in 1..COMPLETED_STREAM_CHUNK_BITS {
+            completed.insert((sequence << 2) | 0x3);
+        }
+        assert_eq!(completed.storage_units(), 1);
+
+        completed.insert(3);
+        assert_eq!(completed.len(), COMPLETED_STREAM_CHUNK_BITS);
+        assert_eq!(completed.storage_units(), 1);
+        assert!(
+            completed.contains(((COMPLETED_STREAM_CHUNK_BITS - 1) << 2) | 0x3)
+        );
     }
 }

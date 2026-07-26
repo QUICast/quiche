@@ -23,7 +23,9 @@ For each client connection:
    `MAX_STREAMS_UNI` before sending `MC_JOIN`.
 4. Call `publisher.attach(&controller)` and retain the returned
    `ServerStreamAttachment` for the connection lifetime. Dropping it stops new
-   publications from being fanned out to that connection.
+   publications from being fanned out to that connection. Already committed
+   publications and FIN are drained in order before connection-local recovery
+   state is released.
 
 For each shared range:
 
@@ -57,6 +59,8 @@ is shared across connections.
 
 - Before a validated `MC_ACK`, every committed range is sent on the ordinary
   unicast QUIC stream. `MC_STATE(JOINED)` alone does not disable fallback.
+- Reattaching a publisher starts a fresh probe generation. Prior viability and
+  delayed ACKs from the previous attachment cannot suppress initial fallback.
 - After `MC_ACK` makes a channel viable, committed ranges are retained without
   unicast duplication.
 - Duplicate or regressive ACKs can still resolve retained ranges but do not

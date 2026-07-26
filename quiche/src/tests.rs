@@ -594,6 +594,60 @@ fn multicast_probe_becomes_viable_on_first_ack() {
 }
 
 #[test]
+fn multicast_probe_reset_requires_ack_from_new_stream_generation() {
+    let mut pipe = multicast_stream_negotiated_pipe();
+    let channel_id = vec![1, 2, 3, 4];
+    let stream_id = 3;
+    multicast_stream_prefix(&mut pipe, stream_id);
+
+    pipe.server
+        .multicast_stream_send(&channel_id, 0, stream_id, 10, b"old", false)
+        .unwrap();
+    pipe.server
+        .multicast_process_peer_ack(multicast_ack_for(&channel_id, 0))
+        .unwrap();
+    assert_eq!(
+        pipe.server.multicast_probe_status(&channel_id),
+        Some(multicast::ProbeStatus::Viable)
+    );
+
+    pipe.server
+        .multicast_stream_stop_channel(&channel_id)
+        .unwrap();
+    pipe.server
+        .multicast_set_stream_recovery_reordering_threshold(&channel_id, 3)
+        .unwrap();
+    pipe.server.multicast_probe_reset(&channel_id).unwrap();
+    pipe.server
+        .multicast_process_peer_ack(multicast_ack_for(&channel_id, 0))
+        .unwrap();
+    assert_eq!(
+        pipe.server.multicast_probe_status(&channel_id),
+        Some(multicast::ProbeStatus::Probing)
+    );
+
+    pipe.server
+        .multicast_stream_send(&channel_id, 1, stream_id, 13, b"new", true)
+        .unwrap();
+
+    pipe.server
+        .multicast_process_peer_ack(multicast_ack_for(&channel_id, 0))
+        .unwrap();
+    assert_eq!(
+        pipe.server.multicast_probe_status(&channel_id),
+        Some(multicast::ProbeStatus::Probing)
+    );
+
+    pipe.server
+        .multicast_process_peer_ack(multicast_ack_for(&channel_id, 1))
+        .unwrap();
+    assert_eq!(
+        pipe.server.multicast_probe_status(&channel_id),
+        Some(multicast::ProbeStatus::Viable)
+    );
+}
+
+#[test]
 fn multicast_probe_times_out() {
     let mut pipe = multicast_negotiated_pipe();
     let channel_id = vec![1, 2, 3, 4];
