@@ -1003,6 +1003,48 @@ fn multicast_stream_fallback_emits_before_viability() {
 }
 
 #[test]
+fn multicast_stream_retries_missing_prefix_but_rejects_collected_stream() {
+    let mut pipe = multicast_stream_negotiated_pipe();
+    let channel_id = vec![1, 2, 3, 4];
+    let stream_id = 3;
+
+    assert_eq!(
+        pipe.server.multicast_stream_send(
+            &channel_id,
+            0,
+            stream_id,
+            10,
+            b"fallback",
+            true,
+        ),
+        Err(Error::Done)
+    );
+
+    multicast_stream_prefix(&mut pipe, stream_id);
+    pipe.server
+        .multicast_stream_send(&channel_id, 0, stream_id, 10, b"fallback", true)
+        .unwrap();
+    pipe.advance().unwrap();
+
+    let mut out = [0; 32];
+    assert_eq!(pipe.client.stream_recv(stream_id, &mut out), Ok((8, true)));
+    assert_eq!(&out[..8], b"fallback");
+    assert!(pipe.server.streams.is_collected(stream_id));
+
+    assert_eq!(
+        pipe.server.multicast_stream_send(
+            &channel_id,
+            1,
+            stream_id,
+            18,
+            b"late",
+            false,
+        ),
+        Err(Error::InvalidStreamState(stream_id))
+    );
+}
+
+#[test]
 fn multicast_stream_ack_before_publication_is_rejected() {
     let mut pipe = multicast_stream_negotiated_pipe();
     let channel_id = vec![1, 2, 3, 4];

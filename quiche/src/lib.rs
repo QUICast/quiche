@@ -7611,6 +7611,15 @@ impl<F: BufFactory> Connection<F> {
     /// normal unicast QUIC transmission immediately. While multicast is viable,
     /// it is retained without being emitted and is released over unicast if the
     /// channel packet is reported lost or the channel re-enters fallback.
+    ///
+    /// [`Done`] is returned when the stream has not yet been created by its
+    /// connection-specific prefix or has not caught up to `offset`; the
+    /// registration can be retried. [`InvalidStreamState`] is returned when the
+    /// stream has already finished, been shut down, or been garbage collected
+    /// and can never accept the registration.
+    ///
+    /// [`Done`]: enum.Error.html#variant.Done
+    /// [`InvalidStreamState`]: enum.Error.html#variant.InvalidStreamState
     pub fn multicast_stream_send(
         &mut self, channel_id: &[u8], packet_number: u64, stream_id: u64,
         offset: u64, buf: &[u8], fin: bool,
@@ -7870,8 +7879,18 @@ impl<F: BufFactory> Connection<F> {
     ) -> Result<()> {
         let len = buf.as_ref().len();
 
-        if offset > 0 && self.streams.get(stream_id).is_none() {
+        let stream = self.streams.get(stream_id);
+        if self.streams.is_collected(stream_id) ||
+            stream.is_some_and(|stream| {
+                stream.send.is_shutdown() ||
+                    (stream.send.is_fin() && !stream.send.is_stopped())
+            })
+        {
             return Err(Error::InvalidStreamState(stream_id));
+        }
+
+        if offset > 0 && stream.is_none() {
+            return Err(Error::Done);
         }
 
         if self.max_tx_data - self.tx_data < len as u64 {
