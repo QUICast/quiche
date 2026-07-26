@@ -1141,7 +1141,7 @@ pub struct ChannelSendMetricsSnapshot {
     /// Total successful payload-protection key updates.
     pub key_updates: u64,
 
-    /// Total failed encode attempts from [`ChannelSendState::write_packet()`].
+    /// Total failed packet-sizing or packet-encoding attempts.
     pub encode_errors: u64,
 
     /// Total valid `MC_ACK` frames processed by [`ChannelSendState::on_ack()`].
@@ -1509,24 +1509,48 @@ impl ChannelSendState {
     }
 
     /// Returns the exact output size required to encode `frames`.
-    pub fn packet_len(&self, frames: &[ChannelFrame]) -> Result<usize> {
-        let payload_len = frames.iter().try_fold(0_usize, |total, frame| {
+    ///
+    /// A sizing failure increments the sender's `encode_errors` metric.
+    pub fn packet_len(&mut self, frames: &[ChannelFrame]) -> Result<usize> {
+        let result = frames.iter().try_fold(0_usize, |total, frame| {
             total
                 .checked_add(channel_frame_wire_len(frame)?)
                 .ok_or(Error::InvalidState)
-        })?;
+        });
 
-        channel_packet_len(&self.announce, self.seal.alg().tag_len(), payload_len)
+        let result = result.and_then(|payload_len| {
+            channel_packet_len(
+                &self.announce,
+                self.seal.alg().tag_len(),
+                payload_len,
+            )
+        });
+        self.record_encode_result(result)
     }
 
     /// Returns the exact output size required for one borrowed STREAM frame.
+    ///
+    /// A sizing failure increments the sender's `encode_errors` metric.
     pub fn stream_packet_len(
-        &self, stream_id: u64, offset: u64, data_len: usize,
+        &mut self, stream_id: u64, offset: u64, data_len: usize,
     ) -> Result<usize> {
-        let payload_len =
-            channel_stream_frame_wire_len(stream_id, offset, data_len)?;
+        let result = channel_stream_frame_wire_len(stream_id, offset, data_len)
+            .and_then(|payload_len| {
+                channel_packet_len(
+                    &self.announce,
+                    self.seal.alg().tag_len(),
+                    payload_len,
+                )
+            });
+        self.record_encode_result(result)
+    }
 
-        channel_packet_len(&self.announce, self.seal.alg().tag_len(), payload_len)
+    fn record_encode_result(&mut self, result: Result<usize>) -> Result<usize> {
+        if result.is_err() {
+            self.metrics.encode_errors =
+                self.metrics.encode_errors.saturating_add(1);
+        }
+        result
     }
 
     /// Encodes one multicast packet carrying the provided channel frames.
@@ -3987,7 +4011,7 @@ mod tests {
     fn channel_packet_len_rejects_oversized_two_byte_payload() {
         let announce = test_announce();
         let key = test_key(&announce.channel_id);
-        let sender = ChannelSendState::new(announce, key).unwrap();
+        let mut sender = ChannelSendState::new(announce, key).unwrap();
 
         assert_eq!(
             sender.stream_packet_len(3, 0, 16384),
@@ -3999,6 +4023,10 @@ mod tests {
             }]),
             Err(Error::InvalidFrame)
         );
+        let metrics = sender.metrics_snapshot();
+        assert_eq!(metrics.write_calls, 0);
+        assert_eq!(metrics.encode_errors, 2);
+        assert_eq!(metrics.next_packet_number, 0);
     }
 
     #[test]

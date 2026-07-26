@@ -46,6 +46,9 @@ use crate::Error;
 use crate::Result;
 
 const DEFAULT_URGENCY: u8 = 127;
+const COLLECTED_STREAM_CHUNK_BITS: u64 = 1024;
+const COLLECTED_STREAM_CHUNK_WORDS: usize = 16;
+const COLLECTED_STREAM_DENSE_THRESHOLD: usize = 32;
 
 /// The default size of the receiver stream flow control window.
 pub(crate) const DEFAULT_STREAM_WINDOW: u64 = 32 * 1024;
@@ -144,10 +147,10 @@ impl CollectedStreamIds {
     }
 
     #[cfg(test)]
-    fn range_count(&self) -> usize {
+    fn storage_units(&self) -> usize {
         self.spaces
             .iter()
-            .map(CollectedStreamSpace::range_count)
+            .map(CollectedStreamSpace::storage_units)
             .sum()
     }
 }
@@ -155,16 +158,18 @@ impl CollectedStreamIds {
 #[derive(Default)]
 struct CollectedStreamSpace {
     contiguous_end: Option<u64>,
-    sparse: BTreeMap<u64, u64>,
+    chunks: BTreeMap<u64, CollectedStreamChunk>,
 }
 
 impl CollectedStreamSpace {
     fn contains(&self, sequence: u64) -> bool {
         self.contiguous_end.is_some_and(|end| sequence <= end) ||
-            self.sparse
-                .range(..=sequence)
-                .next_back()
-                .is_some_and(|(_, end)| sequence <= *end)
+            self.chunks
+                .get(&(sequence / COLLECTED_STREAM_CHUNK_BITS))
+                .is_some_and(|chunk| {
+                    chunk
+                        .contains((sequence % COLLECTED_STREAM_CHUNK_BITS) as u16)
+                })
     }
 
     fn insert(&mut self, sequence: u64) {
@@ -181,25 +186,16 @@ impl CollectedStreamSpace {
             return;
         }
 
-        let mut start = sequence;
-        let mut end = sequence;
-        if let Some((&previous_start, &previous_end)) =
-            self.sparse.range(..sequence).next_back()
+        let chunk_index = sequence / COLLECTED_STREAM_CHUNK_BITS;
+        let chunk_bit = (sequence % COLLECTED_STREAM_CHUNK_BITS) as u16;
+        if !self
+            .chunks
+            .entry(chunk_index)
+            .or_default()
+            .insert(chunk_bit)
         {
-            if previous_end.checked_add(1) == Some(sequence) {
-                start = previous_start;
-                self.sparse.remove(&previous_start);
-            }
+            return;
         }
-        if let Some((&next_start, &next_end)) =
-            self.sparse.range(sequence.saturating_add(1)..).next()
-        {
-            if sequence.checked_add(1) == Some(next_start) {
-                end = next_end;
-                self.sparse.remove(&next_start);
-            }
-        }
-        self.sparse.insert(start, end);
         self.promote_contiguous();
     }
 
@@ -211,21 +207,106 @@ impl CollectedStreamSpace {
             let Some(expected) = expected else {
                 return;
             };
-            let Some((&start, &end)) = self.sparse.first_key_value() else {
+            let chunk_index = expected / COLLECTED_STREAM_CHUNK_BITS;
+            let chunk_bit = (expected % COLLECTED_STREAM_CHUNK_BITS) as u16;
+            let Some(chunk) = self.chunks.get_mut(&chunk_index) else {
                 return;
             };
-            if start != expected {
+            if !chunk.remove(chunk_bit) {
                 return;
             }
+            let remove_chunk = chunk.is_empty();
 
-            self.sparse.remove(&start);
-            self.contiguous_end = Some(end);
+            if remove_chunk {
+                self.chunks.remove(&chunk_index);
+            }
+            self.contiguous_end = Some(expected);
         }
     }
 
     #[cfg(test)]
-    fn range_count(&self) -> usize {
-        self.sparse.len() + usize::from(self.contiguous_end.is_some())
+    fn storage_units(&self) -> usize {
+        self.chunks.len() + usize::from(self.contiguous_end.is_some())
+    }
+}
+
+enum CollectedStreamChunk {
+    Sparse(SmallVec<[u16; 8]>),
+    Dense(Box<[u64; COLLECTED_STREAM_CHUNK_WORDS]>),
+}
+
+impl Default for CollectedStreamChunk {
+    fn default() -> Self {
+        Self::Sparse(SmallVec::new())
+    }
+}
+
+impl CollectedStreamChunk {
+    fn contains(&self, bit: u16) -> bool {
+        match self {
+            Self::Sparse(bits) => bits.binary_search(&bit).is_ok(),
+
+            Self::Dense(words) => {
+                let word = usize::from(bit / 64);
+                words[word] & (1_u64 << (bit % 64)) != 0
+            },
+        }
+    }
+
+    fn insert(&mut self, bit: u16) -> bool {
+        match self {
+            Self::Sparse(bits) => {
+                let Err(index) = bits.binary_search(&bit) else {
+                    return false;
+                };
+                bits.insert(index, bit);
+
+                if bits.len() >= COLLECTED_STREAM_DENSE_THRESHOLD {
+                    let mut words = Box::new([0; COLLECTED_STREAM_CHUNK_WORDS]);
+                    for bit in bits.iter().copied() {
+                        words[usize::from(bit / 64)] |= 1_u64 << (bit % 64);
+                    }
+                    *self = Self::Dense(words);
+                }
+
+                true
+            },
+
+            Self::Dense(words) => {
+                let word = usize::from(bit / 64);
+                let mask = 1_u64 << (bit % 64);
+                let inserted = words[word] & mask == 0;
+                words[word] |= mask;
+                inserted
+            },
+        }
+    }
+
+    fn remove(&mut self, bit: u16) -> bool {
+        match self {
+            Self::Sparse(bits) => {
+                let Ok(index) = bits.binary_search(&bit) else {
+                    return false;
+                };
+                bits.remove(index);
+                true
+            },
+
+            Self::Dense(words) => {
+                let word = usize::from(bit / 64);
+                let mask = 1_u64 << (bit % 64);
+                let removed = words[word] & mask != 0;
+                words[word] &= !mask;
+                removed
+            },
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        match self {
+            Self::Sparse(bits) => bits.is_empty(),
+            Self::Dense(words) => words.iter().all(|word| *word == 0),
+        }
     }
 }
 
@@ -239,7 +320,7 @@ pub struct StreamMap<F: BufFactory = DefaultBufFactory> {
     /// Map of streams indexed by stream ID.
     streams: StreamIdHashMap<Stream<F>>,
 
-    /// Compact ranges of streams that were completed and garbage collected.
+    /// Compact chunks of streams that were completed and garbage collected.
     ///
     /// Instead of keeping the full stream state forever, we collect completed
     /// streams to save memory, but we still need to keep track of previously
@@ -2023,7 +2104,7 @@ mod tests {
             collected.insert((sequence << 2) | 0x3);
         }
 
-        assert_eq!(collected.range_count(), 1);
+        assert_eq!(collected.storage_units(), 1);
         assert!(collected.contains(3));
         assert!(collected.contains((999_999 << 2) | 0x3));
         assert!(!collected.contains((1_000_000 << 2) | 0x3));
@@ -2038,7 +2119,7 @@ mod tests {
             collected.insert((2 << 2) | stream_type);
         }
 
-        assert_eq!(collected.range_count(), 8);
+        assert_eq!(collected.storage_units(), 8);
         for stream_type in 0..4 {
             assert!(collected.contains(stream_type));
             assert!(!collected.contains((1 << 2) | stream_type));
@@ -2049,7 +2130,7 @@ mod tests {
             collected.insert((1 << 2) | stream_type);
         }
 
-        assert_eq!(collected.range_count(), 4);
+        assert_eq!(collected.storage_units(), 4);
         for stream_type in 0..4 {
             assert!(collected.contains((1 << 2) | stream_type));
         }
@@ -2058,7 +2139,36 @@ mod tests {
         let sparse_high_id = (max_sequence << 2) | 0x3;
         collected.insert(sparse_high_id);
         assert!(collected.contains(sparse_high_id));
-        assert_eq!(collected.range_count(), 5);
+        assert_eq!(collected.storage_units(), 5);
+    }
+
+    #[test]
+    fn collected_stream_ids_bound_interleaved_storage() {
+        let mut collected = CollectedStreamIds::default();
+
+        for sequence in 0..1_000_000 {
+            collected.insert(((sequence * 2) << 2) | 0x3);
+        }
+
+        assert!(collected.storage_units() < 2_000);
+        assert!(collected.contains(((999_999 * 2) << 2) | 0x3));
+        assert!(!collected.contains(((999_999 * 2 + 1) << 2) | 0x3));
+    }
+
+    #[test]
+    fn collected_stream_ids_promote_dense_chunk_into_prefix() {
+        let mut collected = CollectedStreamIds::default();
+
+        for sequence in 1..COLLECTED_STREAM_CHUNK_BITS {
+            collected.insert((sequence << 2) | 0x3);
+        }
+        assert_eq!(collected.storage_units(), 1);
+
+        collected.insert(3);
+        assert_eq!(collected.storage_units(), 1);
+        assert!(
+            collected.contains(((COLLECTED_STREAM_CHUNK_BITS - 1) << 2) | 0x3)
+        );
     }
 
     #[test]

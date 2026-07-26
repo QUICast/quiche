@@ -1692,8 +1692,10 @@ struct MulticastStreamRange {
 
 #[derive(Debug)]
 struct MulticastStreamRecovery {
+    first_published: Option<u64>,
     largest_published: Option<u64>,
     largest_acknowledged: Option<u64>,
+    awaiting_generation_publication: bool,
     reordering_threshold: u64,
     pending: BTreeMap<u64, MulticastStreamRange>,
     delivery_metrics: multicast::StreamDeliveryMetricsSnapshot,
@@ -1733,8 +1735,10 @@ impl MulticastStreamDelivery {
 impl Default for MulticastStreamRecovery {
     fn default() -> Self {
         Self {
+            first_published: None,
             largest_published: None,
             largest_acknowledged: None,
+            awaiting_generation_publication: false,
             reordering_threshold:
                 multicast::DEFAULT_STREAM_RECOVERY_REORDERING_THRESHOLD,
             pending: BTreeMap::new(),
@@ -7308,6 +7312,34 @@ impl<F: BufFactory> Connection<F> {
         })
     }
 
+    /// Starts a fresh multicast probe generation for the provided channel.
+    ///
+    /// This immediately restores ordinary unicast fallback and clears the
+    /// current probe deadline while retaining the configured ACK timeout.
+    /// Servers should reset a channel before attaching a new publisher
+    /// generation so prior viability cannot suppress its initial fallback.
+    pub fn multicast_probe_reset(&mut self, channel_id: &[u8]) -> Result<()> {
+        if !self.is_server || channel_id.is_empty() {
+            return Err(Error::InvalidState);
+        }
+
+        if let Some(recovery) = self.multicast_stream_recovery.get_mut(channel_id)
+        {
+            // An ACK must advance beyond data published before this generation.
+            recovery.largest_acknowledged = recovery.largest_published;
+            recovery.awaiting_generation_publication =
+                recovery.largest_published.is_none();
+        }
+
+        self.multicast_set_probe_state(MulticastProbeStateUpdate {
+            emit_if_unchanged: true,
+            ..MulticastProbeStateUpdate::new(
+                channel_id.to_vec(),
+                multicast::ProbeStatus::Probing,
+            )
+        })
+    }
+
     /// Returns the current multicast probe status for the provided channel.
     pub fn multicast_probe_status(
         &self, channel_id: &[u8],
@@ -7598,6 +7630,8 @@ impl<F: BufFactory> Connection<F> {
             .multicast_stream_recovery
             .entry(channel_id.to_vec())
             .or_default();
+        state.awaiting_generation_publication = false;
+        state.first_published.get_or_insert(packet_number);
         state.largest_published = Some(packet_number);
 
         let delivery_metrics_changed = fallback && (len > 0 || fin);
@@ -7687,7 +7721,12 @@ impl<F: BufFactory> Connection<F> {
     ///
     /// Applications should call this after detaching or retiring a stream
     /// publisher. Calling it while the publisher is active resets packet-number
-    /// ordering and delivery metrics for subsequent registrations.
+    /// ordering and delivery metrics for subsequent registrations. This does
+    /// not alter channel probe state; call [`multicast_probe_reset()`] before
+    /// reusing a detached channel.
+    ///
+    /// [`multicast_probe_reset()`]:
+    ///     struct.Connection.html#method.multicast_probe_reset
     pub fn multicast_stream_stop_channel(
         &mut self, channel_id: &[u8],
     ) -> Result<Option<multicast::StreamDeliveryMetricsSnapshot>> {
@@ -8024,12 +8063,20 @@ impl<F: BufFactory> Connection<F> {
             return Ok(true);
         };
 
-        let Some(largest_published) = state.largest_published else {
+        let (Some(first_published), Some(largest_published)) =
+            (state.first_published, state.largest_published)
+        else {
+            if state.awaiting_generation_publication {
+                return Ok(false);
+            }
             return Err(Error::InvalidAckRange);
         };
 
         if frame.largest_acknowledged > largest_published {
             return Err(Error::InvalidAckRange);
+        }
+        if frame.largest_acknowledged < first_published {
+            return Ok(false);
         }
 
         let spans = multicast::ack_spans(frame)?;
