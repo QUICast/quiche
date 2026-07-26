@@ -476,7 +476,7 @@ impl ServerStreamPublisher {
             frame: publication.frame,
         });
 
-        let commands_sent = inner
+        let _commands_sent = inner
             .fanout(ServerStreamPublisherQueueItem::Publication(publication));
         if let Some(stream_id) = finished_stream_id {
             inner.streams.remove(&stream_id);
@@ -487,7 +487,7 @@ impl ServerStreamPublisher {
             inner.profile.publication_commands_sent = inner
                 .profile
                 .publication_commands_sent
-                .saturating_add(commands_sent);
+                .saturating_add(_commands_sent);
         }
 
         Ok(())
@@ -774,10 +774,12 @@ impl CompletedStreamSequences {
         }
     }
 
+    #[cfg(test)]
     fn len(&self) -> u64 {
         self.len
     }
 
+    #[cfg(test)]
     fn range_count(&self) -> usize {
         self.sparse.len() + usize::from(self.contiguous_end.is_some())
     }

@@ -1556,9 +1556,15 @@ impl ChannelSendState {
         &mut self, stream_id: u64, offset: u64, fin: bool, data: &[u8],
         out: &mut [u8],
     ) -> Result<ChannelSendOutput> {
+        let frame = BorrowedChannelStreamFrame {
+            stream_id,
+            offset,
+            fin,
+            data,
+        };
         self.write_packet_inner(out, 1, |announce, seal, pn, phase, out| {
             encode_channel_stream_packet_bytes(
-                announce, seal, pn, phase, stream_id, offset, fin, data, out,
+                announce, seal, pn, phase, &frame, out,
             )
         })
     }
@@ -3176,20 +3182,23 @@ fn encode_channel_packet_bytes(
 
 fn encode_channel_stream_packet_bytes(
     announce: &Announce, seal: &mut crypto::Seal, packet_number: u64,
-    key_phase: bool, stream_id: u64, offset: u64, fin: bool, data: &[u8],
-    out: &mut [u8],
+    key_phase: bool, frame: &BorrowedChannelStreamFrame<'_>, out: &mut [u8],
 ) -> Result<usize> {
-    channel_stream_frame_wire_len(stream_id, offset, data.len())?;
+    channel_stream_frame_wire_len(
+        frame.stream_id,
+        frame.offset,
+        frame.data.len(),
+    )?;
     let (mut b, payload_offset) =
         encode_channel_packet_header(announce, packet_number, key_phase, out)?;
     frame::encode_stream_header(
-        stream_id,
-        offset,
-        data.len() as u64,
-        fin,
+        frame.stream_id,
+        frame.offset,
+        frame.data.len() as u64,
+        frame.fin,
         &mut b,
     )?;
-    b.put_bytes(data)?;
+    b.put_bytes(frame.data)?;
     let payload_len = b.off() - payload_offset;
 
     packet::encrypt_pkt(
@@ -3201,6 +3210,13 @@ fn encode_channel_stream_packet_bytes(
         None,
         seal,
     )
+}
+
+struct BorrowedChannelStreamFrame<'a> {
+    stream_id: u64,
+    offset: u64,
+    fin: bool,
+    data: &'a [u8],
 }
 
 fn encode_channel_packet_header<'a>(
