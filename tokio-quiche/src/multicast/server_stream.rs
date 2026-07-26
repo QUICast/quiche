@@ -721,6 +721,16 @@ impl CompletedStreamSequences {
         }
 
         let sequence = stream_id >> 2;
+        if self
+            .contiguous_end
+            .map_or(sequence == 0, |end| end.checked_add(1) == Some(sequence))
+        {
+            self.contiguous_end = Some(sequence);
+            self.promote_contiguous();
+            self.len = self.len.saturating_add(1);
+            return;
+        }
+
         let mut start = sequence;
         let mut end = sequence;
         if let Some((&previous_start, &previous_end)) =
