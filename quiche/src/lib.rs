@@ -7678,6 +7678,33 @@ impl<F: BufFactory> Connection<F> {
             .collect()
     }
 
+    /// Stops retaining STREAM recovery state for one multicast channel.
+    ///
+    /// Any ranges still awaiting a multicast delivery decision are first
+    /// released through their ordinary QUIC streams. The returned snapshot
+    /// contains the channel's final cumulative delivery metrics. `None` is
+    /// returned when the channel had no STREAM recovery state.
+    ///
+    /// Applications should call this after detaching or retiring a stream
+    /// publisher. Calling it while the publisher is active resets packet-number
+    /// ordering and delivery metrics for subsequent registrations.
+    pub fn multicast_stream_stop_channel(
+        &mut self, channel_id: &[u8],
+    ) -> Result<Option<multicast::StreamDeliveryMetricsSnapshot>> {
+        if !self.is_server || channel_id.is_empty() {
+            return Err(Error::InvalidState);
+        }
+
+        self.multicast_stream_release_channel(channel_id);
+        self.multicast_stream_delivery_metrics_dirty
+            .remove(channel_id);
+
+        Ok(self
+            .multicast_stream_recovery
+            .remove(channel_id)
+            .map(|state| state.delivery_metrics))
+    }
+
     /// Queues a multicast control frame for transmission on the unicast
     /// connection.
     ///

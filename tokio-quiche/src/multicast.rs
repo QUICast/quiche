@@ -2076,6 +2076,24 @@ impl ServerControlRuntime {
         }
     }
 
+    fn stop_stream_publisher(
+        &mut self, qconn: &mut QuicheConnection, channel_id: &[u8],
+    ) -> QuicResult<()> {
+        if let Some(snapshot) = qconn.multicast_stream_stop_channel(channel_id)? {
+            self.fold_stream_delivery_metrics_snapshot(channel_id, snapshot);
+        }
+
+        if let Some(channel) = self.channels.get_mut(channel_id) {
+            channel.stream_publisher = false;
+            channel.stream_delivery_metrics = None;
+            if let Some(queue) = channel.stream_publication_queue.take() {
+                queue.close();
+            }
+        }
+
+        Ok(())
+    }
+
     fn forward_probe_events(
         &mut self, qconn: &mut QuicheConnection,
     ) -> QuicResult<()> {
@@ -2483,15 +2501,13 @@ impl ServerControlRuntime {
                         continue;
                     }
 
-                    self.fold_dirty_stream_delivery_metrics(qconn);
                     self.pending_stream_publications.retain(|publication| {
                         publication.integrity.channel_id != channel_id
                     });
-                    if let Some(channel) = self.channels.get_mut(channel_id) {
-                        channel.stream_publisher = false;
-                        channel.stream_delivery_metrics = None;
-                        channel.stream_publication_queue = None;
-                    }
+                    self.pending_integrities
+                        .retain(|frame| frame.channel_id != channel_id);
+                    self.pending_stream_integrity_batches.remove(channel_id);
+                    self.stop_stream_publisher(qconn, channel_id)?;
                     self.stream_retry_blocked = false;
                 },
 
@@ -2599,9 +2615,9 @@ impl ServerControlRuntime {
                     }
                     self.flush_stream_integrity_batch(&frame.channel_id);
                     self.flush_pending_integrities(qconn)?;
+                    let channel_id = frame.channel_id.clone();
 
-                    let Some(channel) = self.channels.get_mut(&frame.channel_id)
-                    else {
+                    let Some(channel) = self.channels.get_mut(&channel_id) else {
                         return Err(quiche::Error::InvalidState.into());
                     };
                     channel.retired = true;
@@ -2611,7 +2627,7 @@ impl ServerControlRuntime {
 
                     qconn
                         .multicast_process_local_state(quiche::multicast::State {
-                        channel_id: frame.channel_id.clone(),
+                        channel_id: channel_id.clone(),
                         sequence: 0,
                         state: quiche::multicast::ChannelState::Retired,
                         reason_scope:
@@ -2625,6 +2641,7 @@ impl ServerControlRuntime {
                             quiche::multicast::Frame::Retire(frame),
                         )?;
                     }
+                    self.stop_stream_publisher(qconn, &channel_id)?;
                 },
             }
         }
@@ -4358,8 +4375,9 @@ mod tests {
             delivery.fallback_reentry_ranges_total,
             (CLIENT_COUNT * RANGES_PER_PHASE) as u64
         );
-        assert_eq!(profile.tracked_streams, 1);
+        assert_eq!(profile.tracked_streams, 0);
         assert_eq!(profile.finished_streams, 1);
+        assert_eq!(profile.finished_stream_ranges, 1);
         assert_eq!(profile.attached_connections, CLIENT_COUNT);
         assert!(
             profile.preparation_capacity_bytes <
@@ -4376,7 +4394,8 @@ mod tests {
                 "final_recovery_ranges={} direct_ranges={} ",
                 "gap_recovery_ranges={} reentry_ranges={} ",
                 "publisher_tracked_streams={} ",
-                "publisher_finished_streams={}"
+                "publisher_finished_streams={} ",
+                "publisher_finished_stream_ranges={}"
             ),
             CLIENT_COUNT,
             RANGES_PER_PHASE,
@@ -4395,6 +4414,7 @@ mod tests {
             delivery.fallback_reentry_ranges_total,
             profile.tracked_streams,
             profile.finished_streams,
+            profile.finished_stream_ranges,
         );
     }
 
@@ -5262,6 +5282,30 @@ mod tests {
         assert!(matches!(
             publisher.prepare_stream(3, 0, false, b"retired"),
             Err(ServerStreamPublisherError::Retired)
+        ));
+    }
+
+    #[test]
+    fn server_stream_publisher_compacts_finished_streams_and_rejects_reuse() {
+        let publisher =
+            ServerStreamPublisher::new(test_stream_control_config()).unwrap();
+
+        for sequence in 0..100 {
+            let stream_id = (sequence << 2) | 0x3;
+            let publication = publisher
+                .prepare_stream(stream_id, 10, true, b"finished")
+                .unwrap();
+            publisher.commit(publication).unwrap();
+        }
+
+        let profile = publisher.test_profile().unwrap();
+        assert_eq!(profile.tracked_streams, 0);
+        assert_eq!(profile.finished_streams, 100);
+        assert_eq!(profile.finished_stream_ranges, 1);
+        assert_eq!(publisher.next_stream_offset(3).unwrap(), None);
+        assert!(matches!(
+            publisher.prepare_stream(3, 10, false, b"reuse"),
+            Err(ServerStreamPublisherError::StreamFinished { stream_id: 3 })
         ));
     }
 

@@ -203,6 +203,7 @@ impl ServerStreamPublisher {
                 channel,
                 send_state,
                 streams: BTreeMap::new(),
+                finished_streams: CompletedStreamSequences::default(),
                 subscribers: BTreeMap::new(),
                 next_subscriber_id: 0,
                 pending_token: None,
@@ -329,6 +330,7 @@ impl ServerStreamPublisher {
     ///
     /// A newly attached connection can use this to finish any connection-local
     /// unicast catch-up before it begins consuming committed shared ranges.
+    /// Unknown and already-finished streams return `None`.
     pub fn next_stream_offset(
         &self, stream_id: u64,
     ) -> Result<Option<u64>, ServerStreamPublisherError> {
@@ -381,13 +383,10 @@ impl ServerStreamPublisher {
             return Err(ServerStreamPublisherError::PublicationPending);
         }
 
+        if inner.finished_streams.contains(stream_id) {
+            return Err(ServerStreamPublisherError::StreamFinished { stream_id });
+        }
         if let Some(stream) = inner.streams.get(&stream_id) {
-            if stream.finished {
-                return Err(ServerStreamPublisherError::StreamFinished {
-                    stream_id,
-                });
-            }
-
             if stream.next_offset != offset {
                 return Err(ServerStreamPublisherError::NonContiguousOffset {
                     stream_id,
@@ -426,10 +425,9 @@ impl ServerStreamPublisher {
         debug_assert_eq!(output.packet_len, packet_len);
         packet.truncate(output.packet_len);
 
-        inner.streams.insert(stream_id, PublisherStreamState {
-            next_offset: end,
-            finished: fin,
-        });
+        inner
+            .streams
+            .insert(stream_id, PublisherStreamState { next_offset: end });
         inner.max_stream_id = Some(
             inner
                 .max_stream_id
@@ -470,6 +468,8 @@ impl ServerStreamPublisher {
         }
 
         inner.pending_token = None;
+        let finished_stream_id =
+            publication.frame.fin.then_some(publication.frame.stream_id);
         let publication = Arc::new(CommittedServerStreamPublication {
             packet_number: publication.packet_number,
             integrity: publication.integrity,
@@ -478,6 +478,10 @@ impl ServerStreamPublisher {
 
         let commands_sent = inner
             .fanout(ServerStreamPublisherQueueItem::Publication(publication));
+        if let Some(stream_id) = finished_stream_id {
+            inner.streams.remove(&stream_id);
+            inner.finished_streams.insert(stream_id);
+        }
         #[cfg(test)]
         {
             inner.profile.publication_commands_sent = inner
@@ -584,11 +588,9 @@ impl ServerStreamPublisher {
         let inner = self.lock()?;
         let mut profile = inner.profile;
         profile.tracked_streams = inner.streams.len();
-        profile.finished_streams = inner
-            .streams
-            .values()
-            .filter(|stream| stream.finished)
-            .count();
+        profile.finished_streams =
+            usize::try_from(inner.finished_streams.len()).unwrap_or(usize::MAX);
+        profile.finished_stream_ranges = inner.finished_streams.range_count();
         profile.attached_connections = inner.subscribers.len();
 
         Ok(profile)
@@ -640,7 +642,6 @@ impl Drop for ServerStreamAttachment {
 #[derive(Clone, Copy, Debug)]
 struct PublisherStreamState {
     next_offset: u64,
-    finished: bool,
 }
 
 struct ServerStreamPublisherInner {
@@ -648,6 +649,7 @@ struct ServerStreamPublisherInner {
     channel: ServerControlChannelConfig,
     send_state: quiche::multicast::ChannelSendState,
     streams: BTreeMap<u64, PublisherStreamState>,
+    finished_streams: CompletedStreamSequences,
     subscribers: BTreeMap<u64, PublisherSubscriber>,
     next_subscriber_id: u64,
     pending_token: Option<u64>,
@@ -694,6 +696,81 @@ impl ServerStreamPublisherInner {
 struct PublisherSubscriber {
     command_sender: UnboundedSender<ServerControlCommand>,
     publication_queue: Arc<ServerStreamPublisherQueue>,
+}
+
+#[derive(Debug, Default)]
+struct CompletedStreamSequences {
+    contiguous_end: Option<u64>,
+    sparse: BTreeMap<u64, u64>,
+    len: u64,
+}
+
+impl CompletedStreamSequences {
+    fn contains(&self, stream_id: u64) -> bool {
+        let sequence = stream_id >> 2;
+        self.contiguous_end.is_some_and(|end| sequence <= end) ||
+            self.sparse
+                .range(..=sequence)
+                .next_back()
+                .is_some_and(|(_, end)| sequence <= *end)
+    }
+
+    fn insert(&mut self, stream_id: u64) {
+        if self.contains(stream_id) {
+            return;
+        }
+
+        let sequence = stream_id >> 2;
+        let mut start = sequence;
+        let mut end = sequence;
+        if let Some((&previous_start, &previous_end)) =
+            self.sparse.range(..sequence).next_back()
+        {
+            if previous_end.checked_add(1) == Some(sequence) {
+                start = previous_start;
+                self.sparse.remove(&previous_start);
+            }
+        }
+        if let Some((&next_start, &next_end)) =
+            self.sparse.range(sequence.saturating_add(1)..).next()
+        {
+            if sequence.checked_add(1) == Some(next_start) {
+                end = next_end;
+                self.sparse.remove(&next_start);
+            }
+        }
+        self.sparse.insert(start, end);
+        self.len = self.len.saturating_add(1);
+        self.promote_contiguous();
+    }
+
+    fn promote_contiguous(&mut self) {
+        loop {
+            let expected = self
+                .contiguous_end
+                .map_or(Some(0), |end| end.checked_add(1));
+            let Some(expected) = expected else {
+                return;
+            };
+            let Some((&start, &end)) = self.sparse.first_key_value() else {
+                return;
+            };
+            if start != expected {
+                return;
+            }
+
+            self.sparse.remove(&start);
+            self.contiguous_end = Some(end);
+        }
+    }
+
+    fn len(&self) -> u64 {
+        self.len
+    }
+
+    fn range_count(&self) -> usize {
+        self.sparse.len() + usize::from(self.contiguous_end.is_some())
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -785,6 +862,7 @@ pub(super) struct ServerStreamPublisherTestProfile {
     pub(super) publication_commands_sent: u64,
     pub(super) tracked_streams: usize,
     pub(super) finished_streams: usize,
+    pub(super) finished_stream_ranges: usize,
     pub(super) attached_connections: usize,
 }
 
@@ -869,4 +947,46 @@ pub(super) struct CommittedServerStreamPublication {
     pub(super) packet_number: u64,
     pub(super) integrity: quiche::multicast::Integrity,
     pub(super) frame: ServerStreamFrame,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CompletedStreamSequences;
+
+    #[test]
+    fn completed_stream_sequences_compact_one_million_streams() {
+        let mut completed = CompletedStreamSequences::default();
+
+        for sequence in 0..1_000_000 {
+            completed.insert((sequence << 2) | 0x3);
+        }
+
+        assert_eq!(completed.len(), 1_000_000);
+        assert_eq!(completed.range_count(), 1);
+        assert!(completed.contains(3));
+        assert!(completed.contains((999_999 << 2) | 0x3));
+        assert!(!completed.contains((1_000_000 << 2) | 0x3));
+    }
+
+    #[test]
+    fn completed_stream_sequences_preserve_sparse_and_out_of_order_ids() {
+        let mut completed = CompletedStreamSequences::default();
+
+        for sequence in [10, 12, 11, 1, 0, 1] {
+            completed.insert((sequence << 2) | 0x3);
+        }
+
+        assert_eq!(completed.len(), 5);
+        assert_eq!(completed.range_count(), 2);
+        assert!(completed.contains((12 << 2) | 0x3));
+        assert!(!completed.contains((9 << 2) | 0x3));
+
+        for sequence in 2..10 {
+            completed.insert((sequence << 2) | 0x3);
+        }
+
+        assert_eq!(completed.len(), 13);
+        assert_eq!(completed.range_count(), 1);
+        assert!(completed.contains((12 << 2) | 0x3));
+    }
 }
