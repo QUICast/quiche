@@ -1351,6 +1351,54 @@ fn multicast_stream_delivery_metric_updates_are_dirty_driven() {
 }
 
 #[test]
+fn multicast_stream_stop_channel_releases_and_removes_recovery_state() {
+    let mut pipe = multicast_stream_negotiated_pipe();
+    let channel_id = vec![1, 2, 3, 4];
+    let stream_id = 3;
+    multicast_stream_prefix(&mut pipe, stream_id);
+
+    pipe.server
+        .multicast_stream_send(&channel_id, 0, stream_id, 10, b"a", false)
+        .unwrap();
+    pipe.advance().unwrap();
+    pipe.server
+        .multicast_process_peer_ack(multicast_ack_for(&channel_id, 0))
+        .unwrap();
+    pipe.server
+        .multicast_stream_send(&channel_id, 1, stream_id, 11, b"held", true)
+        .unwrap();
+
+    assert_eq!(
+        pipe.server.multicast_stream_stop_channel(&channel_id),
+        Ok(Some(multicast::StreamDeliveryMetricsSnapshot {
+            direct_fallback_ranges_total: 1,
+            direct_fallback_bytes_total: 1,
+            fallback_reentry_ranges_total: 1,
+            fallback_reentry_bytes_total: 4,
+            ..Default::default()
+        }))
+    );
+    assert!(!pipe
+        .server
+        .multicast_stream_recovery
+        .contains_key(&channel_id));
+    assert_eq!(pipe.server.multicast_stream_recovery_withheld_bytes(), 0);
+    assert!(pipe
+        .server
+        .multicast_stream_take_delivery_metric_updates()
+        .is_empty());
+    assert_eq!(
+        pipe.server.multicast_stream_stop_channel(&channel_id),
+        Ok(None)
+    );
+
+    pipe.advance().unwrap();
+    let mut out = [0; 8];
+    assert_eq!(pipe.client.stream_recv(stream_id, &mut out), Ok((5, true)));
+    assert_eq!(&out[..5], b"aheld");
+}
+
+#[test]
 fn multicast_stream_zero_length_fin_counts_one_fallback_range() {
     let mut pipe = multicast_stream_negotiated_pipe();
     let channel_id = vec![1, 2, 3, 4];
