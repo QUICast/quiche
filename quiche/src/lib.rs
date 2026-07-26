@@ -1678,6 +1678,8 @@ struct MulticastStreamRecovery {
     reordering_threshold: u64,
     pending: BTreeMap<u64, MulticastStreamRange>,
     delivery_metrics: multicast::StreamDeliveryMetricsSnapshot,
+    #[cfg(test)]
+    ack_pending_entries_examined: u64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1718,6 +1720,8 @@ impl Default for MulticastStreamRecovery {
                 multicast::DEFAULT_STREAM_RECOVERY_REORDERING_THRESHOLD,
             pending: BTreeMap::new(),
             delivery_metrics: multicast::StreamDeliveryMetricsSnapshot::default(),
+            #[cfg(test)]
+            ack_pending_entries_examined: 0,
         }
     }
 }
@@ -7993,20 +7997,6 @@ impl<F: BufFactory> Connection<F> {
             .largest_acknowledged
             .is_none_or(|largest| frame.largest_acknowledged > largest);
         let threshold = state.reordering_threshold;
-        let actions = state
-            .pending
-            .iter()
-            .filter_map(|(&packet_number, &range)| {
-                let delivered = spans.iter().any(|span| {
-                    span.start <= packet_number && packet_number <= span.end
-                });
-                let lost = fresh &&
-                    packet_number.saturating_add(threshold) <=
-                        frame.largest_acknowledged;
-
-                (delivered || lost).then_some((packet_number, range, delivered))
-            })
-            .collect::<Vec<_>>();
 
         if let Some(state) =
             self.multicast_stream_recovery.get_mut(&frame.channel_id)
@@ -8018,21 +8008,74 @@ impl<F: BufFactory> Connection<F> {
                         largest.max(frame.largest_acknowledged)
                     }),
             );
+        }
 
-            for (packet_number, ..) in &actions {
-                state.pending.remove(packet_number);
+        for span in spans {
+            loop {
+                let delivered = {
+                    let state = self
+                        .multicast_stream_recovery
+                        .get_mut(&frame.channel_id)
+                        .expect("recovery state was checked above");
+                    let packet_number = state
+                        .pending
+                        .range(span.start..=span.end)
+                        .next()
+                        .map(|(&packet_number, _)| packet_number);
+                    #[cfg(test)]
+                    if packet_number.is_some() {
+                        state.ack_pending_entries_examined =
+                            state.ack_pending_entries_examined.saturating_add(1);
+                    }
+                    packet_number.and_then(|packet_number| {
+                        state.pending.remove(&packet_number)
+                    })
+                };
+                let Some(delivered) = delivered else {
+                    break;
+                };
+
+                self.multicast_stream_mark_delivered(delivered);
             }
         }
 
         let mut recovered_ranges = 0_u64;
         let mut recovered_bytes = 0_u64;
-        for (_, range, delivered) in actions {
-            if delivered {
-                self.multicast_stream_mark_delivered(range);
-            } else if self.multicast_stream_release_range(range) {
-                recovered_ranges = recovered_ranges.saturating_add(1);
-                recovered_bytes =
-                    recovered_bytes.saturating_add(range.len as u64);
+        if fresh {
+            loop {
+                let lost = {
+                    let state = self
+                        .multicast_stream_recovery
+                        .get_mut(&frame.channel_id)
+                        .expect("recovery state was checked above");
+                    let packet_number = state
+                        .pending
+                        .first_key_value()
+                        .map(|(&packet_number, _)| packet_number);
+                    #[cfg(test)]
+                    if packet_number.is_some() {
+                        state.ack_pending_entries_examined =
+                            state.ack_pending_entries_examined.saturating_add(1);
+                    }
+
+                    packet_number
+                        .filter(|packet_number| {
+                            packet_number.saturating_add(threshold) <=
+                                frame.largest_acknowledged
+                        })
+                        .and_then(|_| {
+                            state.pending.pop_first().map(|(_, range)| range)
+                        })
+                };
+                let Some(lost) = lost else {
+                    break;
+                };
+
+                if self.multicast_stream_release_range(lost) {
+                    recovered_ranges = recovered_ranges.saturating_add(1);
+                    recovered_bytes =
+                        recovered_bytes.saturating_add(lost.len as u64);
+                }
             }
         }
 
