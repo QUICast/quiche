@@ -75,7 +75,6 @@ const STATE_REASON_UNSPECIFIED_OTHER: u64 = 0x0;
 const STATE_REASON_UNSYNCHRONIZED_PROPERTIES: u64 = 0x5;
 const SERVER_ACK_FRESHNESS_TIMEOUT_MULTIPLIER: u64 = 4;
 const PUBLISH_RETRY_DELAY: Duration = Duration::from_millis(10);
-const CHANNEL_PACKET_BUFFER_LEN: usize = 64 * 1024;
 
 /// A point-in-time multicast receive metrics snapshot for one joined channel.
 #[derive(Clone, Debug)]
@@ -3410,10 +3409,22 @@ impl<B: PublishBackend> ServerRuntime<B> {
                         let _ = qconn.multicast_dgram_send(&channel_id, data);
                     }
 
-                    let mut packet = vec![0; CHANNEL_PACKET_BUFFER_LEN];
+                    let packet_len = match channel.send_state.packet_len(&frames)
+                    {
+                        Ok(packet_len) => packet_len,
+
+                        Err(error) => {
+                            let _ = self.event_sender.send(
+                                ServerEvent::EncodeError { channel_id, error },
+                            );
+                            continue;
+                        },
+                    };
+                    let mut packet = vec![0; packet_len];
 
                     match channel.send_state.write_packet(&frames, &mut packet) {
                         Ok(output) => {
+                            debug_assert_eq!(output.packet_len, packet_len);
                             packet.truncate(output.packet_len);
                             self.pending_publications.push_back(
                                 PendingPublication {
@@ -4354,6 +4365,10 @@ mod tests {
         assert_eq!(profile.tracked_streams, 1);
         assert_eq!(profile.finished_streams, 1);
         assert_eq!(profile.attached_connections, CLIENT_COUNT);
+        assert!(
+            profile.preparation_capacity_bytes <
+                (RANGES_PER_PHASE * 3 * 2048) as u64
+        );
 
         println!(
             concat!(

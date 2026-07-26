@@ -39,7 +39,6 @@ use super::ServerControlChannelConfig;
 use super::ServerControlCommand;
 use super::ServerControlController;
 
-const CHANNEL_PACKET_BUFFER_LEN: usize = 64 * 1024;
 const MAX_STREAM_OFFSET: u64 = 1 << 62;
 
 static NEXT_PUBLISHER_ID: AtomicU64 = AtomicU64::new(1);
@@ -404,7 +403,12 @@ impl ServerStreamPublisher {
             fin,
             data,
         };
-        let mut packet = vec![0; CHANNEL_PACKET_BUFFER_LEN];
+        let packet_len = inner.send_state.stream_packet_len(
+            stream_id,
+            offset,
+            frame.data.len(),
+        )?;
+        let mut packet = vec![0; packet_len];
         #[cfg(test)]
         {
             inner.profile.preparation_capacity_bytes = inner
@@ -412,15 +416,14 @@ impl ServerStreamPublisher {
                 .preparation_capacity_bytes
                 .saturating_add(packet.capacity() as u64);
         }
-        let output = inner.send_state.write_packet(
-            &[quiche::multicast::ChannelFrame::Stream {
-                stream_id,
-                offset,
-                fin,
-                data: frame.data.to_vec(),
-            }],
+        let output = inner.send_state.write_stream_packet(
+            stream_id,
+            offset,
+            fin,
+            &frame.data,
             &mut packet,
         )?;
+        debug_assert_eq!(output.packet_len, packet_len);
         packet.truncate(output.packet_len);
 
         inner.streams.insert(stream_id, PublisherStreamState {
