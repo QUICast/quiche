@@ -1371,6 +1371,68 @@ pub enum ServerEvent {
 /// Event receiver for [`ServerDriver`].
 pub type ServerEventStream = UnboundedReceiver<ServerEvent>;
 
+#[derive(Default)]
+struct ServerEventCoalescer {
+    pending_client_acks: BTreeMap<Vec<u8>, quiche::multicast::Ack>,
+    last_client_ack_largest: BTreeMap<Vec<u8>, u64>,
+    last_probe_events: BTreeMap<Vec<u8>, quiche::multicast::ProbeEvent>,
+}
+
+impl ServerEventCoalescer {
+    fn queue_client_ack(&mut self, frame: quiche::multicast::Ack) {
+        if self
+            .last_client_ack_largest
+            .get(&frame.channel_id)
+            .is_some_and(|largest| frame.largest_acknowledged <= *largest)
+        {
+            return;
+        }
+
+        match self.pending_client_acks.entry(frame.channel_id.clone()) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(frame);
+            },
+
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                if frame.largest_acknowledged > entry.get().largest_acknowledged {
+                    entry.insert(frame);
+                }
+            },
+        }
+    }
+
+    fn flush_client_acks(&mut self, event_sender: &UnboundedSender<ServerEvent>) {
+        for (channel_id, frame) in std::mem::take(&mut self.pending_client_acks) {
+            self.last_client_ack_largest
+                .insert(channel_id, frame.largest_acknowledged);
+            let _ = event_sender.send(ServerEvent::ClientAck(frame));
+        }
+    }
+
+    fn forward_probe_event(
+        &mut self, event_sender: &UnboundedSender<ServerEvent>,
+        event: quiche::multicast::ProbeEvent,
+    ) {
+        if self
+            .last_probe_events
+            .get(&event.channel_id)
+            .is_some_and(|previous| previous == &event)
+        {
+            return;
+        }
+
+        self.last_probe_events
+            .insert(event.channel_id.clone(), event.clone());
+        let _ = event_sender.send(ServerEvent::ProbeStatusChanged(event));
+    }
+
+    fn clear(&mut self) {
+        self.pending_client_acks.clear();
+        self.last_client_ack_largest.clear();
+        self.last_probe_events.clear();
+    }
+}
+
 /// Handle for consuming multicast control events and relaying integrity from
 /// an external multicast sender.
 pub struct ServerControlController {
@@ -1794,6 +1856,7 @@ struct ServerControlRuntime {
         BTreeMap<Vec<u8>, PendingStreamIntegrityBatch>,
     channels: BTreeMap<Vec<u8>, ServerControlChannel>,
     last_client_limits: Option<quiche::multicast::Limits>,
+    event_coalescer: ServerEventCoalescer,
     #[cfg(test)]
     stream_delivery_metric_fold_attempts: u64,
 }
@@ -1815,6 +1878,7 @@ impl ServerControlRuntime {
             pending_stream_integrity_batches: BTreeMap::new(),
             channels: BTreeMap::new(),
             last_client_limits: None,
+            event_coalescer: ServerEventCoalescer::default(),
             #[cfg(test)]
             stream_delivery_metric_fold_attempts: 0,
         }
@@ -1828,6 +1892,7 @@ impl ServerControlRuntime {
         self.pending_stream_integrity_batches.clear();
         self.channels.clear();
         self.last_client_limits = None;
+        self.event_coalescer.clear();
 
         while self.command_receiver.try_recv().is_ok() {}
     }
@@ -1900,16 +1965,21 @@ impl ServerControlRuntime {
     }
 
     fn process_reads(&mut self, qconn: &mut QuicheConnection) -> QuicResult<()> {
-        loop {
+        let result: QuicResult<()> = loop {
             match qconn.multicast_recv() {
-                Ok(frame) => self.handle_frame(qconn, frame)?,
+                Ok(frame) =>
+                    if let Err(error) = self.handle_frame(qconn, frame) {
+                        break Err(error);
+                    },
 
-                Err(quiche::Error::Done) => break,
+                Err(quiche::Error::Done) => break Ok(()),
 
-                Err(err) => return Err(err.into()),
+                Err(err) => break Err(err.into()),
             }
-        }
+        };
 
+        self.event_coalescer.flush_client_acks(&self.event_sender);
+        result?;
         self.fold_all_stream_delivery_metrics(qconn);
         self.forward_probe_events(qconn)
     }
@@ -1989,14 +2059,13 @@ impl ServerControlRuntime {
     }
 
     fn forward_probe_events(
-        &self, qconn: &mut QuicheConnection,
+        &mut self, qconn: &mut QuicheConnection,
     ) -> QuicResult<()> {
         loop {
             match qconn.multicast_probe_recv() {
                 Ok(event) => {
-                    let _ = self
-                        .event_sender
-                        .send(ServerEvent::ProbeStatusChanged(event));
+                    self.event_coalescer
+                        .forward_probe_event(&self.event_sender, event);
                 },
 
                 Err(quiche::Error::Done) => return Ok(()),
@@ -2060,7 +2129,7 @@ impl ServerControlRuntime {
                     qconn.multicast_process_peer_ack(frame.clone())?;
                     self.fold_stream_delivery_metrics(qconn, &frame.channel_id);
                 }
-                let _ = self.event_sender.send(ServerEvent::ClientAck(frame));
+                self.event_coalescer.queue_client_ack(frame);
             },
 
             quiche::multicast::Frame::Announce(..) |
@@ -2983,6 +3052,7 @@ struct ServerRuntime<B: PublishBackend> {
     publish_retry_deadline: Option<Instant>,
     channels: BTreeMap<Vec<u8>, ServerChannel<B::Publication>>,
     backend: B,
+    event_coalescer: ServerEventCoalescer,
 }
 
 impl ServerRuntime<MctxPublishBackend> {
@@ -3014,6 +3084,7 @@ impl<B: PublishBackend> ServerRuntime<B> {
             publish_retry_deadline: None,
             channels: BTreeMap::new(),
             backend,
+            event_coalescer: ServerEventCoalescer::default(),
         }
     }
 
@@ -3023,6 +3094,7 @@ impl<B: PublishBackend> ServerRuntime<B> {
         self.pending_integrities.clear();
         self.publish_retry_deadline = None;
         self.channels.clear();
+        self.event_coalescer.clear();
 
         while self.command_receiver.try_recv().is_ok() {}
     }
@@ -3088,15 +3160,21 @@ impl<B: PublishBackend> ServerRuntime<B> {
     }
 
     fn process_reads(&mut self, qconn: &mut QuicheConnection) -> QuicResult<()> {
-        loop {
+        let result: QuicResult<()> = loop {
             match qconn.multicast_recv() {
-                Ok(frame) => self.handle_frame(qconn, frame)?,
+                Ok(frame) =>
+                    if let Err(error) = self.handle_frame(qconn, frame) {
+                        break Err(error);
+                    },
 
-                Err(quiche::Error::Done) => return Ok(()),
+                Err(quiche::Error::Done) => break Ok(()),
 
-                Err(err) => return Err(err.into()),
+                Err(err) => break Err(err.into()),
             }
-        }
+        };
+
+        self.event_coalescer.flush_client_acks(&self.event_sender);
+        result
     }
 
     fn process_writes(&mut self, qconn: &mut QuicheConnection) -> QuicResult<()> {
@@ -3172,7 +3250,7 @@ impl<B: PublishBackend> ServerRuntime<B> {
                     qconn.multicast_process_peer_ack(frame.clone())?;
                 }
 
-                let _ = self.event_sender.send(ServerEvent::ClientAck(frame));
+                self.event_coalescer.queue_client_ack(frame);
             },
 
             quiche::multicast::Frame::Announce(..) |
@@ -5814,6 +5892,106 @@ mod tests {
         assert_eq!(metrics.acked_packets_reported, 3);
         assert_eq!(metrics.ack_errors, 0);
         assert_eq!(metrics.largest_acknowledged, Some(7));
+    }
+
+    #[test]
+    fn server_runtime_processes_all_acks_and_coalesces_notifications() {
+        let settings = test_settings();
+        let server_settings = test_server_settings();
+        let mut pipe = test_pipe(&settings);
+        let backend = FakePublishBackend::default();
+        let (_command_sender, command_receiver) = mpsc::unbounded_channel();
+        let (event_sender, mut event_receiver) = mpsc::unbounded_channel();
+        let mut runtime = ServerRuntime::with_backend(
+            server_settings,
+            event_sender,
+            command_receiver,
+            backend,
+        );
+        let ack = |largest_acknowledged| quiche::multicast::Ack {
+            channel_id: vec![1, 2, 3, 4],
+            largest_acknowledged,
+            ack_delay: 0,
+            first_ack_range: 0,
+            ack_ranges: Vec::new(),
+            ecn_counts: None,
+        };
+
+        runtime.on_conn_established(&mut pipe.server).unwrap();
+        let mut out = [0; 256];
+        let channel = runtime.channels.get_mut(&[1, 2, 3, 4][..]).unwrap();
+        for _ in 0..8 {
+            channel
+                .send_state
+                .write_packet(&[quiche::multicast::ChannelFrame::Ping], &mut out)
+                .unwrap();
+        }
+
+        for frame in [ack(5), ack(5), ack(7)] {
+            pipe.client
+                .multicast_send(quiche::multicast::Frame::Ack(frame))
+                .unwrap();
+        }
+        let flight = quiche::test_utils::emit_flight(&mut pipe.client).unwrap();
+        quiche::test_utils::process_flight(&mut pipe.server, flight).unwrap();
+        runtime.process_reads(&mut pipe.server).unwrap();
+
+        assert!(matches!(
+            event_receiver.try_recv(),
+            Ok(ServerEvent::ClientAck(frame))
+                if frame.largest_acknowledged == 7
+        ));
+        assert!(event_receiver.try_recv().is_err());
+
+        pipe.client
+            .multicast_send(quiche::multicast::Frame::Ack(ack(7)))
+            .unwrap();
+        let flight = quiche::test_utils::emit_flight(&mut pipe.client).unwrap();
+        quiche::test_utils::process_flight(&mut pipe.server, flight).unwrap();
+        runtime.process_reads(&mut pipe.server).unwrap();
+        assert!(event_receiver.try_recv().is_err());
+
+        let metrics = runtime
+            .channels
+            .get([1, 2, 3, 4].as_slice())
+            .unwrap()
+            .send_state
+            .metrics_snapshot();
+        assert_eq!(metrics.ack_frames_processed, 4);
+        assert_eq!(metrics.largest_acknowledged, Some(7));
+    }
+
+    #[test]
+    fn server_event_coalescer_suppresses_identical_probe_events() {
+        let (event_sender, mut event_receiver) = mpsc::unbounded_channel();
+        let mut coalescer = ServerEventCoalescer::default();
+        let event = quiche::multicast::ProbeEvent {
+            channel_id: vec![1, 2, 3, 4],
+            status: quiche::multicast::ProbeStatus::Probing,
+            reason_scope: Some(quiche::multicast::StateReasonScope::Transport),
+            reason_code: Some(
+                quiche::multicast::STATE_REASON_REQUESTED_BY_SERVER,
+            ),
+            reason_phrase: Vec::new(),
+        };
+
+        coalescer.forward_probe_event(&event_sender, event.clone());
+        coalescer.forward_probe_event(&event_sender, event.clone());
+
+        assert!(matches!(
+            event_receiver.try_recv(),
+            Ok(ServerEvent::ProbeStatusChanged(received)) if received == event
+        ));
+        assert!(event_receiver.try_recv().is_err());
+
+        let mut changed = event;
+        changed.reason_phrase = b"path changed".to_vec();
+        coalescer.forward_probe_event(&event_sender, changed.clone());
+        assert!(matches!(
+            event_receiver.try_recv(),
+            Ok(ServerEvent::ProbeStatusChanged(received))
+                if received == changed
+        ));
     }
 
     #[test]
