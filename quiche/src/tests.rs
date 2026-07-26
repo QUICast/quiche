@@ -1167,6 +1167,55 @@ fn multicast_stream_ack_gap_recovers_exact_missing_ranges() {
 }
 
 #[test]
+fn multicast_stream_ack_uses_ordered_pending_ranges() {
+    let mut pipe = multicast_stream_negotiated_pipe();
+    let channel_id = vec![1, 2, 3, 4];
+    let stream_id = 3;
+    multicast_stream_prefix(&mut pipe, stream_id);
+
+    pipe.server
+        .multicast_stream_send(&channel_id, 0, stream_id, 10, b"x", false)
+        .unwrap();
+    pipe.server
+        .multicast_process_peer_ack(multicast_ack_for(&channel_id, 0))
+        .unwrap();
+    pipe.server
+        .multicast_set_stream_recovery_reordering_threshold(&channel_id, 2000)
+        .unwrap();
+
+    for packet_number in 1..=1000 {
+        pipe.server
+            .multicast_stream_send(
+                &channel_id,
+                packet_number,
+                stream_id,
+                10 + packet_number,
+                b"x",
+                false,
+            )
+            .unwrap();
+    }
+    pipe.server
+        .multicast_process_peer_ack(multicast::Ack {
+            channel_id: channel_id.clone(),
+            largest_acknowledged: 1000,
+            ack_delay: 0,
+            first_ack_range: 0,
+            ack_ranges: vec![multicast::AckRange {
+                gap: 498,
+                ack_range_length: 0,
+            }],
+            ecn_counts: None,
+        })
+        .unwrap();
+
+    let recovery = &pipe.server.multicast_stream_recovery[&channel_id];
+    assert_eq!(recovery.pending.len(), 998);
+    assert_eq!(recovery.ack_pending_entries_examined, 3);
+    assert_eq!(pipe.server.multicast_stream_recovery_withheld_bytes(), 998);
+}
+
+#[test]
 fn multicast_stream_fallback_reentry_releases_pending_ranges() {
     let mut pipe = multicast_stream_negotiated_pipe();
     let channel_id = vec![1, 2, 3, 4];
