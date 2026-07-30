@@ -1104,6 +1104,22 @@ pub struct ChannelPacket {
     pub frames: Vec<ChannelFrame>,
 }
 
+/// Packet metadata produced without external integrity information.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChannelPacketOutput {
+    /// The packet number used in the encoded channel packet.
+    pub packet_number: u64,
+
+    /// The key sequence used to encrypt the packet.
+    pub key_sequence: u64,
+
+    /// The short-header key phase bit encoded into the packet.
+    pub key_phase: bool,
+
+    /// The number of bytes written into the caller's output buffer.
+    pub packet_len: usize,
+}
+
 /// The result of encoding one multicast channel packet.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChannelSendOutput {
@@ -1137,6 +1153,9 @@ pub struct ChannelSendMetricsSnapshot {
 
     /// Total channel frames encoded into multicast packets.
     pub frames_encoded: u64,
+
+    /// Total packet-integrity hashes computed for `MC_INTEGRITY` payloads.
+    pub integrity_hash_operations: u64,
 
     /// Total successful payload-protection key updates.
     pub key_updates: u64,
@@ -1181,6 +1200,10 @@ pub struct ChannelSendMetricsDelta {
 
     /// Change in [`ChannelSendMetricsSnapshot::frames_encoded`].
     pub frames_encoded: u64,
+
+    /// Change in
+    /// [`ChannelSendMetricsSnapshot::integrity_hash_operations`].
+    pub integrity_hash_operations: u64,
 
     /// Change in [`ChannelSendMetricsSnapshot::key_updates`].
     pub key_updates: u64,
@@ -1310,6 +1333,9 @@ impl ChannelSendMetricsDelta {
             frames_encoded: after
                 .frames_encoded
                 .saturating_sub(before.frames_encoded),
+            integrity_hash_operations: after
+                .integrity_hash_operations
+                .saturating_sub(before.integrity_hash_operations),
             key_updates: after.key_updates.saturating_sub(before.key_updates),
             encode_errors: after
                 .encode_errors
@@ -1561,6 +1587,21 @@ impl ChannelSendState {
     pub fn write_packet(
         &mut self, frames: &[ChannelFrame], out: &mut [u8],
     ) -> Result<ChannelSendOutput> {
+        let output = self.write_packet_without_integrity(frames, out)?;
+        Ok(self.attach_integrity(output, out))
+    }
+
+    /// Encodes one multicast packet without computing `MC_INTEGRITY`.
+    ///
+    /// This is intended for delivery profiles that deliberately provide
+    /// integrity association through another mechanism. The packet still has
+    /// ordinary channel AEAD and header protection, but receivers cannot
+    /// release it through [`ChannelReceiveState`] until matching integrity
+    /// metadata is supplied. Callers must not describe this output as
+    /// independently source-authenticated.
+    pub fn write_packet_without_integrity(
+        &mut self, frames: &[ChannelFrame], out: &mut [u8],
+    ) -> Result<ChannelPacketOutput> {
         self.write_packet_inner(
             out,
             frames.len(),
@@ -1586,11 +1627,13 @@ impl ChannelSendState {
             fin,
             data,
         };
-        self.write_packet_inner(out, 1, |announce, seal, pn, phase, out| {
-            encode_channel_stream_packet_bytes(
-                announce, seal, pn, phase, &frame, out,
-            )
-        })
+        let output =
+            self.write_packet_inner(out, 1, |announce, seal, pn, phase, out| {
+                encode_channel_stream_packet_bytes(
+                    announce, seal, pn, phase, &frame, out,
+                )
+            })?;
+        Ok(self.attach_integrity(output, out))
     }
 
     fn write_packet_inner(
@@ -1602,7 +1645,7 @@ impl ChannelSendState {
             bool,
             &mut [u8],
         ) -> Result<usize>,
-    ) -> Result<ChannelSendOutput> {
+    ) -> Result<ChannelPacketOutput> {
         self.metrics.write_calls = self.metrics.write_calls.saturating_add(1);
         let packet_number = self.next_packet_number;
         let key_phase = self.key.key_sequence % 2 == 1;
@@ -1621,8 +1664,6 @@ impl ChannelSendState {
                 return Err(error);
             },
         };
-        let packet = &out[..packet_len];
-
         self.next_packet_number += 1;
         self.metrics.packets_encoded =
             self.metrics.packets_encoded.saturating_add(1);
@@ -1634,18 +1675,33 @@ impl ChannelSendState {
             .saturating_add(frame_count as u64);
         self.metrics.last_packet_number = Some(packet_number);
 
-        Ok(ChannelSendOutput {
+        Ok(ChannelPacketOutput {
             packet_number,
             key_sequence: self.key.key_sequence,
             key_phase,
             packet_len,
+        })
+    }
+
+    fn attach_integrity(
+        &mut self, output: ChannelPacketOutput, packet: &[u8],
+    ) -> ChannelSendOutput {
+        self.metrics.integrity_hash_operations =
+            self.metrics.integrity_hash_operations.saturating_add(1);
+        ChannelSendOutput {
+            packet_number: output.packet_number,
+            key_sequence: output.key_sequence,
+            key_phase: output.key_phase,
+            packet_len: output.packet_len,
             integrity: Integrity {
                 channel_id: self.announce.channel_id.clone(),
-                packet_number_start: packet_number,
+                packet_number_start: output.packet_number,
                 packet_hash_count: Some(1),
-                packet_hashes: self.integrity_hash.hash(packet),
+                packet_hashes: self
+                    .integrity_hash
+                    .hash(&packet[..output.packet_len]),
             },
-        })
+        }
     }
 }
 
@@ -2394,6 +2450,7 @@ struct ChannelSendMetricsState {
     packets_encoded: u64,
     bytes_encoded: u64,
     frames_encoded: u64,
+    integrity_hash_operations: u64,
     key_updates: u64,
     encode_errors: u64,
     ack_frames_processed: u64,
@@ -2411,6 +2468,7 @@ impl ChannelSendMetricsState {
             packets_encoded: self.packets_encoded,
             bytes_encoded: self.bytes_encoded,
             frames_encoded: self.frames_encoded,
+            integrity_hash_operations: self.integrity_hash_operations,
             key_updates: self.key_updates,
             encode_errors: self.encode_errors,
             ack_frames_processed: self.ack_frames_processed,
@@ -3909,6 +3967,7 @@ mod tests {
             packets_encoded: 1,
             bytes_encoded: send_metrics.bytes_encoded,
             frames_encoded: 1,
+            integrity_hash_operations: 1,
             key_updates: 0,
             encode_errors: 0,
             ack_frames_processed: 0,
@@ -4005,6 +4064,49 @@ mod tests {
         assert_eq!(borrowed_output.packet_len, borrowed_len);
         assert_eq!(owned_packet, borrowed_packet);
         assert_eq!(owned_output.integrity, borrowed_output.integrity);
+    }
+
+    #[test]
+    fn channel_packet_can_omit_external_integrity_work() {
+        let announce = test_announce();
+        let key = test_key(&announce.channel_id);
+        let frames = [ChannelFrame::Datagram {
+            data: b"group-protected payload".to_vec(),
+        }];
+        let mut with_integrity =
+            ChannelSendState::new(announce.clone(), key.clone()).unwrap();
+        let mut without_integrity = ChannelSendState::new(announce, key).unwrap();
+        let mut protected = [0; 256];
+        let mut protected_without_integrity = [0; 256];
+
+        let full = with_integrity
+            .write_packet(&frames, &mut protected)
+            .unwrap();
+        let packet_only = without_integrity
+            .write_packet_without_integrity(
+                &frames,
+                &mut protected_without_integrity,
+            )
+            .unwrap();
+
+        assert_eq!(full.packet_number, packet_only.packet_number);
+        assert_eq!(full.key_sequence, packet_only.key_sequence);
+        assert_eq!(full.key_phase, packet_only.key_phase);
+        assert_eq!(full.packet_len, packet_only.packet_len);
+        assert_eq!(
+            &protected[..full.packet_len],
+            &protected_without_integrity[..packet_only.packet_len]
+        );
+        assert_eq!(
+            with_integrity.metrics_snapshot().integrity_hash_operations,
+            1
+        );
+        assert_eq!(
+            without_integrity
+                .metrics_snapshot()
+                .integrity_hash_operations,
+            0
+        );
     }
 
     #[test]
@@ -4173,6 +4275,7 @@ mod tests {
             packets_encoded: 1,
             bytes_encoded: after.bytes_encoded,
             frames_encoded: 1,
+            integrity_hash_operations: 1,
             key_updates: 0,
             encode_errors: 0,
             ack_frames_processed: 0,
