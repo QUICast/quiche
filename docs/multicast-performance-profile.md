@@ -1,196 +1,324 @@
-# MCQUIC Server STREAM Performance And Corrective Pass
+# MCQUIC Resource And Performance Profile
 
 ## Scope
 
-This report covers the performance pass from baseline commit `54684d20`
-through review commit `6d7e917c` and its lifecycle corrective follow-up. The
-wire format, cryptography, congestion control, WebTransport offsets, and
-unicast fallback semantics are unchanged.
+This report covers the correctness/resource pass after baseline `c779bb98`.
+It measures the structures that can grow with multicast packet reordering,
+missing ACKs, key rotation, shared publisher fanout, and stalled connections.
+It does not include TLS setup, socket throughput, kernel multicast behavior, or
+media encoding.
 
-Changed files:
+The implementation keeps socket ownership outside quiche and uses shared
+`Bytes` for STREAM publication fanout. Queue byte counters are deliberately
+logical retained bytes per connection or attachment. They represent overload
+risk and recovery obligations, not necessarily unique allocator-backed payload
+bytes.
 
-- `quiche/src/lib.rs`: ordered ACK recovery, dirty delivery metrics, and
-  explicit recovery-state retirement.
-- `quiche/src/multicast.rs`: exact packet sizing and borrowed STREAM encoding.
-- `quiche/src/stream/mod.rs`: generic completed-stream chunk tracking.
-- `quiche/src/tests.rs`: core fallback, recovery, metrics, and lifetime tests.
-- `tokio-quiche/src/multicast.rs`: event coalescing, edge-triggered publication
-  draining, dirty metrics, lifecycle cleanup, and the profile harness.
-- `tokio-quiche/src/multicast/server_stream.rs`: shared publisher queues,
-  exact packet preparation, ordered detach barriers, and compact
-  completed-stream tracking.
+## Default Bounds
 
-The `StreamMap` change in `4ec488bc` is generic basic QUIC behavior. All other
-production changes in this pass are MCQUIC-specific.
-
-## Reproducible Workload
-
-The ignored deterministic test
-`server_stream_publisher_profiles_eighty_connections` creates 80 in-memory QUIC
-client/server pairs. Every connection writes its own 10-byte WebTransport
-prefix. One shared publisher then commits three bursts of 32 ranges, each with
-a 1,024-byte payload:
-
-1. `Joined` without `MC_ACK`, so ordinary unicast fallback remains active.
-2. One advancing `MC_ACK` per client, followed by a multicast-green burst.
-3. `Left` on every client, followed by fallback re-entry and a final FIN.
-
-Run it with:
-
-```bash
-cargo test -p tokio-quiche --lib --features multicast \
-  server_stream_publisher_profiles_eighty_connections -- \
-  --ignored --nocapture
-```
-
-The longer
-`server_stream_publisher_profiles_established_connections` test excludes TLS
-fixture creation from its timer. After all 80 connections are established and
-multicast-green, it publishes four rounds of 4,096 24-byte ranges. Each round
-is ACKed before the next starts, bounding retained recovery at 327,680 entries
-while performing 1,310,720 connection-local registrations:
-
-```bash
-cargo test --release -p tokio-quiche --lib --features multicast \
-  server_stream_publisher_profiles_established_connections -- \
-  --ignored --nocapture
-```
-
-CPU and memory were measured by launching the already-built test binary from
-`tokio-quiche/` under `/usr/bin/time -l`. CPU samples were captured with the
-macOS Time Profiler. The traces are:
-
-- `/tmp/mcquic-baseline-time-valid.trace`
-- `/tmp/mcquic-post-time.trace`
-
-The Instruments Allocations template did not attach reliably to this short
-test process. Allocation improvement is therefore demonstrated by an exact
-test counter over preparation-buffer capacity, not an inferred wall-clock
-allocation count.
-
-## Before And After
-
-| Metric | Baseline | Final | Result |
-| --- | ---: | ---: | ---: |
-| Publisher notification commands | 7,680 | 240 | -96.88% |
-| Task wake calls | 240 | 240 | unchanged |
-| Preparation-buffer capacity | 6,291,456 B | 101,439 B | -98.39% |
-| Delivery metric fold attempts | 8,800 | 240 | -97.27% |
-| Connection-local registrations | 7,680 | 7,680 | required work unchanged |
-| Peak retained recovery ranges | 2,560 | 2,560 | semantics unchanged |
-| Final retained recovery ranges | 0 | 0 | bounded |
-| Active publisher stream entries after FIN | 1 | 0 | removed |
-| Compact publisher completion storage units | n/a | 1 | bounded |
-| Application ACK events | 80 | 80 | no duplicates in workload |
-| Application probe events | 240 | 240 | no duplicates in workload |
-| Wall time | 1.92 s | 1.67-1.69 s | about -12% |
-| User CPU | 1.62 s | 1.58-1.59 s | slightly lower |
-| System CPU | 0.15 s | 0.06-0.07 s | materially lower |
-| Maximum RSS | 149,635,072 B | 149,389,312-149,422,080 B | effectively flat |
-
-The macOS `peak memory footprint` counter was not stable between runs even
-though maximum RSS was stable, so it is not used as evidence.
-
-Targeted event tests process four valid ACK frames internally while forwarding
-the two distinct `ClientAck` frames and suppressing exact duplicates. An ACK
-whose largest packet number is unchanged but whose lower ranges differ is
-preserved. Coalescer history is reset when a channel generation is replaced.
-Probe tests forward one copy of two identical events within one generation.
-The ordered ACK test starts with 1,000 pending packets, examines three map
-entries for two sparse ACK hits plus the loss boundary, and leaves the expected
-998 pending packets.
-
-Both publisher and generic completion tests insert one million sequential
-server-unidirectional stream IDs and retain one prefix marker. Interleaved
-million-stream tests retain fewer than 2,000 fixed-size chunks rather than one
-tree node per completed stream. Sparse high IDs, out-of-order completion, all
-four stream spaces, stream limits, and recreation rejection remain covered.
-
-## Corrective Lifecycle Pass
-
-The post-review pass adds coverage for cases the first profile did not model:
-
-- Dropping a live attachment seals its queue against future fanout, drains
-  already committed publications and FIN in order, waits through stream-offset
-  backpressure, then releases recovery state.
-- Detach and channel reuse start a fresh probe generation. Prior `Viable`
-  state cannot suppress fallback, and an ACK from the previous publication
-  generation cannot make the replacement green.
-- Publisher and generic completed-stream tracking use 1,024-bit chunks that
-  begin sparse and become dense at 32 entries.
-- Distinct ACK frames are no longer conflated solely because their largest
-  packet number is unchanged.
-- Exact-size preflight failures increment `encode_errors` even when packet
-  writing is never attempted.
-
-## Time Profiler
-
-The sampled test is dominated by fixture setup, not multicast recovery:
-
-| Inclusive sampled CPU | Baseline | Final |
+| Resource | Items | Logical retained bytes |
 | --- | ---: | ---: |
-| Total | 1,646 ms | 1,642 ms |
-| `quiche::tls::Context::new` | 1,248 ms | 1,242 ms |
-| `ServerControlRuntime::process_writes` | 15 ms | 12 ms |
-| `flush_pending_stream_publications` | 10 ms | 6 ms |
-| `multicast_stream_send_buf` | 8 ms | 4 ms |
-| `ServerStreamPublisher::commit` | 3 ms | 1 ms |
-| Delivery metric folding | 2 ms | 1 ms |
+| Core outgoing multicast control | 1,024 | 2 MiB |
+| Connection-lifetime Channel IDs | 1,024 | At most 20 KiB ID payload |
+| Pending encrypted receive packets | 4,096 | 8 MiB |
+| Pending receive integrity | 8,192 | 1 MiB |
+| Core STREAM recovery, connection | 65,536 ranges | 64 MiB |
+| Core STREAM recovery, channel | 16,384 ranges | 16 MiB |
+| Tokio events | 4,096 | 64 MiB |
+| Tokio commands | 4,096 | 64 MiB |
+| Tokio receive ingress | 4,096 | 64 MiB |
+| Tokio pending publications | 4,096 | 64 MiB |
+| Tokio pending integrity | 8,192 | 8 MiB |
+| Publisher attachment queue | 4,096 | 8 MiB |
+| Publisher active streams | 65,536 | Stream-state dependent |
+| Publisher completed-stream history | 4,096 storage units | Representation dependent |
 
-The short profile cannot support a catalogue decision because TLS setup
-dominates its samples. The established-connection profile addresses that
-limitation:
+The receive decoder performs at most 256 indexed operations and releases at
+most 128 packet/error events per convenience input call. Its budget-aware
+entry points let Tokio admit one packet, key, or integrity frame without
+opening a nested 256-operation drain.
 
-| Build | Measured steady-state | Per registration | Whole test |
-| --- | ---: | ---: | ---: |
-| Debug | 3.911 s | 2,984 ns | 5.60 s |
-| Release | 417.329 ms | 318 ns | 0.87 s |
+Each complete Tokio multicast driver callback has one aggregate 256-unit
+budget. One unit is one successful scheduled work-class operation: a control
+frame handled; an ingress, command, publisher, publication, integrity, or
+pending-control item transferred or handled; a standalone core maintenance
+operation; or an ACK, metric, or probe forwarded. Ingress/control processing
+includes its one core receive admission. Readiness scans and unsuccessful class
+attempts are free. Class and Channel-ID continuation cursors rotate across
+callbacks.
 
-The timer starts after TLS setup, stream-prefix construction, attachment, and
-the first successful ACK. It includes publication fanout, connection-local
-registration, integrity batching, and ACK processing.
+Permits remain charged when an item moves from a bounded Tokio channel to
+runtime staging. Pending integrity batches and ready integrity frames share one
+budget. Attachment-to-runtime staging removes only the admitted ordered prefix,
+restores any rejected suffix with exact byte accounting, and never creates a
+hidden unbounded transfer queue. One attachment item may retain at most 64 KiB;
+the configured attachment byte budget must be at least 128 KiB. Each
+asynchronous multicast ingress producer can own one packet outside queue
+accounting while it waits for capacity; that packet is not duplicated.
 
-This result still does not justify a shared recovery catalogue. `Bytes`
-already shares payload backing across connections, while stream offsets, flow
-control, ACK progress, loss decisions, reset handling, and teardown are
-connection-local. At 318 ns per registration in this synthetic release
-workload, a catalogue would add synchronization and lifecycle complexity
-without removing the dominant required state. Revisit this only if a
-production release profile identifies registration lookup or per-connection
-range metadata as a leading cost.
+## Release Probes
 
-The short profile's unchanged 2,560-range peak is intentional: each green
-connection retains
-32 ranges until ACK, loss recovery, or fallback re-entry. A longer production
-profile with delayed or missing ACKs is the next useful memory-scaling test.
+All probes are deterministic ignored tests so normal test runs stay fast.
+Timing rows are one local run and are intentionally secondary to deterministic
+item, byte, work, and progress assertions.
 
-## Commits
+### Aggregate Scheduler Scaling
 
-- `99f4e90f` tests: add MCQUIC connection profile harness
-- `e371189c` perf: coalesce multicast server events
-- `1ffc2a2a` perf: edge-trigger stream publication fanout
-- `84ad3aa4` perf: right-size multicast packet preparation
-- `be245511` perf: match multicast ACKs against ordered ranges
-- `e6b6a1fe` perf: fold multicast delivery metrics on change
-- `94d2fdf3` perf: retire multicast stream state
-- `ef4d761b` perf: fast-path completed publisher streams
-- `4ec488bc` perf: compact collected stream tracking
-- `7828d107` tests: count multicast stream registrations
-- `4359ea47` refactor: tidy multicast stream encoding
+Run:
 
-## Verification
+```bash
+cargo test --release -p tokio-quiche --features multicast --lib \
+  aggregate_scheduler_scaling_release_probe -- --ignored --nocapture
+```
 
-- `cargo test -p quiche multicast`: 64 passed.
-- The same 64 multicast tests passed with
-  `--no-default-features --features boringssl-boring-crate`.
-- Generic collected-stream chunk tests: 4 passed, including one million
-  sequential, one million interleaved, and dense-to-prefix promotion.
-- `cargo test -p tokio-quiche --features multicast -- --test-threads=1`: 99
-  library passed, 2 ignored profiles; 19 integration passed; 1 doc test passed.
-- Both ignored profiles passed explicitly. The established profile passed in
-  debug and release builds.
-- Strict clippy with `-D warnings`: passed for `quiche` tests with
-  `boringssl-boring-crate` and `tokio-quiche` tests with `multicast`.
-- Yggdrasil `cargo test --locked --features tokio-quiche-interop`: 232 library
-  tests and 1 CLI integration test passed. Its worktree remained clean.
-- `cargo +nightly fmt -- --check` and `git diff --check`: passed.
+| Complete callback | Active channels | Calls | Total | Per call | Peak work |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Client `process_reads` | 1 | 1 | 65 us | 65 us | 2 |
+| Client `process_reads` | 128 | 1 | 106 us | 106 us | 256 |
+| Client `process_reads` | 1,024 | 8 | 879 us | 109 us | 256 |
+| Control server `process_writes` | 1 | 1 | 15 us | 15 us | 3 |
+| Control server `process_writes` | 128 | 2 | 186 us | 93 us | 256 |
+| Control server `process_writes` | 1,024 | 12 | 2,545 us | 212 us | 256 |
+
+These are complete callback invocations with the real work-class scheduler, not
+helper-level maintenance/staging calls. For `K` continuously ready classes and
+budget `B`, every class receives a successful turn within `ceil(K / B)`
+callbacks. A class containing `N` continuously ready channels reaches every
+channel within the conservative `N * ceil(K / B)` callback bound. If it is the
+only ready class, this tightens to `ceil(N / B)`. Deterministic 300-channel
+tests use `B = 32`, never exceed 32 units in a complete callback, and prove
+eventual progress through the highest-sorted Channel ID. Cursor lookup remains
+correct when channels are inserted, removed, replaced, blocked, or closed.
+
+### Reliable Control ACK/Loss Churn
+
+Run:
+
+```bash
+cargo test --release -p quiche --lib \
+  control_send_queue_ack_loss_churn_release_probe -- \
+  --ignored --nocapture
+```
+
+The initial payload-equality scan showed material quadratic growth, so the
+queue now indexes reliable reservations by a collision-checked frame
+fingerprint. The frame itself remains the source of truth; hash collisions
+fall back to exact equality within the bounded bucket.
+
+| Retained reliable frames | Before | After |
+| ---: | ---: | ---: |
+| 1 | 103 us | 190 us |
+| 128 | 115 us | 97 us |
+| 1,024 | 5,010 us | 1,642 us |
+
+At 1,024 retained frames the identical probe improved by 67.2%. The one-frame
+row is dominated by cold-start and timer noise rather than the indexed lookup.
+The internal
+index adds one bounded ID entry per reliable reservation and does not duplicate
+secret-bearing frame payloads.
+
+### Publisher Producer/Stager Lock Contention
+
+Run:
+
+```bash
+cargo test --release -p tokio-quiche --features multicast --lib \
+  publisher_queue_staging_lock_contention_release_probe -- \
+  --ignored --nocapture
+```
+
+Four producers enqueue 80,000 items, first without and then with a concurrent
+256-item stager.
+
+| Concurrent staging | Elapsed | Push p50 | Push p95 | Push p99 | Worst |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| No | 12 ms | 41 ns | 42 ns | 42 ns | 3.466 ms |
+| Yes | 39 ms | 41 ns | 42 ns | 42 ns | 11.949 ms |
+
+Concurrent staging still drains 80,000 items in 39 ms with a 42 ns p99 and no
+retention leak. The isolated worst cases are scheduler-sensitive and much
+higher than the percentiles. This remains a production-profile watch point; the
+distribution and absolute throughput did not justify replacing the small mutex
+with a more complex queue in this pass.
+
+### Attachment Fanout
+
+Run:
+
+```bash
+cargo test --release -p tokio-quiche --features multicast --lib \
+  server_stream_publisher_profiles_one_and_ten_thousand_attachments -- \
+  --ignored --nocapture
+```
+
+The probe attaches lightweight connection controllers, then commits 32 shared
+256-byte STREAM ranges. It excludes TLS and QUIC fixture creation and times
+only each `commit()` fanout.
+
+| Clients | Queue items | Logical queue bytes | Command peak items | Command peak bytes |
+| ---: | ---: | ---: | ---: | ---: |
+| 1,000 | 32,000 | 13,312,000 | 2,000 | 648,000 |
+| 10,000 | 320,000 | 133,120,000 | 20,000 | 6,480,000 |
+
+| Clients | p50 | p95 | p99 | Worst | Edge notifications |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1,000 | 11.375 us | 123.000 us | 178.667 us | 222.041 us | 1,000 |
+| 10,000 | 381.250 us | 1.303 ms | 3.671 ms | 3.905 ms | 10,000 |
+
+There is one queue-ready notification per attachment, not one notification per
+publication. The 10,000-client result therefore retains 320,000 logical
+connection obligations while issuing 10,000 edge notifications.
+
+The payload allocation is shared. The logical queue-byte total includes
+per-attachment STREAM and integrity obligations, so it must not be read as 133
+MiB of duplicate payload backing.
+
+### Receive Floods And Key Rotation
+
+Run:
+
+```bash
+cargo test --release -p quiche --lib \
+  channel_receive_profiles_metadata_floods_and_key_rotation -- \
+  --ignored --nocapture
+```
+
+The probe covers 4,000 integrity-before-data packets, 4,000
+data-before-integrity packets, and 1,000 key rotations using the injected test
+clock.
+
+| Metric | Result |
+| --- | ---: |
+| Integrity-first elapsed | 10.581 ms |
+| Data-first elapsed | 3.759 ms |
+| Peak integrity entries | 4,000 |
+| Peak pending packets | 4,000 |
+| Peak pending packet bytes | 104,000 |
+| Integrity-first indexed work | 16,002 |
+| Data-first indexed work | 16,002 |
+| Maximum work in one integrity-first input | 2 |
+| Maximum work in one data-first input | 3 |
+| Active keys after rapid rotations | 3 |
+
+Work is proportional to newly actionable metadata. Inserting one key or hash
+does not rescan every pending packet. Three keys can coexist under the tested
+two-second rotation cadence because the three-second idle grace overlaps two
+superseded generations; this remains below the default eight-generation bound.
+
+### One-Minute Missing ACK Window
+
+Run:
+
+```bash
+cargo test --release -p quiche --lib \
+  multicast_stream_profiles_sixty_second_missing_ack_window -- \
+  --ignored --nocapture
+```
+
+The structural horizon represents 60 seconds at 16 ranges per second after the
+channel becomes viable, with no later ACK.
+
+| Metric | Result |
+| --- | ---: |
+| Retained ranges | 960 |
+| Retained payload bytes | 3,840 |
+| Registration p50 | 125 ns |
+| Registration p95 | 166 ns |
+| Registration p99 | 292 ns |
+| Worst registration | 1.916 us |
+
+A local `LEFT` transition releases all 960 ranges and returns both connection
+and channel retained-byte accounting to zero. The test is structural; it does
+not sleep for one minute.
+
+## Fairness And Saturation
+
+Focused tests cover one connection whose STREAM prefix never becomes available
+beside a healthy connection. The stalled connection retains one bounded
+publication while the healthy connection reaches zero pending publications and
+receives the complete STREAM plus FIN in the same processing pass. Once the
+stalled prefix arrives, it resumes independently.
+
+Separate tests cover:
+
+- multiple channels where one stream is blocked and another channel publishes
+  and retires;
+- integrity-before-key and publication-before-key barriers;
+- a never-polled event consumer;
+- required-event saturation mixed with latest-only metrics;
+- receiver take, transfer, close, and drop;
+- shutdown while the event queue is full;
+- command, integrity-batch, ingress, and attachment saturation;
+- transactional attachment staging with a one-item work budget and a
+  two-command capacity;
+- live detach with committed bytes and FIN;
+- stale viability after reattachment;
+- recovery release on ACK gaps, timeout, leave, reset, and teardown.
+- simultaneous adversarial backlog in every client, control-server, and
+  publication-owning-server callback phase.
+
+Required event or control state is not silently discarded. A full required
+event stream records terminal overload out of band and terminates its runtime.
+A saturated publisher attachment is sealed and detached without affecting
+healthy attachments. If the runtime cannot retain an already committed
+required item, that connection fail-stops rather than continuing with a STREAM
+offset gap.
+
+The adversarial callback tests observe exact peak work equal to their configured
+budgets: client read/write 4/5 units, control-server read/write 10/8 units, and
+publication-owning-server read/write 3/5 units. Subsequent callbacks remain at
+or below the same limit while every preloaded class drains.
+
+## Copies And Allocations
+
+- Shared STREAM publication uses one `Bytes` backing allocation across
+  attachments.
+- The Tokio receive path no longer clones a complete decoded `ChannelPacket`
+  before passing it to core quiche and emitting diagnostics.
+- Only DATAGRAM payloads copied into the owned core receive queue are cloned.
+- Exact packet sizing avoids a maximum-size temporary publication buffer.
+- Queue metrics use O(1) item/byte accounting.
+- Delivery metric snapshots are folded only when dirty and use atomic
+  accumulators across detached connections.
+
+No unsafe allocator hooks or pooling were added. Exact global allocation counts
+are therefore not claimed. The observable copy count for the decoded packet
+path falls from one complete packet clone plus owned DATAGRAM payloads to only
+the owned DATAGRAM payload clones.
+
+## Historical Established-Connection Profile
+
+The existing 80-connection established profile remains useful for comparison.
+The current release result was 2.145 seconds for 1,310,720 connection-local
+registrations, or 1,636 ns per registration, after TLS setup and first viability
+ACK. Publications are fed in batches of 128 while callbacks preserve their
+256-item work budget. The run issued 10,240 task wakes, peaked at 327,680
+recovery ranges, and returned to zero retained ranges. It also demonstrated:
+
+- 96.88% fewer publisher notification commands;
+- 98.39% less preparation-buffer capacity;
+- 97.27% fewer delivery metric fold attempts;
+- unchanged required connection-local registration work;
+- zero retained ranges after ACK/re-entry teardown.
+
+This still does not justify a shared recovery catalogue. Payload bytes are
+already shared, while stream offsets, flow control, reset state, ACK progress,
+loss decisions, and teardown are connection-local.
+
+## Interpretation
+
+The probes establish bounded structure and healthy-client isolation, not
+production throughput. The 10,000-attachment fanout remains linear in client
+count because each connection needs independent recovery metadata. Publication
+p99 was 3.671 ms in this synthetic release run, but scheduling, allocator, TLS,
+kernel, and socket costs are absent.
+
+No additional receive-copy optimization was attempted in this pass. The
+existing borrowed core handoff avoids cloning a complete decoded
+`ChannelPacket`, but ownership/accounting changes that depend on transparent
+multicast STREAM flow control remain deferred with that draft-08 question.
+
+Before deployment, capture a production release profile with real established
+connections, delayed ACK distributions, socket publication, and application
+load. Reconsider queue defaults only from observed retained-byte peaks and
+fallback objectives, not from synthetic wall time alone.

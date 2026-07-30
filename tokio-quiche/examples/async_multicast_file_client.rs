@@ -239,7 +239,7 @@ async fn run() -> anyhow::Result<()> {
     params.multicast_client = Some(multicast_settings.clone());
 
     let (driver, mut controller) =
-        MulticastClientDriver::new(IdleApp::new(), multicast_settings);
+        MulticastClientDriver::new(IdleApp::new(), multicast_settings)?;
     let conn =
         connect_with_config(socket, Some(&args.server_name), &params, driver)
             .await
@@ -279,7 +279,9 @@ async fn run() -> anyhow::Result<()> {
     let mut last_decode_errors = 0_u64;
     let mut receive_errors_total = 0_u64;
     let mut last_receive_errors = 0_u64;
-    let mut events = controller.take_event_receiver();
+    let mut events = controller
+        .take_event_receiver()
+        .ok_or_else(|| anyhow::anyhow!("multicast event receiver was taken"))?;
     let emit_console_metrics = args.metrics_interval_secs > 0;
     let emit_heimdall_metrics = heimdall_metrics_writer.is_some();
     let metrics_tick_secs = if emit_console_metrics || emit_heimdall_metrics {
@@ -465,6 +467,22 @@ async fn run() -> anyhow::Result<()> {
                         eprintln!(
                             "multicast receive error on channel {}: {error}",
                             format_channel_id(&channel_id),
+                        );
+                    },
+
+                    ClientEvent::IngressOverload {
+                        channel_id,
+                        retained_bytes,
+                        max_retained_bytes,
+                    } => {
+                        receive_errors_total =
+                            receive_errors_total.saturating_add(1);
+                        eprintln!(
+                            "multicast ingress overload on channel {}: \
+                             item={}B limit={}B; channel returned to fallback",
+                            format_channel_id(&channel_id),
+                            retained_bytes,
+                            max_retained_bytes,
                         );
                     },
                 }

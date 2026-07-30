@@ -396,6 +396,8 @@ use debug_panic::debug_panic;
 
 use std::net::SocketAddr;
 
+use std::ops::Bound;
+
 use std::str::FromStr;
 
 use std::sync::Arc;
@@ -472,6 +474,9 @@ const DEFAULT_MAX_DGRAM_QUEUE_LEN: usize = 0;
 
 // The default length of multicast control frame receive queues.
 const DEFAULT_MAX_MULTICAST_QUEUE_LEN: usize = 32;
+const DEFAULT_MAX_MULTICAST_SEND_QUEUE_LEN: usize = 1024;
+const DEFAULT_MAX_MULTICAST_SEND_QUEUE_BYTES: usize = 2 * 1024 * 1024;
+const DEFAULT_MAX_MULTICAST_TRACKED_CHANNEL_IDS: usize = 1024;
 
 // The default length of PATH_CHALLENGE receive queue.
 const DEFAULT_MAX_PATH_CHALLENGE_RX_QUEUE_LEN: usize = 3;
@@ -598,6 +603,10 @@ pub struct Config {
     dgram_recv_max_queue_len: usize,
     dgram_send_max_queue_len: usize,
     multicast_recv_max_queue_len: usize,
+    multicast_send_max_queue_len: usize,
+    multicast_send_max_queue_bytes: usize,
+    multicast_max_tracked_channel_ids: usize,
+    multicast_stream_recovery_limits: multicast::StreamRecoveryLimits,
 
     path_challenge_recv_max_queue_len: usize,
 
@@ -677,6 +686,13 @@ impl Config {
             dgram_recv_max_queue_len: DEFAULT_MAX_DGRAM_QUEUE_LEN,
             dgram_send_max_queue_len: DEFAULT_MAX_DGRAM_QUEUE_LEN,
             multicast_recv_max_queue_len: DEFAULT_MAX_MULTICAST_QUEUE_LEN,
+            multicast_send_max_queue_len: DEFAULT_MAX_MULTICAST_SEND_QUEUE_LEN,
+            multicast_send_max_queue_bytes:
+                DEFAULT_MAX_MULTICAST_SEND_QUEUE_BYTES,
+            multicast_max_tracked_channel_ids:
+                DEFAULT_MAX_MULTICAST_TRACKED_CHANNEL_IDS,
+            multicast_stream_recovery_limits:
+                multicast::StreamRecoveryLimits::default(),
 
             path_challenge_recv_max_queue_len:
                 DEFAULT_MAX_PATH_CHALLENGE_RX_QUEUE_LEN,
@@ -1225,10 +1241,18 @@ impl Config {
     ///
     /// This parameter is only encoded by client connections. Pass `None` to
     /// stop advertising multicast client capabilities.
+    ///
+    /// Returns [`Error::InvalidTransportParam`] without changing the current
+    /// configuration when any field cannot be encoded as a QUIC varint.
     pub fn set_multicast_client_params(
         &mut self, params: Option<multicast::ClientTransportParams>,
-    ) {
+    ) -> Result<()> {
+        if let Some(params) = &params {
+            params.encoded_len()?;
+        }
+
         self.local_transport_params.multicast_client_params = params;
+        Ok(())
     }
 
     /// Configures the max number of queued received PATH_CHALLENGE frames.
@@ -1243,12 +1267,53 @@ impl Config {
 
     /// Configures the max number of queued received multicast control frames.
     ///
-    /// When an endpoint receives a multicast control frame and the queue is
-    /// full, the oldest frame is discarded.
+    /// Exact retransmissions already present in the queue are coalesced. When
+    /// an endpoint receives a distinct multicast control frame and the queue is
+    /// full, the connection is closed with `INTERNAL_ERROR` rather than
+    /// acknowledging and silently discarding protocol state.
     ///
     /// The default is 32.
     pub fn set_multicast_recv_max_queue_len(&mut self, queue_len: usize) {
         self.multicast_recv_max_queue_len = queue_len;
+    }
+
+    /// Configures item and retained-byte limits for queued outgoing multicast
+    /// control frames.
+    ///
+    /// [`Connection::multicast_try_send()`] reports transient saturation as an
+    /// owned [`multicast::ControlSendErrorKind::Full`] error. The compatibility
+    /// [`Connection::multicast_send()`] wrapper maps that condition to
+    /// [`Error::Done`] and consumes the frame. Reliable frames retain their
+    /// logical item and byte reservation until acknowledged, so loss recovery
+    /// never needs to reacquire queue capacity.
+    ///
+    /// Defaults to 1024 frames and 2 MiB.
+    pub fn set_multicast_send_queue_limits(
+        &mut self, max_frames: usize, max_bytes: usize,
+    ) {
+        self.multicast_send_max_queue_len = max_frames;
+        self.multicast_send_max_queue_bytes = max_bytes;
+    }
+
+    /// Configures the connection-lifetime bound on tracked multicast Channel
+    /// IDs.
+    ///
+    /// This bounds peer-selected identifiers retained by control, integrity,
+    /// probe, and diagnostic state, including retired identifiers. The default
+    /// is 1024. A value of zero disables Channel ID admission.
+    pub fn set_multicast_max_tracked_channel_ids(&mut self, max_ids: usize) {
+        self.multicast_max_tracked_channel_ids = max_ids;
+    }
+
+    /// Configures retained range and byte limits for multicast STREAM recovery.
+    ///
+    /// Reaching any connection or channel limit releases the affected
+    /// channel's retained ranges through ordinary unicast QUIC and prevents
+    /// new multicast withholding until a fresh probe generation is started.
+    pub fn set_multicast_stream_recovery_limits(
+        &mut self, limits: multicast::StreamRecoveryLimits,
+    ) {
+        self.multicast_stream_recovery_limits = limits;
     }
 
     /// Sets the maximum size of the connection window.
@@ -1590,7 +1655,9 @@ where
 
     /// Multicast control frame queues.
     multicast_recv_queue: multicast::ControlFrameQueue,
-    multicast_send_queue: VecDeque<multicast::Frame>,
+    multicast_send_queue: multicast::ControlSendQueue,
+    multicast_tracked_channel_ids: BTreeSet<Vec<u8>>,
+    multicast_max_tracked_channel_ids: usize,
     multicast_peer_integrity_hash_lens: BTreeMap<Vec<u8>, usize>,
     multicast_dgram_recv_queue: multicast::ChannelDatagramQueue,
     multicast_probe_event_queue: multicast::ProbeEventQueue,
@@ -1598,6 +1665,8 @@ where
     multicast_default_dgram_channel_id: Option<Vec<u8>>,
     multicast_stream_recovery: BTreeMap<Vec<u8>, MulticastStreamRecovery>,
     multicast_stream_delivery_metrics_dirty: BTreeSet<Vec<u8>>,
+    multicast_stream_recovery_limits: multicast::StreamRecoveryLimits,
+    multicast_stream_pending_ranges: usize,
     multicast_stream_withheld_bytes: usize,
     multicast_stream_deliveries: BTreeMap<u64, MulticastStreamDelivery>,
 
@@ -1682,6 +1751,7 @@ struct MulticastStreamRecovery {
     awaiting_generation_publication: bool,
     reordering_threshold: u64,
     pending: BTreeMap<u64, MulticastStreamRange>,
+    pending_bytes: usize,
     delivery_metrics: multicast::StreamDeliveryMetricsSnapshot,
     #[cfg(test)]
     ack_pending_entries_examined: u64,
@@ -1726,6 +1796,7 @@ impl Default for MulticastStreamRecovery {
             reordering_threshold:
                 multicast::DEFAULT_STREAM_RECOVERY_REORDERING_THRESHOLD,
             pending: BTreeMap::new(),
+            pending_bytes: 0,
             delivery_metrics: multicast::StreamDeliveryMetricsSnapshot::default(),
             #[cfg(test)]
             ack_pending_entries_examined: 0,
@@ -2349,7 +2420,13 @@ impl<F: BufFactory> Connection<F> {
             multicast_recv_queue: multicast::ControlFrameQueue::new(
                 config.multicast_recv_max_queue_len,
             ),
-            multicast_send_queue: VecDeque::new(),
+            multicast_send_queue: multicast::ControlSendQueue::new(
+                config.multicast_send_max_queue_len,
+                config.multicast_send_max_queue_bytes,
+            ),
+            multicast_tracked_channel_ids: BTreeSet::new(),
+            multicast_max_tracked_channel_ids: config
+                .multicast_max_tracked_channel_ids,
             multicast_peer_integrity_hash_lens: BTreeMap::new(),
             multicast_dgram_recv_queue: multicast::ChannelDatagramQueue::new(
                 config.multicast_recv_max_queue_len,
@@ -2361,6 +2438,9 @@ impl<F: BufFactory> Connection<F> {
             multicast_default_dgram_channel_id: None,
             multicast_stream_recovery: BTreeMap::new(),
             multicast_stream_delivery_metrics_dirty: BTreeSet::new(),
+            multicast_stream_recovery_limits: config
+                .multicast_stream_recovery_limits,
+            multicast_stream_pending_ranges: 0,
             multicast_stream_withheld_bytes: 0,
             multicast_stream_deliveries: BTreeMap::new(),
 
@@ -3755,7 +3835,9 @@ impl<F: BufFactory> Connection<F> {
                         }
                     },
 
-                    frame::Frame::Multicast(..) => (),
+                    frame::Frame::Multicast(frame) => {
+                        self.multicast_send_queue.release_acked(&frame);
+                    },
 
                     frame::Frame::CryptoHeader { offset, length } => {
                         self.crypto_ctx[epoch]
@@ -4401,7 +4483,7 @@ impl<F: BufFactory> Connection<F> {
 
                     frame::Frame::Multicast(frame) => {
                         if frame.retransmit_on_loss() {
-                            self.multicast_send_queue.push_front(frame);
+                            self.multicast_send_queue.requeue_lost(frame);
                         } else {
                             pkt_space.ack_elicited = true;
                         }
@@ -5191,7 +5273,7 @@ impl<F: BufFactory> Connection<F> {
                 let frame = frame::Frame::Multicast(frame);
 
                 if push_frame_to_pkt!(b, frames, frame, left) {
-                    self.multicast_send_queue.pop_front();
+                    self.multicast_send_queue.pop_front_for_send();
 
                     if ack_eliciting_frame {
                         ack_eliciting = true;
@@ -7323,15 +7405,40 @@ impl<F: BufFactory> Connection<F> {
         self.multicast_send_queue.len()
     }
 
+    /// Returns retained bytes in the multicast control frame send queue.
+    #[inline]
+    pub fn multicast_send_queue_byte_size(&self) -> usize {
+        self.multicast_send_queue.retained_bytes()
+    }
+
+    /// Returns the number of connection-lifetime multicast Channel IDs
+    /// retained by this connection.
+    #[inline]
+    pub fn multicast_tracked_channel_id_count(&self) -> usize {
+        self.multicast_tracked_channel_ids.len()
+    }
+
+    /// Returns the payload bytes retained by tracked multicast Channel IDs.
+    #[inline]
+    pub fn multicast_tracked_channel_id_byte_size(&self) -> usize {
+        self.multicast_tracked_channel_ids
+            .iter()
+            .map(Vec::len)
+            .sum()
+    }
+
     /// Starts multicast probing for the provided channel on this connection.
     ///
     /// The first valid peer `MC_ACK` processed for the channel will mark it as
     /// viable. If no valid `MC_ACK` arrives before `timeout`, the channel will
-    /// transition to timed out the next time [`on_timeout()`] runs.
+    /// transition to timed out the next time [`Connection::on_timeout()`] runs.
     pub fn multicast_probe_start(
         &mut self, channel_id: &[u8], timeout: Duration,
     ) -> Result<()> {
-        let deadline = Instant::now() + timeout;
+        multicast::validate_channel_id(channel_id)?;
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or(Error::InvalidState)?;
 
         self.multicast_set_probe_state(MulticastProbeStateUpdate {
             deadline: Some(deadline),
@@ -7350,7 +7457,8 @@ impl<F: BufFactory> Connection<F> {
     /// Servers should reset a channel before attaching a new publisher
     /// generation so prior viability cannot suppress its initial fallback.
     pub fn multicast_probe_reset(&mut self, channel_id: &[u8]) -> Result<()> {
-        if !self.is_server || channel_id.is_empty() {
+        multicast::validate_channel_id(channel_id)?;
+        if !self.is_server {
             return Err(Error::InvalidState);
         }
 
@@ -7403,6 +7511,7 @@ impl<F: BufFactory> Connection<F> {
     pub fn multicast_process_local_state(
         &mut self, frame: multicast::State,
     ) -> Result<()> {
+        frame.validate()?;
         self.multicast_on_state_frame(&frame)
     }
 
@@ -7422,9 +7531,29 @@ impl<F: BufFactory> Connection<F> {
     pub fn multicast_set_ack_timeout(
         &mut self, channel_id: &[u8], timeout: Option<Duration>,
     ) -> Result<()> {
+        multicast::validate_channel_id(channel_id)?;
         if !self.is_server {
             return Err(Error::InvalidState);
         }
+
+        let validated_deadline = timeout
+            .map(|timeout| {
+                Instant::now()
+                    .checked_add(timeout)
+                    .ok_or(Error::InvalidState)
+            })
+            .transpose()?;
+        let deadline = if self
+            .multicast_probe_states
+            .get(channel_id)
+            .is_some_and(|state| state.status == multicast::ProbeStatus::Viable)
+        {
+            validated_deadline
+        } else {
+            None
+        };
+
+        self.multicast_track_channel_id(channel_id)?;
 
         let state = self
             .multicast_probe_states
@@ -7435,7 +7564,7 @@ impl<F: BufFactory> Connection<F> {
         state.ack_timeout = timeout;
 
         if state.status == multicast::ProbeStatus::Viable {
-            state.deadline = timeout.map(|timeout| Instant::now() + timeout);
+            state.deadline = deadline;
         }
 
         Ok(())
@@ -7453,8 +7582,27 @@ impl<F: BufFactory> Connection<F> {
     pub fn multicast_process_peer_ack(
         &mut self, frame: multicast::Ack,
     ) -> Result<()> {
+        frame.validate()?;
+        if !self
+            .multicast_tracked_channel_ids
+            .contains(frame.channel_id.as_slice())
+        {
+            return Ok(());
+        }
+
+        let deadline = self
+            .multicast_probe_states
+            .get(frame.channel_id.as_slice())
+            .and_then(|state| state.ack_timeout)
+            .map(|timeout| {
+                Instant::now()
+                    .checked_add(timeout)
+                    .ok_or(Error::InvalidState)
+            })
+            .transpose()?;
+
         if self.multicast_stream_on_peer_ack(&frame)? {
-            return self.multicast_on_peer_ack(&frame);
+            return self.multicast_on_peer_ack(&frame, deadline);
         }
 
         Ok(())
@@ -7464,6 +7612,7 @@ impl<F: BufFactory> Connection<F> {
     pub fn multicast_process_channel_packet(
         &mut self, packet: multicast::ChannelPacket,
     ) -> Result<()> {
+        packet.validate()?;
         let channel_id = packet.channel_id;
         let packet_number = packet.packet_number;
 
@@ -7477,6 +7626,36 @@ impl<F: BufFactory> Connection<F> {
                     channel_id: channel_id.clone(),
                     packet_number,
                     data,
+                },
+            )?;
+        }
+
+        Ok(())
+    }
+
+    /// Queues decoded multicast DATAGRAM payloads from a borrowed channel
+    /// packet.
+    ///
+    /// Unlike [`multicast_process_channel_packet()`], this keeps ownership of
+    /// the decoded packet with the caller. Only DATAGRAM payloads that enter
+    /// the connection receive queue are cloned.
+    ///
+    /// [`multicast_process_channel_packet()`]:
+    ///     struct.Connection.html#method.multicast_process_channel_packet
+    pub fn multicast_process_channel_packet_ref(
+        &mut self, packet: &multicast::ChannelPacket,
+    ) -> Result<()> {
+        packet.validate()?;
+        for frame in &packet.frames {
+            let multicast::ChannelFrame::Datagram { data } = frame else {
+                continue;
+            };
+
+            self.multicast_dgram_recv_queue.push_drop_oldest(
+                multicast::ChannelDatagram {
+                    channel_id: packet.channel_id.clone(),
+                    packet_number: packet.packet_number,
+                    data: data.clone(),
                 },
             )?;
         }
@@ -7519,8 +7698,14 @@ impl<F: BufFactory> Connection<F> {
     pub fn multicast_set_default_dgram_channel(
         &mut self, channel_id: Option<Vec<u8>>,
     ) -> Result<()> {
+        if let Some(channel_id) = channel_id.as_deref() {
+            multicast::validate_channel_id(channel_id)?;
+        }
         if channel_id.is_some() && !self.is_server {
             return Err(Error::InvalidState);
+        }
+        if let Some(channel_id) = channel_id.as_deref() {
+            self.multicast_track_channel_id(channel_id)?;
         }
 
         self.multicast_default_dgram_channel_id = channel_id;
@@ -7567,9 +7752,11 @@ impl<F: BufFactory> Connection<F> {
     pub fn multicast_dgram_send_buf(
         &mut self, channel_id: &[u8], buf: F::DgramBuf,
     ) -> Result<()> {
+        multicast::validate_channel_id(channel_id)?;
         if !self.is_server {
             return Err(Error::InvalidState);
         }
+        self.multicast_track_channel_id(channel_id)?;
 
         if self.multicast_channel_needs_unicast_fallback(channel_id) {
             self.dgram_send_buf_direct(buf)?;
@@ -7587,9 +7774,11 @@ impl<F: BufFactory> Connection<F> {
     pub fn multicast_set_stream_recovery_reordering_threshold(
         &mut self, channel_id: &[u8], threshold: u64,
     ) -> Result<()> {
-        if !self.is_server || channel_id.is_empty() || threshold == 0 {
+        multicast::validate_channel_id(channel_id)?;
+        if !self.is_server || threshold == 0 {
             return Err(Error::InvalidState);
         }
+        self.multicast_track_channel_id(channel_id)?;
 
         self.multicast_stream_recovery
             .entry(channel_id.to_vec())
@@ -7644,13 +7833,21 @@ impl<F: BufFactory> Connection<F> {
         &mut self, channel_id: &[u8], packet_number: u64, stream_id: u64,
         offset: u64, buf: F::Buf, fin: bool,
     ) -> Result<()> {
+        multicast::validate_channel_id(channel_id)?;
         if !self.is_server ||
-            channel_id.is_empty() ||
             stream::is_bidi(stream_id) ||
             !stream::is_local(stream_id, self.is_server)
         {
             return Err(Error::InvalidState);
         }
+        multicast::validate_channel_stream_publication(
+            channel_id,
+            packet_number,
+            stream_id,
+            offset,
+            buf.as_ref().len(),
+        )?;
+        self.multicast_track_channel_id(channel_id)?;
 
         if self
             .multicast_stream_recovery
@@ -7661,38 +7858,71 @@ impl<F: BufFactory> Connection<F> {
             return Err(Error::InvalidState);
         }
 
-        let fallback = self.multicast_channel_needs_unicast_fallback(channel_id);
         let len = buf.as_ref().len();
+        let mut fallback =
+            self.multicast_channel_needs_unicast_fallback(channel_id);
+
+        if !fallback &&
+            self.multicast_stream_recovery_would_exceed(channel_id, len)
+        {
+            self.multicast_set_probe_state(MulticastProbeStateUpdate {
+                reason_phrase: b"multicast STREAM recovery limit reached"
+                    .to_vec(),
+                ..MulticastProbeStateUpdate::new(
+                    channel_id.to_vec(),
+                    multicast::ProbeStatus::RecoveryLimited,
+                )
+            })?;
+
+            if let Some(state) =
+                self.multicast_stream_recovery.get_mut(channel_id)
+            {
+                state.delivery_metrics.recovery_limit_fallbacks_total = state
+                    .delivery_metrics
+                    .recovery_limit_fallbacks_total
+                    .saturating_add(1);
+            }
+            self.multicast_stream_delivery_metrics_dirty
+                .insert(channel_id.to_vec());
+            fallback = true;
+        }
 
         self.multicast_stream_do_send_buf(stream_id, offset, buf, fin, fallback)?;
 
-        let state = self
-            .multicast_stream_recovery
-            .entry(channel_id.to_vec())
-            .or_default();
-        state.awaiting_generation_publication = false;
-        state.first_published.get_or_insert(packet_number);
-        state.largest_published = Some(packet_number);
-
         let delivery_metrics_changed = fallback && (len > 0 || fin);
-        if fallback {
-            if delivery_metrics_changed {
-                state.delivery_metrics.direct_fallback_ranges_total = state
-                    .delivery_metrics
-                    .direct_fallback_ranges_total
-                    .saturating_add(1);
-                state.delivery_metrics.direct_fallback_bytes_total = state
-                    .delivery_metrics
-                    .direct_fallback_bytes_total
-                    .saturating_add(len as u64);
+        {
+            let state = self
+                .multicast_stream_recovery
+                .entry(channel_id.to_vec())
+                .or_default();
+            state.awaiting_generation_publication = false;
+            state.first_published.get_or_insert(packet_number);
+            state.largest_published = Some(packet_number);
+
+            if fallback {
+                if delivery_metrics_changed {
+                    state.delivery_metrics.direct_fallback_ranges_total = state
+                        .delivery_metrics
+                        .direct_fallback_ranges_total
+                        .saturating_add(1);
+                    state.delivery_metrics.direct_fallback_bytes_total = state
+                        .delivery_metrics
+                        .direct_fallback_bytes_total
+                        .saturating_add(len as u64);
+                }
+            } else {
+                state.pending.insert(packet_number, MulticastStreamRange {
+                    stream_id,
+                    offset,
+                    len,
+                    fin,
+                });
+                state.pending_bytes = state.pending_bytes.saturating_add(len);
             }
-        } else {
-            state.pending.insert(packet_number, MulticastStreamRange {
-                stream_id,
-                offset,
-                len,
-                fin,
-            });
+        }
+        if !fallback {
+            self.multicast_stream_pending_ranges =
+                self.multicast_stream_pending_ranges.saturating_add(1);
         }
         if delivery_metrics_changed {
             self.multicast_stream_delivery_metrics_dirty
@@ -7708,6 +7938,20 @@ impl<F: BufFactory> Connection<F> {
         self.multicast_stream_recovery
             .get(channel_id)
             .map_or(0, |state| state.pending.len())
+    }
+
+    /// Returns retained multicast STREAM ranges across all channels.
+    pub fn multicast_stream_recovery_pending_total(&self) -> usize {
+        self.multicast_stream_pending_ranges
+    }
+
+    /// Returns withheld multicast STREAM bytes for one channel.
+    pub fn multicast_stream_recovery_withheld_bytes_for_channel(
+        &self, channel_id: &[u8],
+    ) -> usize {
+        self.multicast_stream_recovery
+            .get(channel_id)
+            .map_or(0, |state| state.pending_bytes)
     }
 
     /// Returns the bytes retained for multicast STREAM recovery across all
@@ -7752,6 +7996,45 @@ impl<F: BufFactory> Connection<F> {
             .collect()
     }
 
+    /// Returns whether changed multicast STREAM delivery metrics remain.
+    pub fn is_multicast_stream_delivery_metrics_readable(&self) -> bool {
+        !self.multicast_stream_delivery_metrics_dirty.is_empty()
+    }
+
+    /// Takes one changed delivery-metric snapshot in round-robin order.
+    ///
+    /// When `after_channel_id` is present, the first dirty Channel ID ordered
+    /// after it is selected, wrapping to the first dirty ID when necessary.
+    /// This allows an outer callback scheduler to bound and fairly continue
+    /// metric folding without draining the complete dirty set.
+    pub fn multicast_stream_take_next_delivery_metric_update(
+        &mut self, after_channel_id: Option<&[u8]>,
+    ) -> Option<(Vec<u8>, multicast::StreamDeliveryMetricsSnapshot)> {
+        let channel_id = after_channel_id
+            .and_then(|channel_id| {
+                self.multicast_stream_delivery_metrics_dirty
+                    .range((
+                        Bound::Excluded(channel_id.to_vec()),
+                        Bound::Unbounded,
+                    ))
+                    .next()
+                    .cloned()
+            })
+            .or_else(|| {
+                self.multicast_stream_delivery_metrics_dirty
+                    .first()
+                    .cloned()
+            })?;
+        self.multicast_stream_delivery_metrics_dirty
+            .remove(&channel_id);
+        let snapshot = self
+            .multicast_stream_recovery
+            .get(&channel_id)
+            .map_or_else(Default::default, |state| state.delivery_metrics);
+
+        Some((channel_id, snapshot))
+    }
+
     /// Stops retaining STREAM recovery state for one multicast channel.
     ///
     /// Any ranges still awaiting a multicast delivery decision are first
@@ -7770,7 +8053,8 @@ impl<F: BufFactory> Connection<F> {
     pub fn multicast_stream_stop_channel(
         &mut self, channel_id: &[u8],
     ) -> Result<Option<multicast::StreamDeliveryMetricsSnapshot>> {
-        if !self.is_server || channel_id.is_empty() {
+        multicast::validate_channel_id(channel_id)?;
+        if !self.is_server {
             return Err(Error::InvalidState);
         }
 
@@ -7787,23 +8071,104 @@ impl<F: BufFactory> Connection<F> {
     /// Queues a multicast control frame for transmission on the unicast
     /// connection.
     ///
-    /// [`InvalidState`] is returned if the peer has not negotiated support for
-    /// receiving multicast frames from this endpoint, or if the frame exceeds
-    /// the current maximum writable 1-RTT payload size.
+    /// [`Error::InvalidState`] is returned if the peer has not negotiated
+    /// support for receiving multicast frames from this endpoint, or if the
+    /// frame exceeds the current maximum writable 1-RTT payload size.
     pub fn multicast_send(&mut self, frame: multicast::Frame) -> Result<()> {
+        self.multicast_try_send(frame)
+            .map_err(|error| error.quiche_error())
+    }
+
+    /// Attempts to queue a multicast control frame without consuming it on
+    /// failure.
+    ///
+    /// Transient queue saturation is reported as
+    /// [`multicast::ControlSendErrorKind::Full`]. The returned error retains
+    /// ownership of the frame so the caller can retry it exactly.
+    pub fn multicast_try_send(
+        &mut self, frame: multicast::Frame,
+    ) -> std::result::Result<(), multicast::ControlSendError> {
+        if self.is_closed() || self.is_draining() {
+            return Err(multicast::ControlSendError::new(
+                multicast::ControlSendErrorKind::Closed,
+                frame,
+            ));
+        }
+
         if !self.multicast_send_enabled() {
-            return Err(Error::InvalidState);
+            return Err(multicast::ControlSendError::new(
+                multicast::ControlSendErrorKind::Disabled,
+                frame,
+            ));
         }
 
         if !self.multicast_frame_sent_by_local(&frame) {
-            return Err(Error::InvalidFrame);
+            return Err(multicast::ControlSendError::new(
+                multicast::ControlSendErrorKind::InvalidFrame,
+                frame,
+            ));
         }
 
-        if frame.wire_len() > self.max_multicast_frame_len()? {
-            return Err(Error::BufferTooShort);
+        let max_frame_len = match self.max_multicast_frame_len() {
+            Ok(max_frame_len) => max_frame_len,
+
+            Err(_) =>
+                return Err(multicast::ControlSendError::new(
+                    multicast::ControlSendErrorKind::Disabled,
+                    frame,
+                )),
+        };
+        let frame_len = match frame.encoded_len() {
+            Ok(frame_len) => frame_len,
+
+            Err(_) =>
+                return Err(multicast::ControlSendError::new(
+                    multicast::ControlSendErrorKind::InvalidValue,
+                    frame,
+                )),
+        };
+        if frame_len > max_frame_len {
+            return Err(multicast::ControlSendError::new(
+                multicast::ControlSendErrorKind::Oversized,
+                frame,
+            ));
         }
 
-        self.multicast_send_queue.push_back(frame);
+        let tracked_channel_id = frame.channel_id().map(<[u8]>::to_vec);
+        if tracked_channel_id.as_deref().is_some_and(|channel_id| {
+            !self.multicast_can_track_channel_id(channel_id)
+        }) {
+            return Err(multicast::ControlSendError::new(
+                multicast::ControlSendErrorKind::ResourceLimit,
+                frame,
+            ));
+        }
+
+        self.multicast_send_queue.push_back(frame).map_err(
+            |error| match error {
+                multicast::ControlSendQueueError::Full(frame) =>
+                    multicast::ControlSendError::new(
+                        multicast::ControlSendErrorKind::Full,
+                        frame,
+                    ),
+
+                multicast::ControlSendQueueError::Oversized(frame) =>
+                    multicast::ControlSendError::new(
+                        multicast::ControlSendErrorKind::Oversized,
+                        frame,
+                    ),
+
+                multicast::ControlSendQueueError::Invalid(frame) =>
+                    multicast::ControlSendError::new(
+                        multicast::ControlSendErrorKind::InvalidValue,
+                        frame,
+                    ),
+            },
+        )?;
+
+        if let Some(channel_id) = tracked_channel_id {
+            self.multicast_tracked_channel_ids.insert(channel_id);
+        }
 
         Ok(())
     }
@@ -7871,6 +8236,42 @@ impl<F: BufFactory> Connection<F> {
         self.multicast_peer_integrity_hash_lens
             .get(channel_id)
             .copied()
+    }
+
+    fn multicast_can_track_channel_id(&self, channel_id: &[u8]) -> bool {
+        multicast::validate_channel_id(channel_id).is_ok() &&
+            (self.multicast_tracked_channel_ids.contains(channel_id) ||
+                self.multicast_tracked_channel_ids.len() <
+                    self.multicast_max_tracked_channel_ids)
+    }
+
+    fn multicast_track_channel_id(&mut self, channel_id: &[u8]) -> Result<()> {
+        multicast::validate_channel_id(channel_id)?;
+        if !self.multicast_can_track_channel_id(channel_id) {
+            return Err(Error::InvalidState);
+        }
+
+        self.multicast_tracked_channel_ids
+            .insert(channel_id.to_vec());
+        Ok(())
+    }
+
+    fn multicast_stream_recovery_would_exceed(
+        &self, channel_id: &[u8], additional_bytes: usize,
+    ) -> bool {
+        let limits = self.multicast_stream_recovery_limits;
+        let state = self.multicast_stream_recovery.get(channel_id);
+        let channel_ranges = state.map_or(0, |state| state.pending.len());
+        let channel_bytes = state.map_or(0, |state| state.pending_bytes);
+
+        self.multicast_stream_pending_ranges >=
+            limits.max_pending_ranges_per_connection ||
+            channel_ranges >= limits.max_pending_ranges_per_channel ||
+            self.multicast_stream_withheld_bytes
+                .saturating_add(additional_bytes) >
+                limits.max_withheld_bytes_per_connection ||
+            channel_bytes.saturating_add(additional_bytes) >
+                limits.max_withheld_bytes_per_channel
     }
 
     fn multicast_stream_do_send_buf(
@@ -8038,16 +8439,38 @@ impl<F: BufFactory> Connection<F> {
         true
     }
 
+    fn multicast_stream_take_pending(
+        &mut self, channel_id: &[u8], packet_number: u64,
+    ) -> Option<MulticastStreamRange> {
+        let range = {
+            let state = self.multicast_stream_recovery.get_mut(channel_id)?;
+            let range = state.pending.remove(&packet_number)?;
+            state.pending_bytes = state.pending_bytes.saturating_sub(range.len);
+            range
+        };
+
+        self.multicast_stream_pending_ranges =
+            self.multicast_stream_pending_ranges.saturating_sub(1);
+
+        Some(range)
+    }
+
     fn multicast_stream_release_channel(&mut self, channel_id: &[u8]) {
-        let pending = self
+        let (pending, pending_ranges) = self
             .multicast_stream_recovery
             .get_mut(channel_id)
             .map(|state| {
-                std::mem::take(&mut state.pending)
+                let pending = std::mem::take(&mut state.pending)
                     .into_values()
-                    .collect::<Vec<_>>()
+                    .collect::<Vec<_>>();
+                let pending_ranges = pending.len();
+                state.pending_bytes = 0;
+                (pending, pending_ranges)
             })
             .unwrap_or_default();
+        self.multicast_stream_pending_ranges = self
+            .multicast_stream_pending_ranges
+            .saturating_sub(pending_ranges);
 
         let mut released_ranges = 0_u64;
         let mut released_bytes = 0_u64;
@@ -8079,18 +8502,27 @@ impl<F: BufFactory> Connection<F> {
         _reset_drop_range: Option<std::ops::Range<u64>>,
     ) {
         let mut forgotten_withheld = 0_usize;
+        let mut forgotten_ranges = 0_usize;
 
         for state in self.multicast_stream_recovery.values_mut() {
+            let before = forgotten_withheld;
             state.pending.retain(|_, range| {
                 if range.stream_id != stream_id {
                     return true;
                 }
 
                 forgotten_withheld = forgotten_withheld.saturating_add(range.len);
+                forgotten_ranges = forgotten_ranges.saturating_add(1);
                 false
             });
+            state.pending_bytes = state
+                .pending_bytes
+                .saturating_sub(forgotten_withheld.saturating_sub(before));
         }
 
+        self.multicast_stream_pending_ranges = self
+            .multicast_stream_pending_ranges
+            .saturating_sub(forgotten_ranges);
         self.multicast_stream_withheld_bytes = self
             .multicast_stream_withheld_bytes
             .saturating_sub(forgotten_withheld);
@@ -8155,13 +8587,17 @@ impl<F: BufFactory> Connection<F> {
                         state.ack_pending_entries_examined =
                             state.ack_pending_entries_examined.saturating_add(1);
                     }
-                    packet_number.and_then(|packet_number| {
-                        state.pending.remove(&packet_number)
-                    })
+                    packet_number
                 };
-                let Some(delivered) = delivered else {
+                let Some(packet_number) = delivered else {
                     break;
                 };
+                let delivered = self
+                    .multicast_stream_take_pending(
+                        &frame.channel_id,
+                        packet_number,
+                    )
+                    .expect("pending range was selected above");
 
                 self.multicast_stream_mark_delivered(delivered);
             }
@@ -8186,18 +8622,20 @@ impl<F: BufFactory> Connection<F> {
                             state.ack_pending_entries_examined.saturating_add(1);
                     }
 
-                    packet_number
-                        .filter(|packet_number| {
-                            packet_number.saturating_add(threshold) <=
-                                frame.largest_acknowledged
-                        })
-                        .and_then(|_| {
-                            state.pending.pop_first().map(|(_, range)| range)
-                        })
+                    packet_number.filter(|packet_number| {
+                        packet_number.saturating_add(threshold) <=
+                            frame.largest_acknowledged
+                    })
                 };
-                let Some(lost) = lost else {
+                let Some(packet_number) = lost else {
                     break;
                 };
+                let lost = self
+                    .multicast_stream_take_pending(
+                        &frame.channel_id,
+                        packet_number,
+                    )
+                    .expect("pending range was selected above");
 
                 if self.multicast_stream_release_range(lost) {
                     recovered_ranges = recovered_ranges.saturating_add(1);
@@ -8239,6 +8677,7 @@ impl<F: BufFactory> Connection<F> {
             reason_phrase,
             emit_if_unchanged,
         } = update;
+        self.multicast_track_channel_id(&channel_id)?;
 
         let existed = self.multicast_probe_states.contains_key(&channel_id);
         let changed = {
@@ -8290,10 +8729,15 @@ impl<F: BufFactory> Connection<F> {
             self.multicast_probe_states
                 .get(frame.channel_id.as_slice())
                 .and_then(|state| {
-                    state.deadline.or_else(|| {
-                        state.ack_timeout.map(|timeout| Instant::now() + timeout)
+                    state.deadline.map(Ok).or_else(|| {
+                        state.ack_timeout.map(|timeout| {
+                            Instant::now()
+                                .checked_add(timeout)
+                                .ok_or(Error::InvalidState)
+                        })
                     })
                 })
+                .transpose()?
         } else {
             None
         };
@@ -8307,12 +8751,18 @@ impl<F: BufFactory> Connection<F> {
         })
     }
 
-    fn multicast_on_peer_ack(&mut self, frame: &multicast::Ack) -> Result<()> {
-        let deadline = self
+    fn multicast_on_peer_ack(
+        &mut self, frame: &multicast::Ack, deadline: Option<Instant>,
+    ) -> Result<()> {
+        if self
             .multicast_probe_states
             .get(frame.channel_id.as_slice())
-            .and_then(|state| state.ack_timeout)
-            .map(|timeout| Instant::now() + timeout);
+            .is_some_and(|state| {
+                state.status == multicast::ProbeStatus::RecoveryLimited
+            })
+        {
+            return Ok(());
+        }
 
         self.multicast_set_probe_state(MulticastProbeStateUpdate {
             deadline,
@@ -10231,6 +10681,30 @@ impl<F: BufFactory> Connection<F> {
                     return Err(Error::InvalidFrame);
                 }
 
+                let peer_establishes_channel = !self.is_server &&
+                    matches!(
+                        &frame,
+                        multicast::Frame::Announce(..) |
+                            multicast::Frame::Key(..) |
+                            multicast::Frame::Join(..) |
+                            multicast::Frame::Leave(..) |
+                            multicast::Frame::Integrity(..) |
+                            multicast::Frame::Retire(..)
+                    );
+                if peer_establishes_channel &&
+                    self.multicast_track_channel_id(
+                        frame.channel_id().expect("channel frame has an ID"),
+                    )
+                    .is_err()
+                {
+                    let _ = self.close(
+                        false,
+                        WireErrorCode::InternalError as u64,
+                        b"multicast Channel ID resource exhausted",
+                    );
+                    return Err(Error::InvalidState);
+                }
+
                 if let multicast::Frame::Announce(announce) = &frame {
                     let hash_len = multicast::integrity_hash_len_from_id(
                         announce.integrity_hash_algorithm,
@@ -10242,10 +10716,26 @@ impl<F: BufFactory> Connection<F> {
                 }
 
                 if let multicast::Frame::State(state) = &frame {
-                    self.multicast_on_state_frame(state)?;
+                    if self
+                        .multicast_tracked_channel_ids
+                        .contains(state.channel_id.as_slice())
+                    {
+                        self.multicast_on_state_frame(state)?;
+                    }
                 }
 
-                self.multicast_recv_queue.push_drop_oldest(frame)?;
+                if self.multicast_recv_queue.push(frame).is_err() {
+                    let _ = self.close(
+                        false,
+                        WireErrorCode::InternalError as u64,
+                        b"multicast control receive queue exhausted",
+                    );
+
+                    // Returning before packet-number bookkeeping prevents this
+                    // packet from being acknowledged after its control state
+                    // could not be retained.
+                    return Err(Error::InvalidState);
+                }
             },
 
             frame::Frame::ConnectionClose {

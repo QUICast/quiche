@@ -611,7 +611,7 @@ impl TransportParams {
                 TransportParams::encode_param(
                     &mut b,
                     multicast::CLIENT_PARAMS_TRANSPORT_PARAMETER_ID,
-                    multicast_client_params.wire_len(),
+                    multicast_client_params.encoded_len()?,
                 )?;
 
                 multicast_client_params.encode(&mut b)?;

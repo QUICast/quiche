@@ -32,20 +32,62 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::Weak;
 
-use bytes::Bytes;
-use smallvec::SmallVec;
-use tokio::sync::mpsc::UnboundedSender;
-
+use super::bounded_queue::BoundedSender;
+use super::bounded_queue::QueueSendError;
 use super::ServerControlChannelConfig;
 use super::ServerControlCommand;
 use super::ServerControlController;
-
+use bytes::Bytes;
+use smallvec::SmallVec;
 const MAX_STREAM_OFFSET: u64 = 1 << 62;
 const COMPLETED_STREAM_CHUNK_BITS: u64 = 1024;
 const COMPLETED_STREAM_CHUNK_WORDS: usize = 16;
 const COMPLETED_STREAM_DENSE_THRESHOLD: usize = 32;
+const ATTACHMENT_QUEUE_ITEM_RESERVE_BYTES: usize = 64 * 1024;
 
 static NEXT_PUBLISHER_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Per-connection fanout queue limits for a shared stream publisher.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ServerStreamPublisherLimits {
+    /// Maximum committed control/publication items retained per attachment.
+    pub max_attachment_queue_items: usize,
+
+    /// Maximum logical item bytes retained per attachment.
+    pub max_attachment_queue_bytes: usize,
+
+    /// Maximum streams retaining unfinished shared offset state.
+    pub max_active_streams: usize,
+
+    /// Maximum range/bitmap storage units retained for completed stream IDs.
+    pub max_completed_stream_storage_units: usize,
+}
+
+impl Default for ServerStreamPublisherLimits {
+    fn default() -> Self {
+        Self {
+            max_attachment_queue_items: 4096,
+            max_attachment_queue_bytes: 8 * 1024 * 1024,
+            max_active_streams: 65_536,
+            max_completed_stream_storage_units: 4096,
+        }
+    }
+}
+
+impl ServerStreamPublisherLimits {
+    fn validate(self) -> Result<Self, ServerStreamPublisherError> {
+        if self.max_attachment_queue_items == 0 ||
+            self.max_attachment_queue_bytes <
+                ATTACHMENT_QUEUE_ITEM_RESERVE_BYTES * 2 ||
+            self.max_active_streams == 0 ||
+            self.max_completed_stream_storage_units == 0
+        {
+            return Err(ServerStreamPublisherError::InvalidState);
+        }
+
+        Ok(self)
+    }
+}
 
 /// One shared STREAM frame carried by an MCQUIC channel packet.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -69,17 +111,19 @@ pub struct ServerStreamFrame {
 /// multicast publisher, then passes this value to
 /// [`ServerStreamPublisher::commit()`]. Committing relays integrity and the
 /// retained recovery range to every attached connection.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 #[must_use = "a prepared multicast packet must be published and committed"]
 pub struct ServerStreamPublication {
+    publisher: Weak<Mutex<ServerStreamPublisherInner>>,
     publisher_id: u64,
     token: u64,
     packet_number: u64,
     key_sequence: u64,
     key_phase: bool,
     packet: Bytes,
-    integrity: quiche::multicast::Integrity,
-    frame: ServerStreamFrame,
+    integrity: Option<quiche::multicast::Integrity>,
+    frame: Option<ServerStreamFrame>,
+    resolved: bool,
 }
 
 impl ServerStreamPublication {
@@ -105,12 +149,32 @@ impl ServerStreamPublication {
 
     /// Returns the matching integrity frame.
     pub fn integrity(&self) -> &quiche::multicast::Integrity {
-        &self.integrity
+        self.integrity
+            .as_ref()
+            .expect("unresolved publication retains integrity")
     }
 
     /// Returns the STREAM frame represented by this publication.
     pub fn frame(&self) -> &ServerStreamFrame {
-        &self.frame
+        self.frame
+            .as_ref()
+            .expect("unresolved publication retains its frame")
+    }
+}
+
+impl Drop for ServerStreamPublication {
+    fn drop(&mut self) {
+        if self.resolved {
+            return;
+        }
+
+        let Some(publisher) = self.publisher.upgrade() else {
+            return;
+        };
+        let Ok(mut inner) = publisher.lock() else {
+            return;
+        };
+        inner.fail_stop_prepared(self.token);
     }
 }
 
@@ -166,6 +230,60 @@ pub enum ServerStreamPublisherError {
     #[error("the multicast control driver is closed")]
     ControllerClosed,
 
+    /// The target control driver's bounded command queue is temporarily full.
+    #[error("the multicast control driver command queue is full")]
+    ControllerQueueFull,
+
+    /// The attachment command cannot fit the target driver's byte limit.
+    #[error("the multicast publisher attachment command is oversized")]
+    ControllerCommandTooLarge,
+
+    /// The publisher exhausted its attachment identifier space.
+    #[error("the multicast publisher attachment identifier space is exhausted")]
+    AttachmentIdExhausted,
+
+    /// One publication cannot fit the fixed per-attachment structural reserve.
+    #[error(
+        "multicast stream publication retains {retained_bytes} bytes, above the structural limit {max_retained_bytes}"
+    )]
+    PublicationTooLarge {
+        /// Logical bytes the publication would retain.
+        retained_bytes: usize,
+
+        /// Fixed per-item retained-byte bound.
+        max_retained_bytes: usize,
+    },
+
+    /// One key update cannot fit the fixed per-attachment structural reserve.
+    #[error(
+        "multicast key update retains {retained_bytes} bytes, above the structural limit {max_retained_bytes}"
+    )]
+    KeyTooLarge {
+        /// Logical bytes the key update would retain.
+        retained_bytes: usize,
+
+        /// Fixed per-item retained-byte bound.
+        max_retained_bytes: usize,
+    },
+
+    /// Too many unfinished shared streams are active on the channel.
+    #[error(
+        "multicast active stream limit {limit} reached; roll over the channel"
+    )]
+    ActiveStreamLimit {
+        /// Configured active stream bound.
+        limit: usize,
+    },
+
+    /// Completed stream history reached its fixed sparse-storage bound.
+    #[error(
+        "multicast completed stream history limit {limit} reached; roll over the channel"
+    )]
+    CompletedStreamHistoryLimit {
+        /// Configured completed-history storage-unit bound.
+        limit: usize,
+    },
+
     /// Shared publisher state was poisoned by a panic while locked.
     #[error("multicast stream publisher state is poisoned")]
     StatePoisoned,
@@ -193,9 +311,17 @@ impl ServerStreamPublisher {
     pub fn new(
         channel: ServerControlChannelConfig,
     ) -> Result<Self, ServerStreamPublisherError> {
+        Self::with_limits(channel, ServerStreamPublisherLimits::default())
+    }
+
+    /// Creates a shared publisher with explicit per-attachment queue limits.
+    pub fn with_limits(
+        channel: ServerControlChannelConfig, limits: ServerStreamPublisherLimits,
+    ) -> Result<Self, ServerStreamPublisherError> {
         channel
             .validate()
             .map_err(|_| ServerStreamPublisherError::InvalidState)?;
+        let limits = limits.validate()?;
         let send_state = quiche::multicast::ChannelSendState::new(
             channel.announce.clone(),
             channel.key.clone(),
@@ -214,6 +340,7 @@ impl ServerStreamPublisher {
                 max_stream_id: None,
                 reordering_threshold:
                     quiche::multicast::DEFAULT_STREAM_RECOVERY_REORDERING_THRESHOLD,
+                limits,
                 retired: false,
                 #[cfg(test)]
                 profile: ServerStreamPublisherTestProfile::default(),
@@ -265,22 +392,35 @@ impl ServerStreamPublisher {
         }
 
         let subscriber_id = inner.next_subscriber_id;
-        inner.next_subscriber_id = inner.next_subscriber_id.saturating_add(1);
+        let next_subscriber_id = subscriber_id
+            .checked_add(1)
+            .ok_or(ServerStreamPublisherError::AttachmentIdExhausted)?;
         let publication_queue = Arc::new(ServerStreamPublisherQueue::new(
             inner.channel.announce.channel_id.clone(),
+            inner.limits,
         ));
 
         controller
             .command_sender
-            .send(ServerControlCommand::AttachStreamPublisher {
+            .try_send(ServerControlCommand::AttachStreamPublisher {
                 config: inner.channel.clone(),
                 reordering_threshold: inner.reordering_threshold,
                 max_stream_id: inner.max_stream_id,
                 delivery_metrics: Arc::clone(&self.delivery_metrics),
                 publication_queue: Arc::clone(&publication_queue),
             })
-            .map_err(|_| ServerStreamPublisherError::ControllerClosed)?;
+            .map_err(|error| match error {
+                QueueSendError::Full(..) =>
+                    ServerStreamPublisherError::ControllerQueueFull,
 
+                QueueSendError::Oversized(..) =>
+                    ServerStreamPublisherError::ControllerCommandTooLarge,
+
+                QueueSendError::Closed(..) =>
+                    ServerStreamPublisherError::ControllerClosed,
+            })?;
+
+        inner.next_subscriber_id = next_subscriber_id;
         inner
             .subscribers
             .insert(subscriber_id, PublisherSubscriber {
@@ -311,6 +451,13 @@ impl ServerStreamPublisher {
                 stream_id,
             });
         }
+        quiche::multicast::ChannelFrame::Stream {
+            stream_id,
+            offset: 0,
+            fin: false,
+            data: Vec::new(),
+        }
+        .encoded_len()?;
 
         let mut inner = self.lock()?;
         if inner.retired {
@@ -325,7 +472,7 @@ impl ServerStreamPublisher {
         }
 
         inner.max_stream_id = Some(stream_id);
-        inner.fanout(ServerStreamPublisherQueueItem::MaxStreamId(stream_id));
+        inner.fanout(ServerStreamPublisherQueueItem::MaxStreamId(stream_id))?;
 
         Ok(())
     }
@@ -398,6 +545,33 @@ impl ServerStreamPublisher {
                     actual: offset,
                 });
             }
+        } else if inner.streams.len() >= inner.limits.max_active_streams {
+            return Err(ServerStreamPublisherError::ActiveStreamLimit {
+                limit: inner.limits.max_active_streams,
+            });
+        }
+        if fin &&
+            !inner.finished_streams.can_insert_within(
+                stream_id,
+                inner.limits.max_completed_stream_storage_units,
+            )
+        {
+            return Err(
+                ServerStreamPublisherError::CompletedStreamHistoryLimit {
+                    limit: inner.limits.max_completed_stream_storage_units,
+                },
+            );
+        }
+
+        let retained_bytes = data
+            .len()
+            .saturating_add(inner.send_state.integrity_hash_len())
+            .saturating_add(128);
+        if retained_bytes > ATTACHMENT_QUEUE_ITEM_RESERVE_BYTES {
+            return Err(ServerStreamPublisherError::PublicationTooLarge {
+                retained_bytes,
+                max_retained_bytes: ATTACHMENT_QUEUE_ITEM_RESERVE_BYTES,
+            });
         }
 
         let frame = ServerStreamFrame {
@@ -441,14 +615,16 @@ impl ServerStreamPublisher {
         inner.pending_token = Some(token);
 
         Ok(ServerStreamPublication {
+            publisher: Arc::downgrade(&self.inner),
             publisher_id: inner.publisher_id,
             token,
             packet_number: output.packet_number,
             key_sequence: output.key_sequence,
             key_phase: output.key_phase,
             packet: Bytes::from(packet),
-            integrity: output.integrity,
-            frame,
+            integrity: Some(output.integrity),
+            frame: Some(frame),
+            resolved: false,
         })
     }
 
@@ -461,7 +637,7 @@ impl ServerStreamPublisher {
     /// packet first is rejected so the channel packet number space cannot
     /// develop a silent gap.
     pub fn commit(
-        &self, publication: ServerStreamPublication,
+        &self, mut publication: ServerStreamPublication,
     ) -> Result<(), ServerStreamPublisherError> {
         let mut inner = self.lock()?;
 
@@ -471,17 +647,36 @@ impl ServerStreamPublisher {
             return Err(ServerStreamPublisherError::UnknownPublication);
         }
 
-        inner.pending_token = None;
-        let finished_stream_id =
-            publication.frame.fin.then_some(publication.frame.stream_id);
-        let publication = Arc::new(CommittedServerStreamPublication {
-            packet_number: publication.packet_number,
-            integrity: publication.integrity,
-            frame: publication.frame,
+        let token = publication.token;
+        let packet_number = publication.packet_number;
+        let integrity = publication
+            .integrity
+            .take()
+            .ok_or(ServerStreamPublisherError::UnknownPublication)?;
+        let frame = publication
+            .frame
+            .take()
+            .ok_or(ServerStreamPublisherError::UnknownPublication)?;
+        let finished_stream_id = frame.fin.then_some(frame.stream_id);
+        let committed = Arc::new(CommittedServerStreamPublication {
+            packet_number,
+            integrity,
+            frame,
         });
 
-        let _commands_sent = inner
-            .fanout(ServerStreamPublisherQueueItem::Publication(publication));
+        let fanout =
+            inner.fanout(ServerStreamPublisherQueueItem::Publication(committed));
+        let _commands_sent = match fanout {
+            Ok(commands_sent) => commands_sent,
+
+            Err(error) => {
+                inner.fail_stop_prepared(token);
+                publication.resolved = true;
+                return Err(error);
+            },
+        };
+        inner.pending_token = None;
+        publication.resolved = true;
         if let Some(stream_id) = finished_stream_id {
             inner.streams.remove(&stream_id);
             inner.finished_streams.insert(stream_id);
@@ -494,6 +689,45 @@ impl ServerStreamPublisher {
                 .saturating_add(_commands_sent);
         }
 
+        Ok(())
+    }
+
+    /// Abandons a prepared packet before any external publication attempt.
+    ///
+    /// The channel is retired rather than rolling back its packet number or
+    /// reusing AEAD nonce material. Applications can create a new channel
+    /// after observing this explicit fail-stop outcome.
+    pub fn abandon(
+        &self, mut publication: ServerStreamPublication,
+    ) -> Result<(), ServerStreamPublisherError> {
+        let mut inner = self.lock()?;
+        if publication.publisher_id != inner.publisher_id ||
+            inner.pending_token != Some(publication.token)
+        {
+            return Err(ServerStreamPublisherError::UnknownPublication);
+        }
+
+        inner.fail_stop_prepared(publication.token);
+        publication.resolved = true;
+        Ok(())
+    }
+
+    /// Resolves a publication whose external socket outcome is uncertain.
+    ///
+    /// Uncertain progress always fail-stops and retires the channel. It never
+    /// rolls back or reuses the prepared channel packet number.
+    pub fn publication_progress_uncertain(
+        &self, mut publication: ServerStreamPublication,
+    ) -> Result<(), ServerStreamPublisherError> {
+        let mut inner = self.lock()?;
+        if publication.publisher_id != inner.publisher_id ||
+            inner.pending_token != Some(publication.token)
+        {
+            return Err(ServerStreamPublisherError::UnknownPublication);
+        }
+
+        inner.fail_stop_prepared(publication.token);
+        publication.resolved = true;
         Ok(())
     }
 
@@ -518,9 +752,21 @@ impl ServerStreamPublisher {
             return Err(ServerStreamPublisherError::InvalidState);
         }
 
+        let retained_bytes = key
+            .channel_id
+            .len()
+            .saturating_add(key.secret.len())
+            .saturating_add(64);
+        if retained_bytes > ATTACHMENT_QUEUE_ITEM_RESERVE_BYTES {
+            return Err(ServerStreamPublisherError::KeyTooLarge {
+                retained_bytes,
+                max_retained_bytes: ATTACHMENT_QUEUE_ITEM_RESERVE_BYTES,
+            });
+        }
+
         inner.send_state.update_key(key.clone())?;
         inner.channel.key = key.clone();
-        inner.fanout(ServerStreamPublisherQueueItem::Key(key));
+        inner.fanout(ServerStreamPublisherQueueItem::Key(key))?;
 
         Ok(())
     }
@@ -545,7 +791,7 @@ impl ServerStreamPublisher {
         }
 
         inner.retired = true;
-        inner.fanout(ServerStreamPublisherQueueItem::Retire(frame));
+        inner.fanout(ServerStreamPublisherQueueItem::Retire(frame))?;
 
         Ok(())
     }
@@ -597,6 +843,13 @@ impl ServerStreamPublisher {
         profile.finished_stream_storage_units =
             inner.finished_streams.storage_units();
         profile.attached_connections = inner.subscribers.len();
+        for subscriber in inner.subscribers.values() {
+            let (items, bytes) = subscriber.publication_queue.test_retained();
+            profile.attachment_queue_items =
+                profile.attachment_queue_items.saturating_add(items);
+            profile.attachment_queue_bytes =
+                profile.attachment_queue_bytes.saturating_add(bytes);
+        }
 
         Ok(profile)
     }
@@ -622,7 +875,7 @@ impl ServerStreamPublisher {
 pub struct ServerStreamAttachment {
     publisher: Weak<Mutex<ServerStreamPublisherInner>>,
     subscriber_id: u64,
-    command_sender: UnboundedSender<ServerControlCommand>,
+    command_sender: BoundedSender<ServerControlCommand>,
     publication_queue: Arc<ServerStreamPublisherQueue>,
 }
 
@@ -639,14 +892,14 @@ impl Drop for ServerStreamAttachment {
             self.publication_queue.seal();
         }
 
-        if self
-            .command_sender
-            .send(ServerControlCommand::DetachStreamPublisher {
-                publication_queue: Arc::clone(&self.publication_queue),
-            })
-            .is_err()
+        if self.publication_queue.claim_detach() &&
+            self.command_sender
+                .try_send(ServerControlCommand::DetachStreamPublisher {
+                    publication_queue: Arc::clone(&self.publication_queue),
+                })
+                .is_err()
         {
-            self.publication_queue.close();
+            self.publication_queue.release_detach_claim();
         }
     }
 }
@@ -667,13 +920,42 @@ struct ServerStreamPublisherInner {
     pending_token: Option<u64>,
     max_stream_id: Option<u64>,
     reordering_threshold: u64,
+    limits: ServerStreamPublisherLimits,
     retired: bool,
     #[cfg(test)]
     profile: ServerStreamPublisherTestProfile,
 }
 
 impl ServerStreamPublisherInner {
-    fn fanout(&mut self, item: ServerStreamPublisherQueueItem) -> u64 {
+    fn fail_stop_prepared(&mut self, token: u64) {
+        if self.pending_token != Some(token) {
+            return;
+        }
+
+        self.pending_token = None;
+        self.retired = true;
+
+        // A prepared channel packet consumed packet-number and AEAD nonce
+        // state. If publication progress is not known, neither can safely be
+        // rolled back or reused. Retire this channel immediately instead.
+        let _ = self.fanout(ServerStreamPublisherQueueItem::Retire(
+            quiche::multicast::Retire {
+                channel_id: self.channel.announce.channel_id.clone(),
+                after_packet_number: 0,
+            },
+        ));
+    }
+
+    fn fanout(
+        &mut self, item: ServerStreamPublisherQueueItem,
+    ) -> Result<u64, ServerStreamPublisherError> {
+        if item.retained_bytes() > ATTACHMENT_QUEUE_ITEM_RESERVE_BYTES {
+            return Err(ServerStreamPublisherError::PublicationTooLarge {
+                retained_bytes: item.retained_bytes(),
+                max_retained_bytes: ATTACHMENT_QUEUE_ITEM_RESERVE_BYTES,
+            });
+        }
+
         let mut notifications_sent = 0_u64;
 
         self.subscribers.retain(|_, subscriber| {
@@ -683,36 +965,59 @@ impl ServerStreamPublisherInner {
                 QueuePushResult::Notify => {
                     let sent = subscriber
                         .command_sender
-                        .send(ServerControlCommand::StreamPublisherQueueReady {
-                            publication_queue: Arc::clone(
-                                &subscriber.publication_queue,
-                            ),
-                        })
+                        .try_send(
+                            ServerControlCommand::StreamPublisherQueueReady {
+                                publication_queue: Arc::clone(
+                                    &subscriber.publication_queue,
+                                ),
+                            },
+                        )
                         .is_ok();
                     if sent {
                         notifications_sent = notifications_sent.saturating_add(1);
                     } else {
-                        subscriber.publication_queue.close();
+                        subscriber.publication_queue.seal();
                     }
                     sent
+                },
+
+                QueuePushResult::Saturated => {
+                    let claimed = subscriber.publication_queue.claim_detach();
+                    let sent = claimed &&
+                        subscriber
+                            .command_sender
+                            .try_send(
+                                ServerControlCommand::DetachStreamPublisher {
+                                    publication_queue: Arc::clone(
+                                        &subscriber.publication_queue,
+                                    ),
+                                },
+                            )
+                            .is_ok();
+                    if sent {
+                        notifications_sent = notifications_sent.saturating_add(1);
+                    } else if claimed {
+                        subscriber.publication_queue.release_detach_claim();
+                    }
+                    false
                 },
 
                 QueuePushResult::Closed => false,
             }
         });
 
-        notifications_sent
+        Ok(notifications_sent)
     }
 }
 
 struct PublisherSubscriber {
-    command_sender: UnboundedSender<ServerControlCommand>,
+    command_sender: BoundedSender<ServerControlCommand>,
     publication_queue: Arc<ServerStreamPublisherQueue>,
 }
 
 #[derive(Debug, Default)]
 struct CompletedStreamSequences {
-    contiguous_end: Option<u64>,
+    contiguous: Option<(u64, u64)>,
     chunks: BTreeMap<u64, CompletedStreamChunk>,
     len: u64,
 }
@@ -720,7 +1025,8 @@ struct CompletedStreamSequences {
 impl CompletedStreamSequences {
     fn contains(&self, stream_id: u64) -> bool {
         let sequence = stream_id >> 2;
-        self.contiguous_end.is_some_and(|end| sequence <= end) ||
+        self.contiguous
+            .is_some_and(|(start, end)| start <= sequence && sequence <= end) ||
             self.chunks
                 .get(&(sequence / COMPLETED_STREAM_CHUNK_BITS))
                 .is_some_and(|chunk| {
@@ -729,17 +1035,45 @@ impl CompletedStreamSequences {
                 })
     }
 
+    fn can_insert_within(&self, stream_id: u64, max_storage: usize) -> bool {
+        if self.contains(stream_id) {
+            return true;
+        }
+
+        let sequence = stream_id >> 2;
+        if self.contiguous.is_none() ||
+            self.contiguous.is_some_and(|(start, end)| {
+                end.checked_add(1) == Some(sequence) ||
+                    sequence.checked_add(1) == Some(start)
+            }) ||
+            self.chunks
+                .contains_key(&(sequence / COMPLETED_STREAM_CHUNK_BITS))
+        {
+            return self.storage_units().max(1) <= max_storage;
+        }
+
+        self.storage_units().saturating_add(1) <= max_storage
+    }
+
     fn insert(&mut self, stream_id: u64) {
         if self.contains(stream_id) {
             return;
         }
 
         let sequence = stream_id >> 2;
-        if self
-            .contiguous_end
-            .map_or(sequence == 0, |end| end.checked_add(1) == Some(sequence))
-        {
-            self.contiguous_end = Some(sequence);
+        let Some((start, end)) = self.contiguous else {
+            self.contiguous = Some((sequence, sequence));
+            self.len = self.len.saturating_add(1);
+            return;
+        };
+        if end.checked_add(1) == Some(sequence) {
+            self.contiguous = Some((start, sequence));
+            self.promote_contiguous();
+            self.len = self.len.saturating_add(1);
+            return;
+        }
+        if sequence.checked_add(1) == Some(start) {
+            self.contiguous = Some((sequence, end));
             self.promote_contiguous();
             self.len = self.len.saturating_add(1);
             return;
@@ -761,27 +1095,45 @@ impl CompletedStreamSequences {
 
     fn promote_contiguous(&mut self) {
         loop {
-            let expected = self
-                .contiguous_end
-                .map_or(Some(0), |end| end.checked_add(1));
-            let Some(expected) = expected else {
+            let Some((mut start, mut end)) = self.contiguous else {
                 return;
             };
-            let chunk_index = expected / COMPLETED_STREAM_CHUNK_BITS;
-            let chunk_bit = (expected % COMPLETED_STREAM_CHUNK_BITS) as u16;
-            let Some(chunk) = self.chunks.get_mut(&chunk_index) else {
-                return;
-            };
-            if !chunk.remove(chunk_bit) {
-                return;
-            }
-            let remove_chunk = chunk.is_empty();
+            let mut promoted = false;
 
-            if remove_chunk {
-                self.chunks.remove(&chunk_index);
+            if let Some(expected) = start.checked_sub(1) {
+                promoted |= self.remove_sequence(expected);
+                if promoted {
+                    start = expected;
+                }
             }
-            self.contiguous_end = Some(expected);
+
+            if let Some(expected) = end.checked_add(1) {
+                if self.remove_sequence(expected) {
+                    end = expected;
+                    promoted = true;
+                }
+            }
+
+            self.contiguous = Some((start, end));
+            if !promoted {
+                return;
+            }
         }
+    }
+
+    fn remove_sequence(&mut self, sequence: u64) -> bool {
+        let chunk_index = sequence / COMPLETED_STREAM_CHUNK_BITS;
+        let chunk_bit = (sequence % COMPLETED_STREAM_CHUNK_BITS) as u16;
+        let Some(chunk) = self.chunks.get_mut(&chunk_index) else {
+            return false;
+        };
+        if !chunk.remove(chunk_bit) {
+            return false;
+        }
+        if chunk.is_empty() {
+            self.chunks.remove(&chunk_index);
+        }
+        true
     }
 
     #[cfg(test)]
@@ -789,9 +1141,8 @@ impl CompletedStreamSequences {
         self.len
     }
 
-    #[cfg(test)]
     fn storage_units(&self) -> usize {
-        self.chunks.len() + usize::from(self.contiguous_end.is_some())
+        self.chunks.len() + usize::from(self.contiguous.is_some())
     }
 }
 
@@ -884,16 +1235,43 @@ pub(super) enum ServerStreamPublisherQueueItem {
     Retire(quiche::multicast::Retire),
 }
 
+impl ServerStreamPublisherQueueItem {
+    fn retained_bytes(&self) -> usize {
+        match self {
+            Self::Publication(publication) => publication
+                .frame
+                .data
+                .len()
+                .saturating_add(publication.integrity.packet_hashes.len())
+                .saturating_add(128),
+
+            Self::Key(frame) => frame
+                .channel_id
+                .len()
+                .saturating_add(frame.secret.len())
+                .saturating_add(64),
+
+            Self::MaxStreamId(..) => 16,
+
+            Self::Retire(frame) => frame.channel_id.len().saturating_add(32),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(super) struct ServerStreamPublisherQueue {
     channel_id: Vec<u8>,
+    limits: ServerStreamPublisherLimits,
     state: Mutex<ServerStreamPublisherQueueState>,
 }
 
 impl ServerStreamPublisherQueue {
-    fn new(channel_id: Vec<u8>) -> Self {
+    pub(super) fn new(
+        channel_id: Vec<u8>, limits: ServerStreamPublisherLimits,
+    ) -> Self {
         Self {
             channel_id,
+            limits,
             state: Mutex::new(ServerStreamPublisherQueueState::default()),
         }
     }
@@ -913,8 +1291,27 @@ impl ServerStreamPublisherQueue {
             return QueuePushResult::Closed;
         }
 
+        let retained_bytes =
+            state.retained_bytes.saturating_add(item.retained_bytes());
+        if state.items.len() >= self.limits.max_attachment_queue_items ||
+            retained_bytes > self.limits.max_attachment_queue_bytes
+        {
+            state.sealed = true;
+            return QueuePushResult::Closed;
+        }
+
         state.items.push_back(item);
-        if state.dirty {
+        state.retained_bytes = retained_bytes;
+        let saturated = state.items.len() >=
+            self.limits.max_attachment_queue_items ||
+            state
+                .retained_bytes
+                .saturating_add(ATTACHMENT_QUEUE_ITEM_RESERVE_BYTES) >
+                self.limits.max_attachment_queue_bytes;
+        if saturated {
+            state.sealed = true;
+            QueuePushResult::Saturated
+        } else if state.dirty {
             QueuePushResult::AlreadyDirty
         } else {
             state.dirty = true;
@@ -922,6 +1319,7 @@ impl ServerStreamPublisherQueue {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn drain(&self) -> VecDeque<ServerStreamPublisherQueueItem> {
         let Ok(mut state) = self.state.lock() else {
             return VecDeque::new();
@@ -931,7 +1329,44 @@ impl ServerStreamPublisherQueue {
         }
 
         state.dirty = false;
+        state.retained_bytes = 0;
         std::mem::take(&mut state.items)
+    }
+
+    pub(super) fn stage_up_to<R>(
+        &self, max_items: usize,
+        stage: impl FnOnce(
+            VecDeque<ServerStreamPublisherQueueItem>,
+        ) -> (R, VecDeque<ServerStreamPublisherQueueItem>),
+    ) -> Option<R> {
+        let Ok(mut state) = self.state.lock() else {
+            return None;
+        };
+        if state.closed || state.items.is_empty() || max_items == 0 {
+            return None;
+        }
+
+        let mut selected = std::mem::take(&mut state.items);
+        let remaining = selected.split_off(max_items.min(selected.len()));
+        state.items = remaining;
+        let selected_bytes = selected.iter().fold(0_usize, |total, item| {
+            total.saturating_add(item.retained_bytes())
+        });
+
+        let (result, mut unconsumed) = stage(selected);
+        let unconsumed_bytes = unconsumed.iter().fold(0_usize, |total, item| {
+            total.saturating_add(item.retained_bytes())
+        });
+        debug_assert!(unconsumed_bytes <= selected_bytes);
+
+        unconsumed.append(&mut state.items);
+        state.items = unconsumed;
+        state.retained_bytes = state
+            .retained_bytes
+            .saturating_sub(selected_bytes.saturating_sub(unconsumed_bytes));
+        state.dirty = !state.items.is_empty();
+
+        Some(result)
     }
 
     pub(super) fn close(&self) {
@@ -939,15 +1374,36 @@ impl ServerStreamPublisherQueue {
             return;
         };
         state.items.clear();
+        state.retained_bytes = 0;
         state.dirty = false;
+        state.detach_queued = false;
         state.closed = true;
     }
 
-    fn seal(&self) {
+    pub(super) fn seal(&self) {
         let Ok(mut state) = self.state.lock() else {
             return;
         };
         state.sealed = true;
+    }
+
+    pub(super) fn claim_detach(&self) -> bool {
+        let Ok(mut state) = self.state.lock() else {
+            return false;
+        };
+        if state.closed || !state.sealed || state.detach_queued {
+            return false;
+        }
+
+        state.detach_queued = true;
+        true
+    }
+
+    pub(super) fn release_detach_claim(&self) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        state.detach_queued = false;
     }
 
     fn is_closed(&self) -> bool {
@@ -955,19 +1411,40 @@ impl ServerStreamPublisherQueue {
             .lock()
             .map_or(true, |state| state.sealed || state.closed)
     }
+
+    pub(super) fn has_pending(&self) -> bool {
+        self.state.lock().is_ok_and(|state| {
+            !state.items.is_empty() ||
+                (state.sealed && !state.closed && !state.detach_queued)
+        })
+    }
+
+    pub(super) fn has_items(&self) -> bool {
+        self.state.lock().is_ok_and(|state| !state.items.is_empty())
+    }
+
+    #[cfg(test)]
+    fn test_retained(&self) -> (usize, usize) {
+        self.state
+            .lock()
+            .map_or((0, 0), |state| (state.items.len(), state.retained_bytes))
+    }
 }
 
 #[derive(Debug, Default)]
 struct ServerStreamPublisherQueueState {
     items: VecDeque<ServerStreamPublisherQueueItem>,
+    retained_bytes: usize,
     dirty: bool,
     sealed: bool,
+    detach_queued: bool,
     closed: bool,
 }
 
 enum QueuePushResult {
     AlreadyDirty,
     Notify,
+    Saturated,
     Closed,
 }
 
@@ -980,6 +1457,8 @@ pub(super) struct ServerStreamPublisherTestProfile {
     pub(super) finished_streams: usize,
     pub(super) finished_stream_storage_units: usize,
     pub(super) attached_connections: usize,
+    pub(super) attachment_queue_items: usize,
+    pub(super) attachment_queue_bytes: usize,
 }
 
 #[derive(Debug, Default)]
@@ -990,6 +1469,7 @@ pub(super) struct ServerStreamDeliveryMetricsAccumulator {
     ack_gap_recovery_bytes_total: AtomicU64,
     fallback_reentry_ranges_total: AtomicU64,
     fallback_reentry_bytes_total: AtomicU64,
+    recovery_limit_fallbacks_total: AtomicU64,
 }
 
 impl ServerStreamDeliveryMetricsAccumulator {
@@ -1020,6 +1500,10 @@ impl ServerStreamDeliveryMetricsAccumulator {
             &self.fallback_reentry_bytes_total,
             delta.fallback_reentry_bytes_total,
         );
+        atomic_saturating_add(
+            &self.recovery_limit_fallbacks_total,
+            delta.recovery_limit_fallbacks_total,
+        );
     }
 
     fn snapshot(&self) -> quiche::multicast::StreamDeliveryMetricsSnapshot {
@@ -1041,6 +1525,9 @@ impl ServerStreamDeliveryMetricsAccumulator {
                 .load(Ordering::Relaxed),
             fallback_reentry_bytes_total: self
                 .fallback_reentry_bytes_total
+                .load(Ordering::Relaxed),
+            recovery_limit_fallbacks_total: self
+                .recovery_limit_fallbacks_total
                 .load(Ordering::Relaxed),
         }
     }
@@ -1067,7 +1554,17 @@ pub(super) struct CommittedServerStreamPublication {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use std::time::Instant;
+
     use super::CompletedStreamSequences;
+    use super::QueuePushResult;
+    use super::ServerStreamPublisherLimits;
+    use super::ServerStreamPublisherQueue;
+    use super::ServerStreamPublisherQueueItem;
     use super::COMPLETED_STREAM_CHUNK_BITS;
 
     #[test]
@@ -1136,5 +1633,149 @@ mod tests {
         assert!(
             completed.contains(((COMPLETED_STREAM_CHUNK_BITS - 1) << 2) | 0x3)
         );
+    }
+
+    #[test]
+    fn completed_stream_sequences_start_high_without_claiming_lower_ids() {
+        let mut completed = CompletedStreamSequences::default();
+        let high_sequence = COMPLETED_STREAM_CHUNK_BITS * 4;
+
+        completed.insert((high_sequence << 2) | 0x3);
+        assert_eq!(completed.storage_units(), 1);
+        assert!(completed.contains((high_sequence << 2) | 0x3));
+        assert!(!completed.contains(3));
+
+        assert!(!completed.can_insert_within(3, 1));
+        assert!(completed.can_insert_within(3, 2));
+        completed.insert(3);
+
+        assert_eq!(completed.len(), 2);
+        assert_eq!(completed.storage_units(), 2);
+        assert!(completed.contains(3));
+        assert!(completed.contains((high_sequence << 2) | 0x3));
+    }
+
+    #[test]
+    fn completed_stream_sequences_reject_next_sparse_storage_unit() {
+        let mut completed = CompletedStreamSequences::default();
+
+        for sequence in [
+            0,
+            COMPLETED_STREAM_CHUNK_BITS * 2,
+            COMPLETED_STREAM_CHUNK_BITS * 4,
+        ] {
+            let stream_id = (sequence << 2) | 0x3;
+            assert!(
+                completed.can_insert_within(stream_id, 3),
+                "sequence {sequence} should fit the three-unit bound"
+            );
+            completed.insert(stream_id);
+        }
+
+        let rejected = ((COMPLETED_STREAM_CHUNK_BITS * 6) << 2) | 0x3;
+        assert_eq!(completed.storage_units(), 3);
+        assert!(!completed.can_insert_within(rejected, 3));
+        assert!(completed.can_insert_within(rejected, 4));
+    }
+
+    #[test]
+    #[ignore = "release-mode producer/stager lock-contention probe"]
+    fn publisher_queue_staging_lock_contention_release_probe() {
+        const PRODUCERS: usize = 4;
+        const ITEMS_PER_PRODUCER: usize = 20_000;
+
+        for concurrent_staging in [false, true] {
+            let queue = Arc::new(ServerStreamPublisherQueue::new(
+                vec![1],
+                ServerStreamPublisherLimits {
+                    max_attachment_queue_items: PRODUCERS * ITEMS_PER_PRODUCER +
+                        1,
+                    max_attachment_queue_bytes: 16 * 1024 * 1024,
+                    ..ServerStreamPublisherLimits::default()
+                },
+            ));
+            let completed = Arc::new(AtomicUsize::new(0));
+            let started = Instant::now();
+            let mut samples = std::thread::scope(|scope| {
+                let stager = concurrent_staging.then(|| {
+                    let queue = Arc::clone(&queue);
+                    let completed = Arc::clone(&completed);
+                    scope.spawn(move || {
+                        let mut staged = 0_usize;
+                        while completed.load(Ordering::Acquire) < PRODUCERS ||
+                            queue.has_items()
+                        {
+                            if let Some(count) = queue.stage_up_to(256, |items| {
+                                let count = items.len();
+                                (count, std::collections::VecDeque::new())
+                            }) {
+                                staged = staged.saturating_add(count);
+                            } else {
+                                std::thread::yield_now();
+                            }
+                        }
+                        staged
+                    })
+                });
+
+                let producers = (0..PRODUCERS)
+                    .map(|producer| {
+                        let queue = Arc::clone(&queue);
+                        let completed = Arc::clone(&completed);
+                        scope.spawn(move || {
+                            let mut samples =
+                                Vec::with_capacity(ITEMS_PER_PRODUCER);
+                            for item in 0..ITEMS_PER_PRODUCER {
+                                let before = Instant::now();
+                                let result = queue.push(
+                                    ServerStreamPublisherQueueItem::MaxStreamId(
+                                        ((producer * ITEMS_PER_PRODUCER + item)
+                                            as u64) <<
+                                            2,
+                                    ),
+                                );
+                                samples.push(before.elapsed());
+                                assert!(!matches!(
+                                    result,
+                                    QueuePushResult::Closed
+                                ));
+                            }
+                            completed.fetch_add(1, Ordering::Release);
+                            samples
+                        })
+                    })
+                    .collect::<Vec<_>>();
+
+                let mut samples =
+                    Vec::with_capacity(PRODUCERS * ITEMS_PER_PRODUCER);
+                for producer in producers {
+                    samples.extend(producer.join().unwrap());
+                }
+                if let Some(stager) = stager {
+                    assert_eq!(
+                        stager.join().unwrap(),
+                        PRODUCERS * ITEMS_PER_PRODUCER
+                    );
+                }
+                samples
+            });
+            let elapsed = started.elapsed();
+            samples.sort_unstable();
+            let percentile =
+                |numerator: usize| samples[(samples.len() - 1) * numerator / 100];
+            let retained = queue.test_retained();
+
+            println!(
+                "publisher_queue staging={} elapsed_ms={} push_p50_ns={} \
+                 push_p95_ns={} push_p99_ns={} push_worst_ns={} retained={:?}",
+                concurrent_staging,
+                elapsed.as_millis(),
+                percentile(50).as_nanos(),
+                percentile(95).as_nanos(),
+                percentile(99).as_nanos(),
+                samples.last().unwrap_or(&Duration::ZERO).as_nanos(),
+                retained,
+            );
+        }
     }
 }

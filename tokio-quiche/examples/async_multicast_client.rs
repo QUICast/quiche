@@ -196,7 +196,7 @@ async fn run() -> anyhow::Result<()> {
     let (h3_driver, mut h3_controller) =
         ClientH3Driver::new(Http3Settings::default());
     let (driver, mut multicast_controller) =
-        MulticastClientDriver::new(h3_driver, multicast_settings);
+        MulticastClientDriver::new(h3_driver, multicast_settings)?;
 
     let conn = connect_with_config(socket, Some(&host), &params, driver)
         .await
@@ -227,7 +227,9 @@ async fn run() -> anyhow::Result<()> {
         })?;
 
     let mut h3_events = h3_controller.take_event_receiver();
-    let mut multicast_events = multicast_controller.take_event_receiver();
+    let mut multicast_events = multicast_controller
+        .take_event_receiver()
+        .ok_or_else(|| anyhow::anyhow!("multicast event receiver was taken"))?;
     let timeout = sleep(Duration::from_secs(args.run_for_secs));
     tokio::pin!(timeout);
 
@@ -568,6 +570,20 @@ fn handle_multicast_event(event: ClientEvent) {
             println!(
                 "multicast receive error: channel={} error={error:?}",
                 format_channel_id(&channel_id),
+            );
+        },
+
+        ClientEvent::IngressOverload {
+            channel_id,
+            retained_bytes,
+            max_retained_bytes,
+        } => {
+            println!(
+                "multicast ingress overload: channel={} item={}B limit={}B; \
+                 channel returned to fallback",
+                format_channel_id(&channel_id),
+                retained_bytes,
+                max_retained_bytes,
             );
         },
     }

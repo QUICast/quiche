@@ -193,7 +193,9 @@ fn transport_params_multicast_negotiated_in_handshake() {
     };
 
     let mut client_config = test_utils::Pipe::default_config("cubic").unwrap();
-    client_config.set_multicast_client_params(Some(client_params.clone()));
+    client_config
+        .set_multicast_client_params(Some(client_params.clone()))
+        .unwrap();
 
     let mut server_config = test_utils::Pipe::default_config("cubic").unwrap();
     server_config.enable_multicast_server_support(true);
@@ -218,6 +220,26 @@ fn transport_params_multicast_negotiated_in_handshake() {
             .peer_transport_params()
             .unwrap()
             .multicast_server_support
+    );
+}
+
+#[test]
+fn invalid_multicast_transport_params_do_not_replace_handshake_config() {
+    let valid = multicast_test_client_params();
+    let mut invalid = valid.clone();
+    invalid.limits.max_channel_ids = 1 << 62;
+    let mut client_config = test_utils::Pipe::default_config("cubic").unwrap();
+
+    client_config
+        .set_multicast_client_params(Some(valid.clone()))
+        .unwrap();
+    assert_eq!(
+        client_config.set_multicast_client_params(Some(invalid)),
+        Err(Error::InvalidTransportParam)
+    );
+    assert_eq!(
+        client_config.local_transport_params.multicast_client_params,
+        Some(valid)
     );
 }
 
@@ -285,7 +307,8 @@ fn multicast_test_integrity_frame(
 fn multicast_negotiated_pipe() -> test_utils::Pipe {
     let mut client_config = test_utils::Pipe::default_config("cubic").unwrap();
     client_config
-        .set_multicast_client_params(Some(multicast_test_client_params()));
+        .set_multicast_client_params(Some(multicast_test_client_params()))
+        .unwrap();
 
     let mut server_config = test_utils::Pipe::default_config("cubic").unwrap();
     server_config.enable_multicast_server_support(true);
@@ -304,7 +327,8 @@ fn multicast_negotiated_pipe() -> test_utils::Pipe {
 fn multicast_dgram_negotiated_pipe() -> test_utils::Pipe {
     let mut client_config = test_utils::Pipe::default_config("cubic").unwrap();
     client_config
-        .set_multicast_client_params(Some(multicast_test_client_params()));
+        .set_multicast_client_params(Some(multicast_test_client_params()))
+        .unwrap();
     client_config.enable_dgram(true, 10, 10);
 
     let mut server_config = test_utils::Pipe::default_config("cubic").unwrap();
@@ -323,9 +347,18 @@ fn multicast_dgram_negotiated_pipe() -> test_utils::Pipe {
 }
 
 fn multicast_stream_negotiated_pipe() -> test_utils::Pipe {
+    multicast_stream_negotiated_pipe_with_limits(
+        multicast::StreamRecoveryLimits::default(),
+    )
+}
+
+fn multicast_stream_negotiated_pipe_with_limits(
+    limits: multicast::StreamRecoveryLimits,
+) -> test_utils::Pipe {
     let mut client_config = test_utils::Pipe::default_config("cubic").unwrap();
     client_config
-        .set_multicast_client_params(Some(multicast_test_client_params()));
+        .set_multicast_client_params(Some(multicast_test_client_params()))
+        .unwrap();
     client_config.set_initial_max_data(4096);
     client_config.set_initial_max_stream_data_uni(4096);
 
@@ -333,6 +366,7 @@ fn multicast_stream_negotiated_pipe() -> test_utils::Pipe {
     server_config.enable_multicast_server_support(true);
     server_config.set_initial_max_data(4096);
     server_config.set_initial_max_stream_data_uni(4096);
+    server_config.set_multicast_stream_recovery_limits(limits);
 
     let mut pipe = test_utils::Pipe::with_client_and_server_config(
         &mut client_config,
@@ -343,6 +377,68 @@ fn multicast_stream_negotiated_pipe() -> test_utils::Pipe {
     assert_eq!(pipe.handshake(), Ok(()));
 
     pipe
+}
+
+type MulticastStreamRecoverySnapshot =
+    (Vec<u8>, Option<u64>, Option<u64>, usize, usize);
+
+#[derive(Debug, PartialEq, Eq)]
+struct MulticastMutationSnapshot {
+    tracked_channel_ids: BTreeSet<Vec<u8>>,
+    peer_integrity_hash_lens: BTreeMap<Vec<u8>, usize>,
+    probe_states: BTreeMap<Vec<u8>, multicast::ProbeState>,
+    probe_events: usize,
+    control_send_items: usize,
+    control_send_bytes: usize,
+    dgram_send_items: usize,
+    dgram_send_bytes: usize,
+    dgram_recv_items: usize,
+    default_dgram_channel: Option<Vec<u8>>,
+    stream_recovery: Vec<MulticastStreamRecoverySnapshot>,
+    stream_pending_ranges: usize,
+    stream_withheld_bytes: usize,
+    stream_metrics_dirty: BTreeSet<Vec<u8>>,
+    stream_deliveries: usize,
+    tx_buffered: usize,
+    emit_dgram: bool,
+}
+
+fn multicast_mutation_snapshot(
+    conn: &Connection<DefaultBufFactory>,
+) -> MulticastMutationSnapshot {
+    MulticastMutationSnapshot {
+        tracked_channel_ids: conn.multicast_tracked_channel_ids.clone(),
+        peer_integrity_hash_lens: conn.multicast_peer_integrity_hash_lens.clone(),
+        probe_states: conn.multicast_probe_states.clone(),
+        probe_events: conn.multicast_probe_queue_len(),
+        control_send_items: conn.multicast_send_queue_len(),
+        control_send_bytes: conn.multicast_send_queue_byte_size(),
+        dgram_send_items: conn.dgram_send_queue_len(),
+        dgram_send_bytes: conn.dgram_send_queue_byte_size(),
+        dgram_recv_items: conn.multicast_dgram_recv_queue_len(),
+        default_dgram_channel: conn.multicast_default_dgram_channel_id.clone(),
+        stream_recovery: conn
+            .multicast_stream_recovery
+            .iter()
+            .map(|(channel_id, state)| {
+                (
+                    channel_id.clone(),
+                    state.first_published,
+                    state.largest_published,
+                    state.pending.len(),
+                    state.pending_bytes,
+                )
+            })
+            .collect(),
+        stream_pending_ranges: conn.multicast_stream_pending_ranges,
+        stream_withheld_bytes: conn.multicast_stream_withheld_bytes,
+        stream_metrics_dirty: conn
+            .multicast_stream_delivery_metrics_dirty
+            .clone(),
+        stream_deliveries: conn.multicast_stream_deliveries.len(),
+        tx_buffered: conn.tx_buffered,
+        emit_dgram: conn.emit_dgram,
+    }
 }
 
 fn multicast_test_ack(channel_id: &[u8]) -> multicast::Ack {
@@ -437,6 +533,396 @@ fn multicast_control_frame_client_to_server_roundtrip() {
 }
 
 #[test]
+fn multicast_owned_control_send_preserves_rejected_frames() {
+    let mut client_config = test_utils::Pipe::default_config("cubic").unwrap();
+    client_config
+        .set_multicast_client_params(Some(multicast_test_client_params()))
+        .unwrap();
+
+    let mut server_config = test_utils::Pipe::default_config("cubic").unwrap();
+    server_config.enable_multicast_server_support(true);
+    server_config.set_multicast_send_queue_limits(1, 4096);
+
+    let mut pipe = test_utils::Pipe::with_client_and_server_config(
+        &mut client_config,
+        &mut server_config,
+    )
+    .unwrap();
+    pipe.handshake().unwrap();
+
+    let announce = multicast_test_server_frame();
+    let key = multicast_test_server_key_frame();
+    pipe.server.multicast_try_send(announce).unwrap();
+    let full = pipe.server.multicast_try_send(key.clone()).unwrap_err();
+    assert_eq!(full.kind(), multicast::ControlSendErrorKind::Full);
+    assert_eq!(full.into_frame(), key);
+
+    let mut closed_pipe = multicast_negotiated_pipe();
+    closed_pipe.client.close(false, 0, b"test close").unwrap();
+    let close_flight = test_utils::emit_flight(&mut closed_pipe.client).unwrap();
+    test_utils::process_flight(&mut closed_pipe.server, close_flight).unwrap();
+    assert!(closed_pipe.server.is_draining());
+
+    let retire = multicast::Frame::Retire(multicast::Retire {
+        channel_id: vec![1, 2, 3, 4],
+        after_packet_number: 0,
+    });
+    let closed = closed_pipe
+        .server
+        .multicast_try_send(retire.clone())
+        .unwrap_err();
+    assert_eq!(closed.kind(), multicast::ControlSendErrorKind::Closed);
+    assert_eq!(closed.into_frame(), retire);
+
+    let mut client_config = test_utils::Pipe::default_config("cubic").unwrap();
+    client_config
+        .set_multicast_client_params(Some(multicast_test_client_params()))
+        .unwrap();
+    let mut server_config = test_utils::Pipe::default_config("cubic").unwrap();
+    server_config.enable_multicast_server_support(true);
+    server_config.set_multicast_send_queue_limits(1, 1);
+    let mut oversized_pipe = test_utils::Pipe::with_client_and_server_config(
+        &mut client_config,
+        &mut server_config,
+    )
+    .unwrap();
+    oversized_pipe.handshake().unwrap();
+
+    let announce = multicast_test_server_frame();
+    let oversized = oversized_pipe
+        .server
+        .multicast_try_send(announce.clone())
+        .unwrap_err();
+    assert_eq!(oversized.kind(), multicast::ControlSendErrorKind::Oversized);
+    assert_eq!(oversized.into_frame(), announce);
+}
+
+#[test]
+fn multicast_channel_id_registry_is_lifetime_bounded() {
+    let mut client_config = test_utils::Pipe::default_config("cubic").unwrap();
+    client_config
+        .set_multicast_client_params(Some(multicast_test_client_params()))
+        .unwrap();
+
+    let mut server_config = test_utils::Pipe::default_config("cubic").unwrap();
+    server_config.enable_multicast_server_support(true);
+    server_config.set_multicast_max_tracked_channel_ids(2);
+
+    let mut pipe = test_utils::Pipe::with_client_and_server_config(
+        &mut client_config,
+        &mut server_config,
+    )
+    .unwrap();
+    pipe.handshake().unwrap();
+
+    for channel_id in [vec![1], vec![2]] {
+        let frame = multicast::Frame::Retire(multicast::Retire {
+            channel_id,
+            after_packet_number: 0,
+        });
+        pipe.server.multicast_try_send(frame).unwrap();
+    }
+
+    assert_eq!(pipe.server.multicast_tracked_channel_id_count(), 2);
+    assert_eq!(pipe.server.multicast_tracked_channel_id_byte_size(), 2);
+
+    let overflow = multicast::Frame::Retire(multicast::Retire {
+        channel_id: vec![3],
+        after_packet_number: 0,
+    });
+    let error = pipe
+        .server
+        .multicast_try_send(overflow.clone())
+        .unwrap_err();
+    assert_eq!(error.kind(), multicast::ControlSendErrorKind::ResourceLimit);
+    assert_eq!(error.into_frame(), overflow);
+    assert_eq!(pipe.server.multicast_tracked_channel_id_count(), 2);
+
+    for id in 10_u16..110 {
+        let channel_id = id.to_be_bytes();
+        pipe.server
+            .multicast_process_peer_ack(multicast::Ack {
+                channel_id: channel_id.to_vec(),
+                largest_acknowledged: 0,
+                ack_delay: 0,
+                first_ack_range: 0,
+                ack_ranges: Vec::new(),
+                ecn_counts: None,
+            })
+            .unwrap();
+        assert_eq!(pipe.server.multicast_probe_status(&channel_id), None);
+    }
+    assert_eq!(pipe.server.multicast_tracked_channel_id_count(), 2);
+    assert_eq!(pipe.server.multicast_tracked_channel_id_byte_size(), 2);
+}
+
+#[test]
+fn multicast_invalid_local_inputs_preserve_all_connection_state() {
+    const OVERSIZED_VARINT: u64 = 1 << 62;
+
+    type InvalidMutation = Box<
+        dyn Fn(&mut Connection<DefaultBufFactory>) -> Result<()> + Send + Sync,
+    >;
+
+    assert!(Instant::now().checked_add(Duration::MAX).is_none());
+    let invalid_cases: Vec<(&str, InvalidMutation)> = vec![
+        (
+            "empty channel ID",
+            Box::new(|conn| {
+                conn.multicast_probe_start(&[], Duration::from_millis(1))
+            }),
+        ),
+        (
+            "21-byte channel ID",
+            Box::new(|conn| {
+                conn.multicast_set_default_dgram_channel(Some(vec![7; 21]))
+            }),
+        ),
+        (
+            "oversized stream packet number",
+            Box::new(|conn| {
+                conn.multicast_stream_send(
+                    &[9],
+                    OVERSIZED_VARINT,
+                    3,
+                    0,
+                    b"x",
+                    false,
+                )
+            }),
+        ),
+        (
+            "oversized stream offset",
+            Box::new(|conn| {
+                conn.multicast_stream_send(
+                    &[9],
+                    0,
+                    3,
+                    OVERSIZED_VARINT,
+                    b"x",
+                    false,
+                )
+            }),
+        ),
+        (
+            "invalid state reason",
+            Box::new(|conn| {
+                conn.multicast_process_local_state(multicast::State {
+                    channel_id: vec![9],
+                    sequence: 0,
+                    state: multicast::ChannelState::Joined,
+                    reason_scope: multicast::StateReasonScope::Transport,
+                    reason_code: 0,
+                    reason_phrase: Vec::new(),
+                })
+            }),
+        ),
+        (
+            "oversized state sequence",
+            Box::new(|conn| {
+                conn.multicast_process_local_state(multicast::State {
+                    channel_id: vec![9],
+                    sequence: OVERSIZED_VARINT,
+                    state: multicast::ChannelState::Joined,
+                    reason_scope: multicast::StateReasonScope::Transport,
+                    reason_code: multicast::STATE_REASON_REQUESTED_BY_SERVER,
+                    reason_phrase: Vec::new(),
+                })
+            }),
+        ),
+        (
+            "oversized peer ACK",
+            Box::new(|conn| {
+                conn.multicast_process_peer_ack(multicast::Ack {
+                    channel_id: vec![9],
+                    largest_acknowledged: OVERSIZED_VARINT,
+                    ack_delay: 0,
+                    first_ack_range: 0,
+                    ack_ranges: Vec::new(),
+                    ecn_counts: None,
+                })
+            }),
+        ),
+        (
+            "oversized decoded packet number",
+            Box::new(|conn| {
+                conn.multicast_process_channel_packet(multicast::ChannelPacket {
+                    channel_id: vec![9],
+                    packet_number: OVERSIZED_VARINT,
+                    key_sequence: 0,
+                    key_phase: false,
+                    frames: vec![multicast::ChannelFrame::Datagram {
+                        data: b"x".to_vec(),
+                    }],
+                })
+            }),
+        ),
+        (
+            "unrepresentable probe timeout",
+            Box::new(|conn| conn.multicast_probe_start(&[9], Duration::MAX)),
+        ),
+        (
+            "unrepresentable ACK timeout",
+            Box::new(|conn| {
+                conn.multicast_set_ack_timeout(&[9], Some(Duration::MAX))
+            }),
+        ),
+        (
+            "overlong DATAGRAM channel ID",
+            Box::new(|conn| conn.multicast_dgram_send(&[9; 21], b"x")),
+        ),
+    ];
+
+    for (name, invalid_mutation) in invalid_cases {
+        let mut pipe = multicast_dgram_negotiated_pipe();
+        pipe.server.multicast_max_tracked_channel_ids = 1;
+        let before = multicast_mutation_snapshot(&pipe.server);
+
+        assert!(
+            invalid_mutation(&mut pipe.server).is_err(),
+            "{name} unexpectedly succeeded"
+        );
+        assert_eq!(
+            multicast_mutation_snapshot(&pipe.server),
+            before,
+            "{name} mutated connection state"
+        );
+
+        pipe.server
+            .multicast_probe_start(&[1], Duration::from_millis(1))
+            .unwrap();
+        assert_eq!(
+            pipe.server.multicast_tracked_channel_id_count(),
+            1,
+            "{name} consumed Channel ID capacity"
+        );
+    }
+}
+
+#[test]
+fn multicast_peer_channel_id_flood_is_bounded_across_retirement() {
+    let mut client_config = test_utils::Pipe::default_config("cubic").unwrap();
+    client_config
+        .set_multicast_client_params(Some(multicast_test_client_params()))
+        .unwrap();
+    client_config.set_multicast_max_tracked_channel_ids(2);
+
+    let mut server_config = test_utils::Pipe::default_config("cubic").unwrap();
+    server_config.enable_multicast_server_support(true);
+
+    let mut pipe = test_utils::Pipe::with_client_and_server_config(
+        &mut client_config,
+        &mut server_config,
+    )
+    .unwrap();
+    pipe.handshake().unwrap();
+
+    for id in [1_u8, 2] {
+        let mut announce = match multicast_test_server_frame() {
+            multicast::Frame::Announce(frame) => frame,
+            _ => unreachable!(),
+        };
+        announce.channel_id = vec![id];
+        pipe.server
+            .multicast_try_send(multicast::Frame::Announce(announce.clone()))
+            .unwrap();
+        pipe.advance().unwrap();
+        assert_eq!(
+            pipe.client.multicast_recv(),
+            Ok(multicast::Frame::Announce(announce))
+        );
+    }
+
+    assert_eq!(pipe.client.multicast_tracked_channel_id_count(), 2);
+    assert_eq!(pipe.client.multicast_tracked_channel_id_byte_size(), 2);
+    assert_eq!(pipe.client.multicast_peer_integrity_hash_lens.len(), 2);
+
+    for id in [1_u8, 2] {
+        let retire = multicast::Frame::Retire(multicast::Retire {
+            channel_id: vec![id],
+            after_packet_number: 0,
+        });
+        pipe.server.multicast_try_send(retire.clone()).unwrap();
+        pipe.advance().unwrap();
+        assert_eq!(pipe.client.multicast_recv(), Ok(retire));
+    }
+
+    assert_eq!(pipe.client.multicast_tracked_channel_id_count(), 2);
+    assert_eq!(pipe.client.multicast_peer_integrity_hash_lens.len(), 2);
+    assert!(pipe.client.multicast_probe_states.is_empty());
+
+    let mut overflow = match multicast_test_server_frame() {
+        multicast::Frame::Announce(frame) => frame,
+        _ => unreachable!(),
+    };
+    overflow.channel_id = vec![3];
+    pipe.server
+        .multicast_try_send(multicast::Frame::Announce(overflow))
+        .unwrap();
+    assert_eq!(pipe.advance(), Err(Error::InvalidState));
+    assert_eq!(
+        pipe.client.local_error(),
+        Some(&ConnectionError {
+            is_app: false,
+            error_code: WireErrorCode::InternalError as u64,
+            reason: b"multicast Channel ID resource exhausted".to_vec(),
+        })
+    );
+    assert_eq!(pipe.client.multicast_tracked_channel_id_count(), 2);
+    assert_eq!(pipe.client.multicast_peer_integrity_hash_lens.len(), 2);
+}
+
+#[test]
+fn multicast_control_queue_overflow_closes_without_evicting() {
+    let mut client_config = test_utils::Pipe::default_config("cubic").unwrap();
+    client_config
+        .set_multicast_client_params(Some(multicast_test_client_params()))
+        .unwrap();
+    client_config.set_multicast_recv_max_queue_len(2);
+
+    let mut server_config = test_utils::Pipe::default_config("cubic").unwrap();
+    server_config.enable_multicast_server_support(true);
+
+    let mut pipe = test_utils::Pipe::with_client_and_server_config(
+        &mut client_config,
+        &mut server_config,
+    )
+    .unwrap();
+    assert_eq!(pipe.handshake(), Ok(()));
+
+    let announce = multicast_test_server_frame();
+    let key = multicast_test_server_key_frame();
+    let join = multicast::Frame::Join(multicast::Join {
+        channel_id: vec![1, 2, 3, 4],
+        mc_limits_sequence: 0,
+        mc_state_sequence: 0,
+        mc_key_sequence: 1,
+    });
+    pipe.server.multicast_send(announce.clone()).unwrap();
+    pipe.advance().unwrap();
+    assert_eq!(pipe.client.multicast_recv_queue_len(), 1);
+
+    pipe.server.multicast_send(key.clone()).unwrap();
+    pipe.advance().unwrap();
+    assert_eq!(pipe.client.multicast_recv_queue_len(), 2);
+
+    pipe.server.multicast_send(join).unwrap();
+    assert_eq!(pipe.advance(), Err(Error::InvalidState));
+    assert_eq!(
+        pipe.client.local_error(),
+        Some(&ConnectionError {
+            is_app: false,
+            error_code: WireErrorCode::InternalError as u64,
+            reason: b"multicast control receive queue exhausted".to_vec(),
+        })
+    );
+    assert_eq!(pipe.client.multicast_recv_queue_len(), 2);
+    assert_eq!(pipe.client.multicast_recv(), Ok(announce));
+    assert_eq!(pipe.client.multicast_recv(), Ok(key));
+    assert_eq!(pipe.client.multicast_recv(), Err(Error::Done));
+}
+
+#[test]
 fn multicast_control_frame_coalesced_integrity_roundtrip() {
     let mut pipe = multicast_negotiated_pipe();
     let announce = multicast_test_server_frame();
@@ -518,6 +1004,9 @@ fn multicast_control_frame_rejects_wrong_sender() {
 #[test]
 fn multicast_state_frame_updates_probe_state_on_receive() {
     let mut pipe = multicast_negotiated_pipe();
+    pipe.server
+        .multicast_try_send(multicast_test_server_frame())
+        .unwrap();
     let frame = multicast::Frame::State(multicast::State {
         channel_id: vec![1, 2, 3, 4],
         sequence: 1,
@@ -546,6 +1035,28 @@ fn multicast_state_frame_updates_probe_state_on_receive() {
             reason_phrase: Vec::new(),
         })
     );
+    assert_eq!(pipe.server.multicast_recv(), Ok(frame));
+}
+
+#[test]
+fn multicast_unknown_state_does_not_allocate_channel_state() {
+    let mut pipe = multicast_negotiated_pipe();
+    let frame = multicast::Frame::State(multicast::State {
+        channel_id: vec![1, 2, 3, 4],
+        sequence: 1,
+        state: multicast::ChannelState::Joined,
+        reason_scope: multicast::StateReasonScope::Transport,
+        reason_code: multicast::STATE_REASON_REQUESTED_BY_SERVER,
+        reason_phrase: Vec::new(),
+    });
+
+    assert_eq!(pipe.client.multicast_send(frame.clone()), Ok(()));
+
+    let flight = test_utils::emit_flight(&mut pipe.client).unwrap();
+    test_utils::process_flight(&mut pipe.server, flight).unwrap();
+
+    assert_eq!(pipe.server.multicast_tracked_channel_id_count(), 0);
+    assert_eq!(pipe.server.multicast_probe_status(&[1, 2, 3, 4]), None);
     assert_eq!(pipe.server.multicast_recv(), Ok(frame));
 }
 
@@ -735,7 +1246,7 @@ fn multicast_process_local_state_reports_join_failed() {
         sequence: 1,
         state: multicast::ChannelState::DeclinedJoin,
         reason_scope: multicast::StateReasonScope::Transport,
-        reason_code: 9,
+        reason_code: 3,
         reason_phrase: b"join failed".to_vec(),
     };
 
@@ -751,7 +1262,7 @@ fn multicast_process_local_state_reports_join_failed() {
             channel_id: vec![1, 2, 3, 4],
             status: multicast::ProbeStatus::JoinFailed,
             reason_scope: Some(multicast::StateReasonScope::Transport),
-            reason_code: Some(9),
+            reason_code: Some(3),
             reason_phrase: b"join failed".to_vec(),
         })
     );
@@ -789,6 +1300,42 @@ fn multicast_process_channel_packet_queues_datagram() {
 }
 
 #[test]
+fn multicast_process_borrowed_channel_packet_preserves_packet() {
+    let mut pipe = multicast_negotiated_pipe();
+    let packet = multicast::ChannelPacket {
+        channel_id: vec![1, 2, 3, 4],
+        packet_number: 12,
+        key_sequence: 0,
+        key_phase: false,
+        frames: vec![
+            multicast::ChannelFrame::Stream {
+                stream_id: 3,
+                offset: 10,
+                fin: false,
+                data: b"shared stream bytes".to_vec(),
+            },
+            multicast::ChannelFrame::Datagram {
+                data: b"owned datagram".to_vec(),
+            },
+        ],
+    };
+
+    pipe.client
+        .multicast_process_channel_packet_ref(&packet)
+        .unwrap();
+
+    assert_eq!(packet.frames.len(), 2);
+    assert_eq!(
+        pipe.client.multicast_dgram_recv(),
+        Ok(multicast::ChannelDatagram {
+            channel_id: vec![1, 2, 3, 4],
+            packet_number: 12,
+            data: b"owned datagram".to_vec(),
+        })
+    );
+}
+
+#[test]
 fn multicast_dgram_fallback_emits_while_probe_is_pending() {
     let mut pipe = multicast_dgram_negotiated_pipe();
     let channel_id = vec![1, 2, 3, 4];
@@ -812,6 +1359,9 @@ fn multicast_dgram_fallback_is_not_suppressed_by_joined_state() {
     let channel_id = vec![1, 2, 3, 4];
     let data = b"joined-is-not-green";
 
+    pipe.server
+        .multicast_probe_start(&channel_id, Duration::from_secs(1))
+        .unwrap();
     pipe.client
         .multicast_send(multicast::Frame::State(multicast::State {
             channel_id: channel_id.clone(),
@@ -842,6 +1392,9 @@ fn multicast_dgram_fallback_stops_after_ack_makes_channel_viable() {
     let channel_id = vec![1, 2, 3, 4];
 
     pipe.server
+        .multicast_probe_start(&channel_id, Duration::from_secs(1))
+        .unwrap();
+    pipe.server
         .multicast_process_peer_ack(multicast_test_ack(&channel_id))
         .unwrap();
 
@@ -868,6 +1421,9 @@ fn multicast_dgram_fallback_resumes_after_channel_leaves() {
     let channel_id = vec![1, 2, 3, 4];
     let data = b"fallback-after-leave";
 
+    pipe.server
+        .multicast_probe_start(&channel_id, Duration::from_secs(1))
+        .unwrap();
     pipe.server
         .multicast_process_peer_ack(multicast_test_ack(&channel_id))
         .unwrap();
@@ -999,6 +1555,166 @@ fn multicast_stream_fallback_emits_before_viability() {
             direct_fallback_bytes_total: 8,
             ..Default::default()
         }
+    );
+}
+
+#[test]
+fn multicast_stream_channel_range_limit_releases_and_latches_fallback() {
+    let mut pipe = multicast_stream_negotiated_pipe_with_limits(
+        multicast::StreamRecoveryLimits {
+            max_pending_ranges_per_connection: 8,
+            max_pending_ranges_per_channel: 1,
+            max_withheld_bytes_per_connection: 1024,
+            max_withheld_bytes_per_channel: 1024,
+        },
+    );
+    let channel_id = vec![1, 2, 3, 4];
+    let stream_id = 3;
+    multicast_stream_prefix(&mut pipe, stream_id);
+
+    pipe.server
+        .multicast_stream_send(&channel_id, 0, stream_id, 10, b"a", false)
+        .unwrap();
+    pipe.server
+        .multicast_process_peer_ack(multicast_ack_for(&channel_id, 0))
+        .unwrap();
+    pipe.server
+        .multicast_stream_send(&channel_id, 1, stream_id, 11, b"retained", false)
+        .unwrap();
+    assert_eq!(
+        pipe.server.multicast_stream_recovery_pending(&channel_id),
+        1
+    );
+    assert_eq!(
+        pipe.server
+            .multicast_stream_recovery_withheld_bytes_for_channel(&channel_id),
+        8
+    );
+
+    pipe.server
+        .multicast_stream_send(&channel_id, 2, stream_id, 19, b"fallback", true)
+        .unwrap();
+
+    assert_eq!(
+        pipe.server.multicast_probe_status(&channel_id),
+        Some(multicast::ProbeStatus::RecoveryLimited)
+    );
+    assert_eq!(
+        pipe.server.multicast_stream_recovery_pending(&channel_id),
+        0
+    );
+    assert_eq!(pipe.server.multicast_stream_recovery_pending_total(), 0);
+    assert_eq!(pipe.server.multicast_stream_recovery_withheld_bytes(), 0);
+    assert_eq!(
+        pipe.server
+            .multicast_stream_delivery_metrics_snapshot(&channel_id),
+        multicast::StreamDeliveryMetricsSnapshot {
+            direct_fallback_ranges_total: 2,
+            direct_fallback_bytes_total: 9,
+            fallback_reentry_ranges_total: 1,
+            fallback_reentry_bytes_total: 8,
+            recovery_limit_fallbacks_total: 1,
+            ..Default::default()
+        }
+    );
+
+    pipe.server
+        .multicast_process_peer_ack(multicast_ack_for(&channel_id, 2))
+        .unwrap();
+    assert_eq!(
+        pipe.server.multicast_probe_status(&channel_id),
+        Some(multicast::ProbeStatus::RecoveryLimited)
+    );
+    pipe.server.multicast_probe_reset(&channel_id).unwrap();
+    assert_eq!(
+        pipe.server.multicast_probe_status(&channel_id),
+        Some(multicast::ProbeStatus::Probing)
+    );
+}
+
+#[test]
+fn multicast_stream_channel_byte_limit_is_independent_of_range_limit() {
+    let mut pipe = multicast_stream_negotiated_pipe_with_limits(
+        multicast::StreamRecoveryLimits {
+            max_pending_ranges_per_connection: 8,
+            max_pending_ranges_per_channel: 8,
+            max_withheld_bytes_per_connection: 1024,
+            max_withheld_bytes_per_channel: 4,
+        },
+    );
+    let channel_id = vec![1, 2, 3, 4];
+    let stream_id = 3;
+    multicast_stream_prefix(&mut pipe, stream_id);
+
+    pipe.server
+        .multicast_stream_send(&channel_id, 0, stream_id, 10, b"a", false)
+        .unwrap();
+    pipe.server
+        .multicast_process_peer_ack(multicast_ack_for(&channel_id, 0))
+        .unwrap();
+    pipe.server
+        .multicast_stream_send(&channel_id, 1, stream_id, 11, b"four", false)
+        .unwrap();
+    pipe.server
+        .multicast_stream_send(&channel_id, 2, stream_id, 15, b"x", false)
+        .unwrap();
+
+    assert_eq!(
+        pipe.server.multicast_probe_status(&channel_id),
+        Some(multicast::ProbeStatus::RecoveryLimited)
+    );
+    assert_eq!(pipe.server.multicast_stream_recovery_pending_total(), 0);
+    assert_eq!(pipe.server.multicast_stream_recovery_withheld_bytes(), 0);
+}
+
+#[test]
+fn multicast_stream_connection_limit_only_demotes_triggering_channel() {
+    let mut pipe = multicast_stream_negotiated_pipe_with_limits(
+        multicast::StreamRecoveryLimits {
+            max_pending_ranges_per_connection: 1,
+            max_pending_ranges_per_channel: 8,
+            max_withheld_bytes_per_connection: 1024,
+            max_withheld_bytes_per_channel: 1024,
+        },
+    );
+    let first_channel = vec![1, 2, 3, 4];
+    let second_channel = vec![5, 6, 7, 8];
+    multicast_stream_prefix(&mut pipe, 3);
+    multicast_stream_prefix(&mut pipe, 7);
+
+    for (channel_id, stream_id) in [(&first_channel, 3), (&second_channel, 7)] {
+        pipe.server
+            .multicast_stream_send(channel_id, 0, stream_id, 10, b"a", false)
+            .unwrap();
+        pipe.server
+            .multicast_process_peer_ack(multicast_ack_for(channel_id, 0))
+            .unwrap();
+    }
+    pipe.server
+        .multicast_stream_send(&first_channel, 1, 3, 11, b"kept", false)
+        .unwrap();
+    pipe.server
+        .multicast_stream_send(&second_channel, 1, 7, 11, b"direct", false)
+        .unwrap();
+
+    assert_eq!(pipe.server.multicast_stream_recovery_pending_total(), 1);
+    assert_eq!(
+        pipe.server
+            .multicast_stream_recovery_pending(&first_channel),
+        1
+    );
+    assert_eq!(
+        pipe.server
+            .multicast_stream_recovery_pending(&second_channel),
+        0
+    );
+    assert_eq!(
+        pipe.server.multicast_probe_status(&first_channel),
+        Some(multicast::ProbeStatus::Viable)
+    );
+    assert_eq!(
+        pipe.server.multicast_probe_status(&second_channel),
+        Some(multicast::ProbeStatus::RecoveryLimited)
     );
 }
 
@@ -1599,6 +2315,102 @@ fn multicast_stream_ack_timeout_releases_pending_ranges() {
             fallback_reentry_bytes_total: 7,
             ..Default::default()
         }
+    );
+}
+
+#[test]
+#[ignore = "release-mode missing-ACK retention profile; run explicitly"]
+fn multicast_stream_profiles_sixty_second_missing_ack_window() {
+    const WINDOW_SECONDS: u64 = 60;
+    const RANGES_PER_SECOND: u64 = 16;
+    const RANGE_COUNT: u64 = WINDOW_SECONDS * RANGES_PER_SECOND;
+
+    let mut pipe = multicast_stream_negotiated_pipe();
+    let channel_id = vec![1, 2, 3, 4];
+    let stream_id = 3;
+    multicast_stream_prefix(&mut pipe, stream_id);
+    pipe.server
+        .multicast_set_ack_timeout(
+            &channel_id,
+            Some(Duration::from_secs(WINDOW_SECONDS)),
+        )
+        .unwrap();
+
+    pipe.server
+        .multicast_stream_send(&channel_id, 0, stream_id, 10, b"x", false)
+        .unwrap();
+    pipe.server
+        .multicast_process_peer_ack(multicast_ack_for(&channel_id, 0))
+        .unwrap();
+    assert_eq!(
+        pipe.server.multicast_probe_status(&channel_id),
+        Some(multicast::ProbeStatus::Viable)
+    );
+
+    let mut offset = 11_u64;
+    let mut send_nanos = Vec::with_capacity(RANGE_COUNT as usize);
+    for packet_number in 1..=RANGE_COUNT {
+        let started = Instant::now();
+        pipe.server
+            .multicast_stream_send(
+                &channel_id,
+                packet_number,
+                stream_id,
+                offset,
+                b"data",
+                false,
+            )
+            .unwrap();
+        send_nanos.push(started.elapsed().as_nanos());
+        offset = offset.saturating_add(4);
+    }
+    send_nanos.sort_unstable();
+
+    assert_eq!(
+        pipe.server.multicast_stream_recovery_pending(&channel_id),
+        RANGE_COUNT as usize
+    );
+    assert_eq!(
+        pipe.server
+            .multicast_stream_recovery_withheld_bytes_for_channel(&channel_id),
+        RANGE_COUNT as usize * 4
+    );
+
+    pipe.server
+        .multicast_process_local_state(multicast::State {
+            channel_id: channel_id.clone(),
+            sequence: 1,
+            state: multicast::ChannelState::Left,
+            reason_scope: multicast::StateReasonScope::Transport,
+            reason_code: multicast::STATE_REASON_REQUESTED_BY_SERVER,
+            reason_phrase: Vec::new(),
+        })
+        .unwrap();
+    assert_eq!(
+        pipe.server.multicast_stream_recovery_pending(&channel_id),
+        0
+    );
+    assert_eq!(pipe.server.multicast_stream_recovery_withheld_bytes(), 0);
+
+    let percentile = |value: usize| {
+        let index =
+            send_nanos.len().saturating_sub(1).saturating_mul(value) / 100;
+        send_nanos[index]
+    };
+    println!(
+        concat!(
+            "MCQUIC_MISSING_ACK_PROFILE window_seconds={} ranges={} ",
+            "peak_ranges={} peak_bytes={} p50_ns={} p95_ns={} ",
+            "p99_ns={} worst_ns={}"
+        ),
+        WINDOW_SECONDS,
+        RANGE_COUNT,
+        RANGE_COUNT,
+        RANGE_COUNT * 4,
+        percentile(50),
+        percentile(95),
+        percentile(99),
+        send_nanos.last().copied().unwrap_or(0),
     );
 }
 

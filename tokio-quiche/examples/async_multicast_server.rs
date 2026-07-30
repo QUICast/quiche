@@ -139,7 +139,7 @@ struct Args {
 
 #[cfg(feature = "multicast")]
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::builder().format_timestamp_nanos().init();
 
     let args = Args::parse();
@@ -184,7 +184,7 @@ async fn main() {
                     MulticastServerDriver::new(
                         h3_driver,
                         multicast_settings.clone(),
-                    );
+                    )?;
 
                 conn.start(driver);
 
@@ -210,6 +210,8 @@ async fn main() {
             },
         }
     }
+
+    Ok(())
 }
 
 #[cfg(feature = "multicast")]
@@ -242,7 +244,10 @@ async fn drive_multicast(
     controller: &mut tokio_quiche::multicast::ServerController,
     channel_id: Vec<u8>, publish_interval: Duration, publish_text: String,
 ) {
-    let mut events = controller.take_event_receiver();
+    let Some(mut events) = controller.take_event_receiver() else {
+        log::error!("multicast event receiver was already taken");
+        return;
+    };
     let mut joined_channels = BTreeSet::new();
     let mut ticker = interval(publish_interval);
     let mut counter = 0u64;
