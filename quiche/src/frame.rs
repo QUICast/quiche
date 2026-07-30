@@ -876,7 +876,7 @@ impl Frame {
                 *length // data
             },
 
-            Frame::Multicast(frame) => frame.wire_len(),
+            Frame::Multicast(frame) => frame.encoded_len().unwrap_or(usize::MAX),
         }
     }
 

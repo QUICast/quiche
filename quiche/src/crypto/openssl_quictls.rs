@@ -415,6 +415,9 @@ fn make_evp_cipher_ctx_basic(
         );
 
         if rc != 1 {
+            // `ctx` is not owned by a wrapper yet, so this failure path must
+            // release it directly.
+            EVP_CIPHER_CTX_free(ctx);
             return Err(Error::CryptoFail);
         }
 
