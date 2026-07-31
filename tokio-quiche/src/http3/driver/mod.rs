@@ -835,6 +835,11 @@ impl<H: DriverHooks> H3Driver<H> {
             },
 
             h3::Event::PriorityUpdate => Ok(()),
+            // Tokio does not enable core native classification until its
+            // selected-stream admission path can take ownership. Reaching this
+            // arm is therefore an invariant failure, never silent disposal.
+            h3::Event::WebTransportStream { .. } =>
+                Err(H3ConnectionError::H3(h3::Error::InternalError)),
             h3::Event::GoAway => {
                 self.h3_event_sender
                     .send(H3Event::GoAway { id: stream_id }.into())

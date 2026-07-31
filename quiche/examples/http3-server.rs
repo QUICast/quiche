@@ -370,6 +370,11 @@ fn main() {
                         Ok((_stream_id, quiche::h3::Event::Reset { .. })) => (),
 
                         Ok((
+                            _stream_id,
+                            quiche::h3::Event::WebTransportStream { .. },
+                        )) => (),
+
+                        Ok((
                             _prioritized_element_id,
                             quiche::h3::Event::PriorityUpdate,
                         )) => (),

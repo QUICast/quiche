@@ -172,6 +172,10 @@
 //!             // Peer reset the stream, handle it.
 //!         },
 //!
+//!         Ok((stream_id, quiche::h3::Event::WebTransportStream { .. })) => {
+//!             // Read selected-stream payload directly from `conn`.
+//!         },
+//!
 //!         Ok((_flow_id, quiche::h3::Event::PriorityUpdate)) => (),
 //!
 //!         Ok((goaway_id, quiche::h3::Event::GoAway)) => {
@@ -233,6 +237,10 @@
 //!             // Peer reset the stream, handle it.
 //!         },
 //!
+//!         Ok((stream_id, quiche::h3::Event::WebTransportStream { .. })) => {
+//!             // Read selected-stream payload directly from `conn`.
+//!         },
+//!
 //!         Ok((_prioritized_element_id, quiche::h3::Event::PriorityUpdate)) => (),
 //!
 //!         Ok((goaway_id, quiche::h3::Event::GoAway)) => {
@@ -252,6 +260,35 @@
 //! }
 //! # Ok::<(), quiche::h3::Error>(())
 //! ```
+//!
+//! ## WebTransport stream classification
+//!
+//! When [`Config::set_additional_settings()`] advertises a nonzero
+//! [`SETTINGS_WT_ENABLED`] value and
+//! [`Config::enable_webtransport_stream_classification()`] is enabled,
+//! [`poll()`] recognizes the draft-ietf-webtrans-http3-15 bidirectional `0x41`
+//! signal and unidirectional `0x54` stream type. Classification starts only
+//! after the peer's SETTINGS frame selects this draft with the same setting at
+//! a nonzero value.
+//!
+//! A candidate that arrives before peer SETTINGS retains its already-decoded
+//! signal or stream type, but does not consume a Session ID or detach the QUIC
+//! stream. Once negotiation succeeds, the classifier incrementally consumes
+//! the Session ID and returns [`Event::WebTransportStream`]. Classification is
+//! syntactic and can happen before session admission because draft-15 permits
+//! optimistic streams in the same flight as the CONNECT request. The caller
+//! remains responsible for bounded session admission. A Session ID that is not
+//! a client-initiated bidirectional stream closes the connection with
+//! `H3_ID_ERROR`.
+//!
+//! The classifier uses the existing fixed 16-byte state-buffer allocation and
+//! initializes at most one eight-byte QUIC varint at a time. After association,
+//! H3 stops parsing the stream. Payload, FIN, STOP, and reset handling remain
+//! available through the ordinary QUIC stream APIs; the exact consumed prefix
+//! length is included in the event for `RESET_STREAM_AT` Reliable Size
+//! calculation. Native classification is disabled by default so an adapter
+//! cannot advertise WebTransport while silently abandoning selected streams it
+//! is not yet prepared to own.
 //!
 //! ## Detecting end of request or response
 //!
@@ -283,6 +320,7 @@
 //! [`send_body()`]: struct.Connection.html#method.send_body
 
 use std::collections::hash_map;
+use std::collections::BTreeSet;
 use std::collections::HashSet;
 use std::collections::VecDeque;
 
@@ -345,6 +383,15 @@ pub const PRIORITY_UPDATE_FRAME_PAYLOAD_MAX_SIZE_DEFAULT: u64 = 256;
 ///
 /// See <https://datatracker.ietf.org/doc/html/rfc9114#section-4.2.2>.
 pub const SETTINGS_MAX_FIELD_SECTION_SIZE_DEFAULT: u64 = 32_768;
+
+/// WebTransport support setting from draft-ietf-webtrans-http3-15.
+pub const SETTINGS_WT_ENABLED: u64 = 0x2c7c_f000;
+
+/// Bidirectional WebTransport stream signal from draft-15.
+pub const WEBTRANSPORT_BIDI_STREAM_SIGNAL: u64 = 0x41;
+
+/// Unidirectional WebTransport stream type from draft-15.
+pub const WEBTRANSPORT_UNI_STREAM_TYPE: u64 = 0x54;
 
 #[cfg(feature = "qlog")]
 const QLOG_FRAME_CREATED: EventType =
@@ -583,6 +630,8 @@ pub struct Config {
     /// settings explicitly handled above
     additional_settings: Option<Vec<(u64, u64)>>,
 
+    webtransport_stream_classification: bool,
+
     max_priority_update_size: u64,
 }
 
@@ -595,6 +644,7 @@ impl Config {
             qpack_blocked_streams: None,
             connect_protocol_enabled: None,
             additional_settings: None,
+            webtransport_stream_classification: false,
             max_priority_update_size:
                 PRIORITY_UPDATE_FRAME_PAYLOAD_MAX_SIZE_DEFAULT,
         })
@@ -686,6 +736,21 @@ impl Config {
         }
         self.additional_settings = Some(additional_settings);
         Ok(())
+    }
+
+    /// Enables native draft-15 WebTransport stream-prefix classification.
+    ///
+    /// The default is `false`. This only activates classification when this
+    /// configuration also advertises a nonzero [`SETTINGS_WT_ENABLED`] value
+    /// and the peer later sends the same draft-specific setting with a nonzero
+    /// value. Advertising the setting alone does not transfer stream ownership
+    /// out of HTTP/3.
+    ///
+    /// Applications must consume every [`Event::WebTransportStream`] and take
+    /// ownership of the corresponding QUIC stream. Session admission remains
+    /// the application's responsibility.
+    pub fn enable_webtransport_stream_classification(&mut self, enabled: bool) {
+        self.webtransport_stream_classification = enabled;
     }
 
     /// Sets the maximum size for the payload of PRIORITY_UPDATE frames.
@@ -822,6 +887,25 @@ pub enum Event {
     /// The associated data represents the error code sent by the peer.
     Reset(u64),
 
+    /// A WebTransport stream prefix was received and consumed.
+    ///
+    /// The stream ID is returned by [`Connection::poll()`] alongside this
+    /// event. Only the encoded stream signal/type and Session ID have been
+    /// consumed. Any payload remains readable through the ordinary QUIC stream
+    /// APIs at the returned stream ID. This event is only emitted when native
+    /// classification was explicitly enabled and both endpoints advertised a
+    /// nonzero draft-15 [`SETTINGS_WT_ENABLED`] value.
+    WebTransportStream {
+        /// The client-initiated bidirectional stream identifying the session.
+        session_id: u64,
+
+        /// Whether the associated stream is bidirectional or unidirectional.
+        direction: WebTransportStreamDirection,
+
+        /// Exact encoded length of the signal/type and Session ID prefix.
+        prefix_len: usize,
+    },
+
     /// PRIORITY_UPDATE was received.
     ///
     /// This indicates that the application can use the
@@ -839,6 +923,16 @@ pub enum Event {
 
     /// GOAWAY was received.
     GoAway,
+}
+
+/// Direction of a classified WebTransport stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WebTransportStreamDirection {
+    /// A bidirectional stream beginning with the `0x41` signal.
+    Bidirectional,
+
+    /// A unidirectional stream beginning with stream type `0x54`.
+    Unidirectional,
 }
 
 /// Extensible Priorities parameters.
@@ -1005,6 +1099,12 @@ pub struct Connection {
     local_settings: ConnectionSettings,
     peer_settings: ConnectionSettings,
 
+    local_webtransport_support: bool,
+    peer_webtransport_support: WebTransportPeerSupport,
+    webtransport_stream_classification: bool,
+    pending_webtransport_streams: BTreeSet<u64>,
+    pending_invalid_webtransport_signal: bool,
+
     control_stream_id: Option<u64>,
     peer_control_stream_id: Option<u64>,
 
@@ -1030,12 +1130,25 @@ pub struct Connection {
     max_priority_update_size: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WebTransportPeerSupport {
+    Pending,
+    Disabled,
+    Enabled,
+}
+
 impl Connection {
     fn new(
         config: &Config, is_server: bool, enable_dgram: bool,
     ) -> Result<Connection> {
         let initial_uni_stream_id = if is_server { 0x3 } else { 0x2 };
         let h3_datagram = if enable_dgram { Some(1) } else { None };
+        let local_webtransport_support =
+            config.additional_settings.as_ref().is_some_and(|settings| {
+                settings.iter().any(|(identifier, value)| {
+                    *identifier == SETTINGS_WT_ENABLED && *value > 0
+                })
+            });
 
         Ok(Connection {
             is_server,
@@ -1065,6 +1178,13 @@ impl Connection {
                 additional_settings: Default::default(),
                 raw: Default::default(),
             },
+
+            local_webtransport_support,
+            peer_webtransport_support: WebTransportPeerSupport::Pending,
+            webtransport_stream_classification: config
+                .webtransport_stream_classification,
+            pending_webtransport_streams: BTreeSet::new(),
+            pending_invalid_webtransport_signal: false,
 
             control_stream_id: None,
             peer_control_stream_id: None,
@@ -2116,6 +2236,12 @@ impl Connection {
         // to a protocol error), the connection itself might be in a broken
         // state, so return early.
         if conn.local_error.is_some() {
+            self.clear_stream_state_on_connection_close();
+            return Err(Error::Done);
+        }
+
+        if conn.is_closed() {
+            self.clear_stream_state_on_connection_close();
             return Err(Error::Done);
         }
 
@@ -2126,7 +2252,13 @@ impl Connection {
 
                 Err(Error::Done) => (),
 
-                Err(e) => return Err(e),
+                Err(e) => {
+                    if conn.local_error.is_some() {
+                        self.clear_stream_state_on_connection_close();
+                    }
+
+                    return Err(e);
+                },
             };
         }
 
@@ -2136,7 +2268,13 @@ impl Connection {
 
                 Err(Error::Done) => (),
 
-                Err(e) => return Err(e),
+                Err(e) => {
+                    if conn.local_error.is_some() {
+                        self.clear_stream_state_on_connection_close();
+                    }
+
+                    return Err(e);
+                },
             };
         }
 
@@ -2146,8 +2284,18 @@ impl Connection {
 
                 Err(Error::Done) => (),
 
-                Err(e) => return Err(e),
+                Err(e) => {
+                    if conn.local_error.is_some() {
+                        self.clear_stream_state_on_connection_close();
+                    }
+
+                    return Err(e);
+                },
             };
+        }
+
+        if let Some(ev) = self.poll_pending_webtransport_stream(conn)? {
+            return Ok(ev);
         }
 
         // Process finished streams list.
@@ -2157,32 +2305,16 @@ impl Connection {
 
         // Process HTTP/3 data from readable streams.
         for s in conn.readable() {
-            trace!("{} stream id {} is readable", conn.trace_id(), s);
-
-            let ev = match self.process_readable_stream(conn, s, true) {
-                Ok(v) => Some(v),
-
-                Err(Error::Done) => None,
-
-                // Return early if the stream was reset, to avoid returning
-                // a Finished event later as well.
-                Err(Error::TransportError(crate::Error::StreamReset(e))) => {
-                    self.remove_local_finished_stream(s);
-
-                    return Ok((s, Event::Reset(e)));
-                },
-
-                Err(e) => return Err(e),
-            };
-
-            if conn.stream_finished(s) {
-                self.process_finished_stream(s);
-            }
-
-            // TODO: check if stream is completed so it can be freed
-            if let Some(ev) = ev {
+            if let Some(ev) = self.poll_stream(conn, s)? {
                 return Ok(ev);
             }
+        }
+
+        // The peer's control stream can be discovered after an optimistic
+        // stream in the same readable snapshot. Resolve candidates before
+        // reporting Done so no additional socket wake is required.
+        if let Some(ev) = self.poll_pending_webtransport_stream(conn)? {
+            return Ok(ev);
         }
 
         // Process finished streams list once again, to make sure `Finished`
@@ -2193,6 +2325,120 @@ impl Connection {
         }
 
         Err(Error::Done)
+    }
+
+    fn clear_stream_state_on_connection_close(&mut self) {
+        self.streams.clear();
+        self.finished_streams.clear();
+        self.pending_webtransport_streams.clear();
+        self.pending_invalid_webtransport_signal = false;
+    }
+
+    fn poll_pending_webtransport_stream<F: BufFactory>(
+        &mut self, conn: &mut super::Connection<F>,
+    ) -> Result<Option<(u64, Event)>> {
+        if self.peer_webtransport_support == WebTransportPeerSupport::Pending {
+            return Ok(None);
+        }
+
+        while let Some(stream_id) =
+            self.pending_webtransport_streams.iter().next().copied()
+        {
+            self.pending_webtransport_streams.remove(&stream_id);
+
+            let Some(stream) = self.streams.get_mut(&stream_id) else {
+                continue;
+            };
+
+            let transition = match self.peer_webtransport_support {
+                WebTransportPeerSupport::Enabled =>
+                    stream.resolve_webtransport_candidate(),
+
+                WebTransportPeerSupport::Disabled =>
+                    stream.resolve_webtransport_candidate_as_http3(),
+
+                WebTransportPeerSupport::Pending => unreachable!(),
+            };
+
+            if let Err(e) = transition {
+                conn.close(
+                    true,
+                    e.to_wire(),
+                    b"Error resolving WebTransport stream",
+                )?;
+                self.clear_stream_state_on_connection_close();
+                return Err(e);
+            }
+
+            if let Some(ev) = self.poll_stream(conn, stream_id)? {
+                return Ok(Some(ev));
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn poll_stream<F: BufFactory>(
+        &mut self, conn: &mut super::Connection<F>, stream_id: u64,
+    ) -> Result<Option<(u64, Event)>> {
+        if conn.stream_is_detached_from_app_proto(stream_id) {
+            return Ok(None);
+        }
+
+        trace!("{} stream id {} is readable", conn.trace_id(), stream_id);
+
+        let ev = match self.process_readable_stream(conn, stream_id, true) {
+            Ok(v) => Some(v),
+
+            Err(Error::Done) => None,
+
+            // Return the reset before any Finished event for the same stream.
+            Err(Error::TransportError(crate::Error::StreamReset(e))) => {
+                self.pending_webtransport_streams.remove(&stream_id);
+
+                let remove = self.streams.get(&stream_id).is_some_and(|stream| {
+                    stream.ty() == Some(stream::Type::WebTransport)
+                }) || !crate::stream::is_bidi(stream_id);
+
+                if remove {
+                    self.streams.remove(&stream_id);
+                } else {
+                    if let Some(stream) = self.streams.get_mut(&stream_id) {
+                        stream.finished();
+                    }
+
+                    self.remove_local_finished_stream(stream_id);
+                }
+
+                return Ok(Some((stream_id, Event::Reset(e))));
+            },
+
+            Err(e) => {
+                if conn.local_error.is_some() {
+                    self.clear_stream_state_on_connection_close();
+                }
+
+                return Err(e);
+            },
+        };
+
+        if matches!(ev.as_ref(), Some((_, Event::WebTransportStream { .. }))) {
+            self.pending_webtransport_streams.remove(&stream_id);
+            self.streams.remove(&stream_id);
+
+            return Ok(ev);
+        }
+
+        if conn.stream_finished(stream_id) {
+            // No Session ID bytes remain, so both negotiated classification
+            // and ordinary H3 reach the existing incomplete-stream outcome.
+            // Releasing the candidate also prevents finished streams from
+            // accumulating after QUIC returns their stream-limit credit.
+            self.pending_webtransport_streams.remove(&stream_id);
+            self.process_finished_stream(stream_id);
+        }
+
+        Ok(ev)
     }
 
     /// Sends a GOAWAY frame to initiate graceful connection closure.
@@ -2596,6 +2842,13 @@ impl Connection {
     fn process_readable_stream<F: BufFactory>(
         &mut self, conn: &mut super::Connection<F>, stream_id: u64, polling: bool,
     ) -> Result<(u64, Event)> {
+        let webtransport_classification_enabled = self
+            .webtransport_stream_classification &&
+            self.local_webtransport_support;
+        let peer_webtransport_support = self.peer_webtransport_support;
+        let remote_initiated =
+            !crate::stream::is_local(stream_id, self.is_server);
+
         self.streams.entry(stream_id).or_insert_with(|| {
             <stream::Stream>::new(
                 stream_id,
@@ -2622,19 +2875,48 @@ impl Connection {
                         Err(_) => continue,
                     };
 
-                    let ty = stream::Type::deserialize(varint)?;
+                    let varint_len = stream.varint_len()?;
 
-                    if let Err(e) = stream.set_ty(ty) {
+                    let webtransport_candidate =
+                        webtransport_classification_enabled &&
+                            varint == WEBTRANSPORT_UNI_STREAM_TYPE;
+
+                    let (ty, set_type_result, pending) =
+                        match (webtransport_candidate, peer_webtransport_support)
+                        {
+                            (true, WebTransportPeerSupport::Pending) => (
+                                stream::Type::WebTransport,
+                                stream.set_webtransport_candidate(varint_len),
+                                true,
+                            ),
+
+                            (true, WebTransportPeerSupport::Enabled) => (
+                                stream::Type::WebTransport,
+                                stream.set_webtransport_type(varint_len),
+                                false,
+                            ),
+
+                            _ => {
+                                let ty = stream::Type::deserialize(varint)?;
+                                (ty, stream.set_ty(ty), false)
+                            },
+                        };
+
+                    if let Err(e) = set_type_result {
                         conn.close(true, e.to_wire(), b"")?;
                         return Err(e);
                     }
 
+                    if pending {
+                        self.pending_webtransport_streams.insert(stream_id);
+                    }
+
                     qlog_with_type!(QLOG_STREAM_TYPE_SET, conn.qlog, q, {
-                        let ty_val = if matches!(ty, stream::Type::Unknown) {
-                            Some(varint)
-                        } else {
-                            None
-                        };
+                        let ty_val = matches!(
+                            ty,
+                            stream::Type::Unknown | stream::Type::WebTransport
+                        )
+                        .then_some(varint);
 
                         let ev_data =
                             EventData::Http3StreamTypeSet(StreamTypeSet {
@@ -2734,6 +3016,8 @@ impl Connection {
                             // TODO: we MAY send STOP_SENDING
                         },
 
+                        stream::Type::WebTransport => (),
+
                         stream::Type::Request => unreachable!(),
                     }
                 },
@@ -2762,6 +3046,50 @@ impl Connection {
                         Err(_) => continue,
                     };
 
+                    if webtransport_classification_enabled &&
+                        varint == WEBTRANSPORT_BIDI_STREAM_SIGNAL
+                    {
+                        let varint_len = stream.varint_len()?;
+                        let signal_valid =
+                            remote_initiated && stream.frame_type().is_none();
+
+                        match peer_webtransport_support {
+                            WebTransportPeerSupport::Pending => {
+                                if signal_valid {
+                                    stream
+                                        .set_webtransport_candidate(varint_len)?;
+                                    self.pending_webtransport_streams
+                                        .insert(stream_id);
+
+                                    continue;
+                                }
+
+                                // The eventual outcome is connection-wide if
+                                // draft-15 is selected, so ordinary parsing can
+                                // continue without retaining this stream.
+                                self.pending_invalid_webtransport_signal = true;
+                            },
+
+                            WebTransportPeerSupport::Enabled => {
+                                if !signal_valid {
+                                    conn.close(
+                                        true,
+                                        Error::FrameError.to_wire(),
+                                        b"WebTransport signal is not at stream start",
+                                    )?;
+
+                                    return Err(Error::FrameError);
+                                }
+
+                                stream.set_webtransport_type(varint_len)?;
+
+                                continue;
+                            },
+
+                            WebTransportPeerSupport::Disabled => (),
+                        }
+                    }
+
                     match stream.set_frame_type(varint) {
                         Err(Error::FrameUnexpected) => {
                             let msg = format!("Unexpected frame type {varint}");
@@ -2787,6 +3115,41 @@ impl Connection {
 
                         _ => (),
                     }
+                },
+
+                stream::State::WebTransportSessionId => {
+                    stream.try_fill_buffer(conn)?;
+
+                    let session_id = match stream.try_consume_varint() {
+                        Ok(v) => v,
+
+                        Err(_) => continue,
+                    };
+
+                    if session_id & 0x3 != 0 {
+                        conn.close(
+                            true,
+                            Error::IdError.to_wire(),
+                            b"Invalid WebTransport Session ID",
+                        )?;
+
+                        return Err(Error::IdError);
+                    }
+
+                    let prefix_len = stream.set_webtransport_session_id()?;
+                    let direction = if crate::stream::is_bidi(stream_id) {
+                        WebTransportStreamDirection::Bidirectional
+                    } else {
+                        WebTransportStreamDirection::Unidirectional
+                    };
+
+                    conn.stream_detach_from_app_proto(stream_id);
+
+                    return Ok((stream_id, Event::WebTransportStream {
+                        session_id,
+                        direction,
+                        prefix_len,
+                    }));
                 },
 
                 stream::State::FramePayloadLen => {
@@ -2909,6 +3272,8 @@ impl Connection {
                     }
                 },
 
+                stream::State::WebTransportNegotiation => break,
+
                 stream::State::SkipFramePayload => {
                     stream.try_skip_frame(conn)?;
 
@@ -2929,6 +3294,8 @@ impl Connection {
 
                     break;
                 },
+
+                stream::State::WebTransportData => break,
 
                 stream::State::Finished => break,
             }
@@ -2956,6 +3323,14 @@ impl Connection {
             },
             Some(stream::Type::Unknown) | None => {
                 self.streams.remove(&stream_id);
+            },
+            Some(stream::Type::WebTransport) => {
+                if crate::stream::is_bidi(stream_id) {
+                    stream.finished();
+                    self.finished_streams.push_back(stream_id);
+                } else {
+                    self.streams.remove(&stream_id);
+                }
             },
             // Closing any of the critical streams leads to connection close,
             // so there is no need for any cleanup actions here.
@@ -3002,7 +3377,15 @@ impl Connection {
     ) -> Option<(u64, Event)> {
         let finished = self.finished_streams.pop_front()?;
 
-        self.remove_local_finished_stream(finished);
+        if self
+            .streams
+            .get(&finished)
+            .is_some_and(|stream| stream.ty() == Some(stream::Type::WebTransport))
+        {
+            self.streams.remove(&finished);
+        } else {
+            self.remove_local_finished_stream(finished);
+        }
 
         if conn.stream_readable(finished) {
             // The stream is finished, but is still readable, it may indicate
@@ -3055,6 +3438,18 @@ impl Connection {
                 raw,
                 ..
             } => {
+                let peer_webtransport_support =
+                    if raw.as_ref().is_some_and(|settings| {
+                        settings.iter().any(|(identifier, value)| {
+                            *identifier == SETTINGS_WT_ENABLED && *value > 0
+                        })
+                    }) {
+                        WebTransportPeerSupport::Enabled
+                    } else {
+                        WebTransportPeerSupport::Disabled
+                    };
+                self.peer_webtransport_support = peer_webtransport_support;
+
                 self.peer_settings = ConnectionSettings {
                     max_field_section_size,
                     qpack_max_table_capacity,
@@ -3076,6 +3471,21 @@ impl Connection {
 
                         return Err(Error::SettingsError);
                     }
+                }
+
+                let invalid_signal =
+                    std::mem::take(&mut self.pending_invalid_webtransport_signal);
+                if invalid_signal &&
+                    peer_webtransport_support ==
+                        WebTransportPeerSupport::Enabled
+                {
+                    conn.close(
+                        true,
+                        Error::FrameError.to_wire(),
+                        b"WebTransport signal is not at stream start",
+                    )?;
+
+                    return Err(Error::FrameError);
                 }
             },
 
@@ -3771,6 +4181,93 @@ mod tests {
     use super::*;
 
     use super::testing::*;
+
+    fn webtransport_session() -> Session {
+        webtransport_session_with_stream_limit(64)
+    }
+
+    fn webtransport_session_with_stream_limit(stream_limit: u64) -> Session {
+        let (mut transport_config, mut h3_config) =
+            Session::default_configs().unwrap();
+        transport_config.set_initial_max_data(1_000_000);
+        transport_config.set_initial_max_streams_bidi(stream_limit);
+        transport_config.set_initial_max_streams_uni(stream_limit);
+        transport_config.enable_reset_stream_at(true);
+        h3_config
+            .set_additional_settings(vec![(SETTINGS_WT_ENABLED, 1)])
+            .unwrap();
+        h3_config.enable_webtransport_stream_classification(true);
+
+        let mut session =
+            Session::with_configs(&mut transport_config, &h3_config).unwrap();
+        session.handshake().unwrap();
+
+        session
+    }
+
+    fn webtransport_session_without_h3_handshake() -> Session {
+        webtransport_session_without_h3_handshake_with_setting(1)
+    }
+
+    fn webtransport_session_without_h3_handshake_with_setting(
+        setting: u64,
+    ) -> Session {
+        let (mut transport_config, mut h3_config) =
+            Session::default_configs().unwrap();
+        transport_config.enable_reset_stream_at(true);
+        h3_config
+            .set_additional_settings(vec![(SETTINGS_WT_ENABLED, setting)])
+            .unwrap();
+        h3_config.enable_webtransport_stream_classification(true);
+
+        let mut session =
+            Session::with_configs(&mut transport_config, &h3_config).unwrap();
+        session.pipe.handshake().unwrap();
+
+        session
+    }
+
+    fn send_client_settings(session: &mut Session) {
+        session
+            .client
+            .send_settings(&mut session.pipe.client)
+            .unwrap();
+        session.advance().unwrap();
+    }
+
+    fn encode_varint(value: u64) -> Vec<u8> {
+        let mut encoded = vec![0; octets::varint_len(value)];
+        let mut out = octets::OctetsMut::with_slice(&mut encoded);
+        out.put_varint(value).unwrap();
+
+        encoded
+    }
+
+    fn webtransport_prefix(signal: u64, session_id: u64) -> Vec<u8> {
+        let mut prefix = encode_varint(signal);
+        prefix.extend_from_slice(&encode_varint(session_id));
+        prefix
+    }
+
+    fn take_client_uni_stream(session: &mut Session) -> u64 {
+        let stream_id = session.client.next_uni_stream_id;
+        session.client.next_uni_stream_id += 4;
+        stream_id
+    }
+
+    fn take_client_bidi_stream(session: &mut Session) -> u64 {
+        let stream_id = session.client.next_request_stream_id + 4;
+        session.client.next_request_stream_id = stream_id + 4;
+        stream_id
+    }
+
+    fn webtransport_parser_streams(connection: &Connection) -> usize {
+        connection
+            .streams
+            .values()
+            .filter(|stream| stream.ty() == Some(stream::Type::WebTransport))
+            .count()
+    }
 
     #[test]
     /// Make sure that random GREASE values is within the specified limit.
@@ -8543,6 +9040,787 @@ mod tests {
         // The server stream should be gone now
         assert_eq!(s.client.streams.len(), init_streams_client);
         assert_eq!(s.server.streams.len(), init_streams_server);
+    }
+
+    #[test]
+    fn webtransport_classifies_fragmented_prefixes_without_reading_payload() {
+        let mut s = webtransport_session();
+        let payload = b"\x00\x04\x01\x40\x41\x40\x54h3-like-payload";
+
+        for (is_bidi, session_id, expected_direction) in [
+            (true, 0, WebTransportStreamDirection::Bidirectional),
+            (false, 1 << 30, WebTransportStreamDirection::Unidirectional),
+        ] {
+            let stream_id = if is_bidi {
+                take_client_bidi_stream(&mut s)
+            } else {
+                take_client_uni_stream(&mut s)
+            };
+            let signal = if is_bidi {
+                WEBTRANSPORT_BIDI_STREAM_SIGNAL
+            } else {
+                WEBTRANSPORT_UNI_STREAM_TYPE
+            };
+            let prefix = webtransport_prefix(signal, session_id);
+            let consumed_before = s.pipe.server.flow_control.consumed();
+
+            for byte in &prefix[..prefix.len() - 1] {
+                assert_eq!(
+                    s.pipe.client.stream_send(
+                        stream_id,
+                        std::slice::from_ref(byte),
+                        false,
+                    ),
+                    Ok(1),
+                );
+                s.advance().unwrap();
+                assert_eq!(s.poll_server(), Err(Error::Done));
+            }
+
+            let mut final_fragment = vec![*prefix.last().unwrap()];
+            final_fragment.extend_from_slice(payload);
+            assert_eq!(
+                s.pipe.client.stream_send(stream_id, &final_fragment, true,),
+                Ok(final_fragment.len()),
+            );
+            s.advance().unwrap();
+
+            assert_eq!(
+                s.poll_server(),
+                Ok((stream_id, Event::WebTransportStream {
+                    session_id,
+                    direction: expected_direction,
+                    prefix_len: prefix.len(),
+                })),
+            );
+            assert_eq!(
+                s.pipe.server.flow_control.consumed(),
+                consumed_before + prefix.len() as u64,
+            );
+            assert!(s.pipe.server.stream_is_detached_from_app_proto(stream_id));
+            assert!(!s.server.streams.contains_key(&stream_id));
+
+            // A second H3 poll neither duplicates the association nor consumes
+            // bytes that belong to the selected stream.
+            assert_eq!(s.poll_server(), Err(Error::Done));
+            assert_eq!(
+                s.pipe.server.flow_control.consumed(),
+                consumed_before + prefix.len() as u64,
+            );
+
+            let mut received = vec![0; payload.len()];
+            assert_eq!(
+                s.pipe.server.stream_recv(stream_id, &mut received),
+                Ok((payload.len(), true)),
+            );
+            assert_eq!(received, payload);
+        }
+    }
+
+    #[test]
+    fn webtransport_bidi_candidate_waits_for_peer_settings() {
+        let mut s = webtransport_session_without_h3_handshake();
+        let stream_id = take_client_bidi_stream(&mut s);
+        let prefix = webtransport_prefix(WEBTRANSPORT_BIDI_STREAM_SIGNAL, 0);
+        let payload = b"selected payload";
+        let mut bytes = prefix.clone();
+        bytes.extend_from_slice(payload);
+        let consumed_before = s.pipe.server.flow_control.consumed();
+
+        s.pipe.client.stream_send(stream_id, &bytes, false).unwrap();
+        s.advance().unwrap();
+
+        assert_eq!(s.poll_server(), Err(Error::Done));
+        assert_eq!(
+            s.pipe.server.flow_control.consumed(),
+            consumed_before +
+                encode_varint(WEBTRANSPORT_BIDI_STREAM_SIGNAL).len() as u64,
+        );
+        assert!(s.server.pending_webtransport_streams.contains(&stream_id));
+        assert!(!s.pipe.server.stream_is_detached_from_app_proto(stream_id));
+
+        send_client_settings(&mut s);
+
+        assert_eq!(
+            s.poll_server(),
+            Ok((stream_id, Event::WebTransportStream {
+                session_id: 0,
+                direction: WebTransportStreamDirection::Bidirectional,
+                prefix_len: prefix.len(),
+            })),
+        );
+        let mut received = vec![0; payload.len()];
+        assert_eq!(
+            s.pipe.server.stream_recv(stream_id, &mut received),
+            Ok((payload.len(), false)),
+        );
+        assert_eq!(received, payload);
+    }
+
+    #[test]
+    fn webtransport_uni_candidate_waits_for_peer_settings() {
+        let mut s = webtransport_session_without_h3_handshake();
+        let stream_id = take_client_uni_stream(&mut s);
+        let session_id = 1 << 30;
+        let prefix =
+            webtransport_prefix(WEBTRANSPORT_UNI_STREAM_TYPE, session_id);
+        let payload = b"selected payload";
+        let mut bytes = prefix.clone();
+        bytes.extend_from_slice(payload);
+
+        s.pipe.client.stream_send(stream_id, &bytes, false).unwrap();
+        s.advance().unwrap();
+
+        assert_eq!(s.poll_server(), Err(Error::Done));
+        assert!(s.server.pending_webtransport_streams.contains(&stream_id));
+        assert!(!s.pipe.server.stream_is_detached_from_app_proto(stream_id));
+
+        send_client_settings(&mut s);
+
+        assert_eq!(
+            s.poll_server(),
+            Ok((stream_id, Event::WebTransportStream {
+                session_id,
+                direction: WebTransportStreamDirection::Unidirectional,
+                prefix_len: prefix.len(),
+            })),
+        );
+        let mut received = vec![0; payload.len()];
+        assert_eq!(
+            s.pipe.server.stream_recv(stream_id, &mut received),
+            Ok((payload.len(), false)),
+        );
+        assert_eq!(received, payload);
+    }
+
+    #[test]
+    fn webtransport_signal_only_fin_does_not_retain_pending_candidate() {
+        let mut s = webtransport_session_without_h3_handshake();
+        let uni_id = take_client_uni_stream(&mut s);
+        let bidi_id = take_client_bidi_stream(&mut s);
+
+        s.pipe
+            .client
+            .stream_send(
+                uni_id,
+                &encode_varint(WEBTRANSPORT_UNI_STREAM_TYPE),
+                true,
+            )
+            .unwrap();
+        s.pipe
+            .client
+            .stream_send(
+                bidi_id,
+                &encode_varint(WEBTRANSPORT_BIDI_STREAM_SIGNAL),
+                true,
+            )
+            .unwrap();
+        s.advance().unwrap();
+
+        assert_eq!(s.poll_server(), Ok((bidi_id, Event::Finished)));
+        assert_eq!(s.poll_server(), Err(Error::Done));
+        assert!(s.server.pending_webtransport_streams.is_empty());
+        assert!(!s.server.streams.contains_key(&uni_id));
+    }
+
+    #[test]
+    fn webtransport_absent_peer_setting_restores_ordinary_h3_semantics() {
+        let mut s = webtransport_session_without_h3_handshake();
+        let uni_id = take_client_uni_stream(&mut s);
+        let bidi_id = take_client_bidi_stream(&mut s);
+        let mut uni = encode_varint(WEBTRANSPORT_UNI_STREAM_TYPE);
+        uni.extend_from_slice(b"ignored");
+        let bidi = webtransport_prefix(WEBTRANSPORT_BIDI_STREAM_SIGNAL, 0);
+
+        s.pipe.client.stream_send(uni_id, &uni, true).unwrap();
+        s.pipe.client.stream_send(bidi_id, &bidi, true).unwrap();
+        s.advance().unwrap();
+        assert_eq!(s.poll_server(), Err(Error::Done));
+        assert_eq!(s.server.pending_webtransport_streams.len(), 2);
+
+        s.client.local_settings.additional_settings = None;
+        send_client_settings(&mut s);
+
+        assert_eq!(s.poll_server(), Ok((bidi_id, Event::Finished)));
+        assert_eq!(s.poll_server(), Err(Error::Done));
+        assert!(s.pipe.server.local_error.is_none());
+        assert!(s.server.pending_webtransport_streams.is_empty());
+        assert!(!s.pipe.server.stream_is_detached_from_app_proto(uni_id));
+        assert!(!s.pipe.server.stream_is_detached_from_app_proto(bidi_id));
+    }
+
+    #[test]
+    fn webtransport_zero_peer_setting_keeps_unknown_frame_ignorable() {
+        let mut s = webtransport_session_without_h3_handshake();
+        let stream_id = take_client_bidi_stream(&mut s);
+        let mut frame = encode_varint(WEBTRANSPORT_BIDI_STREAM_SIGNAL);
+        frame.extend_from_slice(&encode_varint(1));
+        frame.push(1);
+
+        s.pipe.client.stream_send(stream_id, &frame, true).unwrap();
+        s.advance().unwrap();
+        assert_eq!(s.poll_server(), Err(Error::Done));
+
+        s.client.local_settings.additional_settings =
+            Some(vec![(SETTINGS_WT_ENABLED, 0)]);
+        send_client_settings(&mut s);
+
+        assert_eq!(s.poll_server(), Ok((stream_id, Event::Finished)));
+        assert!(s.pipe.server.local_error.is_none());
+        assert!(!s.pipe.server.stream_is_detached_from_app_proto(stream_id));
+    }
+
+    #[test]
+    fn webtransport_nonzero_setting_other_than_one_negotiates() {
+        let mut s = webtransport_session_without_h3_handshake_with_setting(2);
+        let stream_id = take_client_uni_stream(&mut s);
+        let prefix = webtransport_prefix(WEBTRANSPORT_UNI_STREAM_TYPE, 0);
+
+        s.pipe
+            .client
+            .stream_send(stream_id, &prefix, false)
+            .unwrap();
+        s.advance().unwrap();
+        assert_eq!(s.poll_server(), Err(Error::Done));
+
+        send_client_settings(&mut s);
+
+        assert_eq!(
+            s.poll_server(),
+            Ok((stream_id, Event::WebTransportStream {
+                session_id: 0,
+                direction: WebTransportStreamDirection::Unidirectional,
+                prefix_len: prefix.len(),
+            })),
+        );
+    }
+
+    #[test]
+    fn webtransport_zero_local_setting_does_not_enable_classifier() {
+        let mut s = webtransport_session_without_h3_handshake_with_setting(0);
+        s.client.local_settings.additional_settings =
+            Some(vec![(SETTINGS_WT_ENABLED, 1)]);
+        send_client_settings(&mut s);
+        assert_eq!(s.poll_server(), Err(Error::Done));
+        assert_eq!(
+            s.server.peer_webtransport_support,
+            WebTransportPeerSupport::Enabled,
+        );
+
+        let stream_id = take_client_bidi_stream(&mut s);
+        let mut frame = encode_varint(WEBTRANSPORT_BIDI_STREAM_SIGNAL);
+        frame.extend_from_slice(&encode_varint(1));
+        frame.push(1);
+        s.pipe.client.stream_send(stream_id, &frame, true).unwrap();
+        s.advance().unwrap();
+
+        assert_eq!(s.poll_server(), Ok((stream_id, Event::Finished)));
+        assert!(s.pipe.server.local_error.is_none());
+        assert!(!s.pipe.server.stream_is_detached_from_app_proto(stream_id));
+    }
+
+    #[test]
+    fn webtransport_classifier_is_disabled_by_default() {
+        let (mut transport_config, mut h3_config) =
+            Session::default_configs().unwrap();
+        h3_config
+            .set_additional_settings(vec![(SETTINGS_WT_ENABLED, 1)])
+            .unwrap();
+        let mut s =
+            Session::with_configs(&mut transport_config, &h3_config).unwrap();
+        s.handshake().unwrap();
+        let stream_id = take_client_bidi_stream(&mut s);
+        let mut frame = encode_varint(WEBTRANSPORT_BIDI_STREAM_SIGNAL);
+        frame.extend_from_slice(&encode_varint(1));
+        frame.push(1);
+
+        s.pipe.client.stream_send(stream_id, &frame, true).unwrap();
+        s.advance().unwrap();
+
+        assert_eq!(s.poll_server(), Ok((stream_id, Event::Finished)));
+        assert!(s.pipe.server.local_error.is_none());
+        assert!(!s.pipe.server.stream_is_detached_from_app_proto(stream_id));
+    }
+
+    #[test]
+    fn webtransport_signal_is_an_unknown_frame_for_non_webtransport_peer() {
+        let mut s = Session::new().unwrap();
+        s.handshake().unwrap();
+        let stream_id = take_client_bidi_stream(&mut s);
+        let mut frame = encode_varint(WEBTRANSPORT_BIDI_STREAM_SIGNAL);
+        frame.extend_from_slice(&encode_varint(1));
+        frame.push(0xff);
+
+        s.pipe.client.stream_send(stream_id, &frame, true).unwrap();
+        s.advance().unwrap();
+
+        assert_eq!(s.poll_server(), Ok((stream_id, Event::Finished)));
+        assert!(s.pipe.server.local_error.is_none());
+        assert!(!s.pipe.server.stream_is_detached_from_app_proto(stream_id));
+    }
+
+    #[test]
+    fn webtransport_same_flight_settings_connect_and_stream_reordering() {
+        let mut s = webtransport_session_without_h3_handshake();
+        let selected_stream_id = 0;
+        let session_id = 4;
+        let request = vec![
+            Header::new(b":method", b"CONNECT"),
+            Header::new(b":protocol", b"webtransport-h3"),
+            Header::new(b":scheme", b"https"),
+            Header::new(b":authority", b"quic.tech"),
+            Header::new(b":path", b"/webtransport"),
+        ];
+        let prefix =
+            webtransport_prefix(WEBTRANSPORT_BIDI_STREAM_SIGNAL, session_id);
+        let payload = b"optimistic";
+        let mut selected_stream = prefix.clone();
+        selected_stream.extend_from_slice(payload);
+
+        s.client
+            .send_settings(&mut s.pipe.client)
+            .expect("client SETTINGS");
+        s.client.next_request_stream_id = session_id;
+        assert_eq!(
+            s.client
+                .send_request(&mut s.pipe.client, &request, false)
+                .expect("CONNECT request"),
+            session_id,
+        );
+        s.pipe
+            .client
+            .stream_send(selected_stream_id, &selected_stream, false)
+            .expect("optimistic stream");
+        s.advance().unwrap();
+
+        let mut saw_connect = false;
+        let mut saw_selected_stream = false;
+        for _ in 0..4 {
+            match s.poll_server() {
+                Ok((id, Event::Headers { list, .. })) if id == session_id => {
+                    assert_eq!(list, request);
+                    saw_connect = true;
+                },
+
+                Ok((
+                    id,
+                    Event::WebTransportStream {
+                        session_id: associated_session_id,
+                        direction,
+                        prefix_len,
+                    },
+                )) if id == selected_stream_id => {
+                    assert_eq!(associated_session_id, session_id);
+                    assert_eq!(
+                        direction,
+                        WebTransportStreamDirection::Bidirectional
+                    );
+                    assert_eq!(prefix_len, prefix.len());
+                    saw_selected_stream = true;
+                },
+
+                Err(Error::Done) => break,
+
+                event => panic!("unexpected same-flight event: {event:?}"),
+            }
+        }
+
+        assert!(saw_connect);
+        assert!(saw_selected_stream);
+        assert_eq!(
+            s.server.peer_webtransport_support,
+            WebTransportPeerSupport::Enabled,
+        );
+        let mut received = vec![0; payload.len()];
+        assert_eq!(
+            s.pipe.server.stream_recv(selected_stream_id, &mut received),
+            Ok((payload.len(), false)),
+        );
+        assert_eq!(received, payload);
+    }
+
+    #[test]
+    fn webtransport_rejects_non_client_bidi_session_ids() {
+        for session_id in [1, 2, 3] {
+            let mut s = webtransport_session();
+            let stream_id = take_client_uni_stream(&mut s);
+            let prefix =
+                webtransport_prefix(WEBTRANSPORT_UNI_STREAM_TYPE, session_id);
+            s.pipe
+                .client
+                .stream_send(stream_id, &prefix, false)
+                .unwrap();
+            s.advance().unwrap();
+
+            assert_eq!(s.poll_server(), Err(Error::IdError));
+            let local_error = s.pipe.server.local_error().unwrap();
+            assert!(local_error.is_app);
+            assert_eq!(local_error.error_code, WireErrorCode::IdError as u64,);
+            assert_eq!(webtransport_parser_streams(&s.server), 0);
+        }
+    }
+
+    #[test]
+    fn webtransport_bidi_signal_after_h3_frame_is_frame_error() {
+        let mut s = webtransport_session();
+        let stream_id = take_client_bidi_stream(&mut s);
+        let mut bytes = encode_varint(0x21);
+        bytes.extend_from_slice(&encode_varint(0));
+        bytes.extend_from_slice(&webtransport_prefix(
+            WEBTRANSPORT_BIDI_STREAM_SIGNAL,
+            0,
+        ));
+        s.pipe.client.stream_send(stream_id, &bytes, false).unwrap();
+        s.advance().unwrap();
+
+        assert_eq!(s.poll_server(), Err(Error::FrameError));
+        let local_error = s.pipe.server.local_error().unwrap();
+        assert!(local_error.is_app);
+        assert_eq!(local_error.error_code, WireErrorCode::FrameError as u64,);
+        assert_eq!(webtransport_parser_streams(&s.server), 0);
+    }
+
+    #[test]
+    fn webtransport_late_signal_before_settings_defers_frame_error() {
+        let mut s = webtransport_session_without_h3_handshake();
+        let stream_id = take_client_bidi_stream(&mut s);
+        let mut bytes = encode_varint(0x21);
+        bytes.extend_from_slice(&encode_varint(0));
+        bytes.extend_from_slice(&encode_varint(WEBTRANSPORT_BIDI_STREAM_SIGNAL));
+        bytes.extend_from_slice(&encode_varint(0));
+        s.pipe.client.stream_send(stream_id, &bytes, true).unwrap();
+        s.advance().unwrap();
+
+        assert_eq!(s.poll_server(), Ok((stream_id, Event::Finished)));
+        assert!(s.server.pending_invalid_webtransport_signal);
+        assert!(s.server.pending_webtransport_streams.is_empty());
+
+        send_client_settings(&mut s);
+
+        assert_eq!(s.poll_server(), Err(Error::FrameError));
+        let local_error = s.pipe.server.local_error().unwrap();
+        assert!(local_error.is_app);
+        assert_eq!(local_error.error_code, WireErrorCode::FrameError as u64);
+    }
+
+    #[test]
+    fn webtransport_concurrent_fragmented_streams_do_not_cross_associations() {
+        let mut s = webtransport_session();
+        let bidi_id = take_client_bidi_stream(&mut s);
+        let uni_id = take_client_uni_stream(&mut s);
+        let bidi_prefix = webtransport_prefix(WEBTRANSPORT_BIDI_STREAM_SIGNAL, 0);
+        let uni_session_id = 1 << 30;
+        let uni_prefix =
+            webtransport_prefix(WEBTRANSPORT_UNI_STREAM_TYPE, uni_session_id);
+
+        s.pipe
+            .client
+            .stream_send(bidi_id, &bidi_prefix[..1], false)
+            .unwrap();
+        s.pipe
+            .client
+            .stream_send(uni_id, &uni_prefix[..1], false)
+            .unwrap();
+        s.advance().unwrap();
+        assert_eq!(s.poll_server(), Err(Error::Done));
+
+        let mut bidi_tail = bidi_prefix[1..].to_vec();
+        bidi_tail.extend_from_slice(b"bidi");
+        let mut uni_tail = uni_prefix[1..].to_vec();
+        uni_tail.extend_from_slice(b"uni");
+        s.pipe
+            .client
+            .stream_send(bidi_id, &bidi_tail, false)
+            .unwrap();
+        s.pipe.client.stream_send(uni_id, &uni_tail, false).unwrap();
+        s.advance().unwrap();
+
+        let mut events = [s.poll_server().unwrap(), s.poll_server().unwrap()];
+        events.sort_by_key(|(stream_id, _)| *stream_id);
+        let mut expected = [
+            (bidi_id, Event::WebTransportStream {
+                session_id: 0,
+                direction: WebTransportStreamDirection::Bidirectional,
+                prefix_len: bidi_prefix.len(),
+            }),
+            (uni_id, Event::WebTransportStream {
+                session_id: uni_session_id,
+                direction: WebTransportStreamDirection::Unidirectional,
+                prefix_len: uni_prefix.len(),
+            }),
+        ];
+        expected.sort_by_key(|(stream_id, _)| *stream_id);
+
+        assert_eq!(events, expected);
+        assert_eq!(s.poll_server(), Err(Error::Done));
+    }
+
+    #[test]
+    fn webtransport_incomplete_prefix_fin_preserves_h3_termination() {
+        let mut s = webtransport_session_with_stream_limit(64);
+        let bidi_prefix =
+            webtransport_prefix(WEBTRANSPORT_BIDI_STREAM_SIGNAL, 1 << 30);
+        let uni_prefix =
+            webtransport_prefix(WEBTRANSPORT_UNI_STREAM_TYPE, 1 << 30);
+        let mut bidi_streams = Vec::new();
+
+        for cut in 0..bidi_prefix.len() {
+            let stream_id = take_client_bidi_stream(&mut s);
+            bidi_streams.push(stream_id);
+            s.pipe
+                .client
+                .stream_send(stream_id, &bidi_prefix[..cut], true)
+                .unwrap();
+        }
+
+        for cut in 0..uni_prefix.len() {
+            let stream_id = take_client_uni_stream(&mut s);
+            s.pipe
+                .client
+                .stream_send(stream_id, &uni_prefix[..cut], true)
+                .unwrap();
+        }
+
+        s.advance().unwrap();
+
+        let mut finished = Vec::new();
+        loop {
+            match s.poll_server() {
+                Ok((stream_id, event)) => {
+                    assert!(!matches!(event, Event::WebTransportStream { .. }));
+                    if event == Event::Finished {
+                        finished.push(stream_id);
+                    }
+                },
+                Err(Error::Done) => break,
+                Err(error) =>
+                    panic!("unexpected incomplete-prefix error: {error:?}"),
+            }
+        }
+        finished.sort_unstable();
+        bidi_streams.sort_unstable();
+
+        assert_eq!(finished, bidi_streams);
+        assert_eq!(webtransport_parser_streams(&s.server), 0);
+    }
+
+    #[test]
+    fn webtransport_reset_releases_prefix_and_stop_does_not_cross_directions() {
+        let mut s = webtransport_session();
+        let reset_id = take_client_uni_stream(&mut s);
+        let reset_prefix = webtransport_prefix(WEBTRANSPORT_UNI_STREAM_TYPE, 0);
+        s.pipe
+            .client
+            .stream_send(reset_id, &reset_prefix[..2], false)
+            .unwrap();
+        s.advance().unwrap();
+        assert_eq!(s.poll_server(), Err(Error::Done));
+        assert_eq!(webtransport_parser_streams(&s.server), 1);
+
+        s.pipe.client.stream_shutdown_at(reset_id, 42, 2).unwrap();
+        s.advance().unwrap();
+        assert_eq!(s.poll_server(), Ok((reset_id, Event::Reset(42))));
+        assert_eq!(webtransport_parser_streams(&s.server), 0);
+
+        let early_reset_id = take_client_uni_stream(&mut s);
+        s.pipe
+            .client
+            .stream_send(early_reset_id, &reset_prefix[..1], false)
+            .unwrap();
+        s.advance().unwrap();
+        assert_eq!(s.poll_server(), Err(Error::Done));
+        assert!(s.server.streams.contains_key(&early_reset_id));
+
+        s.pipe
+            .client
+            .stream_shutdown_at(early_reset_id, 43, 1)
+            .unwrap();
+        s.advance().unwrap();
+        assert_eq!(s.poll_server(), Ok((early_reset_id, Event::Reset(43))),);
+        assert!(!s.server.streams.contains_key(&early_reset_id));
+
+        let stopped_id = take_client_bidi_stream(&mut s);
+        let stopped_prefix =
+            webtransport_prefix(WEBTRANSPORT_BIDI_STREAM_SIGNAL, 0);
+        s.pipe
+            .client
+            .stream_send(stopped_id, &stopped_prefix[..1], false)
+            .unwrap();
+        s.advance().unwrap();
+        assert_eq!(s.poll_server(), Err(Error::Done));
+
+        s.pipe
+            .client
+            .stream_shutdown(stopped_id, crate::Shutdown::Read, 77)
+            .unwrap();
+        s.advance().unwrap();
+        assert_eq!(
+            s.pipe.server.stream_capacity(stopped_id),
+            Err(crate::Error::StreamStopped(77)),
+        );
+
+        s.pipe
+            .client
+            .stream_send(stopped_id, &stopped_prefix[1..], false)
+            .unwrap();
+        s.advance().unwrap();
+        assert_eq!(
+            s.poll_server(),
+            Ok((stopped_id, Event::WebTransportStream {
+                session_id: 0,
+                direction: WebTransportStreamDirection::Bidirectional,
+                prefix_len: stopped_prefix.len(),
+            })),
+        );
+    }
+
+    #[test]
+    fn webtransport_complete_prefix_leaves_reliable_reset_to_selected_stream() {
+        let mut s = webtransport_session();
+        let stream_id = take_client_uni_stream(&mut s);
+        let prefix = webtransport_prefix(WEBTRANSPORT_UNI_STREAM_TYPE, 0);
+
+        s.pipe
+            .client
+            .stream_send(stream_id, &prefix, false)
+            .unwrap();
+        s.pipe
+            .client
+            .stream_shutdown_at(stream_id, 91, prefix.len() as u64)
+            .unwrap();
+        s.advance().unwrap();
+
+        assert_eq!(
+            s.poll_server(),
+            Ok((stream_id, Event::WebTransportStream {
+                session_id: 0,
+                direction: WebTransportStreamDirection::Unidirectional,
+                prefix_len: prefix.len(),
+            })),
+        );
+        assert_eq!(s.poll_server(), Err(Error::Done));
+        assert_eq!(
+            s.pipe.server.stream_recv(stream_id, &mut []),
+            Err(crate::Error::StreamReset(91)),
+        );
+        assert!(!s.pipe.server.stream_is_detached_from_app_proto(stream_id));
+    }
+
+    #[test]
+    fn webtransport_prefix_flow_credit_and_collection_are_exact() {
+        let mut s = webtransport_session();
+        let stream_id = take_client_uni_stream(&mut s);
+        let prefix = webtransport_prefix(WEBTRANSPORT_UNI_STREAM_TYPE, 0);
+        let payload = b"selected payload";
+        let mut bytes = prefix.clone();
+        bytes.extend_from_slice(payload);
+        let consumed_before = s.pipe.server.flow_control.consumed();
+
+        s.pipe.client.stream_send(stream_id, &bytes, true).unwrap();
+        s.advance().unwrap();
+        assert_eq!(
+            s.poll_server(),
+            Ok((stream_id, Event::WebTransportStream {
+                session_id: 0,
+                direction: WebTransportStreamDirection::Unidirectional,
+                prefix_len: prefix.len(),
+            })),
+        );
+        assert_eq!(
+            s.pipe.server.flow_control.consumed(),
+            consumed_before + prefix.len() as u64,
+        );
+        assert!(s.pipe.server.stream_is_detached_from_app_proto(stream_id));
+
+        assert_eq!(s.poll_server(), Err(Error::Done));
+        assert_eq!(
+            s.pipe.server.flow_control.consumed(),
+            consumed_before + prefix.len() as u64,
+        );
+
+        let mut received = [0; 16];
+        assert_eq!(
+            s.pipe.server.stream_recv(stream_id, &mut received),
+            Ok((payload.len(), true)),
+        );
+        assert_eq!(&received[..payload.len()], payload);
+        assert_eq!(
+            s.pipe.server.flow_control.consumed(),
+            consumed_before + bytes.len() as u64,
+        );
+        assert!(s.pipe.server.stream_closed(stream_id));
+        assert!(!s.pipe.server.stream_is_detached_from_app_proto(stream_id));
+        assert_eq!(s.poll_server(), Err(Error::Done));
+    }
+
+    #[test]
+    fn webtransport_enabled_keeps_ordinary_h3_and_unknown_streams_unchanged() {
+        let mut s = webtransport_session();
+        let (request_id, request_headers) = s.send_request(true).unwrap();
+        assert_eq!(
+            s.poll_server(),
+            Ok((request_id, Event::Headers {
+                list: request_headers,
+                more_frames: false,
+            })),
+        );
+        assert_eq!(s.poll_server(), Ok((request_id, Event::Finished)));
+
+        let unknown_id = take_client_uni_stream(&mut s);
+        let mut unknown = encode_varint(WEBTRANSPORT_UNI_STREAM_TYPE + 1);
+        unknown.extend_from_slice(b"ignored");
+        s.pipe
+            .client
+            .stream_send(unknown_id, &unknown, false)
+            .unwrap();
+        s.advance().unwrap();
+
+        assert_eq!(s.poll_server(), Err(Error::Done));
+        assert!(s.pipe.server.local_error.is_none());
+        assert!(!s.pipe.server.stream_is_detached_from_app_proto(unknown_id));
+    }
+
+    #[test]
+    fn webtransport_many_incomplete_streams_are_bounded_and_released() {
+        const STREAM_COUNT: usize = 128;
+
+        let mut s =
+            webtransport_session_with_stream_limit(STREAM_COUNT as u64 + 16);
+        let prefix = webtransport_prefix(WEBTRANSPORT_UNI_STREAM_TYPE, 0);
+        let mut stream_ids = Vec::with_capacity(STREAM_COUNT);
+
+        for _ in 0..STREAM_COUNT {
+            let stream_id = take_client_uni_stream(&mut s);
+            stream_ids.push(stream_id);
+            s.pipe
+                .client
+                .stream_send(stream_id, &prefix[..2], false)
+                .unwrap();
+        }
+        s.advance().unwrap();
+
+        assert_eq!(s.poll_server(), Err(Error::Done));
+        assert_eq!(webtransport_parser_streams(&s.server), STREAM_COUNT);
+
+        for stream_id in stream_ids {
+            s.pipe.client.stream_send(stream_id, &[], true).unwrap();
+        }
+        s.advance().unwrap();
+        assert_eq!(s.poll_server(), Err(Error::Done));
+        assert_eq!(webtransport_parser_streams(&s.server), 0);
+
+        let stream_id = take_client_uni_stream(&mut s);
+        s.pipe
+            .client
+            .stream_send(stream_id, &prefix[..1], false)
+            .unwrap();
+        s.advance().unwrap();
+        assert_eq!(s.poll_server(), Err(Error::Done));
+        assert!(s.server.streams.contains_key(&stream_id));
+
+        s.pipe.server.close(true, 0, b"test close").unwrap();
+        assert_eq!(s.poll_server(), Err(Error::Done));
+        assert!(s.server.streams.is_empty());
     }
 }
 

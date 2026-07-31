@@ -6883,6 +6883,20 @@ impl<F: BufFactory> Connection<F> {
         stream.is_readable()
     }
 
+    pub(crate) fn stream_detach_from_app_proto(&mut self, stream_id: u64) {
+        if let Some(stream) = self.streams.get_mut(stream_id) {
+            stream.detach_from_app_proto();
+        }
+    }
+
+    pub(crate) fn stream_is_detached_from_app_proto(
+        &self, stream_id: u64,
+    ) -> bool {
+        self.streams
+            .get(stream_id)
+            .is_some_and(stream::Stream::is_detached_from_app_proto)
+    }
+
     /// Returns the number of bytes that can currently be read from a stream
     /// without gaps.
     ///

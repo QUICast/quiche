@@ -1340,6 +1340,11 @@ impl HttpConn for Http3Conn {
                 },
 
                 Ok((
+                    _stream_id,
+                    quiche::h3::Event::WebTransportStream { .. },
+                )) => (),
+
+                Ok((
                     prioritized_element_id,
                     quiche::h3::Event::PriorityUpdate,
                 )) => {
@@ -1533,6 +1538,11 @@ impl HttpConn for Http3Conn {
                 Ok((_stream_id, quiche::h3::Event::Finished)) => (),
 
                 Ok((_stream_id, quiche::h3::Event::Reset { .. })) => (),
+
+                Ok((
+                    _stream_id,
+                    quiche::h3::Event::WebTransportStream { .. },
+                )) => (),
 
                 Ok((
                     prioritized_element_id,

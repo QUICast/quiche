@@ -157,6 +157,10 @@ pub extern "C" fn quiche_h3_event_type(ev: &h3::Event) -> u32 {
         h3::Event::Reset { .. } => 4,
 
         h3::Event::PriorityUpdate => 5,
+
+        h3::Event::WebTransportStream { .. } => unreachable!(
+            "WebTransport classification cannot be enabled by a C H3 config"
+        ),
     }
 }
 

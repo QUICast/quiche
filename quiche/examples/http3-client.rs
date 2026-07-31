@@ -274,6 +274,11 @@ fn main() {
                         conn.close(true, 0x100, b"kthxbye").unwrap();
                     },
 
+                    Ok((
+                        _stream_id,
+                        quiche::h3::Event::WebTransportStream { .. },
+                    )) => (),
+
                     Ok((_, quiche::h3::Event::PriorityUpdate)) => unreachable!(),
 
                     Ok((goaway_id, quiche::h3::Event::GoAway)) => {

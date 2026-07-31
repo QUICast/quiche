@@ -1004,6 +1004,10 @@ pub struct Stream<F: BufFactory = DefaultBufFactory> {
     /// Whether the stream was created by the local endpoint.
     pub local: bool,
 
+    /// Whether the negotiated application protocol detached this stream from
+    /// its parser so the application can consume it directly.
+    app_proto_detached: bool,
+
     /// The stream's urgency (lower is better). Default is `DEFAULT_URGENCY`.
     pub urgency: u8,
 
@@ -1030,6 +1034,7 @@ impl<F: BufFactory> Stream<F> {
             send_lowat: 1,
             bidi: is_bidi(id),
             local,
+            app_proto_detached: false,
             urgency: priority_key.urgency,
             incremental: priority_key.incremental,
             priority_key,
@@ -1039,6 +1044,14 @@ impl<F: BufFactory> Stream<F> {
     /// Returns true if the stream has data to read.
     pub fn is_readable(&self) -> bool {
         self.recv.ready()
+    }
+
+    pub(crate) fn detach_from_app_proto(&mut self) {
+        self.app_proto_detached = true;
+    }
+
+    pub(crate) fn is_detached_from_app_proto(&self) -> bool {
+        self.app_proto_detached
     }
 
     /// Returns true if the stream has enough flow control capacity to be

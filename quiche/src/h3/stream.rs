@@ -47,6 +47,7 @@ pub enum Type {
     Push,
     QpackEncoder,
     QpackDecoder,
+    WebTransport,
     Unknown,
 }
 
@@ -59,7 +60,8 @@ impl Type {
             Type::Push => qlog::events::http3::StreamType::Push,
             Type::QpackEncoder => qlog::events::http3::StreamType::QpackEncode,
             Type::QpackDecoder => qlog::events::http3::StreamType::QpackDecode,
-            Type::Unknown => qlog::events::http3::StreamType::Unknown,
+            Type::WebTransport | Type::Unknown =>
+                qlog::events::http3::StreamType::Unknown,
         }
     }
 }
@@ -86,6 +88,15 @@ pub enum State {
 
     /// Reading a QPACK instruction.
     QpackInstruction,
+
+    /// Waiting for the peer's draft-specific WebTransport setting.
+    WebTransportNegotiation,
+
+    /// Reading the WebTransport Session ID after the stream signal or type.
+    WebTransportSessionId,
+
+    /// The WebTransport prefix is complete and H3 no longer owns the stream.
+    WebTransportData,
 
     /// Reading the stream's current frame's payload without buffering the data.
     SkipFramePayload,
@@ -145,6 +156,9 @@ pub struct Stream {
     /// already been read from the transport for the current state. When
     /// it reaches `stream_len` the state can be completed.
     state_off: usize,
+
+    /// Encoded length of the WebTransport signal or stream type.
+    webtransport_signal_len: usize,
 
     /// The type of the frame currently being parsed.
     frame_type: Option<u64>,
@@ -227,6 +241,8 @@ impl Stream {
             state_len: 1,
             state_off: 0,
 
+            webtransport_signal_len: 0,
+
             frame_type: None,
 
             is_local,
@@ -277,12 +293,69 @@ impl Stream {
                 State::QpackInstruction
             },
 
+            Type::WebTransport => return Err(Error::InternalError),
+
             Type::Unknown => State::Drain,
         };
 
         self.state_transition(state, 1, true)?;
 
         Ok(())
+    }
+
+    /// Starts parsing a WebTransport stream association.
+    pub fn set_webtransport_type(&mut self, signal_len: usize) -> Result<()> {
+        assert!(matches!(self.state, State::StreamType | State::FrameType));
+
+        self.ty = Some(Type::WebTransport);
+        self.webtransport_signal_len = signal_len;
+        self.state_transition(State::WebTransportSessionId, 1, true)
+    }
+
+    /// Retains a possible WebTransport discriminator until SETTINGS arrives.
+    pub fn set_webtransport_candidate(
+        &mut self, signal_len: usize,
+    ) -> Result<()> {
+        assert!(matches!(self.state, State::StreamType | State::FrameType));
+
+        self.webtransport_signal_len = signal_len;
+        self.state_transition(State::WebTransportNegotiation, 0, false)
+    }
+
+    /// Resolves a retained candidate as a draft-15 WebTransport stream.
+    pub fn resolve_webtransport_candidate(&mut self) -> Result<()> {
+        assert_eq!(self.state, State::WebTransportNegotiation);
+
+        self.ty = Some(Type::WebTransport);
+        self.state_transition(State::WebTransportSessionId, 1, true)
+    }
+
+    /// Resolves a retained candidate using ordinary HTTP/3 semantics.
+    pub fn resolve_webtransport_candidate_as_http3(&mut self) -> Result<()> {
+        assert_eq!(self.state, State::WebTransportNegotiation);
+
+        if crate::stream::is_bidi(self.id) {
+            self.state = State::FrameType;
+            self.set_frame_type(super::WEBTRANSPORT_BIDI_STREAM_SIGNAL)
+        } else {
+            self.state = State::StreamType;
+            self.set_ty(Type::Unknown)
+        }
+    }
+
+    /// Completes a WebTransport stream association and returns its prefix size.
+    pub fn set_webtransport_session_id(&mut self) -> Result<usize> {
+        assert_eq!(self.state, State::WebTransportSessionId);
+        debug_assert!(self.state_buffer_complete());
+
+        let prefix_len = self
+            .webtransport_signal_len
+            .checked_add(self.state_len)
+            .ok_or(Error::InternalError)?;
+
+        self.state_transition(State::WebTransportData, 0, false)?;
+
+        Ok(prefix_len)
     }
 
     /// Sets the push ID and transitions to the next state.
@@ -583,6 +656,14 @@ impl Stream {
             return Ok(());
         }
 
+        // A remotely initiated unidirectional stream can be collected as soon
+        // as its final byte is consumed. If that byte only completed part of a
+        // varint, there is no transport stream left to read from.
+        if conn.stream_finished(self.id) && !conn.stream_readable(self.id) {
+            self.reset_data_event();
+            return Err(Error::Done);
+        }
+
         loop {
             let stream_id = self.id;
 
@@ -804,6 +885,15 @@ impl Stream {
         let varint = octets::Octets::with_slice(&self.state_buf).get_varint()?;
 
         Ok(varint)
+    }
+
+    /// Returns the exact encoded length of the current complete varint.
+    pub fn varint_len(&self) -> Result<usize> {
+        if !self.state_buffer_complete() {
+            return Err(Error::Done);
+        }
+
+        Ok(self.state_len)
     }
 
     /// Tries to parse a frame from the state buffer.

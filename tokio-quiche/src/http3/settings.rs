@@ -77,7 +77,10 @@ pub struct Http3Settings {
     /// Set the WebTransport-over-HTTP/3 SETTINGS_ENABLE_WEB_TRANSPORT setting.
     ///
     /// Chrome requires this in addition to extended CONNECT before it considers
-    /// WebTransport sessions negotiated.
+    /// WebTransport sessions negotiated. This advertises wire support but does
+    /// not enable quiche's native stream classifier; the compatibility driver
+    /// continues to own only explicitly registered sessions until native Tokio
+    /// admission is implemented.
     pub enable_webtransport: bool,
     /// QUIC multicast channel ID used for HTTP/3 DATAGRAM unicast fallback.
     ///
@@ -357,6 +360,44 @@ mod tests {
                 "missing WebTransport setting {id:#x}"
             );
         }
+
+        Ok(())
+    }
+
+    #[test]
+    fn tokio_webtransport_settings_do_not_enable_native_classification(
+    ) -> TestResult {
+        let mut quic_config = h3_quiche_config()?;
+        let mut pipe = quiche::test_utils::Pipe::with_config(&mut quic_config)?;
+        pipe.handshake()?;
+
+        let settings = Http3Settings {
+            enable_webtransport: true,
+            ..Default::default()
+        };
+        let h3_config = quiche::h3::Config::from(&settings);
+        let _client_h3 =
+            quiche::h3::Connection::with_transport(&mut pipe.client, &h3_config)?;
+        let mut server_h3 =
+            quiche::h3::Connection::with_transport(&mut pipe.server, &h3_config)?;
+        pipe.advance()?;
+        assert_eq!(
+            server_h3.poll(&mut pipe.server),
+            Err(quiche::h3::Error::Done)
+        );
+
+        // 0x41, an ordinary unknown-frame length of one, and one payload byte.
+        // Native classification would instead consume the second varint as a
+        // Session ID and detach stream 0.
+        pipe.client
+            .stream_send(0, &[0x40, 0x41, 0x01, 0xff], true)?;
+        pipe.advance()?;
+
+        assert_eq!(
+            server_h3.poll(&mut pipe.server),
+            Ok((0, quiche::h3::Event::Finished)),
+        );
+        assert!(pipe.server.local_error().is_none());
 
         Ok(())
     }
