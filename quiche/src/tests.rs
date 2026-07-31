@@ -436,7 +436,8 @@ fn multicast_mutation_snapshot(
             .multicast_stream_delivery_metrics_dirty
             .clone(),
         stream_deliveries: conn.multicast_stream_deliveries.len(),
-        tx_buffered: conn.tx_buffered,
+        tx_buffered: conn.streams.tx_buffered() +
+            conn.multicast_stream_withheld_bytes,
         emit_dgram: conn.emit_dgram,
     }
 }
@@ -2609,13 +2610,21 @@ fn multicast_stream_reset_preserves_unrelated_buffer_accounting() {
         1
     );
     assert_eq!(pipe.server.stream_send(7, b"other", false), Ok(5));
-    assert_eq!(pipe.server.tx_buffered, 11);
+    assert_eq!(
+        pipe.server.streams.tx_buffered() +
+            pipe.server.multicast_stream_withheld_bytes,
+        11
+    );
 
     pipe.server
         .stream_shutdown(stream_id, Shutdown::Write, 42)
         .unwrap();
 
-    assert_eq!(pipe.server.tx_buffered, 5);
+    assert_eq!(
+        pipe.server.streams.tx_buffered() +
+            pipe.server.multicast_stream_withheld_bytes,
+        5
+    );
     assert_eq!(
         pipe.server.multicast_stream_recovery_pending(&channel_id),
         0
@@ -2655,14 +2664,22 @@ fn multicast_stream_reset_tracks_out_of_order_delivered_ranges() {
         .unwrap();
 
     assert_eq!(pipe.server.stream_send(7, b"other", false), Ok(5));
-    assert_eq!(pipe.server.tx_buffered, 11);
+    assert_eq!(
+        pipe.server.streams.tx_buffered() +
+            pipe.server.multicast_stream_withheld_bytes,
+        11
+    );
     assert_eq!(pipe.server.tx_data, 25);
 
     pipe.server
         .stream_shutdown(stream_id, Shutdown::Write, 42)
         .unwrap();
 
-    assert_eq!(pipe.server.tx_buffered, 5);
+    assert_eq!(
+        pipe.server.streams.tx_buffered() +
+            pipe.server.multicast_stream_withheld_bytes,
+        5
+    );
     assert_eq!(pipe.server.tx_data, 22);
     assert_eq!(
         pipe.server

@@ -398,6 +398,11 @@ fn handle_core_h3_event(event: H3Event) -> bool {
             false
         },
 
+        H3Event::GoAway { id } => {
+            println!("http3 goaway: id={id}");
+            false
+        },
+
         H3Event::RawStreamData {
             stream_id,
             data,

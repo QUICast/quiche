@@ -570,7 +570,6 @@ struct FileControlApp {
     multicast_enabled: bool,
     join_sent: bool,
     joined: bool,
-    out: Vec<u8>,
 }
 
 #[cfg(feature = "multicast")]
@@ -584,7 +583,6 @@ impl FileControlApp {
             multicast_enabled: false,
             join_sent: false,
             joined: false,
-            out: vec![0; CHANNEL_PACKET_BUFFER_LEN],
         }
     }
 
@@ -741,10 +739,6 @@ impl ApplicationOverQuic for FileControlApp {
 
     fn should_act(&self) -> bool {
         true
-    }
-
-    fn buffer(&mut self) -> &mut [u8] {
-        &mut self.out
     }
 
     async fn wait_for_data(
@@ -1075,7 +1069,9 @@ async fn publish_loop(
                 }
                 sent_packets += 1;
 
-                if sent_packets == 1 || sent_packets % PACKET_LOG_INTERVAL == 0 {
+                if sent_packets == 1 ||
+                    sent_packets.is_multiple_of(PACKET_LOG_INTERVAL)
+                {
                     println!(
                         "shared publisher progress: packets_sent={} last_pn={} \
                          bytes={} source={:?} destination={}",

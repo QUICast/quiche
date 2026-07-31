@@ -104,15 +104,11 @@ pub fn hash_algorithm_output_len(id: u16) -> anyhow::Result<usize> {
     })
 }
 
-pub struct IdleApp {
-    out: Vec<u8>,
-}
+pub struct IdleApp;
 
 impl IdleApp {
     pub fn new() -> Self {
-        Self {
-            out: vec![0; 64 * 1024],
-        }
+        Self
     }
 }
 
@@ -131,10 +127,6 @@ impl ApplicationOverQuic for IdleApp {
 
     fn should_act(&self) -> bool {
         true
-    }
-
-    fn buffer(&mut self) -> &mut [u8] {
-        &mut self.out
     }
 
     fn wait_for_data(

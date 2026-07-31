@@ -34,8 +34,8 @@ use std::sync::Weak;
 
 use super::bounded_queue::BoundedSender;
 use super::bounded_queue::QueueSendError;
+use super::server_control::ServerControlCommand;
 use super::ServerControlChannelConfig;
-use super::ServerControlCommand;
 use super::ServerControlController;
 use bytes::Bytes;
 use smallvec::SmallVec;

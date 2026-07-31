@@ -161,7 +161,6 @@ async fn run() -> anyhow::Result<()> {
 }
 
 struct FileServerApp {
-    out: Vec<u8>,
     file_bytes: Arc<[u8]>,
     response_stream_id: Option<u64>,
     response_offset: usize,
@@ -171,7 +170,6 @@ struct FileServerApp {
 impl FileServerApp {
     fn new(file_bytes: Arc<[u8]>) -> Self {
         Self {
-            out: vec![0; 64 * 1024],
             file_bytes,
             response_stream_id: None,
             response_offset: 0,
@@ -195,10 +193,6 @@ impl ApplicationOverQuic for FileServerApp {
 
     fn should_act(&self) -> bool {
         true
-    }
-
-    fn buffer(&mut self) -> &mut [u8] {
-        &mut self.out
     }
 
     fn wait_for_data(

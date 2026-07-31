@@ -189,7 +189,6 @@ async fn run() -> anyhow::Result<()> {
 }
 
 struct FileClientApp {
-    out: Vec<u8>,
     request_sent: bool,
     response_complete: bool,
     response_bytes: Vec<u8>,
@@ -199,7 +198,6 @@ struct FileClientApp {
 impl FileClientApp {
     fn new(done_tx: oneshot::Sender<anyhow::Result<Vec<u8>>>) -> Self {
         Self {
-            out: vec![0; 64 * 1024],
             request_sent: false,
             response_complete: false,
             response_bytes: Vec::new(),
@@ -229,10 +227,6 @@ impl ApplicationOverQuic for FileClientApp {
 
     fn should_act(&self) -> bool {
         !self.response_complete
-    }
-
-    fn buffer(&mut self) -> &mut [u8] {
-        &mut self.out
     }
 
     fn wait_for_data(

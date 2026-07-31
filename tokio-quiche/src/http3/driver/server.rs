@@ -247,6 +247,9 @@ pub struct ServerHooks {
     /// Whether the extended CONNECT protocol is enabled. When disabled,
     /// skip DATAGRAM flow creation for `:protocol` requests.
     extended_connect_enabled: bool,
+    /// Whether WebTransport-specific stream handling and diagnostics are
+    /// enabled.
+    webtransport_enabled: bool,
 }
 
 impl ServerHooks {
@@ -271,7 +274,9 @@ impl ServerHooks {
             return Ok(());
         }
 
-        if is_webtransport_connect_headers(&headers) {
+        if driver.hooks.webtransport_enabled &&
+            is_webtransport_connect_headers(&headers)
+        {
             driver
                 .hooks
                 .webtransport_session_stream_ids
@@ -373,7 +378,9 @@ impl DriverHooks for ServerHooks {
             pending_webtransport_streams: BTreeMap::new(),
             requests: 0,
             post_accept_timeout: None,
-            extended_connect_enabled: settings.enable_extended_connect,
+            extended_connect_enabled: settings.enable_extended_connect ||
+                settings.enable_webtransport,
+            webtransport_enabled: settings.enable_webtransport,
         }
     }
 
