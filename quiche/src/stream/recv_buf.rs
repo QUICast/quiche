@@ -41,6 +41,15 @@ use crate::flowcontrol;
 
 use crate::range_buf::RangeBuf;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RecvResetState {
+    error_code: u64,
+    final_size: u64,
+    reliable_size: u64,
+    reliable_semantics: bool,
+    delivered: bool,
+}
+
 /// Receive-side stream buffer.
 ///
 /// Stream data received by the peer is buffered in a list of data chunks
@@ -64,8 +73,8 @@ pub struct RecvBuf {
     /// The final stream offset received from the peer, if any.
     fin_off: Option<u64>,
 
-    /// The error code received via RESET_STREAM.
-    error: Option<u64>,
+    /// Reliable-prefix reset state established by RESET_STREAM[_AT].
+    reset: Option<RecvResetState>,
 
     /// Whether incoming data is validated but not buffered.
     drain: bool,
@@ -89,12 +98,21 @@ impl RecvBuf {
     /// This also takes care of enforcing stream flow control limits, as well
     /// as handling incoming data that overlaps data that is already in the
     /// buffer.
-    pub fn write(&mut self, buf: RangeBuf) -> Result<()> {
+    pub fn write(&mut self, mut buf: RangeBuf) -> Result<()> {
         if buf.max_off() > self.max_data() {
             return Err(Error::FlowControl);
         }
 
         if let Some(fin_off) = self.fin_off {
+            // Once RESET_STREAM_AT participates in termination, a conflicting
+            // FIN is a STREAM_STATE_ERROR even when it also exceeds Final Size.
+            if buf.fin() &&
+                fin_off != buf.max_off() &&
+                self.reset.is_some_and(|reset| reset.reliable_semantics)
+            {
+                return Err(Error::InvalidState);
+            }
+
             // Stream's size is known, forbid data beyond that point.
             if buf.max_off() > fin_off {
                 return Err(Error::FinalSize);
@@ -102,7 +120,12 @@ impl RecvBuf {
 
             // Stream's size is already known, forbid changing it.
             if buf.fin() && fin_off != buf.max_off() {
-                return Err(Error::FinalSize);
+                return if self.reset.is_some_and(|reset| reset.reliable_semantics)
+                {
+                    Err(Error::InvalidState)
+                } else {
+                    Err(Error::FinalSize)
+                };
             }
         }
 
@@ -119,6 +142,18 @@ impl RecvBuf {
 
         if buf.fin() {
             self.fin_off = Some(buf.max_off());
+        }
+
+        if let Some(reset) = self.reset {
+            if reset.delivered || self.drain || buf.off() >= reset.reliable_size {
+                return Ok(());
+            }
+
+            if buf.max_off() > reset.reliable_size {
+                let keep = usize::try_from(reset.reliable_size - buf.off())
+                    .expect("the incoming range length is represented as usize");
+                let _ = buf.split_off(keep);
+            }
         }
 
         // No need to store empty buffer that doesn't carry the fin flag.
@@ -240,14 +275,11 @@ impl RecvBuf {
             return Err(Error::Done);
         }
 
-        // The stream was reset, so clear its data and return the error code
-        // instead.
-        if let Some(e) = self.error {
-            self.data.clear();
-            return Err(Error::StreamReset(e));
+        if self.reset_is_ready() {
+            return Err(Error::StreamReset(self.deliver_reset()));
         }
 
-        while cap > 0 && self.ready() {
+        while cap > 0 && self.data_is_ready() {
             let mut entry = match self.data.first_entry() {
                 Some(entry) => entry,
                 None => break,
@@ -291,14 +323,44 @@ impl RecvBuf {
         Ok((len, self.is_fin()))
     }
 
-    /// Resets the stream at the given offset.
+    /// Resets the stream without retaining a reliably delivered prefix.
     pub fn reset(
         &mut self, error_code: u64, final_size: u64,
     ) -> Result<RecvBufResetReturn> {
-        // Stream's size is already known, forbid changing it.
+        self.reset_inner(error_code, final_size, 0, false)
+    }
+
+    /// Resets the stream while retaining data through `reliable_size`.
+    pub fn reset_at(
+        &mut self, error_code: u64, final_size: u64, reliable_size: u64,
+    ) -> Result<RecvBufResetReturn> {
+        self.reset_inner(error_code, final_size, reliable_size, true)
+    }
+
+    fn reset_inner(
+        &mut self, error_code: u64, final_size: u64, reliable_size: u64,
+        reliable_semantics: bool,
+    ) -> Result<RecvBufResetReturn> {
+        if reliable_size > final_size {
+            return Err(Error::InvalidFrame);
+        }
+
+        if final_size > self.max_data() {
+            return Err(Error::FlowControl);
+        }
+
+        // A FIN or earlier reset fixes the termination tuple. draft-07
+        // requires STREAM_STATE_ERROR when a later termination signal changes
+        // it, rather than RFC 9000's more general FINAL_SIZE_ERROR.
         if let Some(fin_off) = self.fin_off {
             if fin_off != final_size {
-                return Err(Error::FinalSize);
+                return if reliable_semantics ||
+                    self.reset.is_some_and(|reset| reset.reliable_semantics)
+                {
+                    Err(Error::InvalidState)
+                } else {
+                    Err(Error::FinalSize)
+                };
             }
         }
 
@@ -307,31 +369,124 @@ impl RecvBuf {
             return Err(Error::FinalSize);
         }
 
-        if self.error.is_some() {
-            // We already verified that the final size matches
-            return Ok(RecvBufResetReturn::zero());
+        if let Some(current) = self.reset {
+            let enforce_tuple = reliable_semantics || current.reliable_semantics;
+            if enforce_tuple &&
+                (current.error_code != error_code ||
+                    current.final_size != final_size)
+            {
+                return Err(Error::InvalidState);
+            }
+
+            if !enforce_tuple {
+                return Ok(RecvBufResetReturn::zero());
+            }
+
+            // A reordered larger Reliable Size cannot restore an obligation
+            // that a smaller reset already removed.
+            if reliable_size >= current.reliable_size {
+                if reliable_semantics && !current.reliable_semantics {
+                    self.reset = Some(RecvResetState {
+                        reliable_semantics: true,
+                        ..current
+                    });
+                }
+                return Ok(RecvBufResetReturn::zero());
+            }
+
+            let consumed_flowcontrol = if self.drain || current.delivered {
+                0
+            } else {
+                current
+                    .reliable_size
+                    .max(self.off)
+                    .saturating_sub(reliable_size.max(self.off))
+            };
+
+            self.reset = Some(RecvResetState {
+                reliable_size,
+                reliable_semantics: enforce_tuple,
+                ..current
+            });
+            self.discard_after(reliable_size);
+
+            return Ok(RecvBufResetReturn {
+                max_data_delta: 0,
+                consumed_flowcontrol,
+            });
         }
 
-        // Calculate how many bytes need to be removed from the connection flow
-        // control.
-        let result = RecvBufResetReturn {
-            max_data_delta: final_size - self.len,
-            consumed_flowcontrol: final_size - self.off,
+        let previous_len = self.len;
+        let consumed_flowcontrol = if self.drain {
+            final_size.saturating_sub(self.off)
+        } else {
+            final_size.saturating_sub(reliable_size.max(self.off))
         };
 
-        self.error = Some(error_code);
+        let result = RecvBufResetReturn {
+            max_data_delta: final_size - previous_len,
+            consumed_flowcontrol,
+        };
 
-        // Clear all data already buffered.
-        self.off = final_size;
+        self.fin_off = Some(final_size);
+        self.len = final_size;
+        self.reset = Some(RecvResetState {
+            error_code,
+            final_size,
+            reliable_size,
+            reliable_semantics,
+            delivered: self.drain,
+        });
+        self.discard_after(reliable_size);
 
-        self.data.clear();
-
-        // In order to ensure the application is notified when the stream is
-        // reset, enqueue a zero-length buffer at the final size offset.
-        let buf = RangeBuf::from(b"", final_size, true);
-        self.write(buf)?;
+        if self.drain {
+            self.off = final_size;
+        }
 
         Ok(result)
+    }
+
+    fn discard_after(&mut self, end: u64) {
+        let mut retained = BTreeMap::new();
+
+        for (_, mut buf) in std::mem::take(&mut self.data) {
+            if buf.off() >= end {
+                continue;
+            }
+
+            if buf.max_off() > end {
+                let keep = usize::try_from(end - buf.off())
+                    .expect("the buffered range length is represented as usize");
+                let _ = buf.split_off(keep);
+            }
+
+            retained.insert(buf.max_off(), buf);
+        }
+
+        self.data = retained;
+    }
+
+    fn reset_is_ready(&self) -> bool {
+        self.reset.is_some_and(|reset| {
+            !reset.delivered && self.off >= reset.reliable_size
+        })
+    }
+
+    fn deliver_reset(&mut self) -> u64 {
+        let reset = self
+            .reset
+            .as_mut()
+            .expect("a ready reset is present when it is delivered");
+        reset.delivered = true;
+        self.off = reset.final_size;
+        self.data.clear();
+        reset.error_code
+    }
+
+    fn data_is_ready(&self) -> bool {
+        self.data
+            .first_key_value()
+            .is_some_and(|(_, buf)| buf.off() == self.off)
     }
 
     /// Commits the new max_data limit.
@@ -371,8 +526,14 @@ impl RecvBuf {
 
         self.data.clear();
 
-        let consumed = self.max_off() - self.off;
+        let consumed = self.reset.map_or_else(
+            || self.max_off() - self.off,
+            |reset| reset.reliable_size.saturating_sub(self.off),
+        );
         self.off = self.max_off();
+        if let Some(reset) = self.reset.as_mut() {
+            reset.delivered = true;
+        }
 
         Ok(consumed)
     }
@@ -397,6 +558,13 @@ impl RecvBuf {
     /// This happens when the stream's receive final size is known, and the
     /// application has read all data from the stream.
     pub fn is_fin(&self) -> bool {
+        if let Some(reset) = self.reset {
+            // Preserve RESET_STREAM's immediate terminal indication while the
+            // queued reset remains readable by the application. A non-zero
+            // reliable prefix cannot become terminal until it is consumed.
+            return reset.delivered || reset.reliable_size == 0;
+        }
+
         if self.fin_off == Some(self.off) {
             return true;
         }
@@ -409,14 +577,14 @@ impl RecvBuf {
         self.drain
     }
 
+    /// Returns true if a RESET_STREAM or RESET_STREAM_AT was received.
+    pub(crate) fn is_reset(&self) -> bool {
+        self.reset.is_some()
+    }
+
     /// Returns true if the stream has data to be read.
     pub fn ready(&self) -> bool {
-        let (_, buf) = match self.data.first_key_value() {
-            Some(v) => v,
-            None => return false,
-        };
-
-        buf.off() == self.off
+        self.reset_is_ready() || self.data_is_ready()
     }
 
     /// Returns the number of bytes that can be read contiguously from the
@@ -430,8 +598,14 @@ impl RecvBuf {
     pub fn readable_len(&self) -> usize {
         const MAX_READABLE_LEN: usize = 64 * 1024;
 
+        if self.reset_is_ready() {
+            return 0;
+        }
+
         let mut contiguous = 0;
         let mut next_off = self.off;
+        let reliable_size =
+            self.reset.map_or(u64::MAX, |reset| reset.reliable_size);
 
         // `data` is ordered by offset, so walk from the front and stop at the
         // first gap (a chunk that does not start where the contiguous run so
@@ -441,10 +615,13 @@ impl RecvBuf {
                 break;
             }
 
-            contiguous = (contiguous + buf.len()).min(MAX_READABLE_LEN);
-            next_off = buf.max_off();
+            let readable = buf.max_off().min(reliable_size) - buf.off();
+            contiguous = (contiguous +
+                usize::try_from(readable).unwrap_or(usize::MAX))
+            .min(MAX_READABLE_LEN);
+            next_off = buf.max_off().min(reliable_size);
 
-            if contiguous == MAX_READABLE_LEN {
+            if contiguous == MAX_READABLE_LEN || next_off == reliable_size {
                 break;
             }
         }
@@ -663,6 +840,167 @@ mod tests {
             .is_ok());
         assert!(recv.write(RangeBuf::from(&[0], 64 * 1024, false)).is_ok());
         assert_eq!(recv.readable_len(), 64 * 1024);
+    }
+
+    #[test]
+    fn reset_stream_at_waits_for_gap_and_delivers_prefix() {
+        let mut recv =
+            RecvBuf::new(20, DEFAULT_STREAM_WINDOW, DEFAULT_STREAM_WINDOW);
+        recv.write(RangeBuf::from(b"cde", 2, false)).unwrap();
+
+        assert_eq!(
+            recv.reset_at(42, 8, 5),
+            Ok(RecvBufResetReturn {
+                max_data_delta: 3,
+                consumed_flowcontrol: 3,
+            })
+        );
+        assert!(!recv.ready());
+
+        recv.write(RangeBuf::from(b"ab", 0, false)).unwrap();
+        assert!(recv.ready());
+
+        let mut first = [0; 2];
+        assert_eq!(recv.emit(&mut first), Ok((2, false)));
+        assert_eq!(&first, b"ab");
+
+        let mut second = [0; 8];
+        assert_eq!(recv.emit(&mut second), Ok((3, false)));
+        assert_eq!(&second[..3], b"cde");
+        assert!(recv.ready());
+        assert_eq!(recv.readable_len(), 0);
+        assert_eq!(recv.emit(&mut second), Err(Error::StreamReset(42)));
+        assert!(recv.is_fin());
+        assert_eq!(recv.off_front(), 8);
+        assert!(recv.data.is_empty());
+    }
+
+    #[test]
+    fn reset_stream_at_after_consumed_prefix_is_immediately_observable() {
+        let mut recv =
+            RecvBuf::new(20, DEFAULT_STREAM_WINDOW, DEFAULT_STREAM_WINDOW);
+        recv.write(RangeBuf::from(b"hello", 0, false)).unwrap();
+
+        let mut out = [0; 5];
+        assert_eq!(recv.emit(&mut out), Ok((5, false)));
+        assert_eq!(
+            recv.reset_at(7, 8, 5),
+            Ok(RecvBufResetReturn {
+                max_data_delta: 3,
+                consumed_flowcontrol: 3,
+            })
+        );
+        assert!(recv.ready());
+        assert_eq!(recv.emit(&mut out), Err(Error::StreamReset(7)));
+    }
+
+    #[test]
+    fn reset_stream_at_decreases_without_double_credit() {
+        let mut recv =
+            RecvBuf::new(20, DEFAULT_STREAM_WINDOW, DEFAULT_STREAM_WINDOW);
+        recv.write(RangeBuf::from(b"abcdefghij", 0, false)).unwrap();
+
+        assert_eq!(
+            recv.reset_at(3, 10, 8),
+            Ok(RecvBufResetReturn {
+                max_data_delta: 0,
+                consumed_flowcontrol: 2,
+            })
+        );
+        assert_eq!(recv.reset_at(3, 10, 8), Ok(RecvBufResetReturn::zero()));
+        assert_eq!(
+            recv.reset_at(3, 10, 5),
+            Ok(RecvBufResetReturn {
+                max_data_delta: 0,
+                consumed_flowcontrol: 3,
+            })
+        );
+        assert_eq!(recv.readable_len(), 5);
+
+        // A reordered larger commitment is ignored and cannot restore data.
+        assert_eq!(recv.reset_at(3, 10, 7), Ok(RecvBufResetReturn::zero()));
+        assert_eq!(recv.readable_len(), 5);
+        assert_eq!(recv.reset_at(4, 10, 4), Err(Error::InvalidState));
+
+        assert_eq!(
+            recv.reset(3, 10),
+            Ok(RecvBufResetReturn {
+                max_data_delta: 0,
+                consumed_flowcontrol: 5,
+            })
+        );
+        assert_eq!(recv.emit(&mut [0; 1]), Err(Error::StreamReset(3)));
+    }
+
+    #[test]
+    fn reset_stream_at_conflicting_termination_signals_fail() {
+        let mut recv =
+            RecvBuf::new(20, DEFAULT_STREAM_WINDOW, DEFAULT_STREAM_WINDOW);
+        recv.write(RangeBuf::from(b"hello", 0, true)).unwrap();
+        assert_eq!(recv.reset_at(1, 6, 5), Err(Error::InvalidState));
+
+        let mut recv =
+            RecvBuf::new(20, DEFAULT_STREAM_WINDOW, DEFAULT_STREAM_WINDOW);
+        recv.reset_at(1, 5, 3).unwrap();
+        assert_eq!(
+            recv.write(RangeBuf::from(b"x", 3, true)),
+            Err(Error::InvalidState)
+        );
+        assert_eq!(
+            recv.write(RangeBuf::from(b"xxxx", 3, true)),
+            Err(Error::InvalidState)
+        );
+        assert_eq!(recv.reset_at(2, 5, 2), Err(Error::InvalidState));
+        assert_eq!(recv.reset_at(1, 4, 2), Err(Error::InvalidState));
+
+        let mut recv =
+            RecvBuf::new(20, DEFAULT_STREAM_WINDOW, DEFAULT_STREAM_WINDOW);
+        recv.write(RangeBuf::from(b"abcdef", 0, false)).unwrap();
+        assert_eq!(recv.reset_at(1, 5, 5), Err(Error::FinalSize));
+    }
+
+    #[test]
+    fn reset_stream_at_accepts_reordered_matching_fin() {
+        let mut recv =
+            RecvBuf::new(20, DEFAULT_STREAM_WINDOW, DEFAULT_STREAM_WINDOW);
+        assert_eq!(
+            recv.reset_at(6, 5, 3),
+            Ok(RecvBufResetReturn {
+                max_data_delta: 5,
+                consumed_flowcontrol: 2,
+            })
+        );
+
+        // The matching FIN can arrive after RESET_STREAM_AT. Its suffix is
+        // validated against Final Size but is not retained beyond the prefix.
+        assert_eq!(recv.write(RangeBuf::from(b"de", 3, true)), Ok(()));
+        assert!(!recv.ready());
+        assert_eq!(recv.write(RangeBuf::from(b"abc", 0, false)), Ok(()));
+
+        let mut out = [0; 8];
+        assert_eq!(recv.emit(&mut out), Ok((3, false)));
+        assert_eq!(&out[..3], b"abc");
+        assert_eq!(recv.emit(&mut out), Err(Error::StreamReset(6)));
+    }
+
+    #[test]
+    fn reset_stream_at_shutdown_credits_only_remaining_prefix() {
+        let mut recv =
+            RecvBuf::new(20, DEFAULT_STREAM_WINDOW, DEFAULT_STREAM_WINDOW);
+        recv.write(RangeBuf::from(b"abcdefgh", 0, false)).unwrap();
+        assert_eq!(
+            recv.reset_at(1, 10, 8),
+            Ok(RecvBufResetReturn {
+                max_data_delta: 2,
+                consumed_flowcontrol: 2,
+            })
+        );
+
+        let mut out = [0; 3];
+        assert_eq!(recv.emit(&mut out), Ok((3, false)));
+        assert_eq!(recv.shutdown(), Ok(5));
+        assert!(recv.is_fin());
+        assert!(!recv.ready());
     }
 
     /// Test shutdown behavior

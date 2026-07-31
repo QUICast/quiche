@@ -356,6 +356,7 @@ fn multicast_stream_negotiated_pipe_with_limits(
     limits: multicast::StreamRecoveryLimits,
 ) -> test_utils::Pipe {
     let mut client_config = test_utils::Pipe::default_config("cubic").unwrap();
+    client_config.enable_reset_stream_at(true);
     client_config
         .set_multicast_client_params(Some(multicast_test_client_params()))
         .unwrap();
@@ -363,6 +364,7 @@ fn multicast_stream_negotiated_pipe_with_limits(
     client_config.set_initial_max_stream_data_uni(4096);
 
     let mut server_config = test_utils::Pipe::default_config("cubic").unwrap();
+    server_config.enable_reset_stream_at(true);
     server_config.enable_multicast_server_support(true);
     server_config.set_initial_max_data(4096);
     server_config.set_initial_max_stream_data_uni(4096);
@@ -377,6 +379,528 @@ fn multicast_stream_negotiated_pipe_with_limits(
     assert_eq!(pipe.handshake(), Ok(()));
 
     pipe
+}
+
+fn reset_stream_at_pipe(stream_limit: u64) -> test_utils::Pipe {
+    let mut config = test_utils::Pipe::default_config("cubic").unwrap();
+    config.enable_reset_stream_at(true);
+    config.set_initial_max_data(4096);
+    config.set_initial_max_stream_data_uni(stream_limit);
+
+    let mut pipe = test_utils::Pipe::with_config(&mut config).unwrap();
+    assert_eq!(pipe.handshake(), Ok(()));
+    assert!(pipe.client.peer_transport_params.reset_stream_at);
+    assert!(pipe.server.peer_transport_params.reset_stream_at);
+    pipe
+}
+
+fn decode_flight(
+    receiver: &mut Connection, flight: &[(Vec<u8>, SendInfo)],
+) -> Vec<frame::Frame> {
+    let mut frames = Vec::new();
+
+    for (packet, _) in flight {
+        let mut packet = packet.clone();
+        frames.extend(test_utils::decode_pkt(receiver, &mut packet).unwrap());
+    }
+
+    frames
+}
+
+fn ack_client_packet_range(pipe: &mut test_utils::Pipe, start: u64, end: u64) {
+    let mut ranges = ranges::RangeSet::default();
+    ranges.insert(start..end);
+    let frames = [frame::Frame::ACK {
+        ack_delay: 0,
+        ranges,
+        ecn_counts: None,
+    }];
+    let mut packet = [0; 256];
+    let written = test_utils::encode_pkt(
+        &mut pipe.server,
+        Type::Short,
+        &frames,
+        &mut packet,
+    )
+    .unwrap();
+    assert_eq!(pipe.client_recv(&mut packet[..written]), Ok(written));
+}
+
+fn ack_server_packet_range(pipe: &mut test_utils::Pipe, start: u64, end: u64) {
+    let mut ranges = ranges::RangeSet::default();
+    ranges.insert(start..end);
+    let frames = [frame::Frame::ACK {
+        ack_delay: 0,
+        ranges,
+        ecn_counts: None,
+    }];
+    let mut packet = [0; 256];
+    let written = test_utils::encode_pkt(
+        &mut pipe.client,
+        Type::Short,
+        &frames,
+        &mut packet,
+    )
+    .unwrap();
+    assert_eq!(pipe.server_recv(&mut packet[..written]), Ok(written));
+}
+
+fn assert_received_reliable_reset(
+    receiver: &mut Connection, stream_id: u64, expected: &[u8], error_code: u64,
+) {
+    let mut out = vec![0; expected.len() + 8];
+    assert_eq!(
+        receiver.stream_recv(stream_id, &mut out),
+        Ok((expected.len(), false))
+    );
+    assert_eq!(&out[..expected.len()], expected);
+    assert_eq!(
+        receiver.stream_recv(stream_id, &mut out),
+        Err(Error::StreamReset(error_code))
+    );
+}
+
+#[test]
+fn reset_stream_at_public_api_delivers_prefix_and_waits_for_ack() {
+    let mut pipe = reset_stream_at_pipe(64);
+    let stream_id = 2;
+    assert_eq!(
+        pipe.client.stream_send(stream_id, b"abcdefghij", false),
+        Ok(10)
+    );
+    assert_eq!(pipe.client.stream_shutdown_at(stream_id, 42, 6), Ok(()));
+    assert_eq!(
+        pipe.client.stream_send(stream_id, b"x", false),
+        Err(Error::FinalSize)
+    );
+    assert_eq!(
+        pipe.client.stream_send(stream_id, b"", true),
+        Err(Error::FinalSize)
+    );
+    assert_eq!(pipe.client.stream_capacity(stream_id), Ok(0));
+    assert_eq!(pipe.client.stream_writable(stream_id, 0), Ok(false));
+
+    let first_pn = pipe.client.next_pkt_num;
+    let flight = test_utils::emit_flight(&mut pipe.client).unwrap();
+    let last_pn = pipe.client.next_pkt_num;
+    let frames = decode_flight(&mut pipe.server, &flight);
+
+    assert!(frames.iter().any(|frame| {
+        *frame ==
+            frame::Frame::ResetStreamAt {
+                stream_id,
+                error_code: 42,
+                final_size: 10,
+                reliable_size: 6,
+            }
+    }));
+    assert!(frames.iter().any(|frame| {
+        matches!(frame, frame::Frame::Stream { stream_id: id, data }
+            if *id == stream_id && data.off() == 0 && &data[..] == b"abcdef")
+    }));
+    assert!(!frames.iter().any(|frame| {
+        matches!(frame, frame::Frame::Stream { stream_id: id, data }
+            if *id == stream_id && data.max_off() > 6)
+    }));
+
+    test_utils::process_flight(&mut pipe.server, flight).unwrap();
+    assert!(pipe.client.streams.get(stream_id).is_some());
+    assert_eq!(pipe.server.rx_data, 10);
+    assert_eq!(pipe.server.flow_control.consumed(), 4);
+    assert_received_reliable_reset(&mut pipe.server, stream_id, b"abcdef", 42);
+    assert_eq!(pipe.server.flow_control.consumed(), 10);
+
+    ack_client_packet_range(&mut pipe, first_pn, last_pn);
+    assert!(pipe.client.streams.is_collected(stream_id));
+    assert_eq!(pipe.client.streams.tx_buffered(), 0);
+}
+
+#[test]
+fn reset_stream_at_zero_uses_reliable_reset_wire_semantics() {
+    let mut pipe = reset_stream_at_pipe(64);
+    let stream_id = 2;
+    assert_eq!(
+        pipe.client.stream_send(stream_id, b"discarded", false),
+        Ok(9)
+    );
+    assert_eq!(pipe.client.stream_shutdown_at(stream_id, 5, 0), Ok(()));
+
+    let first_pn = pipe.client.next_pkt_num;
+    let flight = test_utils::emit_flight(&mut pipe.client).unwrap();
+    let last_pn = pipe.client.next_pkt_num;
+    let frames = decode_flight(&mut pipe.server, &flight);
+    assert!(frames.iter().any(|frame| {
+        *frame ==
+            frame::Frame::ResetStreamAt {
+                stream_id,
+                error_code: 5,
+                final_size: 9,
+                reliable_size: 0,
+            }
+    }));
+    assert!(!frames.iter().any(|frame| {
+        matches!(frame, frame::Frame::Stream { stream_id: id, .. }
+            if *id == stream_id)
+    }));
+
+    test_utils::process_flight(&mut pipe.server, flight).unwrap();
+    assert_eq!(
+        pipe.server.stream_recv(stream_id, &mut [0; 1]),
+        Err(Error::StreamReset(5))
+    );
+    assert!(pipe.client.streams.get(stream_id).is_some());
+
+    ack_client_packet_range(&mut pipe, first_pn, last_pn);
+    assert!(pipe.client.streams.is_collected(stream_id));
+}
+
+#[test]
+fn reset_stream_at_prefix_loss_retransmits_after_reset_ack() {
+    let mut pipe = reset_stream_at_pipe(64);
+    let stream_id = 2;
+    assert_eq!(
+        pipe.client.stream_send(stream_id, b"abcdefghij", false),
+        Ok(10)
+    );
+
+    // Drop the original STREAM packet before initiating the reset.
+    let dropped = test_utils::emit_flight(&mut pipe.client).unwrap();
+    assert!(decode_flight(&mut pipe.server, &dropped)
+        .iter()
+        .any(|frame| {
+            matches!(frame, frame::Frame::Stream { stream_id: id, .. }
+            if *id == stream_id)
+        }));
+
+    assert_eq!(pipe.client.stream_shutdown_at(stream_id, 9, 6), Ok(()));
+    let reset_pn = pipe.client.next_pkt_num;
+    let reset_flight = test_utils::emit_flight(&mut pipe.client).unwrap();
+    let reset_end = pipe.client.next_pkt_num;
+    let reset_frames = decode_flight(&mut pipe.server, &reset_flight);
+    assert!(reset_frames.iter().any(|frame| {
+        matches!(frame, frame::Frame::ResetStreamAt {
+            stream_id: id,
+            reliable_size: 6,
+            ..
+        } if *id == stream_id)
+    }));
+    assert!(!reset_frames.iter().any(|frame| {
+        matches!(frame, frame::Frame::Stream { stream_id: id, .. }
+            if *id == stream_id)
+    }));
+    test_utils::process_flight(&mut pipe.server, reset_flight).unwrap();
+    ack_client_packet_range(&mut pipe, reset_pn, reset_end);
+    assert!(!pipe.server.stream_readable(stream_id));
+
+    test_utils::trigger_ack_based_loss(&mut pipe.client, &mut pipe.server);
+    let retransmit_pn = pipe.client.next_pkt_num;
+    let retransmit = test_utils::emit_flight(&mut pipe.client).unwrap();
+    let retransmit_end = pipe.client.next_pkt_num;
+    let retransmit_frames = decode_flight(&mut pipe.server, &retransmit);
+    assert!(retransmit_frames.iter().any(|frame| {
+        matches!(frame, frame::Frame::Stream { stream_id: id, data }
+            if *id == stream_id && data.off() == 0 && &data[..] == b"abcdef")
+    }));
+    assert!(!retransmit_frames.iter().any(|frame| {
+        matches!(frame, frame::Frame::ResetStreamAt { stream_id: id, .. }
+            if *id == stream_id)
+    }));
+
+    test_utils::process_flight(&mut pipe.server, retransmit).unwrap();
+    assert_received_reliable_reset(&mut pipe.server, stream_id, b"abcdef", 9);
+    ack_client_packet_range(&mut pipe, retransmit_pn, retransmit_end);
+    assert!(pipe.client.streams.is_collected(stream_id));
+}
+
+#[test]
+fn reset_stream_at_frame_loss_retransmits_without_prefix_duplicate() {
+    let mut pipe = reset_stream_at_pipe(64);
+    let stream_id = 2;
+    assert_eq!(
+        pipe.client.stream_send(stream_id, b"abcdefghij", false),
+        Ok(10)
+    );
+
+    let data_pn = pipe.client.next_pkt_num;
+    let data = test_utils::emit_flight(&mut pipe.client).unwrap();
+    let data_end = pipe.client.next_pkt_num;
+    test_utils::process_flight(&mut pipe.server, data).unwrap();
+    ack_client_packet_range(&mut pipe, data_pn, data_end);
+
+    assert_eq!(pipe.client.stream_shutdown_at(stream_id, 11, 6), Ok(()));
+    let dropped = test_utils::emit_flight(&mut pipe.client).unwrap();
+    assert!(decode_flight(&mut pipe.server, &dropped)
+        .iter()
+        .any(|frame| {
+            matches!(frame, frame::Frame::ResetStreamAt {
+            stream_id: id,
+            reliable_size: 6,
+            ..
+        } if *id == stream_id)
+        }));
+
+    test_utils::trigger_ack_based_loss(&mut pipe.client, &mut pipe.server);
+    let retransmit_pn = pipe.client.next_pkt_num;
+    let retransmit = test_utils::emit_flight(&mut pipe.client).unwrap();
+    let retransmit_end = pipe.client.next_pkt_num;
+    let frames = decode_flight(&mut pipe.server, &retransmit);
+    assert!(frames.iter().any(|frame| {
+        matches!(frame, frame::Frame::ResetStreamAt { stream_id: id, .. }
+            if *id == stream_id)
+    }));
+    assert!(!frames.iter().any(|frame| {
+        matches!(frame, frame::Frame::Stream { stream_id: id, .. }
+            if *id == stream_id)
+    }));
+
+    test_utils::process_flight(&mut pipe.server, retransmit).unwrap();
+    assert_received_reliable_reset(&mut pipe.server, stream_id, b"abcdef", 11);
+    ack_client_packet_range(&mut pipe, retransmit_pn, retransmit_end);
+    assert!(pipe.client.streams.is_collected(stream_id));
+}
+
+#[test]
+fn reset_stream_at_simultaneous_loss_retransmits_frame_and_prefix() {
+    let mut pipe = reset_stream_at_pipe(64);
+    let stream_id = 2;
+    assert_eq!(
+        pipe.client.stream_send(stream_id, b"abcdefghij", false),
+        Ok(10)
+    );
+    assert_eq!(pipe.client.stream_shutdown_at(stream_id, 13, 6), Ok(()));
+
+    // Drop the packet containing both the first reset and prefix attempt.
+    let dropped = test_utils::emit_flight(&mut pipe.client).unwrap();
+    let dropped_frames = decode_flight(&mut pipe.server, &dropped);
+    assert!(dropped_frames.iter().any(|frame| {
+        matches!(frame, frame::Frame::ResetStreamAt { stream_id: id, .. }
+            if *id == stream_id)
+    }));
+    assert!(dropped_frames.iter().any(|frame| {
+        matches!(frame, frame::Frame::Stream { stream_id: id, .. }
+            if *id == stream_id)
+    }));
+
+    test_utils::trigger_ack_based_loss(&mut pipe.client, &mut pipe.server);
+    let retransmit_pn = pipe.client.next_pkt_num;
+    let retransmit = test_utils::emit_flight(&mut pipe.client).unwrap();
+    let retransmit_end = pipe.client.next_pkt_num;
+    let retransmit_frames = decode_flight(&mut pipe.server, &retransmit);
+    assert!(retransmit_frames.iter().any(|frame| {
+        matches!(frame, frame::Frame::ResetStreamAt { stream_id: id, .. }
+            if *id == stream_id)
+    }));
+    assert!(retransmit_frames.iter().any(|frame| {
+        matches!(frame, frame::Frame::Stream { stream_id: id, data }
+            if *id == stream_id && data.max_off() <= 6)
+    }));
+
+    test_utils::process_flight(&mut pipe.server, retransmit).unwrap();
+    assert_received_reliable_reset(&mut pipe.server, stream_id, b"abcdef", 13);
+    ack_client_packet_range(&mut pipe, retransmit_pn, retransmit_end);
+    assert!(pipe.client.streams.is_collected(stream_id));
+}
+
+#[test]
+fn reset_stream_at_stale_loss_after_stop_preserves_reduction() {
+    let mut pipe = reset_stream_at_pipe(64);
+    let stream_id = 2;
+    assert_eq!(
+        pipe.client.stream_send(stream_id, b"abcdefgh", false),
+        Ok(8)
+    );
+    assert_eq!(pipe.client.stream_shutdown_at(stream_id, 7, 6), Ok(()));
+
+    // Leave the larger reset and its prefix transmission unacknowledged.
+    let stale = test_utils::emit_flight(&mut pipe.client).unwrap();
+    let stale_frames = decode_flight(&mut pipe.server, &stale);
+    assert!(stale_frames.iter().any(|frame| {
+        matches!(frame, frame::Frame::ResetStreamAt {
+            stream_id: id,
+            reliable_size: 6,
+            ..
+        } if *id == stream_id)
+    }));
+
+    pipe.server.streams.insert_stopped(stream_id, 99);
+    let stop = test_utils::emit_flight(&mut pipe.server).unwrap();
+    test_utils::process_flight(&mut pipe.client, stop).unwrap();
+
+    // STOP_SENDING does not change the already fixed outgoing error code.
+    assert_eq!(pipe.client.stream_shutdown_at(stream_id, 7, 3), Ok(()));
+    assert_eq!(
+        pipe.client.stream_send(stream_id, b"x", false),
+        Err(Error::StreamStopped(99))
+    );
+
+    // The helper transmits and acknowledges the current smaller reset before
+    // declaring the original packet lost.
+    test_utils::trigger_ack_based_loss(&mut pipe.client, &mut pipe.server);
+    let retransmit = test_utils::emit_flight(&mut pipe.client).unwrap();
+    let frames = decode_flight(&mut pipe.server, &retransmit);
+    assert!(!frames.iter().any(|frame| {
+        matches!(frame, frame::Frame::ResetStreamAt { stream_id: id, .. }
+            if *id == stream_id)
+    }));
+    assert!(frames.iter().any(|frame| {
+        matches!(frame, frame::Frame::Stream { stream_id: id, data }
+            if *id == stream_id &&
+                data.off() == 0 &&
+                data.max_off() <= 3 &&
+                &data[..] == b"abc")
+    }));
+    assert!(!frames.iter().any(|frame| {
+        matches!(frame, frame::Frame::Stream { stream_id: id, data }
+            if *id == stream_id && data.max_off() > 3)
+    }));
+
+    test_utils::process_flight(&mut pipe.server, retransmit).unwrap();
+    assert_received_reliable_reset(&mut pipe.server, stream_id, b"abc", 7);
+}
+
+#[test]
+fn reset_stream_at_progresses_after_flow_control_credit() {
+    let mut pipe = reset_stream_at_pipe(5);
+    let stream_id = 2;
+    assert_eq!(
+        pipe.client.stream_send(stream_id, b"abcdefghij", false),
+        Ok(5)
+    );
+    pipe.advance().unwrap();
+
+    let mut first = [0; 5];
+    assert_eq!(
+        pipe.server.stream_recv(stream_id, &mut first),
+        Ok((5, false))
+    );
+    assert_eq!(&first, b"abcde");
+    pipe.advance().unwrap();
+
+    assert_eq!(pipe.client.stream_send(stream_id, b"fghij", false), Ok(5));
+    assert_eq!(pipe.client.stream_shutdown_at(stream_id, 17, 10), Ok(()));
+    pipe.advance().unwrap();
+
+    assert_received_reliable_reset(&mut pipe.server, stream_id, b"fghij", 17);
+}
+
+#[test]
+fn reset_stream_at_invalid_calls_are_transactional() {
+    let mut unnegotiated = test_utils::Pipe::new("cubic").unwrap();
+    unnegotiated.handshake().unwrap();
+    assert_eq!(unnegotiated.client.stream_send(2, b"abc", false), Ok(3));
+    let before = (
+        unnegotiated.client.tx_data,
+        unnegotiated.client.streams.tx_buffered(),
+        unnegotiated.client.streams.reset().count(),
+        unnegotiated.client.reset_stream_local_count,
+    );
+    assert_eq!(
+        unnegotiated.client.stream_shutdown_at(2, 1, 2),
+        Err(Error::InvalidState)
+    );
+    assert_eq!(
+        (
+            unnegotiated.client.tx_data,
+            unnegotiated.client.streams.tx_buffered(),
+            unnegotiated.client.streams.reset().count(),
+            unnegotiated.client.reset_stream_local_count,
+        ),
+        before
+    );
+    assert_eq!(
+        unnegotiated.client.stream_shutdown(2, Shutdown::Write, 1),
+        Ok(())
+    );
+
+    let mut pipe = reset_stream_at_pipe(64);
+    assert_eq!(pipe.client.stream_send(2, b"abcde", false), Ok(5));
+    let before = (
+        pipe.client.tx_data,
+        pipe.client.streams.tx_buffered(),
+        pipe.client.streams.reset().count(),
+        pipe.client.reset_stream_local_count,
+    );
+    assert_eq!(
+        pipe.client.stream_shutdown_at(2, 1, 6),
+        Err(Error::FinalSize)
+    );
+    assert_eq!(
+        pipe.client
+            .stream_shutdown_at(2, octets::MAX_VAR_INT + 1, 4),
+        Err(Error::InvalidFrame)
+    );
+    assert_eq!(
+        pipe.client
+            .stream_shutdown_at(2, 1, octets::MAX_VAR_INT + 1),
+        Err(Error::InvalidFrame)
+    );
+    assert_eq!(
+        (
+            pipe.client.tx_data,
+            pipe.client.streams.tx_buffered(),
+            pipe.client.streams.reset().count(),
+            pipe.client.reset_stream_local_count,
+        ),
+        before
+    );
+    assert_eq!(pipe.client.stream_shutdown_at(2, 1, 4), Ok(()));
+    let current = pipe.client.streams.get(2).unwrap().send.pending_reset();
+    assert_eq!(
+        pipe.client.stream_shutdown_at(2, 1, 5),
+        Err(Error::InvalidState)
+    );
+    assert_eq!(
+        pipe.client.stream_shutdown_at(2, 2, 3),
+        Err(Error::InvalidState)
+    );
+    assert_eq!(
+        pipe.client.streams.get(2).unwrap().send.pending_reset(),
+        current
+    );
+    assert_eq!(pipe.client.stream_shutdown_at(2, 1, 3), Ok(()));
+    assert_eq!(pipe.client.stats().reset_stream_count_local, 1);
+    assert_eq!(
+        pipe.client.stream_shutdown_at(3, 1, 0),
+        Err(Error::InvalidStreamState(3))
+    );
+    assert_eq!(pipe.client.stream_shutdown_at(10, 1, 0), Err(Error::Done));
+}
+
+#[test]
+fn reset_stream_at_conflicting_fin_uses_stream_state_error() {
+    let mut pipe = reset_stream_at_pipe(64);
+    let mut buf = [0; 1280];
+    let stream_id = 2;
+    let reset = [frame::Frame::ResetStreamAt {
+        stream_id,
+        error_code: 7,
+        final_size: 5,
+        reliable_size: 3,
+    }];
+    assert!(pipe
+        .send_pkt_to_server(Type::Short, &reset, &mut buf)
+        .is_ok());
+    assert_eq!(pipe.server.stats().reset_stream_count_remote, 1);
+
+    let reduced = [frame::Frame::ResetStreamAt {
+        stream_id,
+        error_code: 7,
+        final_size: 5,
+        reliable_size: 2,
+    }];
+    assert!(pipe
+        .send_pkt_to_server(Type::Short, &reduced, &mut buf)
+        .is_ok());
+    assert_eq!(pipe.server.stats().reset_stream_count_remote, 1);
+
+    let conflicting_fin = [frame::Frame::Stream {
+        stream_id,
+        data: <RangeBuf>::from(b"defg", 3, true),
+    }];
+    assert_eq!(
+        pipe.send_pkt_to_server(Type::Short, &conflicting_fin, &mut buf),
+        Err(Error::InvalidStreamState(stream_id))
+    );
 }
 
 type MulticastStreamRecoverySnapshot =
@@ -2519,6 +3043,230 @@ fn multicast_stream_reset_drops_withheld_recovery() {
             ..Default::default()
         }
     );
+}
+
+#[test]
+fn multicast_stream_reset_at_splits_withheld_range_and_accounts_exactly() {
+    let mut pipe = multicast_stream_negotiated_pipe();
+    let channel_id = vec![1, 2, 3, 4];
+    let warmup_stream_id = 3;
+    multicast_stream_prefix(&mut pipe, warmup_stream_id);
+    pipe.server
+        .multicast_stream_send(
+            &channel_id,
+            0,
+            warmup_stream_id,
+            10,
+            b"warmup",
+            false,
+        )
+        .unwrap();
+    pipe.advance().unwrap();
+    pipe.server
+        .multicast_process_peer_ack(multicast_ack_for(&channel_id, 0))
+        .unwrap();
+
+    let stream_id = 7;
+    multicast_stream_prefix(&mut pipe, stream_id);
+    let tx_data_before = pipe.server.tx_data;
+    assert_eq!(pipe.server.streams.tx_buffered(), 0);
+
+    pipe.server
+        .multicast_stream_send(
+            &channel_id,
+            1,
+            stream_id,
+            10,
+            b"abcdefghij",
+            false,
+        )
+        .unwrap();
+    assert_eq!(
+        pipe.server.multicast_stream_recovery_pending(&channel_id),
+        1
+    );
+    assert_eq!(pipe.server.multicast_stream_recovery_pending_total(), 1);
+    assert_eq!(
+        pipe.server
+            .multicast_stream_recovery_withheld_bytes_for_channel(&channel_id),
+        10
+    );
+    assert_eq!(pipe.server.multicast_stream_recovery_withheld_bytes(), 10);
+    assert_eq!(pipe.server.streams.tx_buffered(), 0);
+    assert_eq!(pipe.server.tx_data, tx_data_before + 10);
+
+    assert_eq!(pipe.server.stream_shutdown_at(stream_id, 42, 16), Ok(()));
+    assert_eq!(
+        pipe.server.multicast_stream_recovery_pending(&channel_id),
+        0
+    );
+    assert_eq!(pipe.server.multicast_stream_recovery_pending_total(), 0);
+    assert_eq!(
+        pipe.server
+            .multicast_stream_recovery_withheld_bytes_for_channel(&channel_id),
+        0
+    );
+    assert_eq!(pipe.server.multicast_stream_recovery_withheld_bytes(), 0);
+    assert_eq!(pipe.server.streams.tx_buffered(), 6);
+    assert_eq!(pipe.server.tx_data, tx_data_before + 10);
+
+    let first_pn = pipe.server.next_pkt_num;
+    let flight = test_utils::emit_flight(&mut pipe.server).unwrap();
+    let last_pn = pipe.server.next_pkt_num;
+    let frames = decode_flight(&mut pipe.client, &flight);
+    assert!(frames.iter().any(|frame| {
+        *frame ==
+            frame::Frame::ResetStreamAt {
+                stream_id,
+                error_code: 42,
+                final_size: 20,
+                reliable_size: 16,
+            }
+    }));
+    assert!(frames.iter().any(|frame| {
+        matches!(frame, frame::Frame::Stream { stream_id: id, data }
+            if *id == stream_id &&
+                data.off() == 10 &&
+                &data[..] == b"abcdef")
+    }));
+    assert!(!frames.iter().any(|frame| {
+        matches!(frame, frame::Frame::Stream { stream_id: id, data }
+            if *id == stream_id && data.max_off() > 16)
+    }));
+
+    test_utils::process_flight(&mut pipe.client, flight).unwrap();
+    assert_received_reliable_reset(&mut pipe.client, stream_id, b"abcdef", 42);
+    ack_server_packet_range(&mut pipe, first_pn, last_pn);
+
+    assert!(pipe.server.streams.is_collected(stream_id));
+    assert_eq!(pipe.server.streams.tx_buffered(), 0);
+    assert_eq!(pipe.server.multicast_stream_recovery_pending_total(), 0);
+    assert_eq!(pipe.server.multicast_stream_recovery_withheld_bytes(), 0);
+    assert!(!pipe
+        .server
+        .multicast_stream_deliveries
+        .contains_key(&stream_id));
+    assert_eq!(pipe.server.tx_data, tx_data_before + 10);
+}
+
+#[test]
+fn multicast_stream_reset_at_mixed_delivery_retransmits_only_pending_prefix() {
+    let mut pipe = multicast_stream_negotiated_pipe();
+    let channel_id = vec![1, 2, 3, 4];
+    let warmup_stream_id = 3;
+    multicast_stream_prefix(&mut pipe, warmup_stream_id);
+    pipe.server
+        .multicast_stream_send(
+            &channel_id,
+            0,
+            warmup_stream_id,
+            10,
+            b"warmup",
+            false,
+        )
+        .unwrap();
+    pipe.advance().unwrap();
+    pipe.server
+        .multicast_process_peer_ack(multicast_ack_for(&channel_id, 0))
+        .unwrap();
+
+    let stream_id = 7;
+    multicast_stream_prefix(&mut pipe, stream_id);
+    let tx_data_before = pipe.server.tx_data;
+
+    pipe.server
+        .multicast_stream_send(&channel_id, 1, stream_id, 10, b"abcd", false)
+        .unwrap();
+    pipe.server
+        .multicast_stream_send(&channel_id, 2, stream_id, 14, b"efghijkl", false)
+        .unwrap();
+    assert_eq!(pipe.server.tx_data, tx_data_before + 12);
+    assert_eq!(pipe.server.multicast_stream_recovery_pending_total(), 2);
+    assert_eq!(pipe.server.multicast_stream_recovery_withheld_bytes(), 12);
+
+    pipe.server
+        .multicast_process_peer_ack(multicast_ack_for(&channel_id, 1))
+        .unwrap();
+    assert_eq!(
+        pipe.server.multicast_stream_recovery_pending(&channel_id),
+        1
+    );
+    assert_eq!(pipe.server.multicast_stream_recovery_pending_total(), 1);
+    assert_eq!(
+        pipe.server
+            .multicast_stream_recovery_withheld_bytes_for_channel(&channel_id),
+        8
+    );
+    assert_eq!(pipe.server.multicast_stream_recovery_withheld_bytes(), 8);
+    assert_eq!(pipe.server.streams.tx_buffered(), 0);
+
+    assert_eq!(pipe.server.stream_shutdown_at(stream_id, 7, 18), Ok(()));
+    assert_eq!(pipe.server.multicast_stream_recovery_pending_total(), 0);
+    assert_eq!(pipe.server.multicast_stream_recovery_withheld_bytes(), 0);
+    assert_eq!(pipe.server.streams.tx_buffered(), 4);
+    assert_eq!(pipe.server.tx_data, tx_data_before + 12);
+
+    let dropped = test_utils::emit_flight(&mut pipe.server).unwrap();
+    let dropped_frames = decode_flight(&mut pipe.client, &dropped);
+    assert!(dropped_frames.iter().any(|frame| {
+        *frame ==
+            frame::Frame::ResetStreamAt {
+                stream_id,
+                error_code: 7,
+                final_size: 22,
+                reliable_size: 18,
+            }
+    }));
+    assert!(dropped_frames.iter().any(|frame| {
+        matches!(frame, frame::Frame::Stream { stream_id: id, data }
+            if *id == stream_id &&
+                data.off() == 14 &&
+                &data[..] == b"efgh")
+    }));
+    assert!(!dropped_frames.iter().any(|frame| {
+        matches!(frame, frame::Frame::Stream { stream_id: id, data }
+            if *id == stream_id && data.max_off() > 18)
+    }));
+
+    let retransmitted_before = pipe.server.stream_retrans_bytes;
+    test_utils::trigger_ack_based_loss(&mut pipe.server, &mut pipe.client);
+
+    let retransmit_pn = pipe.server.next_pkt_num;
+    let retransmit = test_utils::emit_flight(&mut pipe.server).unwrap();
+    let retransmit_end = pipe.server.next_pkt_num;
+    assert_eq!(pipe.server.stream_retrans_bytes, retransmitted_before + 4);
+    let retransmit_frames = decode_flight(&mut pipe.client, &retransmit);
+    assert!(retransmit_frames.iter().any(|frame| {
+        matches!(frame, frame::Frame::ResetStreamAt {
+            stream_id: id,
+            final_size: 22,
+            reliable_size: 18,
+            ..
+        } if *id == stream_id)
+    }));
+    assert!(retransmit_frames.iter().any(|frame| {
+        matches!(frame, frame::Frame::Stream { stream_id: id, data }
+            if *id == stream_id &&
+                data.off() == 14 &&
+                &data[..] == b"efgh")
+    }));
+    assert!(!retransmit_frames.iter().any(|frame| {
+        matches!(frame, frame::Frame::Stream { stream_id: id, data }
+            if *id == stream_id && data.max_off() > 18)
+    }));
+
+    test_utils::process_flight(&mut pipe.client, retransmit).unwrap();
+    ack_server_packet_range(&mut pipe, retransmit_pn, retransmit_end);
+
+    assert!(pipe.server.streams.is_collected(stream_id));
+    assert_eq!(pipe.server.streams.tx_buffered(), 0);
+    assert_eq!(pipe.server.multicast_stream_recovery_pending_total(), 0);
+    assert_eq!(pipe.server.multicast_stream_recovery_withheld_bytes(), 0);
+    assert!(!pipe
+        .server
+        .multicast_stream_deliveries
+        .contains_key(&stream_id));
+    assert_eq!(pipe.server.tx_data, tx_data_before + 12);
 }
 
 #[test]
@@ -5950,8 +6698,9 @@ fn stop_sending(
         Err(Error::StreamStopped(42)),
     );
 
-    // Returning `StreamStopped` causes the stream to be collected.
-    assert_eq!(pipe.server.streams.len(), 0);
+    // The application has observed StreamStopped, but the stream remains until
+    // RESET_STREAM is acknowledged.
+    assert_eq!(pipe.server.streams.len(), 1);
 
     // Client acks RESET_STREAM frame.
     let mut ranges = ranges::RangeSet::default();
@@ -5964,6 +6713,7 @@ fn stop_sending(
     }];
 
     assert_eq!(pipe.send_pkt_to_server(pkt_type, &frames, &mut buf), Ok(0));
+    assert_eq!(pipe.server.streams.len(), 0);
 
     // Sending STOP_SENDING again shouldn't trigger RESET_STREAM again.
     let frames = [frame::Frame::StopSending {
@@ -6054,7 +6804,7 @@ fn stop_sending_fin(
         Some(&frame::Frame::ResetStream {
             stream_id: 4,
             error_code: 42,
-            final_size: 5,
+            final_size: 10,
         })
     );
 
@@ -7503,8 +8253,9 @@ fn stop_sending_before_flushed_packets(
         Err(Error::StreamStopped(42)),
     );
 
-    // Returning `StreamStopped` causes the stream to be collected.
-    assert_eq!(pipe.server.streams.len(), 0);
+    // The application has observed StreamStopped, but the stream remains until
+    // RESET_STREAM is acknowledged.
+    assert_eq!(pipe.server.streams.len(), 1);
 
     // Client acks RESET_STREAM frame.
     let mut ranges = ranges::RangeSet::default();
@@ -7517,6 +8268,7 @@ fn stop_sending_before_flushed_packets(
     }];
 
     assert_eq!(pipe.send_pkt_to_server(pkt_type, &frames, &mut buf), Ok(0));
+    assert_eq!(pipe.server.streams.len(), 0);
 }
 
 #[rstest]
@@ -14374,8 +15126,8 @@ fn stop_sending_stream_send_after_reset_stream_ack(
         Err(Error::StreamStopped(42))
     );
 
-    // Returning `StreamStopped` causes the stream to be collected.
-    assert_eq!(pipe.server.streams.len(), 9);
+    // Stream 0 remains until RESET_STREAM is acknowledged.
+    assert_eq!(pipe.server.streams.len(), 10);
     assert_eq!(pipe.server.writable().len(), 9);
 
     // Client acks RESET_STREAM frame.
@@ -15119,9 +15871,9 @@ fn connect_custom_client_dcid() {
 }
 
 #[rstest]
-/// Tests that RESET_STREAM is retransmitted when the packet containing it is
-/// lost, even if the stream has been collected.
-fn reset_stream_retransmit_after_stream_collected(
+/// Tests that RESET_STREAM is retransmitted before its retained stream state
+/// can be collected.
+fn reset_stream_retransmit_before_stream_collection(
     #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
 ) {
     let mut buf = [0; 65535];
@@ -15178,8 +15930,8 @@ fn reset_stream_retransmit_after_stream_collected(
         Err(Error::StreamStopped(42))
     );
 
-    // Stream 0 should now be collected.
-    assert_eq!(pipe.server.streams.len(), 0);
+    // RESET_STREAM is still unacknowledged, so stream 0 must remain retained.
+    assert_eq!(pipe.server.streams.len(), 1);
 
     // Trigger loss detection for the first RESET_STREAM packet and subsequent
     // retransmission. Confirm the new packet contains RESET_STREAM.
@@ -15198,7 +15950,7 @@ fn reset_stream_retransmit_after_stream_collected(
 
     assert!(
         has_reset_stream,
-        "RESET_STREAM should be retransmitted even after stream is collected"
+        "RESET_STREAM should be retransmitted while stream state is retained"
     );
 }
 

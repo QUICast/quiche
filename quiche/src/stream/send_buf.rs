@@ -37,6 +37,8 @@ use crate::Result;
 use crate::buffers::DefaultBufFactory;
 use crate::ranges;
 
+use super::StreamReset;
+
 #[cfg(test)]
 const SEND_BUFFER_SIZE: usize = 5;
 
@@ -77,6 +79,43 @@ impl<F: BufFactory> Drop for SendReserve<'_, F> {
     fn drop(&mut self) {
         assert_eq!(self.reserved, 0)
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SendResetState {
+    frame: StreamReset,
+    acked: bool,
+}
+
+impl SendResetState {
+    fn error_code(self) -> u64 {
+        match self.frame {
+            StreamReset::Reset { error_code, .. } |
+            StreamReset::ResetAt { error_code, .. } => error_code,
+        }
+    }
+
+    fn final_size(self) -> u64 {
+        match self.frame {
+            StreamReset::Reset { final_size, .. } |
+            StreamReset::ResetAt { final_size, .. } => final_size,
+        }
+    }
+
+    fn reliable_size(self) -> u64 {
+        match self.frame {
+            StreamReset::Reset { .. } => 0,
+            StreamReset::ResetAt { reliable_size, .. } => reliable_size,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SendResetOutcome {
+    pub(crate) final_size: u64,
+    pub(crate) dropped_tx_data: u64,
+    pub(crate) dropped_buffered: usize,
+    pub(crate) changed: bool,
 }
 
 /// Send-side stream buffer.
@@ -123,14 +162,13 @@ where
     fin_off: Option<u64>,
 
     /// Whether an ordinary STREAM frame conveying the final size was acked.
-    ///
-    /// RESET_STREAM retransmission is tracked separately by `StreamMap`, so a
-    /// reset send buffer doesn't need to remain alive until that frame is
-    /// acked.
     fin_acked: bool,
 
     /// Whether the stream's send-side has been shut down.
     shutdown: bool,
+
+    /// Locally generated stream termination, when one is outstanding.
+    reset: Option<SendResetState>,
 
     /// Ranges of data offsets that have been acked.
     acked: ranges::RangeSet,
@@ -152,6 +190,10 @@ impl<F: BufFactory> SendBuf<F> {
     fn reserve_for_write(
         &mut self, mut len: usize, mut fin: bool,
     ) -> Result<SendReserve<'_, F>> {
+        if self.shutdown {
+            return Err(Error::FinalSize);
+        }
+
         let max_off = self.off + len as u64;
 
         // Get the stream send capacity. This will return an error if the stream
@@ -455,16 +497,14 @@ impl<F: BufFactory> SendBuf<F> {
         }
     }
 
-    /// Returns the offset range accounted as unsent by [`SendBuf::reset()`].
-    pub(crate) fn reset_drop_range(&self) -> std::ops::Range<u64> {
-        self.emit_off..self.off_back()
-    }
-
     pub fn retransmit(&mut self, off: u64, len: usize) -> usize {
-        let max_off = off + len as u64;
+        let max_off = off.saturating_add(len as u64);
+        let max_off = self
+            .reset
+            .map_or(max_off, |reset| max_off.min(reset.reliable_size()));
         let ack_off = self.ack_off();
 
-        if self.data.is_empty() {
+        if self.data.is_empty() || off >= max_off {
             return 0;
         }
 
@@ -517,60 +557,267 @@ impl<F: BufFactory> SendBuf<F> {
         total_retransmitted as usize
     }
 
-    /// Resets the stream at the current offset and clears all buffered data.
-    pub fn reset(&mut self) -> (u64, u64) {
-        let unsent = self.reset_drop_range();
-        let unsent_len = unsent.end.saturating_sub(unsent.start);
+    fn retained_covers(&self, end: u64) -> bool {
+        if end == 0 {
+            return true;
+        }
 
-        self.fin_off = Some(unsent.start);
-        self.fin_acked = true;
+        if end > self.off {
+            return false;
+        }
 
-        // Drop all buffered data.
-        self.data.clear();
+        let mut acked_ranges = self.acked.iter().peekable();
+        let mut retained = self
+            .data
+            .iter()
+            .map(|buf| buf.off..buf.off.saturating_add(buf.len as u64))
+            .filter(|range| !range.is_empty())
+            .peekable();
+        let mut covered = 0;
 
-        // Mark relevant data as acked.
-        self.off = unsent.start;
-        self.ack(0, self.off as usize);
+        while covered < end {
+            let next = match (acked_ranges.peek(), retained.peek()) {
+                (Some(acked), Some(retained))
+                    if acked.start <= retained.start =>
+                    acked_ranges.next(),
 
-        self.pos = 0;
-        self.buffered_bytes = 0;
+                (Some(_), Some(_)) => retained.next(),
 
-        (self.emit_off, unsent_len)
+                (Some(_), None) => acked_ranges.next(),
+
+                (None, Some(_)) => retained.next(),
+
+                (None, None) => return false,
+            };
+
+            let Some(range) = next else {
+                return false;
+            };
+
+            if range.start > covered {
+                return false;
+            }
+
+            covered = covered.max(range.end);
+        }
+
+        true
     }
 
-    /// Raises the final size after reset to include multicast-delivered data.
-    pub(crate) fn raise_reset_final_size(&mut self, final_size: u64) {
-        self.off = cmp::max(self.off, final_size);
-        self.emit_off = cmp::max(self.emit_off, final_size);
-        self.fin_off = Some(cmp::max(self.fin_off.unwrap_or(0), final_size));
-        self.fin_acked = true;
-        self.ack(0, final_size as usize);
+    fn discard_after(&mut self, end: u64) -> usize {
+        let mut dropped_buffered = 0_u64;
+        let mut truncate_at = self.data.len();
+
+        for i in 0..self.data.len() {
+            let buf = &mut self.data[i];
+            let buf_start = buf.off;
+            let buf_end = buf.off.saturating_add(buf.len as u64);
+
+            if buf_start >= end {
+                truncate_at = i;
+                break;
+            }
+
+            if end < buf_end {
+                let split_at = usize::try_from(end - buf_start)
+                    .expect("range length is already represented as usize");
+                let tail = buf.split_off(split_at);
+                dropped_buffered =
+                    dropped_buffered.saturating_add(tail.len() as u64);
+                truncate_at = i + 1;
+                break;
+            }
+        }
+
+        for buf in self.data.iter().skip(truncate_at) {
+            dropped_buffered = dropped_buffered.saturating_add(buf.len() as u64);
+        }
+        self.data.truncate(truncate_at);
+        self.pos = self.pos.min(self.data.len());
+        self.buffered_bytes =
+            self.buffered_bytes.saturating_sub(dropped_buffered);
+
+        usize::try_from(dropped_buffered).unwrap_or(usize::MAX)
+    }
+
+    fn terminate(&mut self, frame: StreamReset) -> Result<SendResetOutcome> {
+        let next = SendResetState {
+            frame,
+            acked: false,
+        };
+        let final_size = next.final_size();
+        let reliable_size = next.reliable_size();
+
+        if reliable_size > final_size {
+            return Err(Error::FinalSize);
+        }
+
+        if let Some(fin_off) = self.fin_off {
+            if fin_off != final_size {
+                return Err(Error::InvalidState);
+            }
+        }
+
+        if let Some(current) = self.reset {
+            if current.error_code() != next.error_code() ||
+                current.final_size() != final_size ||
+                reliable_size > current.reliable_size()
+            {
+                return Err(Error::InvalidState);
+            }
+
+            if reliable_size == current.reliable_size() {
+                return Ok(SendResetOutcome {
+                    final_size,
+                    dropped_tx_data: 0,
+                    dropped_buffered: 0,
+                    changed: false,
+                });
+            }
+        }
+
+        if !self.retained_covers(reliable_size) {
+            return Err(Error::InvalidState);
+        }
+
+        let dropped_tx_data = if self.reset.is_none() {
+            self.off.saturating_sub(final_size)
+        } else {
+            0
+        };
+        let dropped_buffered = self.discard_after(reliable_size);
+
+        self.off = final_size;
+        self.fin_off = Some(final_size);
+        self.blocked_at = None;
+        self.reset = Some(next);
+
+        Ok(SendResetOutcome {
+            final_size,
+            dropped_tx_data,
+            dropped_buffered,
+            changed: true,
+        })
     }
 
     /// Resets the streams and records the received error code.
     ///
     /// Calling this again after the first time has no effect.
-    pub fn stop(&mut self, error_code: u64) -> Result<(u64, u64)> {
+    pub(crate) fn stop(
+        &mut self, error_code: u64, final_size: u64,
+    ) -> Result<SendResetOutcome> {
         if self.error.is_some() {
             return Err(Error::Done);
         }
 
-        let (max_off, unsent) = self.reset();
+        let outcome = if let Some(reset) = self.reset {
+            SendResetOutcome {
+                final_size: reset.final_size(),
+                dropped_tx_data: 0,
+                dropped_buffered: 0,
+                changed: false,
+            }
+        } else {
+            self.terminate(StreamReset::Reset {
+                error_code,
+                final_size,
+            })?
+        };
 
         self.error = Some(error_code);
 
-        Ok((max_off, unsent))
+        Ok(outcome)
     }
 
     /// Shuts down sending data.
-    pub fn shutdown(&mut self) -> Result<(u64, u64)> {
-        if self.shutdown {
+    pub(crate) fn shutdown(
+        &mut self, error_code: u64, final_size: u64,
+    ) -> Result<SendResetOutcome> {
+        if self.reset.is_some() && self.is_complete() {
             return Err(Error::Done);
         }
 
+        if self.shutdown &&
+            self.reset.is_none_or(|reset| reset.reliable_size() == 0)
+        {
+            return Err(Error::Done);
+        }
+
+        let outcome = self.terminate(StreamReset::Reset {
+            error_code,
+            final_size,
+        })?;
         self.shutdown = true;
 
-        Ok(self.reset())
+        Ok(outcome)
+    }
+
+    /// Shuts down sending while retaining a reliably delivered prefix.
+    pub(crate) fn shutdown_at(
+        &mut self, error_code: u64, final_size: u64, reliable_size: u64,
+    ) -> Result<SendResetOutcome> {
+        if self.is_complete() {
+            return Err(Error::Done);
+        }
+
+        let outcome = self.terminate(StreamReset::ResetAt {
+            error_code,
+            final_size,
+            reliable_size,
+        })?;
+        self.shutdown = true;
+
+        Ok(outcome)
+    }
+
+    /// Returns the final size for an ordinary locally generated reset.
+    pub(crate) fn ordinary_reset_final_size(&self) -> u64 {
+        self.reset.map_or_else(
+            || self.fin_off.unwrap_or(self.emit_off),
+            SendResetState::final_size,
+        )
+    }
+
+    /// Returns the final size for a locally generated reliable reset.
+    pub(crate) fn reliable_reset_final_size(&self) -> u64 {
+        self.reset.map_or_else(
+            || self.fin_off.unwrap_or(self.off),
+            SendResetState::final_size,
+        )
+    }
+
+    /// Returns the current reset frame while it still needs acknowledgement.
+    pub(crate) fn pending_reset(&self) -> Option<StreamReset> {
+        self.reset
+            .filter(|reset| !reset.acked)
+            .map(|reset| reset.frame)
+    }
+
+    /// Marks an exact current reset frame as acknowledged.
+    pub(crate) fn ack_reset(&mut self, frame: StreamReset) -> bool {
+        let Some(reset) = self.reset.as_mut() else {
+            return false;
+        };
+
+        if reset.frame != frame {
+            return false;
+        }
+
+        reset.acked = true;
+        true
+    }
+
+    /// Returns whether a reliable or ordinary reset has been initiated.
+    pub(crate) fn is_reset(&self) -> bool {
+        self.reset.is_some()
+    }
+
+    /// Returns whether buffered data is still eligible for transmission.
+    pub(crate) fn can_send_buffered(&self) -> bool {
+        self.reset.map_or_else(
+            || !self.is_stopped(),
+            |reset| self.ack_off() < reset.reliable_size(),
+        )
     }
 
     /// Returns the largest offset of data buffered.
@@ -615,9 +862,14 @@ impl<F: BufFactory> SendBuf<F> {
     ///
     /// This happens when the stream's send final size is known, the peer has
     /// acked all stream data up to that point, and the STREAM frame carrying
-    /// FIN has also been acknowledged. Reset final-size delivery is retained
-    /// separately by `StreamMap`.
+    /// FIN has also been acknowledged. A reset stream instead completes when
+    /// its current reset frame and every byte through Reliable Size are
+    /// acknowledged.
     pub fn is_complete(&self) -> bool {
+        if let Some(reset) = self.reset {
+            return reset.acked && self.ack_off() >= reset.reliable_size();
+        }
+
         if let Some(fin_off) = self.fin_off {
             if self.fin_acked && self.acked == (0..fin_off) {
                 return true;
@@ -966,8 +1218,163 @@ mod tests {
         // Server receives STOP_SENDING from client. The final_size we
         // send in the RESET_STREAM should be 50. If we send anything less,
         // it's a FINAL_SIZE_ERROR.
-        let (fin_off, unsent) = send.stop(0).unwrap();
-        assert_eq!(fin_off, 50);
-        assert_eq!(unsent, 0);
+        let outcome = send.stop(0, 50).unwrap();
+        assert_eq!(outcome.final_size, 50);
+        assert_eq!(outcome.dropped_tx_data, 0);
+    }
+
+    #[test]
+    fn reset_stream_at_retains_only_required_prefix() {
+        let mut send = <SendBuf>::new(u64::MAX);
+        send.write(b"abcdefghij", false).unwrap();
+
+        let mut emitted = [0; 4];
+        assert_eq!(send.emit(&mut emitted), Ok((4, false)));
+        assert_eq!(&emitted, b"abcd");
+
+        let outcome = send.shutdown_at(42, 10, 6).unwrap();
+        assert_eq!(outcome, SendResetOutcome {
+            final_size: 10,
+            dropped_tx_data: 0,
+            dropped_buffered: 4,
+            changed: true,
+        });
+        assert_eq!(send.buffered_bytes(), 2);
+        assert_eq!(send.off_back(), 10);
+        assert_eq!(
+            send.pending_reset(),
+            Some(StreamReset::ResetAt {
+                error_code: 42,
+                final_size: 10,
+                reliable_size: 6,
+            })
+        );
+        assert_eq!(send.write(b"x", false), Err(Error::FinalSize));
+        assert_eq!(send.write(b"", true), Err(Error::FinalSize));
+
+        assert_eq!(send.retransmit(0, 4), 4);
+        let mut prefix = [0; 6];
+        assert_eq!(send.emit(&mut prefix), Ok((6, false)));
+        assert_eq!(&prefix, b"abcdef");
+
+        send.ack_and_drop(0, 3);
+        assert!(send.can_send_buffered());
+        assert!(!send.is_complete());
+        send.ack_and_drop(3, 3);
+        assert!(!send.can_send_buffered());
+        assert!(!send.is_complete());
+
+        assert!(send.ack_reset(StreamReset::ResetAt {
+            error_code: 42,
+            final_size: 10,
+            reliable_size: 6,
+        }));
+        assert!(send.is_complete());
+        assert_eq!(send.buffered_bytes(), 0);
+        assert_eq!(send.bufs_count(), 0);
+    }
+
+    #[test]
+    fn reset_stream_at_reduction_is_monotonic_and_exactly_acked() {
+        let mut send = <SendBuf>::new(u64::MAX);
+        send.write(b"abcdefghij", false).unwrap();
+
+        assert!(send.shutdown_at(7, 10, 8).unwrap().changed);
+        assert!(
+            !send
+                .shutdown_at(7, 10, 8)
+                .expect("exact duplicate is idempotent")
+                .changed
+        );
+        assert!(send.shutdown_at(7, 10, 5).unwrap().changed);
+
+        let current = StreamReset::ResetAt {
+            error_code: 7,
+            final_size: 10,
+            reliable_size: 5,
+        };
+        assert_eq!(send.pending_reset(), Some(current));
+        assert!(!send.ack_reset(StreamReset::ResetAt {
+            error_code: 7,
+            final_size: 10,
+            reliable_size: 8,
+        }));
+        assert_eq!(send.pending_reset(), Some(current));
+
+        let buffered = send.buffered_bytes();
+        assert_eq!(send.shutdown_at(7, 10, 6), Err(Error::InvalidState));
+        assert_eq!(send.shutdown_at(8, 10, 4), Err(Error::InvalidState));
+        assert_eq!(send.shutdown_at(7, 9, 4), Err(Error::InvalidState));
+        assert_eq!(send.buffered_bytes(), buffered);
+        assert_eq!(send.pending_reset(), Some(current));
+
+        // STOP_SENDING makes application writes fail, but it cannot prevent a
+        // valid reduction of an already established reliable reset.
+        assert!(!send.stop(99, 10).unwrap().changed);
+        assert!(send.shutdown_at(7, 10, 4).unwrap().changed);
+
+        assert!(send.shutdown(7, 10).unwrap().changed);
+        assert_eq!(
+            send.pending_reset(),
+            Some(StreamReset::Reset {
+                error_code: 7,
+                final_size: 10,
+            })
+        );
+    }
+
+    #[test]
+    fn reset_stream_at_rejects_missing_prefix_transactionally() {
+        let mut send = <SendBuf>::new(u64::MAX);
+        send.write(b"abcdefghij", false).unwrap();
+        let mut out = [0; 10];
+        assert_eq!(send.emit(&mut out), Ok((10, false)));
+
+        // Simulate a violated external-retention contract: these bytes are
+        // neither acknowledged nor available for retransmission.
+        send.data.clear();
+        let before = (
+            send.off,
+            send.emit_off,
+            send.fin_off,
+            send.shutdown,
+            send.reset,
+            send.buffered_bytes,
+        );
+
+        assert_eq!(send.shutdown_at(42, 10, 5), Err(Error::InvalidState));
+        assert_eq!(
+            (
+                send.off,
+                send.emit_off,
+                send.fin_off,
+                send.shutdown,
+                send.reset,
+                send.buffered_bytes,
+            ),
+            before
+        );
+    }
+
+    #[test]
+    fn reset_stream_at_after_fin_waits_for_frame_and_prefix_ack() {
+        let mut send = <SendBuf>::new(u64::MAX);
+        send.write(b"hello", true).unwrap();
+        let mut out = [0; 5];
+        assert_eq!(send.emit(&mut out), Ok((5, true)));
+
+        send.shutdown_at(9, 5, 5).unwrap();
+        send.ack_fin(5);
+        send.ack_and_drop(0, 5);
+        assert!(!send.is_complete());
+
+        assert!(send.ack_reset(StreamReset::ResetAt {
+            error_code: 9,
+            final_size: 5,
+            reliable_size: 5,
+        }));
+        assert!(send.is_complete());
+        assert_eq!(send.shutdown_at(9, 5, 4), Err(Error::Done));
+        assert_eq!(send.shutdown(9, 5), Err(Error::Done));
     }
 }

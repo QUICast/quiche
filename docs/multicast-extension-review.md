@@ -45,10 +45,12 @@ blockers remain intentionally deferred and unchanged: source-neutral
 STREAM/reset receive accounting, and conflicting or exhausted `MC_STATE`
 sequence numbers. Packet-number exhaustion, `MC_LIMITS` equal-sequence or
 exhaustion behavior, and `MC_KEY` conflict error mapping are three additional
-explicit draft gaps. Authenticated multicast STREAM and RESET frames are
-decoded and surfaced, but core quiche does not yet apply them to its ordinary
-receive stream map. Congestion response and correlated circuit-breaker recovery
-also remain application policy rather than a complete transport implementation.
+explicit draft gaps. Receipt of `RESET_STREAM_AT` without locally advertising
+the reliable-stream-reset draft-07 transport parameter is another unresolved
+specification gap. Authenticated multicast STREAM and RESET frames are decoded
+and surfaced, but core quiche does not yet apply them to its ordinary receive
+stream map. Congestion response and correlated circuit-breaker recovery also
+remain application policy rather than a complete transport implementation.
 
 MCQUIC in draft-08 is not the QUIC multipath extension. This implementation
 correctly uses a Channel ID and an independent channel packet-number space with
@@ -379,6 +381,34 @@ Draft-08 says a conflicting repeated key sequence should close with
 fails closed on conflicting key content and prevents arithmetic wrap; Tokio
 continues its existing channel-local protocol-error handling. This pass does
 not substitute a generic QUIC error or choose a new connection-level mapping.
+
+### P0: Unnegotiated `RESET_STREAM_AT` Receipt
+
+Reliable-stream-reset draft-07 says that sending the empty `reset_stream_at`
+transport parameter advertises support for receiving `RESET_STREAM_AT`. RFC
+9000 says that absence of a transport parameter disables an optional feature
+negotiated by that parameter and that an extension sender must first ensure its
+peer understands a new frame. Neither document explicitly prohibits sending
+`RESET_STREAM_AT` to a peer that omitted the parameter, nor assigns the
+receiver's connection error for that case. Draft-07 assigns
+`TRANSPORT_PARAMETER_ERROR` only to a non-empty parameter and
+`FRAME_ENCODING_ERROR` only when Reliable Size exceeds Final Size.
+
+The viable receiver policies are:
+
+1. reject the well-formed but unnegotiated frame with `PROTOCOL_VIOLATION`;
+2. treat the disabled extension as unsupported and use
+   `FRAME_ENCODING_ERROR`, as for an unknown frame type; or
+3. tolerate and process a syntactically understood frame despite the omitted
+   capability advertisement.
+
+The recommended specification correction is to state that a sender MUST NOT
+send `RESET_STREAM_AT` unless its peer advertised the parameter and that a
+receiver MUST close with `PROTOCOL_VIOLATION` if this rule is violated. This
+distinguishes illegal use of a well-formed frame from malformed or genuinely
+unknown framing. Until draft-07 selects a wire error, quiche retains its
+existing tolerant receive behavior; local sending remains gated on the peer's
+advertisement.
 
 ### P1: Congestion Control And Circuit Breakers
 
