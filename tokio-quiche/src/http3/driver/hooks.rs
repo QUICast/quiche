@@ -77,6 +77,13 @@ pub trait DriverHooks: Sized + Send + 'static {
         headers: InboundHeaders,
     ) -> H3ConnectionResult<()>;
 
+    /// Called once after the peer's SETTINGS frame has been parsed.
+    fn settings_received(
+        _driver: &mut H3Driver<Self>, _qconn: &mut QuicheConnection,
+    ) -> H3ConnectionResult<()> {
+        Ok(())
+    }
+
     /// Determines whether the driver should claim a readable QUIC stream as a
     /// raw stream instead of passing it to the HTTP/3 parser.
     fn should_intercept_raw_stream(

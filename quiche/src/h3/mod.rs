@@ -935,6 +935,57 @@ pub enum WebTransportStreamDirection {
     Unidirectional,
 }
 
+/// A locally reserved draft-15 WebTransport stream and its encoded prefix.
+///
+/// The reservation consumes the physical stream ID from HTTP/3's shared local
+/// stream namespace immediately. This prevents a later request or extension
+/// stream from reusing the ID while a partial prefix is flow-control blocked.
+/// Callers write [`prefix()`] from offset zero, then pass the reservation to
+/// [`Connection::commit_webtransport_stream()`] after every prefix byte has
+/// been accepted by QUIC.
+///
+/// Dropping an unfinished reservation does not roll back the stream ID, even
+/// when no prefix bytes were accepted. Callers must eventually finish the
+/// reliable prefix and reset the stream, or commit and close the stream.
+///
+/// [`prefix()`]: Self::prefix
+#[derive(Debug)]
+#[must_use = "a WebTransport stream reservation must be committed or settled"]
+pub struct WebTransportStreamReservation {
+    stream_id: u64,
+    session_id: u64,
+    direction: WebTransportStreamDirection,
+    prefix: [u8; 16],
+    prefix_len: usize,
+}
+
+impl WebTransportStreamReservation {
+    /// Returns the reserved physical QUIC stream ID.
+    pub fn stream_id(&self) -> u64 {
+        self.stream_id
+    }
+
+    /// Returns the CONNECT stream ID identifying the owning session.
+    pub fn session_id(&self) -> u64 {
+        self.session_id
+    }
+
+    /// Returns whether the reserved stream is bidirectional or unidirectional.
+    pub fn direction(&self) -> WebTransportStreamDirection {
+        self.direction
+    }
+
+    /// Returns the exact signal/type and Session ID bytes to write once.
+    pub fn prefix(&self) -> &[u8] {
+        &self.prefix[..self.prefix_len]
+    }
+
+    /// Returns the reliable prefix size required when the initiator resets.
+    pub fn prefix_len(&self) -> usize {
+        self.prefix_len
+    }
+}
+
 /// Extensible Priorities parameters.
 ///
 /// The `TryFrom` trait supports constructing this object from the serialized
@@ -1092,6 +1143,7 @@ pub struct Connection {
     is_server: bool,
 
     next_request_stream_id: u64,
+    next_server_bidi_stream_id: u64,
     next_uni_stream_id: u64,
 
     streams: crate::stream::StreamIdHashMap<stream::Stream>,
@@ -1154,6 +1206,7 @@ impl Connection {
             is_server,
 
             next_request_stream_id: 0,
+            next_server_bidi_stream_id: 1,
 
             next_uni_stream_id: initial_uni_stream_id,
 
@@ -1947,6 +2000,125 @@ impl Connection {
     /// [`poll()`]: struct.Connection.html#method.poll
     pub fn extended_connect_enabled_by_peer(&self) -> bool {
         self.peer_settings.connect_protocol_enabled == Some(1)
+    }
+
+    /// Reserves the next local stream ID and encodes its draft-15
+    /// WebTransport prefix.
+    ///
+    /// Bidirectional client reservations share the request-stream allocator;
+    /// unidirectional reservations share the HTTP/3 extension-stream
+    /// allocator. Server bidirectional streams use their own QUIC stream-ID
+    /// space. The selected ID is consumed only after the transport reserves
+    /// its mandatory reliable prefix.
+    ///
+    /// Both endpoints must have advertised nonzero [`SETTINGS_WT_ENABLED`]
+    /// values, and `session_id` must identify a client-initiated
+    /// bidirectional stream.
+    pub fn reserve_webtransport_stream<F: BufFactory>(
+        &mut self, conn: &mut super::Connection<F>, session_id: u64,
+        direction: WebTransportStreamDirection,
+    ) -> Result<WebTransportStreamReservation> {
+        if conn.is_server != self.is_server {
+            return Err(Error::InternalError);
+        }
+        if !self.local_webtransport_support ||
+            self.peer_webtransport_support != WebTransportPeerSupport::Enabled
+        {
+            return Err(Error::SettingsError);
+        }
+        if session_id > octets::MAX_VAR_INT || session_id & 0x3 != 0 {
+            return Err(Error::IdError);
+        }
+
+        let (stream_id, next_stream_id) = match direction {
+            WebTransportStreamDirection::Bidirectional if self.is_server => {
+                let stream_id = self.next_server_bidi_stream_id;
+                if stream_id > octets::MAX_VAR_INT {
+                    return Err(Error::IdError);
+                }
+                (stream_id, stream_id.checked_add(4).ok_or(Error::IdError)?)
+            },
+            WebTransportStreamDirection::Bidirectional => {
+                let stream_id = self.next_request_stream_id;
+                if stream_id > octets::MAX_VAR_INT {
+                    return Err(Error::IdError);
+                }
+                (stream_id, stream_id.checked_add(4).ok_or(Error::IdError)?)
+            },
+            WebTransportStreamDirection::Unidirectional => {
+                let stream_id = self.next_uni_stream_id;
+                if stream_id > octets::MAX_VAR_INT {
+                    return Err(Error::IdError);
+                }
+                (stream_id, stream_id.checked_add(4).ok_or(Error::IdError)?)
+            },
+        };
+
+        let signal = match direction {
+            WebTransportStreamDirection::Bidirectional =>
+                WEBTRANSPORT_BIDI_STREAM_SIGNAL,
+            WebTransportStreamDirection::Unidirectional =>
+                WEBTRANSPORT_UNI_STREAM_TYPE,
+        };
+        let mut prefix = [0; 16];
+        let mut out = octets::OctetsMut::with_slice(&mut prefix);
+        out.put_varint(signal)?;
+        out.put_varint(session_id)?;
+        let prefix_len = out.off();
+
+        conn.stream_reserve_automatic_reset_reliable_size(
+            stream_id,
+            prefix_len as u64,
+        )?;
+
+        match direction {
+            WebTransportStreamDirection::Bidirectional if self.is_server =>
+                self.next_server_bidi_stream_id = next_stream_id,
+            WebTransportStreamDirection::Bidirectional =>
+                self.next_request_stream_id = next_stream_id,
+            WebTransportStreamDirection::Unidirectional =>
+                self.next_uni_stream_id = next_stream_id,
+        }
+
+        Ok(WebTransportStreamReservation {
+            stream_id,
+            session_id,
+            direction,
+            prefix,
+            prefix_len,
+        })
+    }
+
+    /// Detaches a locally reserved WebTransport stream from HTTP/3 parsing.
+    ///
+    /// Every byte returned by [`WebTransportStreamReservation::prefix()`]
+    /// must already have been accepted at offset zero. A blocked or absent
+    /// stream is rejected without consuming or changing the reservation.
+    pub fn commit_webtransport_stream<F: BufFactory>(
+        &mut self, conn: &mut super::Connection<F>,
+        reservation: &WebTransportStreamReservation,
+    ) -> Result<()> {
+        if conn.is_server != self.is_server {
+            return Err(Error::InternalError);
+        }
+        if self.streams.contains_key(&reservation.stream_id) {
+            return Err(Error::IdError);
+        }
+        let Some(offset) = conn.stream_send_offset(reservation.stream_id) else {
+            return Err(Error::TransportError(super::Error::InvalidStreamState(
+                reservation.stream_id,
+            )));
+        };
+        if offset != reservation.prefix_len as u64 {
+            return Err(Error::StreamBlocked);
+        }
+
+        conn.stream_set_automatic_reset_reliable_size(
+            reservation.stream_id,
+            reservation.prefix_len as u64,
+        )?;
+        conn.stream_detach_from_app_proto(reservation.stream_id);
+        Ok(())
     }
 
     /// Reads request or response body data into the provided buffer.
@@ -3143,6 +3315,13 @@ impl Connection {
                         WebTransportStreamDirection::Unidirectional
                     };
 
+                    if direction == WebTransportStreamDirection::Bidirectional &&
+                        conn.reset_stream_at_enabled()
+                    {
+                        conn.stream_set_automatic_reset_reliable_size(
+                            stream_id, 0,
+                        )?;
+                    }
                     conn.stream_detach_from_app_proto(stream_id);
 
                     return Ok((stream_id, Event::WebTransportStream {
@@ -9114,6 +9293,412 @@ mod tests {
                 Ok((payload.len(), true)),
             );
             assert_eq!(received, payload);
+        }
+    }
+
+    #[test]
+    fn webtransport_local_reservations_share_h3_stream_allocators() {
+        let mut s = webtransport_session();
+        let (session_id, request) = s.send_request(false).unwrap();
+        assert_eq!(session_id, 0);
+        assert_eq!(
+            s.poll_server(),
+            Ok((session_id, Event::Headers {
+                list: request,
+                more_frames: true,
+            }))
+        );
+
+        let next_request = s.client.next_request_stream_id;
+        assert!(matches!(
+            s.client.reserve_webtransport_stream(
+                &mut s.pipe.client,
+                1,
+                WebTransportStreamDirection::Bidirectional,
+            ),
+            Err(Error::IdError)
+        ));
+        assert_eq!(s.client.next_request_stream_id, next_request);
+
+        let reservation = s
+            .client
+            .reserve_webtransport_stream(
+                &mut s.pipe.client,
+                session_id,
+                WebTransportStreamDirection::Bidirectional,
+            )
+            .unwrap();
+        assert_eq!(reservation.stream_id(), 4);
+        assert_eq!(reservation.prefix(), &[0x40, 0x41, 0]);
+
+        let stream_id = reservation.stream_id();
+        let prefix = reservation.prefix().to_vec();
+        assert_eq!(
+            s.pipe.client.stream_send(stream_id, &prefix[..1], false),
+            Ok(1)
+        );
+        assert_eq!(
+            s.client
+                .commit_webtransport_stream(&mut s.pipe.client, &reservation),
+            Err(Error::StreamBlocked)
+        );
+        assert_eq!(
+            s.pipe.client.stream_send(stream_id, &prefix[1..], false),
+            Ok(prefix.len() - 1)
+        );
+        assert_eq!(
+            s.client
+                .commit_webtransport_stream(&mut s.pipe.client, &reservation),
+            Ok(())
+        );
+        assert!(s.pipe.client.stream_is_detached_from_app_proto(stream_id));
+
+        s.advance().unwrap();
+        assert_eq!(
+            s.poll_server(),
+            Ok((stream_id, Event::WebTransportStream {
+                session_id,
+                direction: WebTransportStreamDirection::Bidirectional,
+                prefix_len: prefix.len(),
+            }))
+        );
+
+        let (next_request, _) = s.send_request(false).unwrap();
+        assert_eq!(next_request, 8);
+
+        let client_uni_before = s.client.next_uni_stream_id;
+        let client_uni = s
+            .client
+            .reserve_webtransport_stream(
+                &mut s.pipe.client,
+                session_id,
+                WebTransportStreamDirection::Unidirectional,
+            )
+            .unwrap();
+        assert_eq!(client_uni.stream_id(), client_uni_before);
+        assert_eq!(client_uni.stream_id() & 0x3, 2);
+        assert_eq!(client_uni.prefix(), &[0x40, 0x54, 0]);
+
+        let server_bidi = s
+            .server
+            .reserve_webtransport_stream(
+                &mut s.pipe.server,
+                session_id,
+                WebTransportStreamDirection::Bidirectional,
+            )
+            .unwrap();
+        assert_eq!(server_bidi.stream_id(), 1);
+        let server_uni = s
+            .server
+            .reserve_webtransport_stream(
+                &mut s.pipe.server,
+                session_id,
+                WebTransportStreamDirection::Unidirectional,
+            )
+            .unwrap();
+        assert_eq!(server_uni.stream_id() & 0x3, 3);
+    }
+
+    #[test]
+    fn webtransport_reservation_preflights_reliable_reset_negotiation() {
+        let (mut transport_config, mut h3_config) =
+            Session::default_configs().unwrap();
+        h3_config
+            .set_additional_settings(vec![(SETTINGS_WT_ENABLED, 1)])
+            .unwrap();
+        h3_config.enable_webtransport_stream_classification(true);
+        let mut s =
+            Session::with_configs(&mut transport_config, &h3_config).unwrap();
+        s.handshake().unwrap();
+
+        let next_stream_id = s.server.next_server_bidi_stream_id;
+        assert!(matches!(
+            s.server.reserve_webtransport_stream(
+                &mut s.pipe.server,
+                0,
+                WebTransportStreamDirection::Bidirectional,
+            ),
+            Err(Error::TransportError(crate::Error::InvalidState))
+        ));
+        assert_eq!(s.server.next_server_bidi_stream_id, next_stream_id);
+        assert!(s.pipe.server.streams.get(next_stream_id).is_none());
+    }
+
+    #[test]
+    fn webtransport_reservation_does_not_consume_id_at_stream_limit() {
+        let (mut transport_config, mut h3_config) =
+            Session::default_configs().unwrap();
+        transport_config.set_initial_max_data(1_000_000);
+        transport_config.set_initial_max_streams_bidi(1);
+        transport_config.set_initial_max_streams_uni(64);
+        transport_config.enable_reset_stream_at(true);
+        h3_config
+            .set_additional_settings(vec![(SETTINGS_WT_ENABLED, 1)])
+            .unwrap();
+        h3_config.enable_webtransport_stream_classification(true);
+        let mut s =
+            Session::with_configs(&mut transport_config, &h3_config).unwrap();
+        s.handshake().unwrap();
+
+        let first = s
+            .server
+            .reserve_webtransport_stream(
+                &mut s.pipe.server,
+                0,
+                WebTransportStreamDirection::Bidirectional,
+            )
+            .unwrap();
+        assert_eq!(first.stream_id(), 1);
+
+        let next_stream_id = s.server.next_server_bidi_stream_id;
+        assert!(matches!(
+            s.server.reserve_webtransport_stream(
+                &mut s.pipe.server,
+                0,
+                WebTransportStreamDirection::Bidirectional,
+            ),
+            Err(Error::TransportError(crate::Error::StreamLimit))
+        ));
+        assert_eq!(s.server.next_server_bidi_stream_id, next_stream_id);
+        assert!(s.pipe.server.streams.get(next_stream_id).is_none());
+    }
+
+    #[test]
+    fn webtransport_local_prefixes_cover_every_varint_boundary() {
+        let mut s = webtransport_session();
+        let cases = [
+            (0, 1),
+            (60, 1),
+            (64, 2),
+            (16_380, 2),
+            (16_384, 4),
+            ((1 << 30) - 4, 4),
+            (1 << 30, 8),
+            (octets::MAX_VAR_INT & !3, 8),
+        ];
+
+        for direction in [
+            WebTransportStreamDirection::Bidirectional,
+            WebTransportStreamDirection::Unidirectional,
+        ] {
+            let signal = match direction {
+                WebTransportStreamDirection::Bidirectional =>
+                    WEBTRANSPORT_BIDI_STREAM_SIGNAL,
+                WebTransportStreamDirection::Unidirectional =>
+                    WEBTRANSPORT_UNI_STREAM_TYPE,
+            };
+
+            for (session_id, session_len) in cases {
+                let reservation = s
+                    .server
+                    .reserve_webtransport_stream(
+                        &mut s.pipe.server,
+                        session_id,
+                        direction,
+                    )
+                    .unwrap();
+                assert_eq!(reservation.prefix_len(), 2 + session_len);
+
+                let mut prefix = octets::Octets::with_slice(reservation.prefix());
+                assert_eq!(prefix.get_varint().unwrap(), signal);
+                assert_eq!(prefix.get_varint().unwrap(), session_id);
+                assert_eq!(prefix.cap(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn webtransport_stop_uses_automatic_reliable_prefix_reset() {
+        let mut s = webtransport_session();
+        let reservation = s
+            .server
+            .reserve_webtransport_stream(
+                &mut s.pipe.server,
+                0,
+                WebTransportStreamDirection::Bidirectional,
+            )
+            .unwrap();
+        let stream_id = reservation.stream_id();
+        assert_eq!(
+            s.pipe
+                .server
+                .stream_send(stream_id, reservation.prefix(), false,),
+            Ok(reservation.prefix_len())
+        );
+        s.server
+            .commit_webtransport_stream(&mut s.pipe.server, &reservation)
+            .unwrap();
+        s.advance().unwrap();
+        assert!(matches!(
+            s.poll_client(),
+            Ok((id, Event::WebTransportStream { .. })) if id == stream_id
+        ));
+
+        s.pipe
+            .client
+            .stream_shutdown(stream_id, crate::Shutdown::Read, 77)
+            .unwrap();
+        let stop = crate::test_utils::emit_flight(&mut s.pipe.client).unwrap();
+        crate::test_utils::process_flight(&mut s.pipe.server, stop).unwrap();
+        assert_eq!(
+            s.pipe
+                .server
+                .streams
+                .get(stream_id)
+                .unwrap()
+                .send
+                .pending_reset(),
+            Some(crate::stream::StreamReset::ResetAt {
+                error_code: 77,
+                final_size: reservation.prefix_len() as u64,
+                reliable_size: reservation.prefix_len() as u64,
+            })
+        );
+        let reset = crate::test_utils::emit_flight(&mut s.pipe.server).unwrap();
+        crate::test_utils::process_flight(&mut s.pipe.client, reset).unwrap();
+    }
+
+    #[test]
+    fn webtransport_local_shutdown_preserves_automatic_reliable_prefix() {
+        let mut s = webtransport_session();
+        let reservation = s
+            .server
+            .reserve_webtransport_stream(
+                &mut s.pipe.server,
+                0,
+                WebTransportStreamDirection::Bidirectional,
+            )
+            .unwrap();
+        let stream_id = reservation.stream_id();
+        let prefix_len = reservation.prefix_len() as u64;
+        assert_eq!(
+            s.pipe
+                .server
+                .stream_send(stream_id, reservation.prefix(), false),
+            Ok(reservation.prefix_len()),
+        );
+        s.server
+            .commit_webtransport_stream(&mut s.pipe.server, &reservation)
+            .unwrap();
+        assert_eq!(
+            s.pipe.server.stream_send(stream_id, b"payload", false),
+            Ok(7),
+        );
+
+        assert_eq!(
+            s.pipe
+                .server
+                .stream_shutdown_at(stream_id, 88, prefix_len - 1),
+            Err(crate::Error::FinalSize),
+        );
+        assert_eq!(
+            s.pipe
+                .server
+                .stream_shutdown(stream_id, crate::Shutdown::Write, 88),
+            Ok(()),
+        );
+        assert_eq!(
+            s.pipe
+                .server
+                .streams
+                .get(stream_id)
+                .unwrap()
+                .send
+                .pending_reset(),
+            Some(crate::stream::StreamReset::ResetAt {
+                error_code: 88,
+                final_size: prefix_len + 7,
+                reliable_size: prefix_len,
+            }),
+        );
+    }
+
+    fn assert_webtransport_prefix_stop_is_reliable(
+        h3_conn: &mut Connection, qconn: &mut crate::Connection, session_id: u64,
+        direction: WebTransportStreamDirection, prefix_offset: usize,
+    ) {
+        let reservation = h3_conn
+            .reserve_webtransport_stream(qconn, session_id, direction)
+            .unwrap();
+        let stream_id = reservation.stream_id();
+        let prefix = reservation.prefix().to_vec();
+
+        if prefix_offset != 0 {
+            assert_eq!(
+                qconn.stream_send(stream_id, &prefix[..prefix_offset], false,),
+                Ok(prefix_offset),
+            );
+        }
+        qconn
+            .process_stop_sending(stream_id, 77, true, std::time::Instant::now())
+            .unwrap();
+
+        if prefix_offset < prefix.len() {
+            assert_eq!(
+                qconn.stream_send(stream_id, &prefix[prefix_offset..], false,),
+                Ok(prefix.len() - prefix_offset),
+            );
+        }
+        h3_conn
+            .commit_webtransport_stream(qconn, &reservation)
+            .unwrap();
+
+        assert_eq!(
+            qconn.stream_send_status(stream_id),
+            Ok(crate::StreamSendStatus::Stopped(77)),
+        );
+        assert_eq!(
+            qconn.streams.get(stream_id).unwrap().send.pending_reset(),
+            Some(crate::stream::StreamReset::ResetAt {
+                error_code: 77,
+                final_size: prefix.len() as u64,
+                reliable_size: prefix.len() as u64,
+            }),
+        );
+    }
+
+    #[test]
+    fn webtransport_stop_at_every_prefix_offset_is_always_reliable() {
+        let cases = [
+            0,
+            60,
+            64,
+            16_380,
+            16_384,
+            (1 << 30) - 4,
+            1 << 30,
+            octets::MAX_VAR_INT & !3,
+        ];
+
+        for is_server in [false, true] {
+            for direction in [
+                WebTransportStreamDirection::Bidirectional,
+                WebTransportStreamDirection::Unidirectional,
+            ] {
+                let mut s = webtransport_session();
+                for session_id in cases {
+                    let prefix_len = 2 + octets::varint_len(session_id);
+                    for prefix_offset in 0..=prefix_len {
+                        if is_server {
+                            assert_webtransport_prefix_stop_is_reliable(
+                                &mut s.server,
+                                &mut s.pipe.server,
+                                session_id,
+                                direction,
+                                prefix_offset,
+                            );
+                        } else {
+                            assert_webtransport_prefix_stop_is_reliable(
+                                &mut s.client,
+                                &mut s.pipe.client,
+                                session_id,
+                                direction,
+                                prefix_offset,
+                            );
+                        }
+                    }
+                }
+            }
         }
     }
 

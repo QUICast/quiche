@@ -152,7 +152,7 @@ impl RecvBuf {
             if buf.max_off() > reset.reliable_size {
                 let keep = usize::try_from(reset.reliable_size - buf.off())
                     .expect("the incoming range length is represented as usize");
-                let _ = buf.split_off(keep);
+                buf.truncate_unread(keep);
             }
         }
 
@@ -457,7 +457,7 @@ impl RecvBuf {
             if buf.max_off() > end {
                 let keep = usize::try_from(end - buf.off())
                     .expect("the buffered range length is represented as usize");
-                let _ = buf.split_off(keep);
+                buf.truncate_unread(keep);
             }
 
             retained.insert(buf.max_off(), buf);

@@ -51,9 +51,23 @@ const WT_INITIAL_MAX_DATA: u64 = 8_388_608;
 const WT_INITIAL_MAX_STREAMS_UNI: u64 = 100;
 const WT_INITIAL_MAX_STREAMS_BIDI: u64 = 100;
 
+const DEFAULT_WEBTRANSPORT_MAX_PENDING_STREAMS: usize = 256;
+const DEFAULT_WEBTRANSPORT_MAX_PENDING_STREAMS_PER_SESSION: usize = 64;
+const DEFAULT_WEBTRANSPORT_MAX_STREAM_WAITERS: usize = 256;
+const DEFAULT_WEBTRANSPORT_MAX_SESSION_WORK_PER_CALLBACK: usize = 64;
+const DEFAULT_WEBTRANSPORT_COMMAND_CAPACITY: usize = 256;
+const DEFAULT_WEBTRANSPORT_MAX_STREAM_IO_BYTES: usize = 64 * 1024;
+const DEFAULT_WEBTRANSPORT_MAX_PENDING_DATAGRAMS: usize = 256;
+const DEFAULT_WEBTRANSPORT_MAX_PENDING_DATAGRAMS_PER_SESSION: usize = 64;
+const DEFAULT_WEBTRANSPORT_MAX_PENDING_DATAGRAM_BYTES: usize = 1024 * 1024;
+const DEFAULT_WEBTRANSPORT_MAX_PENDING_DATAGRAM_BYTES_PER_SESSION: usize =
+    256 * 1024;
+const DEFAULT_WEBTRANSPORT_MAX_PENDING_DATAGRAM_AGE: Duration =
+    Duration::from_secs(5);
+
 /// Unified configuration parameters for
 /// [H3Driver](crate::http3::driver::H3Driver)s.
-#[derive(Default, Clone, Debug)]
+#[derive(Clone, Debug)]
 pub struct Http3Settings {
     /// Maximum number of requests a
     /// [ServerH3Driver](crate::http3::driver::ServerH3Driver) allows per
@@ -77,11 +91,47 @@ pub struct Http3Settings {
     /// Set the WebTransport-over-HTTP/3 SETTINGS_ENABLE_WEB_TRANSPORT setting.
     ///
     /// Chrome requires this in addition to extended CONNECT before it considers
-    /// WebTransport sessions negotiated. This advertises wire support but does
-    /// not enable quiche's native stream classifier; the compatibility driver
-    /// continues to own only explicitly registered sessions until native Tokio
-    /// admission is implemented.
+    /// WebTransport sessions negotiated. Enabling it also transfers native
+    /// draft-15 stream classification to the Tokio H3 driver.
     pub enable_webtransport: bool,
+    /// Aggregate maximum for optimistic inbound streams and locally opening
+    /// streams whose association prefix has not committed.
+    pub webtransport_max_pending_streams: usize,
+    /// Per-session aggregate maximum for optimistic inbound and locally opening
+    /// streams.
+    pub webtransport_max_pending_streams_per_session: usize,
+    /// Maximum exact-stream readable and writable wait registrations.
+    pub webtransport_max_stream_waiters: usize,
+    /// Work bound used independently by the native WebTransport runtime's
+    /// selected-I/O, associated-stream maintenance, and Datagram receive
+    /// passes.
+    ///
+    /// A selected-I/O work unit is one controller command or one opening-prefix
+    /// attempt. A maintenance work unit is one admission, teardown, or closed
+    /// stream inspection. A Datagram work unit is one received QUIC Datagram.
+    /// A value of zero is clamped to one.
+    pub webtransport_max_session_work_per_callback: usize,
+    /// Capacity of the dedicated native WebTransport controller command lane.
+    /// A value of zero is clamped to one. Buffer-bearing async calls waiting to
+    /// enter this lane remain caller-owned; use the controller's nonblocking
+    /// `try_*` APIs when this capacity must be a hard aggregate ownership
+    /// bound.
+    pub webtransport_command_capacity: usize,
+    /// Maximum payload bytes accepted by one selected-stream write command.
+    pub webtransport_max_stream_write_bytes: usize,
+    /// Maximum payload bytes returned by one selected-stream read command.
+    pub webtransport_max_stream_read_bytes: usize,
+    /// Maximum queued incoming native WebTransport Datagrams per connection.
+    pub webtransport_max_pending_datagrams: usize,
+    /// Maximum queued incoming native WebTransport Datagrams per session.
+    pub webtransport_max_pending_datagrams_per_session: usize,
+    /// Maximum queued incoming native WebTransport Datagram bytes per
+    /// connection.
+    pub webtransport_max_pending_datagram_bytes: usize,
+    /// Maximum queued incoming native WebTransport Datagram bytes per session.
+    pub webtransport_max_pending_datagram_bytes_per_session: usize,
+    /// Maximum time an incoming Datagram may await CONNECT classification.
+    pub webtransport_max_pending_datagram_age: Duration,
     /// QUIC multicast channel ID used for HTTP/3 DATAGRAM unicast fallback.
     ///
     /// When set, outbound HTTP/3 DATAGRAMs are tagged as data for this MCQUIC
@@ -96,6 +146,45 @@ pub struct Http3Settings {
     /// server driver treats that stream as raw QUIC data and does not pass it
     /// through the HTTP/3 parser.
     pub experimental_raw_quic_stream_ids: Vec<u64>,
+}
+
+impl Default for Http3Settings {
+    fn default() -> Self {
+        Self {
+            max_requests_per_connection: None,
+            max_header_list_size: None,
+            qpack_max_table_capacity: None,
+            qpack_blocked_streams: None,
+            post_accept_timeout: None,
+            enable_extended_connect: false,
+            enable_webtransport: false,
+            webtransport_max_pending_streams:
+                DEFAULT_WEBTRANSPORT_MAX_PENDING_STREAMS,
+            webtransport_max_pending_streams_per_session:
+                DEFAULT_WEBTRANSPORT_MAX_PENDING_STREAMS_PER_SESSION,
+            webtransport_max_stream_waiters:
+                DEFAULT_WEBTRANSPORT_MAX_STREAM_WAITERS,
+            webtransport_max_session_work_per_callback:
+                DEFAULT_WEBTRANSPORT_MAX_SESSION_WORK_PER_CALLBACK,
+            webtransport_command_capacity: DEFAULT_WEBTRANSPORT_COMMAND_CAPACITY,
+            webtransport_max_stream_write_bytes:
+                DEFAULT_WEBTRANSPORT_MAX_STREAM_IO_BYTES,
+            webtransport_max_stream_read_bytes:
+                DEFAULT_WEBTRANSPORT_MAX_STREAM_IO_BYTES,
+            webtransport_max_pending_datagrams:
+                DEFAULT_WEBTRANSPORT_MAX_PENDING_DATAGRAMS,
+            webtransport_max_pending_datagrams_per_session:
+                DEFAULT_WEBTRANSPORT_MAX_PENDING_DATAGRAMS_PER_SESSION,
+            webtransport_max_pending_datagram_bytes:
+                DEFAULT_WEBTRANSPORT_MAX_PENDING_DATAGRAM_BYTES,
+            webtransport_max_pending_datagram_bytes_per_session:
+                DEFAULT_WEBTRANSPORT_MAX_PENDING_DATAGRAM_BYTES_PER_SESSION,
+            webtransport_max_pending_datagram_age:
+                DEFAULT_WEBTRANSPORT_MAX_PENDING_DATAGRAM_AGE,
+            multicast_datagram_channel_id: None,
+            experimental_raw_quic_stream_ids: Vec::new(),
+        }
+    }
 }
 
 impl From<&Http3Settings> for quiche::h3::Config {
@@ -119,6 +208,7 @@ impl From<&Http3Settings> for quiche::h3::Config {
         }
 
         if value.enable_webtransport {
+            config.enable_webtransport_stream_classification(true);
             config
                 .set_additional_settings(vec![
                     (SETTINGS_ENABLE_WEBTRANSPORT_LEGACY, 1),
@@ -365,7 +455,7 @@ mod tests {
     }
 
     #[test]
-    fn tokio_webtransport_settings_do_not_enable_native_classification(
+    fn tokio_webtransport_settings_enable_owned_native_classification(
     ) -> TestResult {
         let mut quic_config = h3_quiche_config()?;
         let mut pipe = quiche::test_utils::Pipe::with_config(&mut quic_config)?;
@@ -386,17 +476,18 @@ mod tests {
             Err(quiche::h3::Error::Done)
         );
 
-        // 0x41, an ordinary unknown-frame length of one, and one payload byte.
-        // Native classification would instead consume the second varint as a
-        // Session ID and detach stream 0.
         pipe.client
-            .stream_send(0, &[0x40, 0x41, 0x01, 0xff], true)?;
+            .stream_send(0, &[0x40, 0x41, 0x00, 0xff], true)?;
         pipe.advance()?;
 
-        assert_eq!(
+        assert!(matches!(
             server_h3.poll(&mut pipe.server),
-            Ok((0, quiche::h3::Event::Finished)),
-        );
+            Ok((0, quiche::h3::Event::WebTransportStream {
+                session_id: 0,
+                direction: quiche::h3::WebTransportStreamDirection::Bidirectional,
+                prefix_len: 3,
+            }))
+        ));
         assert!(pipe.server.local_error().is_none());
 
         Ok(())

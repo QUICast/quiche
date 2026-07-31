@@ -154,6 +154,19 @@ where
 
         buf
     }
+
+    /// Truncates the unread portion to at most `len` bytes.
+    pub(crate) fn truncate_unread(&mut self, len: usize)
+    where
+        F::Buf: Clone + AsRef<[u8]>,
+    {
+        if len >= self.len() {
+            return;
+        }
+
+        let consumed = self.pos - self.start;
+        let _ = self.split_off(consumed + len);
+    }
 }
 
 impl<F: BufFactory> Deref for RangeBuf<F> {

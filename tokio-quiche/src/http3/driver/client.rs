@@ -36,6 +36,9 @@ use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 
 use super::datagram;
+use super::response_status;
+use super::webtransport;
+use super::webtransport_requirements;
 use super::DriverHooks;
 use super::H3Command;
 use super::H3ConnectionError;
@@ -49,6 +52,8 @@ use super::IncomingH3Headers;
 use super::OutboundFrameSender;
 use super::RequestSender;
 use super::StreamCtx;
+use super::WebTransportRequirements;
+use super::WebTransportSessionCloseReason;
 use super::STREAM_CAPACITY;
 use crate::http3::settings::Http3Settings;
 use crate::quic::HandshakeInfo;
@@ -91,6 +96,12 @@ pub enum ClientH3Event {
     /// `stream_id`. The body, if there is one, could still be sending.
     NewOutboundRequest {
         stream_id: u64,
+        request_id: u64,
+    },
+    /// A native WebTransport CONNECT was not sent because the peer or local
+    /// transport did not satisfy draft-15's required negotiation settings.
+    WebTransportRequestRejected {
+        /// User-provided request identifier from [`NewClientRequest`].
         request_id: u64,
     },
 }
@@ -150,6 +161,8 @@ pub struct ClientHooks {
     /// Requests that could not be sent yet due to `StreamBlocked` or
     /// `StreamLimit`. They will be retried after [`BLOCKED_RETRY_DELAY`].
     queued_requests: VecDeque<NewClientRequest>,
+    /// Native CONNECTs waiting for the server SETTINGS frame.
+    queued_webtransport_requests: VecDeque<NewClientRequest>,
     /// A sender back into the driver's own command channel, used to
     /// re-enqueue blocked requests after the retry delay.
     ///
@@ -192,6 +205,32 @@ impl ClientHooks {
         request: NewClientRequest,
     ) -> H3ConnectionResult<()> {
         let body_finished = request.body_writer.is_none();
+        let is_webtransport = driver.webtransport.is_some() &&
+            webtransport::is_connect(&request.headers);
+        if is_webtransport {
+            match webtransport_requirements(
+                driver
+                    .conn
+                    .as_ref()
+                    .ok_or_else(H3Driver::<Self>::connection_not_present)?,
+                qconn,
+            ) {
+                WebTransportRequirements::Pending => {
+                    driver.hooks.queued_webtransport_requests.push_back(request);
+                    return Ok(());
+                },
+                WebTransportRequirements::Failed => {
+                    driver
+                        .h3_event_sender
+                        .send(ClientH3Event::WebTransportRequestRejected {
+                            request_id: request.request_id,
+                        })
+                        .map_err(|_| H3ConnectionError::ControllerWentAway)?;
+                    return Ok(());
+                },
+                WebTransportRequirements::Met => {},
+            }
+        }
 
         let stream_id = match driver.conn_mut()?.send_request(
             qconn,
@@ -226,16 +265,18 @@ impl ClientHooks {
                 .set_sent_stream_fin(StreamClosureKind::Explicit);
         }
 
-        if let Some(quarter_stream_id) =
-            datagram::extract_quarter_stream_id(stream_id, &request.headers)
-        {
-            log::info!(
-                "creating new flow for MASQUE request";
-                "stream_id" => stream_id,
-                "quarter_stream_id" => quarter_stream_id,
-            );
-            let _ = driver.get_or_insert_flow(quarter_stream_id)?;
-            stream_ctx.associated_dgram_flow_id = Some(quarter_stream_id);
+        if !is_webtransport {
+            if let Some(quarter_stream_id) =
+                datagram::extract_quarter_stream_id(stream_id, &request.headers)
+            {
+                log::info!(
+                    "creating new flow for MASQUE request";
+                    "stream_id" => stream_id,
+                    "quarter_stream_id" => quarter_stream_id,
+                );
+                let _ = driver.get_or_insert_flow(quarter_stream_id)?;
+                stream_ctx.associated_dgram_flow_id = Some(quarter_stream_id);
+            }
         }
 
         if let Some(body_writer) = request.body_writer {
@@ -250,6 +291,23 @@ impl ClientHooks {
             .hooks
             .pending_requests
             .insert(stream_id, PendingClientRequest { send, recv });
+
+        if let Some(runtime) = driver.webtransport.as_mut() {
+            let mut events = runtime.observe_request(stream_id, is_webtransport);
+            if is_webtransport && body_finished {
+                events.extend(
+                    runtime.terminate(
+                        stream_id,
+                        WebTransportSessionCloseReason::Clean,
+                    ),
+                );
+                runtime.mark_connect_send_closed(stream_id);
+            }
+            H3Driver::<Self>::emit_webtransport_events(
+                &driver.h3_event_sender,
+                events,
+            )?;
+        }
 
         // Notify the H3Controller that we've allocated a stream_id for a
         // given request_id.
@@ -305,6 +363,7 @@ impl DriverHooks for ClientHooks {
         Self {
             pending_requests: BTreeMap::new(),
             queued_requests: VecDeque::new(),
+            queued_webtransport_requests: VecDeque::new(),
             self_cmd_sender: None,
         }
     }
@@ -322,9 +381,54 @@ impl DriverHooks for ClientHooks {
     }
 
     fn headers_received(
-        driver: &mut H3Driver<Self>, _qconn: &mut QuicheConnection,
+        driver: &mut H3Driver<Self>, qconn: &mut QuicheConnection,
         headers: InboundHeaders,
     ) -> H3ConnectionResult<()> {
+        let is_webtransport = driver
+            .webtransport
+            .as_ref()
+            .is_some_and(|runtime| runtime.is_session(headers.stream_id));
+
+        if is_webtransport {
+            let Some(status) = response_status(&headers.headers) else {
+                let events = driver
+                    .webtransport
+                    .as_mut()
+                    .expect("native runtime was checked above")
+                    .terminate(
+                        headers.stream_id,
+                        WebTransportSessionCloseReason::ProtocolError,
+                    );
+                H3Driver::<Self>::emit_webtransport_events(
+                    &driver.h3_event_sender,
+                    events,
+                )?;
+                driver.hooks.pending_requests.remove(&headers.stream_id);
+                return driver.shutdown_stream(
+                    qconn,
+                    headers.stream_id,
+                    super::StreamShutdown::Both {
+                        read_error_code: h3::WireErrorCode::MessageError as u64,
+                        write_error_code: h3::WireErrorCode::MessageError as u64,
+                    },
+                );
+            };
+
+            if (100..200).contains(&status) {
+                return Ok(());
+            }
+
+            let events = driver
+                .webtransport
+                .as_mut()
+                .expect("native runtime was checked above")
+                .response_accepted(headers.stream_id, status);
+            H3Driver::<Self>::emit_webtransport_events(
+                &driver.h3_event_sender,
+                events,
+            )?;
+        }
+
         let Some(pending_request) =
             driver.hooks.pending_requests.remove(&headers.stream_id)
         else {
@@ -333,6 +437,45 @@ impl DriverHooks for ClientHooks {
             return Ok(());
         };
         Self::handle_response(driver, headers, pending_request)
+    }
+
+    fn settings_received(
+        driver: &mut H3Driver<Self>, qconn: &mut QuicheConnection,
+    ) -> H3ConnectionResult<()> {
+        let requirements = webtransport_requirements(
+            driver
+                .conn
+                .as_ref()
+                .ok_or_else(H3Driver::<Self>::connection_not_present)?,
+            qconn,
+        );
+        let requests: Vec<_> = driver
+            .hooks
+            .queued_webtransport_requests
+            .drain(..)
+            .collect();
+        for request in requests {
+            match requirements {
+                WebTransportRequirements::Met => {
+                    let Some(sender) = &driver.hooks.self_cmd_sender else {
+                        continue;
+                    };
+                    let _ = sender.send(ClientH3Command::ClientRequest(request));
+                },
+                WebTransportRequirements::Pending => {
+                    driver.hooks.queued_webtransport_requests.push_back(request);
+                },
+                WebTransportRequirements::Failed => {
+                    driver
+                        .h3_event_sender
+                        .send(ClientH3Event::WebTransportRequestRejected {
+                            request_id: request.request_id,
+                        })
+                        .map_err(|_| H3ConnectionError::ControllerWentAway)?;
+                },
+            }
+        }
+        Ok(())
     }
 
     fn conn_command(

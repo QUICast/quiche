@@ -343,6 +343,13 @@ fn handle_h3_event(event: ClientH3Event) -> bool {
             false
         },
 
+        ClientH3Event::WebTransportRequestRejected { request_id } => {
+            println!(
+                "webtransport request rejected before send: request_id={request_id}"
+            );
+            false
+        },
+
         ClientH3Event::Core(event) => handle_core_h3_event(event),
     }
 }
@@ -431,6 +438,11 @@ fn handle_core_h3_event(event: H3Event) -> bool {
 
         H3Event::WebTransportDiagnostic(diagnostic) => {
             println!("http3 webtransport diagnostic: {diagnostic:?}");
+            false
+        },
+
+        H3Event::WebTransportSession(event) => {
+            println!("http3 webtransport session: {event:?}");
             false
         },
 

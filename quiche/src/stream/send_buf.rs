@@ -704,7 +704,7 @@ impl<F: BufFactory> SendBuf<F> {
     ///
     /// Calling this again after the first time has no effect.
     pub(crate) fn stop(
-        &mut self, error_code: u64, final_size: u64,
+        &mut self, error_code: u64, final_size: u64, reliable_size: Option<u64>,
     ) -> Result<SendResetOutcome> {
         if self.error.is_some() {
             return Err(Error::Done);
@@ -718,10 +718,18 @@ impl<F: BufFactory> SendBuf<F> {
                 changed: false,
             }
         } else {
-            self.terminate(StreamReset::Reset {
-                error_code,
-                final_size,
-            })?
+            let reset = match reliable_size {
+                Some(reliable_size) => StreamReset::ResetAt {
+                    error_code,
+                    final_size,
+                    reliable_size,
+                },
+                None => StreamReset::Reset {
+                    error_code,
+                    final_size,
+                },
+            };
+            self.terminate(reset)?
         };
 
         self.error = Some(error_code);
@@ -1218,7 +1226,7 @@ mod tests {
         // Server receives STOP_SENDING from client. The final_size we
         // send in the RESET_STREAM should be 50. If we send anything less,
         // it's a FINAL_SIZE_ERROR.
-        let outcome = send.stop(0, 50).unwrap();
+        let outcome = send.stop(0, 50, None).unwrap();
         assert_eq!(outcome.final_size, 50);
         assert_eq!(outcome.dropped_tx_data, 0);
     }
@@ -1310,7 +1318,7 @@ mod tests {
 
         // STOP_SENDING makes application writes fail, but it cannot prevent a
         // valid reduction of an already established reliable reset.
-        assert!(!send.stop(99, 10).unwrap().changed);
+        assert!(!send.stop(99, 10, None).unwrap().changed);
         assert!(send.shutdown_at(7, 10, 4).unwrap().changed);
 
         assert!(send.shutdown(7, 10).unwrap().changed);

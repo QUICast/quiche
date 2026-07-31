@@ -516,6 +516,29 @@ fn reset_stream_at_public_api_delivers_prefix_and_waits_for_ack() {
 }
 
 #[test]
+fn reset_stream_at_reliable_size_remains_absolute_after_prefix_consumption() {
+    let mut pipe = reset_stream_at_pipe(64);
+    let stream_id = 2;
+    assert_eq!(
+        pipe.client.stream_send(stream_id, b"abcdefghijk", false),
+        Ok(11)
+    );
+    assert_eq!(pipe.advance(), Ok(()));
+
+    let mut prefix = [0; 3];
+    assert_eq!(
+        pipe.server.stream_recv(stream_id, &mut prefix),
+        Ok((3, false))
+    );
+    assert_eq!(&prefix, b"abc");
+    assert_eq!(pipe.advance(), Ok(()));
+
+    assert_eq!(pipe.client.stream_shutdown_at(stream_id, 42, 7), Ok(()));
+    assert_eq!(pipe.advance(), Ok(()));
+    assert_received_reliable_reset(&mut pipe.server, stream_id, b"defg", 42);
+}
+
+#[test]
 fn reset_stream_at_zero_uses_reliable_reset_wire_semantics() {
     let mut pipe = reset_stream_at_pipe(64);
     let stream_id = 2;

@@ -555,6 +555,22 @@ pub enum Shutdown {
     Write = 1,
 }
 
+/// Non-consuming status of a QUIC stream's local send side.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StreamSendStatus {
+    /// The send side can currently accept the given number of bytes.
+    Writable(usize),
+
+    /// Flow or congestion control currently prevents progress.
+    Blocked,
+
+    /// The peer sent STOP_SENDING with the given application error code.
+    Stopped(u64),
+
+    /// FIN or a locally initiated reset closed the send side.
+    Closed,
+}
+
 /// Qlog logging level.
 #[repr(C)]
 #[cfg(feature = "qlog")]
@@ -6412,6 +6428,8 @@ impl<F: BufFactory> Connection<F> {
 
         let writable = stream.is_writable();
 
+        let deferred_automatic_stop = stream.take_ready_automatic_stop();
+
         let empty_fin = len == 0 && fin;
 
         if sent < cap {
@@ -6483,6 +6501,15 @@ impl<F: BufFactory> Connection<F> {
             self.streams.insert_writable(&priority_key);
         }
 
+        if let Some(error_code) = deferred_automatic_stop {
+            self.process_stop_sending(
+                stream_id,
+                error_code,
+                false,
+                Instant::now(),
+            )?;
+        }
+
         Ok(ret)
     }
 
@@ -6543,7 +6570,8 @@ impl<F: BufFactory> Connection<F> {
     /// data in the stream's send buffer is dropped, and no additional data is
     /// added to it. Data passed to [`stream_send()`] after calling this method
     /// will be ignored. In addition, a `RESET_STREAM` frame will be sent to the
-    /// peer to signal the reset.
+    /// peer to signal the reset. Streams carrying a protocol-mandated reliable
+    /// prefix use `RESET_STREAM_AT` instead.
     ///
     /// Locally-initiated unidirectional streams can only be closed in the
     /// [`Shutdown::Write`] direction. Remotely-initiated unidirectional streams
@@ -6615,11 +6643,12 @@ impl<F: BufFactory> Connection<F> {
     /// A later call may reduce `reliable_size` while preserving the original
     /// error code and final size. It cannot increase it. Calling
     /// [`stream_shutdown()`] in the write direction reduces an outstanding
-    /// reliable reset to an ordinary reset with reliable size zero. A received
-    /// `STOP_SENDING` does not erase an established reliable-prefix obligation
-    /// or prevent a valid reduction of it. Once the current reset frame and
-    /// required prefix are acknowledged, the send side is terminal and cannot
-    /// be reset again.
+    /// reliable reset to an ordinary reset with reliable size zero, unless a
+    /// protocol-mandated minimum Reliable Size is attached to the stream. A
+    /// received `STOP_SENDING` does not erase an established reliable-prefix
+    /// obligation or prevent a valid reduction of it. Once the current reset
+    /// frame and required prefix are acknowledged, the send side is terminal
+    /// and cannot be reset again.
     ///
     /// Calls made before peer transport parameters are available, or when the
     /// peer did not advertise support, return [`InvalidState`]. Invalid stream
@@ -6653,6 +6682,18 @@ impl<F: BufFactory> Connection<F> {
         {
             return Err(Error::InvalidFrame);
         }
+
+        let automatic_reliable_size = self
+            .streams
+            .get(stream_id)
+            .and_then(|stream| stream.automatic_reset_reliable_size());
+        if reliable_size
+            .zip(automatic_reliable_size)
+            .is_some_and(|(requested, required)| requested < required)
+        {
+            return Err(Error::FinalSize);
+        }
+        let reliable_size = reliable_size.or(automatic_reliable_size);
 
         let multicast_delivery =
             self.multicast_stream_deliveries.get(&stream_id).cloned();
@@ -6852,6 +6893,35 @@ impl<F: BufFactory> Connection<F> {
         Err(Error::InvalidStreamState(stream_id))
     }
 
+    /// Returns the local send side's current status without consuming it.
+    ///
+    /// Unlike [`stream_capacity()`], observing a peer's STOP_SENDING does not
+    /// collect stream state. This is useful for event-driven adapters that must
+    /// wake an exact stream operation before the application consumes the
+    /// terminal signal.
+    ///
+    /// [`stream_capacity()`]: Self::stream_capacity
+    pub fn stream_send_status(&self, stream_id: u64) -> Result<StreamSendStatus> {
+        let stream = self
+            .streams
+            .get(stream_id)
+            .ok_or(Error::InvalidStreamState(stream_id))?;
+
+        if let Err(Error::StreamStopped(error_code)) = stream.send.cap() {
+            return Ok(StreamSendStatus::Stopped(error_code));
+        }
+        if stream.send.is_shutdown() || stream.send.is_fin() {
+            return Ok(StreamSendStatus::Closed);
+        }
+
+        let capacity = cmp::min(self.tx_cap, stream.send.cap()?);
+        if capacity == 0 {
+            return Ok(StreamSendStatus::Blocked);
+        }
+
+        Ok(StreamSendStatus::Writable(capacity))
+    }
+
     /// Returns the next stream that has data to read.
     ///
     /// Note that once returned by this method, a stream ID will not be returned
@@ -6887,6 +6957,46 @@ impl<F: BufFactory> Connection<F> {
         if let Some(stream) = self.streams.get_mut(stream_id) {
             stream.detach_from_app_proto();
         }
+    }
+
+    pub(crate) fn stream_set_automatic_reset_reliable_size(
+        &mut self, stream_id: u64, reliable_size: u64,
+    ) -> Result<()> {
+        if !self.peer_transport_params.reset_stream_at {
+            return Err(Error::InvalidState);
+        }
+        if reliable_size > octets::MAX_VAR_INT {
+            return Err(Error::InvalidFrame);
+        }
+        let stream = self
+            .streams
+            .get_mut(stream_id)
+            .ok_or(Error::InvalidStreamState(stream_id))?;
+        stream.set_automatic_reset_reliable_size(reliable_size)
+    }
+
+    pub(crate) fn stream_reserve_automatic_reset_reliable_size(
+        &mut self, stream_id: u64, reliable_size: u64,
+    ) -> Result<()> {
+        if !self.peer_transport_params.reset_stream_at {
+            return Err(Error::InvalidState);
+        }
+        if stream_id > octets::MAX_VAR_INT || reliable_size > octets::MAX_VAR_INT
+        {
+            return Err(Error::InvalidFrame);
+        }
+        if !stream::is_local(stream_id, self.is_server) {
+            return Err(Error::InvalidStreamState(stream_id));
+        }
+
+        let stream = self.get_or_create_stream(stream_id, true)?;
+        stream.set_automatic_reset_reliable_size(reliable_size)
+    }
+
+    pub(crate) fn stream_send_offset(&self, stream_id: u64) -> Option<u64> {
+        self.streams
+            .get(stream_id)
+            .map(|stream| stream.send.off_back())
     }
 
     pub(crate) fn stream_is_detached_from_app_proto(
@@ -7445,19 +7555,42 @@ impl<F: BufFactory> Connection<F> {
     }
 
     fn dgram_send_buf_direct(&mut self, buf: F::DgramBuf) -> Result<()> {
+        self.dgram_send_buf_unicast(buf).map_err(|(err, _)| err)
+    }
+
+    /// Sends one owned DATAGRAM directly on the ordinary unicast path.
+    ///
+    /// Unlike [`dgram_send_buf()`], this does not apply a configured default
+    /// multicast channel. The buffer is returned on every error that occurs
+    /// before queue admission, allowing a typed upper layer to preserve
+    /// ownership across blocked, unsupported, and too-large outcomes.
+    ///
+    /// [`dgram_send_buf()`]: Self::dgram_send_buf
+    pub fn dgram_send_buf_unicast(
+        &mut self, buf: F::DgramBuf,
+    ) -> std::result::Result<(), (Error, F::DgramBuf)> {
         let max_payload_len = match self.dgram_max_writable_len() {
             Some(v) => v,
 
-            None => return Err(Error::InvalidState),
+            None => return Err((Error::InvalidState, buf)),
         };
 
         if buf.as_ref().len() > max_payload_len {
-            return Err(Error::BufferTooShort);
+            return Err((Error::BufferTooShort, buf));
         }
 
-        self.dgram_send_queue.push(buf)?;
+        if self.dgram_send_queue.is_full() {
+            return Err((Error::Done, buf));
+        }
 
-        let active_path = self.paths.get_active_mut()?;
+        let active_path = match self.paths.get_active_mut() {
+            Ok(path) => path,
+            Err(err) => return Err((err, buf)),
+        };
+
+        self.dgram_send_queue
+            .push(buf)
+            .expect("DATAGRAM queue capacity was preflighted");
 
         if self.dgram_send_queue.byte_size() >
             active_path.recovery.cwnd_available()
@@ -8331,10 +8464,23 @@ impl<F: BufFactory> Connection<F> {
         Ok(())
     }
 
-    fn dgram_enabled(&self) -> bool {
+    /// Returns whether this endpoint advertised QUIC DATAGRAM support.
+    ///
+    /// This reports only the local transport parameter. Use
+    /// [`dgram_max_writable_len()`] to determine whether the peer also permits
+    /// sending DATAGRAM frames.
+    ///
+    /// [`dgram_max_writable_len()`]: Self::dgram_max_writable_len
+    pub fn dgram_enabled(&self) -> bool {
         self.local_transport_params
             .max_datagram_frame_size
             .is_some()
+    }
+
+    /// Returns whether both endpoints negotiated RESET_STREAM_AT support.
+    pub fn reset_stream_at_enabled(&self) -> bool {
+        self.local_transport_params.reset_stream_at &&
+            self.peer_transport_params.reset_stream_at
     }
 
     fn max_multicast_frame_len(&self) -> Result<usize> {
@@ -10292,6 +10438,140 @@ impl<F: BufFactory> Connection<F> {
         )
     }
 
+    fn process_stop_sending(
+        &mut self, stream_id: u64, error_code: u64, count_received: bool,
+        _now: Instant,
+    ) -> Result<()> {
+        let multicast_delivery =
+            self.multicast_stream_deliveries.get(&stream_id).cloned();
+
+        // A protected association prefix remains internally writable after an
+        // early STOP_SENDING. Once buffered, this method is called again to
+        // generate the mandatory RESET_STREAM_AT.
+        let stream = match self.get_or_create_stream(stream_id, false) {
+            Ok(stream) => stream,
+            Err(Error::Done) => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        if stream
+            .automatic_reset_reliable_size()
+            .is_some_and(|size| stream.send.off_back() < size)
+        {
+            if stream.defer_automatic_stop(error_code) && count_received {
+                self.stopped_stream_remote_count =
+                    self.stopped_stream_remote_count.saturating_add(1);
+            }
+            return Ok(());
+        }
+
+        let was_writable = stream.is_writable();
+        let priority_key = Arc::clone(&stream.priority_key);
+        let buffered_before = stream.send.buffered_bytes();
+        let automatic_reliable_size = stream.automatic_reset_reliable_size();
+        let base_final_size = if automatic_reliable_size.is_some() {
+            stream.send.reliable_reset_final_size()
+        } else {
+            stream.send.ordinary_reset_final_size()
+        };
+        let final_size = multicast_delivery
+            .as_ref()
+            .map_or(base_final_size, |delivery| {
+                base_final_size.max(delivery.max_offset)
+            });
+        let outcome = match stream.send.stop(
+            error_code,
+            final_size,
+            automatic_reliable_size,
+        ) {
+            Ok(outcome) => outcome,
+            Err(Error::Done) => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        let flushable = stream.is_flushable();
+        let pending_reset = stream.send.pending_reset();
+        let buffered_after = stream.send.buffered_bytes();
+
+        if buffered_after > buffered_before {
+            self.streams.add_tx_buffered(
+                usize::try_from(buffered_after - buffered_before)
+                    .unwrap_or(usize::MAX),
+            );
+        } else {
+            self.streams.sub_tx_buffered(
+                usize::try_from(buffered_before - buffered_after)
+                    .unwrap_or(usize::MAX),
+            );
+        }
+
+        self.tx_data = self.tx_data.saturating_sub(outcome.dropped_tx_data);
+        self.streams.remove_blocked(stream_id);
+
+        if flushable {
+            self.streams.insert_flushable(&priority_key);
+        } else {
+            self.streams.remove_flushable(&priority_key);
+        }
+
+        match pending_reset {
+            Some(stream::StreamReset::Reset {
+                error_code,
+                final_size,
+            }) => self.streams.insert_reset(stream_id, error_code, final_size),
+            Some(stream::StreamReset::ResetAt {
+                error_code,
+                final_size,
+                reliable_size,
+            }) => self.streams.insert_reset_at(
+                stream_id,
+                error_code,
+                final_size,
+                reliable_size,
+            ),
+            None => {},
+        }
+
+        if !was_writable {
+            self.streams.insert_writable(&priority_key);
+        }
+
+        let _dropped = outcome
+            .dropped_buffered
+            .max(usize::try_from(outcome.dropped_tx_data).unwrap_or(usize::MAX));
+        if _dropped > 0 {
+            qlog_with_type!(QLOG_DATA_MV, self.qlog, q, {
+                let ev_data = EventData::QuicStreamDataMoved(
+                    qlog::events::quic::StreamDataMoved {
+                        stream_id: Some(stream_id),
+                        offset: Some(outcome.final_size),
+                        raw: Some(RawInfo {
+                            length: Some(_dropped as u64),
+                            ..Default::default()
+                        }),
+                        from: Some(DataRecipient::Transport),
+                        to: Some(DataRecipient::Dropped),
+                        ..Default::default()
+                    },
+                );
+
+                q.add_event_data_with_instant(ev_data, _now).ok();
+            });
+        }
+
+        if count_received {
+            self.stopped_stream_remote_count =
+                self.stopped_stream_remote_count.saturating_add(1);
+        }
+        if outcome.changed {
+            self.reset_stream_local_count =
+                self.reset_stream_local_count.saturating_add(1);
+            self.multicast_stream_forget_stream(stream_id);
+            self.multicast_stream_deliveries.remove(&stream_id);
+        }
+
+        self.update_tx_cap();
+        Ok(())
+    }
+
     /// Processes an incoming frame.
     fn process_frame(
         &mut self, frame: frame::Frame, hdr: &Header, recv_path_id: usize,
@@ -10490,131 +10770,7 @@ impl<F: BufFactory> Connection<F> {
                 {
                     return Err(Error::InvalidStreamState(stream_id));
                 }
-
-                let multicast_delivery =
-                    self.multicast_stream_deliveries.get(&stream_id).cloned();
-
-                // Get existing stream or create a new one, but if the stream
-                // has already been closed and collected, ignore the frame.
-                //
-                // This can happen if e.g. an ACK frame is lost, and the peer
-                // retransmits another frame before it realizes that the stream
-                // is gone.
-                //
-                // Note that it makes it impossible to check if the frame is
-                // illegal, since we have no state, but since we ignore the
-                // frame, it should be fine.
-                let stream = match self.get_or_create_stream(stream_id, false) {
-                    Ok(v) => v,
-
-                    Err(Error::Done) => return Ok(()),
-
-                    Err(e) => return Err(e),
-                };
-
-                let was_writable = stream.is_writable();
-                let priority_key = Arc::clone(&stream.priority_key);
-                let buffered_before = stream.send.buffered_bytes();
-                let final_size = multicast_delivery.as_ref().map_or_else(
-                    || stream.send.ordinary_reset_final_size(),
-                    |delivery| {
-                        stream
-                            .send
-                            .ordinary_reset_final_size()
-                            .max(delivery.max_offset)
-                    },
-                );
-
-                let outcome = match stream.send.stop(error_code, final_size) {
-                    Ok(outcome) => outcome,
-                    Err(Error::Done) => return Ok(()),
-                    Err(error) => return Err(error),
-                };
-                let flushable = stream.is_flushable();
-                let pending_reset = stream.send.pending_reset();
-                let buffered_after = stream.send.buffered_bytes();
-
-                if buffered_after > buffered_before {
-                    self.streams.add_tx_buffered(
-                        usize::try_from(buffered_after - buffered_before)
-                            .unwrap_or(usize::MAX),
-                    );
-                } else {
-                    self.streams.sub_tx_buffered(
-                        usize::try_from(buffered_before - buffered_after)
-                            .unwrap_or(usize::MAX),
-                    );
-                }
-
-                self.tx_data =
-                    self.tx_data.saturating_sub(outcome.dropped_tx_data);
-                self.streams.remove_blocked(stream_id);
-
-                if flushable {
-                    self.streams.insert_flushable(&priority_key);
-                } else {
-                    self.streams.remove_flushable(&priority_key);
-                }
-
-                if let Some(stream::StreamReset::Reset {
-                    error_code,
-                    final_size,
-                }) = pending_reset
-                {
-                    self.streams.insert_reset(stream_id, error_code, final_size);
-                } else if let Some(stream::StreamReset::ResetAt {
-                    error_code,
-                    final_size,
-                    reliable_size,
-                }) = pending_reset
-                {
-                    self.streams.insert_reset_at(
-                        stream_id,
-                        error_code,
-                        final_size,
-                        reliable_size,
-                    );
-                }
-
-                if !was_writable {
-                    self.streams.insert_writable(&priority_key);
-                }
-
-                let _dropped = outcome.dropped_buffered.max(
-                    usize::try_from(outcome.dropped_tx_data)
-                        .unwrap_or(usize::MAX),
-                );
-                if _dropped > 0 {
-                    qlog_with_type!(QLOG_DATA_MV, self.qlog, q, {
-                        let ev_data = EventData::QuicStreamDataMoved(
-                            qlog::events::quic::StreamDataMoved {
-                                stream_id: Some(stream_id),
-                                offset: Some(outcome.final_size),
-                                raw: Some(RawInfo {
-                                    length: Some(_dropped as u64),
-                                    ..Default::default()
-                                }),
-                                from: Some(DataRecipient::Transport),
-                                to: Some(DataRecipient::Dropped),
-                                ..Default::default()
-                            },
-                        );
-
-                        q.add_event_data_with_instant(ev_data, now).ok();
-                    });
-                }
-
-                self.stopped_stream_remote_count =
-                    self.stopped_stream_remote_count.saturating_add(1);
-
-                if outcome.changed {
-                    self.reset_stream_local_count =
-                        self.reset_stream_local_count.saturating_add(1);
-                    self.multicast_stream_forget_stream(stream_id);
-                    self.multicast_stream_deliveries.remove(&stream_id);
-                }
-
-                self.update_tx_cap();
+                self.process_stop_sending(stream_id, error_code, true, now)?;
             },
 
             frame::Frame::Crypto { data } => {

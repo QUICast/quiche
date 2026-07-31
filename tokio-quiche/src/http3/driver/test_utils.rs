@@ -138,13 +138,20 @@ impl<H: DriverHooks + GetConnectionForHook> DriverTestHelper<H> {
     }
 
     pub fn with_pipe_and_http3_settings(
-        mut pipe: Pipe, h3_settings: Http3Settings,
+        pipe: Pipe, h3_settings: Http3Settings,
+    ) -> anyhow::Result<Self> {
+        let peer_h3_config = h3::Config::from(&h3_settings);
+        Self::with_pipe_and_http3_configs(pipe, h3_settings, peer_h3_config)
+    }
+
+    pub fn with_pipe_and_http3_configs(
+        mut pipe: Pipe, h3_settings: Http3Settings, peer_h3_config: h3::Config,
     ) -> anyhow::Result<Self> {
         pipe.handshake().context("Failed to handshake pipe")?;
         let (driver, controller) = H3Driver::<H>::new(h3_settings);
         let peer = h3::Connection::with_transport(
             H::peer_qconn(&mut pipe),
-            &h3::Config::new().unwrap(),
+            &peer_h3_config,
         )
         .context("create H3 peer connection")?;
         Ok(Self {
@@ -191,7 +198,7 @@ impl<H: DriverHooks + GetConnectionForHook> DriverTestHelper<H> {
     /// IncomingSettings event for the controller
     /// deal with IncomingSettings events
     pub fn forward_settings(&mut self) -> anyhow::Result<()> {
-        Ok(self.driver.forward_settings()?)
+        Ok(self.driver.forward_settings(H::qconn(&mut self.pipe))?)
     }
 
     /// Run one iteration of the work loop *without* advancing the pipe

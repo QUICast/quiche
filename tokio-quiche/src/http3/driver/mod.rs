@@ -37,6 +37,7 @@ mod streams;
 pub mod test_utils;
 #[cfg(test)]
 mod tests;
+mod webtransport;
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -55,6 +56,7 @@ use foundations::telemetry::log;
 use futures::FutureExt;
 use futures_util::stream::FuturesUnordered;
 use quiche::h3;
+use quiche::h3::NameValue as _;
 use quiche::h3::WireErrorCode;
 use tokio::select;
 use tokio::sync::mpsc;
@@ -75,6 +77,13 @@ use self::streams::StreamReady;
 use self::streams::WaitForDownstreamData;
 use self::streams::WaitForStream;
 use self::streams::WaitForUpstreamCapacity;
+use self::webtransport::AssociatedStream;
+use self::webtransport::CapsuleError;
+use self::webtransport::CloseCapsule;
+use self::webtransport::Runtime as WebTransportRuntime;
+use self::webtransport::RuntimeLimits as WebTransportRuntimeLimits;
+use self::webtransport::WebTransportCommand;
+use self::webtransport::WT_SESSION_GONE;
 use crate::buf_factory::BufFactory;
 use crate::http3::settings::Http3Settings;
 use crate::http3::H3AuditStats;
@@ -99,6 +108,24 @@ pub use self::server::ServerH3Command;
 pub use self::server::ServerH3Controller;
 pub use self::server::ServerH3Driver;
 pub use self::server::ServerH3Event;
+pub use self::webtransport::webtransport_error_from_http3;
+pub use self::webtransport::webtransport_error_to_http3;
+pub use self::webtransport::WebTransportController;
+pub use self::webtransport::WebTransportDatagramError;
+pub use self::webtransport::WebTransportDatagramReadOutcome;
+pub use self::webtransport::WebTransportDatagramSendOperation;
+pub use self::webtransport::WebTransportDatagramSendOutcome;
+pub use self::webtransport::WebTransportDatagramStats;
+pub use self::webtransport::WebTransportOpenStreamOutcome;
+pub use self::webtransport::WebTransportSelectionError;
+pub use self::webtransport::WebTransportSessionCloseError;
+pub use self::webtransport::WebTransportSessionCloseReason;
+pub use self::webtransport::WebTransportSessionEvent;
+pub use self::webtransport::WebTransportStreamControlOutcome;
+pub use self::webtransport::WebTransportStreamReadOutcome;
+pub use self::webtransport::WebTransportStreamReadyOutcome;
+pub use self::webtransport::WebTransportStreamWriteOperation;
+pub use self::webtransport::WebTransportStreamWriteOutcome;
 
 /// Direction of a WebTransport stream carried over HTTP/3.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -204,6 +231,70 @@ const MIN_BODY_RECV_BUF_SIZE: usize = 1024;
 /// (potentially adversarial) read never allocates more than `MAX_BUF_SIZE`.
 fn body_recv_buf_size(readable: usize) -> usize {
     readable.clamp(MIN_BODY_RECV_BUF_SIZE, BufFactory::MAX_BUF_SIZE)
+}
+
+async fn receive_webtransport_command(
+    recv: &mut Option<mpsc::Receiver<WebTransportCommand>>,
+) -> Option<WebTransportCommand> {
+    match recv {
+        Some(recv) => recv.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn wait_for_webtransport_datagram_deadline(
+    deadline: Option<std::time::Instant>,
+) {
+    match deadline {
+        Some(deadline) =>
+            tokio::time::sleep_until(tokio::time::Instant::from_std(deadline))
+                .await,
+        None => std::future::pending().await,
+    }
+}
+
+fn response_status(headers: &[h3::Header]) -> Option<u16> {
+    let value = headers
+        .iter()
+        .find(|header| header.name() == b":status")?
+        .value();
+    if value.len() != 3 || !value.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    std::str::from_utf8(value).ok()?.parse().ok()
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WebTransportRequirements {
+    Pending,
+    Met,
+    Failed,
+}
+
+fn webtransport_requirements(
+    conn: &h3::Connection, qconn: &QuicheConnection,
+) -> WebTransportRequirements {
+    let Some(settings) = conn.peer_settings_raw() else {
+        return WebTransportRequirements::Pending;
+    };
+
+    let peer_wt = settings
+        .iter()
+        .any(|(id, value)| *id == h3::SETTINGS_WT_ENABLED && *value != 0);
+    let endpoint_settings_met = if qconn.is_server() {
+        peer_wt
+    } else {
+        peer_wt && conn.extended_connect_enabled_by_peer()
+    };
+    let transport_met = qconn.dgram_enabled() &&
+        conn.dgram_enabled_by_peer(qconn) &&
+        qconn.reset_stream_at_enabled();
+
+    if endpoint_settings_met && transport_met {
+        WebTransportRequirements::Met
+    } else {
+        WebTransportRequirements::Failed
+    }
 }
 
 /// Used by a local task to send [`OutboundFrame`]s to a peer on the
@@ -371,6 +462,8 @@ pub enum H3Event {
     },
     /// Rare WebTransport/H3 handshake diagnostic.
     WebTransportDiagnostic(WebTransportDiagnostic),
+    /// A native WebTransport session or associated-stream lifecycle update.
+    WebTransportSession(WebTransportSessionEvent),
     /// The stream has been closed. This is used to signal stream closures that
     /// don't result from RST_STREAM frames, unlike the
     /// [`H3Event::ResetStream`] variant.
@@ -413,6 +506,12 @@ pub enum OutboundFrame {
     PeerStreamError,
     /// DATAGRAM flow explicitly closed.
     FlowShutdown { flow_id: u64, stream_id: u64 },
+    /// Driver-owned WT_CLOSE_SESSION capsule plus CONNECT-stream FIN.
+    #[doc(hidden)]
+    WebTransportClose {
+        /// Encoded capsule bytes not yet accepted by H3.
+        capsule: Bytes,
+    },
 }
 
 /// An [`InboundFrame`] is a data frame that was received from the peer over a
@@ -479,6 +578,14 @@ pub struct H3Driver<H: DriverHooks> {
     raw_streams: BTreeSet<u64>,
     /// Scratch space for receiving raw QUIC stream data.
     raw_stream_recv_buf: Vec<u8>,
+    /// Native draft-15 session owner, present only when explicitly enabled.
+    webtransport: Option<WebTransportRuntime>,
+    /// Bounded native WebTransport selected-I/O command receiver.
+    webtransport_cmd_recv: Option<mpsc::Receiver<WebTransportCommand>>,
+    /// Rotates priority between selected-I/O commands and opening prefixes.
+    webtransport_command_turn: bool,
+    /// Rotates native Datagram work across ingress, legacy release, and expiry.
+    webtransport_datagram_turn: u8,
 
     /// The maximum HTTP/3 stream ID seen on this connection.
     max_stream_seen: u64,
@@ -503,6 +610,42 @@ impl<H: DriverHooks> H3Driver<H> {
         let (h3_event_sender, h3_event_recv) = mpsc::unbounded_channel();
         let multicast_datagram_channel_id =
             http3_settings.multicast_datagram_channel_id.clone();
+        let (webtransport, webtransport_cmd_recv, webtransport_controller) =
+            if http3_settings.enable_webtransport {
+                let (sender, recv) = mpsc::channel(
+                    http3_settings.webtransport_command_capacity.max(1),
+                );
+                (
+                    Some(WebTransportRuntime::new(WebTransportRuntimeLimits {
+                        max_pending_streams: http3_settings
+                            .webtransport_max_pending_streams,
+                        max_pending_streams_per_session: http3_settings
+                            .webtransport_max_pending_streams_per_session,
+                        max_stream_waiters: http3_settings
+                            .webtransport_max_stream_waiters,
+                        max_pending_datagrams: http3_settings
+                            .webtransport_max_pending_datagrams,
+                        max_pending_datagrams_per_session: http3_settings
+                            .webtransport_max_pending_datagrams_per_session,
+                        max_pending_datagram_bytes: http3_settings
+                            .webtransport_max_pending_datagram_bytes,
+                        max_pending_datagram_bytes_per_session: http3_settings
+                            .webtransport_max_pending_datagram_bytes_per_session,
+                        max_pending_datagram_age: http3_settings
+                            .webtransport_max_pending_datagram_age,
+                        max_session_work_per_callback: http3_settings
+                            .webtransport_max_session_work_per_callback,
+                    })),
+                    Some(recv),
+                    Some(WebTransportController::new(
+                        sender,
+                        http3_settings.webtransport_max_stream_write_bytes,
+                        http3_settings.webtransport_max_stream_read_bytes,
+                    )),
+                )
+            } else {
+                (None, None, None)
+            };
 
         (
             H3Driver {
@@ -523,6 +666,10 @@ impl<H: DriverHooks> H3Driver<H> {
                 body_recv_buf: None,
                 raw_streams: BTreeSet::new(),
                 raw_stream_recv_buf: vec![0u8; BufFactory::MAX_BUF_SIZE],
+                webtransport,
+                webtransport_cmd_recv,
+                webtransport_command_turn: true,
+                webtransport_datagram_turn: 0,
 
                 waiting_streams: FuturesUnordered::new(),
 
@@ -532,6 +679,7 @@ impl<H: DriverHooks> H3Driver<H> {
             H3Controller {
                 cmd_sender,
                 h3_event_recv: Some(h3_event_recv),
+                webtransport: webtransport_controller,
             },
         )
     }
@@ -578,6 +726,117 @@ impl<H: DriverHooks> H3Driver<H> {
     /// Fetches body chunks from the [`quiche::h3::Connection`] and forwards
     /// them to the stream's associated [`InboundFrameStream`].
     fn process_h3_data(
+        &mut self, qconn: &mut QuicheConnection, stream_id: u64,
+    ) -> H3ConnectionResult<()> {
+        if self
+            .webtransport
+            .as_ref()
+            .is_some_and(|runtime| runtime.capsules_negotiated(stream_id))
+        {
+            return self.process_webtransport_capsules(qconn, stream_id);
+        }
+        self.process_regular_h3_data(qconn, stream_id)
+    }
+
+    fn process_webtransport_capsules(
+        &mut self, qconn: &mut QuicheConnection, stream_id: u64,
+    ) -> H3ConnectionResult<()> {
+        let mut buf = [0; 4096];
+
+        loop {
+            let recv = self.conn_mut()?.recv_body(qconn, stream_id, &mut buf);
+            match recv {
+                Ok(read) => {
+                    if read == 0 {
+                        break;
+                    }
+                    if let Some(ctx) = self.stream_map.get(&stream_id) {
+                        ctx.audit_stats.add_downstream_bytes_recvd(read as u64);
+                    }
+                    let parsed = self
+                        .webtransport
+                        .as_mut()
+                        .and_then(|runtime| runtime.parser_mut(stream_id))
+                        .ok_or(H3ConnectionError::NonexistentStream)?
+                        .consume(&buf[..read]);
+                    match parsed {
+                        Ok(Some(close)) => {
+                            let events = self
+                                .webtransport
+                                .as_mut()
+                                .expect("capsule owner was checked above")
+                                .terminate(
+                                    stream_id,
+                                    WebTransportSessionCloseReason::Peer {
+                                        error_code: close.error_code,
+                                        message: close.message,
+                                    },
+                                );
+                            Self::emit_webtransport_events(
+                                &self.h3_event_sender,
+                                events,
+                            )?;
+                        },
+                        Ok(None) => {},
+                        Err(err) =>
+                            return self.fail_webtransport_capsules(
+                                qconn, stream_id, err,
+                            ),
+                    }
+                },
+                Err(h3::Error::Done) => break,
+                Err(h3::Error::TransportError(quiche::Error::StreamReset(
+                    error_code,
+                ))) => {
+                    let runtime = self
+                        .webtransport
+                        .as_mut()
+                        .expect("capsule owner was checked above");
+                    let mut events = runtime.terminate(
+                        stream_id,
+                        WebTransportSessionCloseReason::ConnectReset {
+                            error_code,
+                        },
+                    );
+                    events.extend(runtime.mark_connect_recv_closed(stream_id));
+                    Self::emit_webtransport_events(
+                        &self.h3_event_sender,
+                        events,
+                    )?;
+                    if let Some(ctx) = self.stream_map.get_mut(&stream_id) {
+                        ctx.handle_recvd_reset(error_code);
+                    }
+                    self.h3_event_sender
+                        .send(H3Event::ResetStream { stream_id }.into())
+                        .map_err(|_| H3ConnectionError::ControllerWentAway)?;
+                    return Ok(());
+                },
+                Err(err) => return Err(H3ConnectionError::from(err)),
+            }
+        }
+        Ok(())
+    }
+
+    fn fail_webtransport_capsules(
+        &mut self, qconn: &mut QuicheConnection, stream_id: u64,
+        _error: CapsuleError,
+    ) -> H3ConnectionResult<()> {
+        let runtime = self
+            .webtransport
+            .as_mut()
+            .expect("capsule owner was checked above");
+        runtime.cancel_peer_close_fin(stream_id);
+        let mut events = runtime
+            .terminate(stream_id, WebTransportSessionCloseReason::ProtocolError);
+        events.extend(runtime.mark_connect_recv_closed(stream_id));
+        Self::emit_webtransport_events(&self.h3_event_sender, events)?;
+        self.shutdown_stream(qconn, stream_id, StreamShutdown::Both {
+            read_error_code: WireErrorCode::MessageError as u64,
+            write_error_code: WireErrorCode::MessageError as u64,
+        })
+    }
+
+    fn process_regular_h3_data(
         &mut self, qconn: &mut QuicheConnection, stream_id: u64,
     ) -> H3ConnectionResult<()> {
         // Split self borrow between conn and stream_map
@@ -753,6 +1012,35 @@ impl<H: DriverHooks> H3Driver<H> {
     fn process_h3_fin(
         &mut self, qconn: &mut QuicheConnection, stream_id: u64,
     ) -> H3ConnectionResult<()> {
+        if self
+            .webtransport
+            .as_ref()
+            .is_some_and(|runtime| runtime.is_session(stream_id))
+        {
+            let finish = if self
+                .webtransport
+                .as_ref()
+                .is_some_and(|runtime| runtime.capsules_negotiated(stream_id))
+            {
+                self.webtransport
+                    .as_mut()
+                    .and_then(|runtime| runtime.parser_mut(stream_id))
+                    .expect("session parser exists")
+                    .finish()
+            } else {
+                Ok(())
+            };
+            if let Err(error) = finish {
+                return self.fail_webtransport_capsules(qconn, stream_id, error);
+            }
+            let events = self
+                .webtransport
+                .as_mut()
+                .expect("session owner was checked above")
+                .mark_connect_recv_closed(stream_id);
+            Self::emit_webtransport_events(&self.h3_event_sender, events)?;
+        }
+
         let ctx = self
             .stream_map
             .get_mut(&stream_id)
@@ -778,7 +1066,15 @@ impl<H: DriverHooks> H3Driver<H> {
 
         // Communicate fin to upstream. Since `ctx.fin_recv` is true now,
         // there can't be a recursive loop.
-        self.process_h3_data(qconn, stream_id)
+        self.process_h3_data(qconn, stream_id)?;
+        if self
+            .webtransport
+            .as_ref()
+            .is_some_and(|runtime| runtime.has_peer_close_fin(stream_id))
+        {
+            self.process_writable_stream(qconn, stream_id)?;
+        }
+        Ok(())
     }
 
     /// Processes a single [`quiche::h3::Event`] received from the underlying
@@ -787,7 +1083,7 @@ impl<H: DriverHooks> H3Driver<H> {
     fn process_read_event(
         &mut self, qconn: &mut QuicheConnection, stream_id: u64, event: h3::Event,
     ) -> H3ConnectionResult<()> {
-        self.forward_settings()?;
+        self.forward_settings(qconn)?;
 
         match event {
             // Requests/responses are exclusively handled by hooks.
@@ -802,6 +1098,27 @@ impl<H: DriverHooks> H3Driver<H> {
             h3::Event::Finished => self.process_h3_fin(qconn, stream_id),
 
             h3::Event::Reset(code) => {
+                if self
+                    .webtransport
+                    .as_ref()
+                    .is_some_and(|runtime| runtime.is_session(stream_id))
+                {
+                    let runtime = self
+                        .webtransport
+                        .as_mut()
+                        .expect("session owner was checked above");
+                    let mut events = runtime.terminate(
+                        stream_id,
+                        WebTransportSessionCloseReason::ConnectReset {
+                            error_code: code,
+                        },
+                    );
+                    events.extend(runtime.mark_connect_recv_closed(stream_id));
+                    Self::emit_webtransport_events(
+                        &self.h3_event_sender,
+                        events,
+                    )?;
+                }
                 if let Some(ctx) = self.stream_map.get_mut(&stream_id) {
                     ctx.handle_recvd_reset(code);
                     // See if we are waiting on this stream and close the channel
@@ -835,11 +1152,31 @@ impl<H: DriverHooks> H3Driver<H> {
             },
 
             h3::Event::PriorityUpdate => Ok(()),
-            // Tokio does not enable core native classification until its
-            // selected-stream admission path can take ownership. Reaching this
-            // arm is therefore an invariant failure, never silent disposal.
-            h3::Event::WebTransportStream { .. } =>
-                Err(H3ConnectionError::H3(h3::Error::InternalError)),
+            h3::Event::WebTransportStream {
+                session_id,
+                direction,
+                prefix_len,
+            } => {
+                let direction = match direction {
+                    h3::WebTransportStreamDirection::Bidirectional =>
+                        WebTransportStreamDirection::Bidi,
+                    h3::WebTransportStreamDirection::Unidirectional =>
+                        WebTransportStreamDirection::Uni,
+                };
+                let Some(runtime) = self.webtransport.as_mut() else {
+                    return Err(H3ConnectionError::H3(h3::Error::InternalError));
+                };
+                let events = runtime.classify(
+                    AssociatedStream {
+                        session_id,
+                        stream_id,
+                        direction,
+                        prefix_len,
+                    },
+                    qconn,
+                );
+                Self::emit_webtransport_events(&self.h3_event_sender, events)
+            },
             h3::Event::GoAway => {
                 self.h3_event_sender
                     .send(H3Event::GoAway { id: stream_id }.into())
@@ -854,7 +1191,9 @@ impl<H: DriverHooks> H3Driver<H> {
     ///
     /// Settings should only be sent once, so we generate a single event
     /// when `peer_settings_raw` transitions from None to Some.
-    fn forward_settings(&mut self) -> H3ConnectionResult<()> {
+    fn forward_settings(
+        &mut self, qconn: &mut QuicheConnection,
+    ) -> H3ConnectionResult<()> {
         if self.settings_received_and_forwarded {
             return Ok(());
         }
@@ -870,6 +1209,7 @@ impl<H: DriverHooks> H3Driver<H> {
                 .map_err(|_| H3ConnectionError::ControllerWentAway)?;
 
             self.settings_received_and_forwarded = true;
+            H::settings_received(self, qconn)?;
         }
         Ok(())
     }
@@ -883,7 +1223,8 @@ impl<H: DriverHooks> H3Driver<H> {
         conn: &mut h3::Connection, qconn: &mut QuicheConnection,
         ctx: &mut StreamCtx, h3_event_sender: &UnboundedSender<H::Event>,
         emit_h3_headers_flushed: bool,
-    ) -> h3::Result<()> {
+        mut webtransport: Option<&mut WebTransportRuntime>,
+    ) -> H3ConnectionResult<()> {
         let Some(frame) = &mut ctx.queued_frame else {
             return Ok(());
         };
@@ -895,6 +1236,40 @@ impl<H: DriverHooks> H3Driver<H> {
             OutboundFrame::Headers(headers, priority) => {
                 let prio = priority.as_ref().unwrap_or(&DEFAULT_PRIO);
                 let initial_headers = !ctx.initial_headers_sent;
+                let status = response_status(headers);
+
+                if qconn.is_server() &&
+                    status.is_some_and(|status| status >= 200) &&
+                    webtransport
+                        .as_deref()
+                        .is_some_and(|runtime| runtime.is_pending(stream_id))
+                {
+                    match webtransport_requirements(conn, qconn) {
+                        WebTransportRequirements::Pending => {
+                            webtransport
+                                .as_deref_mut()
+                                .expect("pending session has a runtime")
+                                .defer_response(stream_id);
+                            return Err(H3ConnectionError::H3(
+                                h3::Error::StreamBlocked,
+                            ));
+                        },
+                        WebTransportRequirements::Failed => {
+                            let events = webtransport
+                                .as_deref_mut()
+                                .expect("pending session has a runtime")
+                                .admission_failed(stream_id);
+                            Self::emit_webtransport_events(
+                                h3_event_sender,
+                                events,
+                            )?;
+                            return Err(H3ConnectionError::H3(
+                                h3::Error::MessageError,
+                            ));
+                        },
+                        WebTransportRequirements::Met => {},
+                    }
+                }
 
                 let res = if ctx.initial_headers_sent {
                     // Initial headers were already sent, send additional
@@ -943,9 +1318,19 @@ impl<H: DriverHooks> H3Driver<H> {
                             Instant::now().duration_since(first),
                         );
                     }
+
+                    if let Some(status) = status {
+                        let events = webtransport.as_deref_mut().map_or_else(
+                            Vec::new,
+                            |runtime| {
+                                runtime.response_accepted(stream_id, status)
+                            },
+                        );
+                        Self::emit_webtransport_events(h3_event_sender, events)?;
+                    }
                 }
 
-                res
+                res.map_err(H3ConnectionError::from)
             },
 
             OutboundFrame::Body(body, fin) => {
@@ -978,10 +1363,25 @@ impl<H: DriverHooks> H3Driver<H> {
                     Err(h3::Error::StreamBlocked)
                 } else {
                     if *fin {
-                        Self::on_fin_sent(ctx)?;
+                        let fin_result = Self::on_fin_sent(ctx);
+                        let events = webtransport.as_deref_mut().map_or_else(
+                            Vec::new,
+                            |runtime| {
+                                runtime.terminate(
+                                    stream_id,
+                                    WebTransportSessionCloseReason::Clean,
+                                )
+                            },
+                        );
+                        Self::emit_webtransport_events(h3_event_sender, events)?;
+                        if let Some(runtime) = webtransport.as_deref_mut() {
+                            runtime.mark_connect_send_closed(stream_id);
+                        }
+                        fin_result?;
                     }
                     Ok(())
                 }
+                .map_err(H3ConnectionError::from)
             },
 
             OutboundFrame::Trailers(headers, priority) => {
@@ -993,12 +1393,27 @@ impl<H: DriverHooks> H3Driver<H> {
                 );
 
                 if res.is_ok() {
-                    Self::on_fin_sent(ctx)?;
+                    let fin_result = Self::on_fin_sent(ctx);
+                    let events = webtransport.as_deref_mut().map_or_else(
+                        Vec::new,
+                        |runtime| {
+                            runtime.terminate(
+                                stream_id,
+                                WebTransportSessionCloseReason::Clean,
+                            )
+                        },
+                    );
+                    Self::emit_webtransport_events(h3_event_sender, events)?;
+                    if let Some(runtime) = webtransport.as_deref_mut() {
+                        runtime.mark_connect_send_closed(stream_id);
+                    }
+                    fin_result?;
                 }
-                res
+                res.map_err(H3ConnectionError::from)
             },
 
-            OutboundFrame::PeerStreamError => Err(h3::Error::MessageError),
+            OutboundFrame::PeerStreamError =>
+                Err(H3ConnectionError::H3(h3::Error::MessageError)),
 
             OutboundFrame::FlowShutdown { .. } => {
                 unreachable!("Only flows send shutdowns")
@@ -1007,7 +1422,35 @@ impl<H: DriverHooks> H3Driver<H> {
             OutboundFrame::Datagram(..) => {
                 unreachable!("Only flows send datagrams")
             },
+
+            OutboundFrame::WebTransportClose { capsule } => {
+                let len = capsule.len();
+                let n = conn.send_body_zc(qconn, stream_id, capsule, true)?;
+                audit_stats.add_downstream_bytes_sent(n as _);
+                if n != len {
+                    debug_assert_eq!(n + capsule.len(), len);
+                    return Err(H3ConnectionError::H3(h3::Error::StreamBlocked));
+                }
+
+                let fin_result = Self::on_fin_sent(ctx);
+                let events = webtransport.map_or_else(Vec::new, |runtime| {
+                    runtime.local_close_committed(stream_id)
+                });
+                Self::emit_webtransport_events(h3_event_sender, events)?;
+                fin_result.map_err(H3ConnectionError::from)
+            },
         }
+    }
+
+    fn emit_webtransport_events(
+        sender: &UnboundedSender<H::Event>, events: Vec<WebTransportSessionEvent>,
+    ) -> H3ConnectionResult<()> {
+        for event in events {
+            sender
+                .send(H3Event::WebTransportSession(event).into())
+                .map_err(|_| H3ConnectionError::ControllerWentAway)?;
+        }
+        Ok(())
     }
 
     fn on_fin_sent(ctx: &mut StreamCtx) -> h3::Result<()> {
@@ -1176,6 +1619,10 @@ impl<H: DriverHooks> H3Driver<H> {
             self.flow_map.remove(&mapped_flow_id);
         }
 
+        if let Some(runtime) = self.webtransport.as_mut() {
+            runtime.forget_non_session_request(stream_id);
+        }
+
         if qconn.is_server() {
             // Signal the server to remove the stream from its map
             let _ = self
@@ -1259,6 +1706,21 @@ impl<H: DriverHooks> H3Driver<H> {
             },
         }
 
+        if let Some(runtime) = self.webtransport.as_mut() {
+            let events = match shutdown {
+                StreamShutdown::Read { .. } | StreamShutdown::Both { .. } =>
+                    runtime.mark_connect_recv_closed(stream_id),
+                StreamShutdown::Write { .. } => Vec::new(),
+            };
+            if matches!(
+                shutdown,
+                StreamShutdown::Write { .. } | StreamShutdown::Both { .. }
+            ) {
+                runtime.mark_connect_send_closed(stream_id);
+            }
+            Self::emit_webtransport_events(&self.h3_event_sender, events)?;
+        }
+
         self.cleanup_stream(qconn, stream_id)
     }
 
@@ -1279,7 +1741,42 @@ impl<H: DriverHooks> H3Driver<H> {
                 stream_id,
                 shutdown,
             } => {
+                if self
+                    .webtransport
+                    .as_ref()
+                    .is_some_and(|runtime| runtime.is_session(stream_id))
+                {
+                    let events = self
+                        .webtransport
+                        .as_mut()
+                        .expect("session owner was checked above")
+                        .output_failed(stream_id);
+                    Self::emit_webtransport_events(
+                        &self.h3_event_sender,
+                        events,
+                    )?;
+                }
                 self.shutdown_stream(qconn, stream_id, shutdown)?;
+            },
+            H3Command::CloseWebTransportSession {
+                session_id,
+                error_code,
+                message,
+            } => {
+                let close =
+                    CloseCapsule::new(error_code, message).map_err(|_| {
+                        H3ConnectionError::H3(h3::Error::MessageError)
+                    })?;
+                if !self.stream_map.contains_key(&session_id) {
+                    return Ok(());
+                }
+                let Some(webtransport) = self.webtransport.as_mut() else {
+                    return Ok(());
+                };
+                if !webtransport.begin_local_close(session_id, close.clone()) {
+                    return Ok(());
+                }
+                self.process_writable_stream(qconn, session_id)?;
             },
         }
         Ok(())
@@ -1295,6 +1792,13 @@ impl<H: DriverHooks> H3Driver<H> {
         let readable = qconn.readable().collect::<Vec<_>>();
 
         for stream_id in readable {
+            if self
+                .webtransport
+                .as_ref()
+                .is_some_and(|runtime| runtime.owns_stream(stream_id))
+            {
+                continue;
+            }
             if !self.raw_streams.contains(&stream_id) &&
                 !H::should_intercept_raw_stream(self, stream_id)
             {
@@ -1340,23 +1844,174 @@ impl<H: DriverHooks> H3Driver<H> {
         Ok(())
     }
 
+    fn handle_webtransport_command(
+        &mut self, qconn: &mut QuicheConnection, command: WebTransportCommand,
+    ) -> H3ConnectionResult<()> {
+        let conn = self.conn.as_mut().ok_or(Self::connection_not_present())?;
+        let runtime = self
+            .webtransport
+            .as_mut()
+            .ok_or(H3ConnectionError::H3(h3::Error::InternalError))?;
+        runtime.handle_command(conn, qconn, command);
+        Ok(())
+    }
+
+    fn try_webtransport_command(
+        &mut self, qconn: &mut QuicheConnection,
+    ) -> H3ConnectionResult<bool> {
+        let command = match self.webtransport_cmd_recv.as_mut() {
+            Some(recv) => match recv.try_recv() {
+                Ok(command) => command,
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) =>
+                    return Ok(false),
+            },
+            None => return Ok(false),
+        };
+        self.handle_webtransport_command(qconn, command)?;
+        Ok(true)
+    }
+
+    fn try_webtransport_opening(
+        &mut self, qconn: &mut QuicheConnection,
+    ) -> H3ConnectionResult<bool> {
+        let conn = self.conn.as_mut().ok_or(Self::connection_not_present())?;
+        let Some(runtime) = self.webtransport.as_mut() else {
+            return Ok(false);
+        };
+        Ok(runtime.process_opening_streams(conn, qconn, 1) != 0)
+    }
+
+    fn process_webtransport_io(
+        &mut self, qconn: &mut QuicheConnection,
+    ) -> H3ConnectionResult<()> {
+        let Some(limit) = self
+            .webtransport
+            .as_ref()
+            .map(WebTransportRuntime::work_limit)
+        else {
+            return Ok(());
+        };
+
+        for _ in 0..limit {
+            let command_first = self.webtransport_command_turn;
+            let progressed = if command_first {
+                self.try_webtransport_command(qconn)? ||
+                    self.try_webtransport_opening(qconn)?
+            } else {
+                self.try_webtransport_opening(qconn)? ||
+                    self.try_webtransport_command(qconn)?
+            };
+            if !progressed {
+                break;
+            }
+            self.webtransport_command_turn = !command_first;
+        }
+        Ok(())
+    }
+
+    fn close_webtransport_command_lane(&mut self) {
+        let Some(recv) = self.webtransport_cmd_recv.as_mut() else {
+            return;
+        };
+        recv.close();
+        while let Ok(command) = recv.try_recv() {
+            command.reject_connection_closed();
+        }
+    }
+
     /// Reads all buffered datagrams out of `qconn` and distributes them to
     /// their flow channels.
     fn process_available_dgrams(
         &mut self, qconn: &mut QuicheConnection,
     ) -> H3ConnectionResult<()> {
-        loop {
-            match datagram::receive_h3_dgram(qconn) {
-                Ok((flow_id, dgram))
-                    if !qconn.is_server() ||
-                        self.hooks.extended_connect_enabled() =>
-                {
-                    self.get_or_insert_flow(flow_id)?.send_best_effort(dgram);
-                },
-                Ok(_) => {},
-                Err(quiche::Error::Done) => return Ok(()),
-                Err(err) => return Err(H3ConnectionError::from(err)),
+        let max_work = self
+            .webtransport
+            .as_ref()
+            .map_or(usize::MAX, WebTransportRuntime::work_limit);
+        for _ in 0..max_work {
+            let start = self.webtransport_datagram_turn;
+            let mut progressed = false;
+            for delta in 0..3 {
+                let class = (start + delta) % 3;
+                progressed = match class {
+                    0 => self.try_process_inbound_dgram(qconn)?,
+                    1 => self.try_process_legacy_dgram(qconn)?,
+                    2 => self.webtransport.as_mut().is_some_and(|runtime| {
+                        runtime.expire_provisional_datagrams(
+                            std::time::Instant::now(),
+                            1,
+                        ) != 0
+                    }),
+                    _ => unreachable!("Datagram work class is modulo three"),
+                };
+                if progressed {
+                    self.webtransport_datagram_turn = (class + 1) % 3;
+                    break;
+                }
             }
+            if !progressed {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn try_process_inbound_dgram(
+        &mut self, qconn: &mut QuicheConnection,
+    ) -> H3ConnectionResult<bool> {
+        let (flow_id, frame) = match datagram::receive_h3_dgram(qconn) {
+            Ok(frame) => frame,
+            Err(quiche::Error::Done) => return Ok(false),
+            Err(error) => return Err(H3ConnectionError::from(error)),
+        };
+        let InboundFrame::Datagram(dgram) = frame else {
+            unreachable!("H3 Datagram decoder only returns Datagrams");
+        };
+        let dgram = match (flow_id.checked_mul(4), self.webtransport.as_mut()) {
+            (Some(session_id), Some(runtime)) => {
+                let Some(dgram) =
+                    runtime.route_datagram(qconn, session_id, dgram)
+                else {
+                    return Ok(true);
+                };
+                dgram
+            },
+            _ => dgram,
+        };
+        self.deliver_legacy_dgram(qconn, flow_id, dgram)?;
+        Ok(true)
+    }
+
+    fn try_process_legacy_dgram(
+        &mut self, qconn: &QuicheConnection,
+    ) -> H3ConnectionResult<bool> {
+        let Some((flow_id, datagram)) = self
+            .webtransport
+            .as_mut()
+            .and_then(WebTransportRuntime::pop_legacy_datagram)
+        else {
+            return Ok(false);
+        };
+        self.deliver_legacy_dgram(qconn, flow_id, datagram)?;
+        Ok(true)
+    }
+
+    fn deliver_legacy_dgram(
+        &mut self, qconn: &QuicheConnection, flow_id: u64, dgram: DgramBuffer,
+    ) -> H3ConnectionResult<()> {
+        if !qconn.is_server() || self.hooks.extended_connect_enabled() {
+            self.get_or_insert_flow(flow_id)?
+                .send_best_effort(InboundFrame::Datagram(dgram));
+        }
+        Ok(())
+    }
+
+    fn process_webtransport_readable_wakes(&mut self, qconn: &QuicheConnection) {
+        let Some(runtime) = self.webtransport.as_mut() else {
+            return;
+        };
+        for stream_id in qconn.readable() {
+            runtime.process_owned_readable(qconn, stream_id);
         }
     }
 
@@ -1383,10 +2038,23 @@ impl<H: DriverHooks> H3Driver<H> {
                 ctx,
                 &h3_event_sender,
                 emit_h3_headers_flushed,
+                self.webtransport.as_mut(),
             ) {
                 Ok(()) => ctx.queued_frame = None,
-                Err(h3::Error::StreamBlocked | h3::Error::Done) => break,
-                Err(h3::Error::MessageError) => {
+                Err(H3ConnectionError::H3(
+                    h3::Error::StreamBlocked | h3::Error::Done,
+                )) => break,
+                Err(H3ConnectionError::H3(h3::Error::MessageError)) => {
+                    let events = self
+                        .webtransport
+                        .as_mut()
+                        .map_or_else(Vec::new, |runtime| {
+                            runtime.output_failed(stream_id)
+                        });
+                    Self::emit_webtransport_events(
+                        &self.h3_event_sender,
+                        events,
+                    )?;
                     return self.shutdown_stream(
                         qconn,
                         stream_id,
@@ -1396,9 +2064,39 @@ impl<H: DriverHooks> H3Driver<H> {
                         },
                     );
                 },
-                Err(h3::Error::TransportError(quiche::Error::StreamStopped(
-                    e,
+                Err(H3ConnectionError::H3(h3::Error::TransportError(
+                    quiche::Error::StreamStopped(e),
                 ))) => {
+                    if self
+                        .webtransport
+                        .as_ref()
+                        .is_some_and(|runtime| runtime.is_session(stream_id))
+                    {
+                        let runtime = self
+                            .webtransport
+                            .as_mut()
+                            .expect("session owner was checked above");
+                        let mut events = runtime.terminate(
+                            stream_id,
+                            WebTransportSessionCloseReason::ConnectStopped {
+                                error_code: e,
+                            },
+                        );
+                        events
+                            .extend(runtime.mark_connect_recv_closed(stream_id));
+                        Self::emit_webtransport_events(
+                            &self.h3_event_sender,
+                            events,
+                        )?;
+                        return self.shutdown_stream(
+                            qconn,
+                            stream_id,
+                            StreamShutdown::Both {
+                                read_error_code: WT_SESSION_GONE,
+                                write_error_code: WT_SESSION_GONE,
+                            },
+                        );
+                    }
                     ctx.handle_recvd_stop_sending(e);
                     if ctx.both_directions_done() {
                         return self.cleanup_stream(qconn, stream_id);
@@ -1406,14 +2104,61 @@ impl<H: DriverHooks> H3Driver<H> {
                         return Ok(());
                     }
                 },
-                Err(h3::Error::TransportError(
+                Err(H3ConnectionError::H3(h3::Error::TransportError(
                     quiche::Error::InvalidStreamState(stream),
-                )) => {
+                ))) => {
                     return self.cleanup_stream(qconn, stream);
                 },
-                Err(_) => {
+                Err(H3ConnectionError::H3(_)) => {
+                    let events = self
+                        .webtransport
+                        .as_mut()
+                        .map_or_else(Vec::new, |runtime| {
+                            runtime.output_failed(stream_id)
+                        });
+                    Self::emit_webtransport_events(
+                        &self.h3_event_sender,
+                        events,
+                    )?;
                     return self.cleanup_stream(qconn, stream_id);
                 },
+                Err(err) => return Err(err),
+            }
+
+            if ctx.queued_frame.is_none() {
+                let local_close_waiting =
+                    self.webtransport.as_ref().is_some_and(|runtime| {
+                        runtime.local_close_waiting(stream_id)
+                    });
+                if local_close_waiting {
+                    if let Some(recv) = ctx.recv.as_mut() {
+                        recv.close();
+                        if let Ok(frame) = recv.try_recv() {
+                            ctx.queued_frame = Some(frame);
+                            continue;
+                        }
+                    }
+                }
+                if let Some(capsule) =
+                    self.webtransport.as_mut().and_then(|runtime| {
+                        runtime.take_local_close_output(stream_id)
+                    })
+                {
+                    ctx.recv = None;
+                    ctx.queued_frame =
+                        Some(OutboundFrame::WebTransportClose { capsule });
+                    continue;
+                }
+                if self
+                    .webtransport
+                    .as_mut()
+                    .is_some_and(|runtime| runtime.take_peer_close_fin(stream_id))
+                {
+                    ctx.recv = None;
+                    ctx.queued_frame =
+                        Some(OutboundFrame::Body(Bytes::new(), true));
+                    continue;
+                }
             }
 
             let Some(recv) = ctx.recv.as_mut() else {
@@ -1531,6 +2276,11 @@ impl<H: DriverHooks> ApplicationOverQuic for H3Driver<H> {
             };
         }
 
+        // SETTINGS can be consumed entirely on the peer control stream without
+        // producing an application event. Synchronize after the poll pass so a
+        // client CONNECT waiting on negotiation cannot deadlock.
+        self.forward_settings(qconn)?;
+        self.process_webtransport_readable_wakes(qconn);
         self.process_available_dgrams(qconn)?;
         Ok(())
     }
@@ -1539,7 +2289,38 @@ impl<H: DriverHooks> ApplicationOverQuic for H3Driver<H> {
     /// all sources. This will attempt to write any queued frames into their
     /// respective streams, if writable.
     fn process_writes(&mut self, qconn: &mut QuicheConnection) -> QuicResult<()> {
+        let retry_deferred = self
+            .webtransport
+            .as_ref()
+            .is_some_and(WebTransportRuntime::has_deferred_responses) &&
+            self.conn.as_ref().is_some_and(|conn| {
+                webtransport_requirements(conn, qconn) !=
+                    WebTransportRequirements::Pending
+            });
+        if retry_deferred {
+            let deferred = self
+                .webtransport
+                .as_mut()
+                .expect("deferred responses require a runtime")
+                .take_deferred_responses();
+            for stream_id in deferred {
+                self.process_writable_stream(qconn, stream_id)?;
+            }
+        }
+
+        self.process_webtransport_io(qconn)?;
+
+        if let Some(runtime) = self.webtransport.as_mut() {
+            let events = runtime.process_work(qconn);
+            Self::emit_webtransport_events(&self.h3_event_sender, events)?;
+        }
+
         while let Some(stream_id) = qconn.stream_writable_next() {
+            if self.webtransport.as_mut().is_some_and(|runtime| {
+                runtime.process_owned_writable(qconn, stream_id)
+            }) {
+                continue;
+            }
             self.process_writable_stream(qconn, stream_id)?;
         }
 
@@ -1563,6 +2344,12 @@ impl<H: DriverHooks> ApplicationOverQuic for H3Driver<H> {
             .observe(max_stream_seen as f64);
 
         Self::record_quiche_error(quiche_conn, metrics);
+
+        if let Some(runtime) = self.webtransport.as_mut() {
+            let events = runtime.clear();
+            let _ = Self::emit_webtransport_events(&self.h3_event_sender, events);
+        }
+        self.close_webtransport_command_lane();
 
         let Err(work_loop_error) = work_loop_result else {
             return;
@@ -1593,10 +2380,30 @@ impl<H: DriverHooks> ApplicationOverQuic for H3Driver<H> {
     async fn wait_for_data(
         &mut self, qconn: &mut QuicheConnection,
     ) -> QuicResult<()> {
+        let webtransport_work =
+            self.webtransport.as_ref().is_some_and(|runtime| {
+                runtime.has_work() ||
+                    runtime.has_legacy_datagrams() ||
+                    (runtime.has_deferred_responses() &&
+                        self.conn.as_ref().is_some_and(|conn| {
+                            webtransport_requirements(conn, qconn) !=
+                                WebTransportRequirements::Pending
+                        }))
+            }) || (self.webtransport.is_some() &&
+                qconn.dgram_recv_queue_len() != 0);
+        let webtransport_datagram_deadline = self
+            .webtransport
+            .as_ref()
+            .and_then(WebTransportRuntime::next_provisional_datagram_deadline);
         select! {
             biased;
+            _ = std::future::ready(()), if webtransport_work => Ok(()),
             Some(ready) = self.waiting_streams.next() => self.upstream_ready(qconn, ready),
             Some(dgram) = self.dgram_recv.recv() => self.dgram_ready(qconn, dgram),
+            Some(command) = receive_webtransport_command(&mut self.webtransport_cmd_recv) => {
+                self.handle_webtransport_command(qconn, command)
+            },
+            _ = wait_for_webtransport_datagram_deadline(webtransport_datagram_deadline) => Ok(()),
             Some(cmd) = self.cmd_recv.recv() => H::conn_command(self, qconn, cmd),
             r = self.hooks.wait_for_action(qconn), if H::has_wait_action(self) => r,
             _ = self.h3_event_sender.closed(), if !self.h3_event_receiver_dropped => {
@@ -1619,6 +2426,10 @@ impl<H: DriverHooks> ApplicationOverQuic for H3Driver<H> {
 
 impl<H: DriverHooks> Drop for H3Driver<H> {
     fn drop(&mut self) {
+        if let Some(runtime) = self.webtransport.as_mut() {
+            let _ = runtime.clear();
+        }
+        self.close_webtransport_command_lane();
         for stream in self.stream_map.values() {
             stream
                 .audit_stats
@@ -1650,6 +2461,15 @@ pub enum H3Command {
     ShutdownStream {
         stream_id: u64,
         shutdown: StreamShutdown,
+    },
+    /// Sends WT_CLOSE_SESSION and FIN on one active CONNECT stream.
+    CloseWebTransportSession {
+        /// CONNECT stream ID and WebTransport Session ID.
+        session_id: u64,
+        /// Application-defined 32-bit close code.
+        error_code: u32,
+        /// UTF-8 close message, limited to 1024 encoded bytes.
+        message: String,
     },
 }
 
@@ -1718,9 +2538,20 @@ pub struct H3Controller<H: DriverHooks> {
     /// Receives [`H3Event`]s from the [H3Driver]. Can be extracted and
     /// used independently of the [H3Controller].
     h3_event_recv: Option<UnboundedReceiver<H::Event>>,
+    /// Native selected-I/O controller when draft-15 support is enabled.
+    webtransport: Option<WebTransportController>,
 }
 
 impl<H: DriverHooks> H3Controller<H> {
+    /// Returns a clone of the native draft-15 selected-I/O controller.
+    ///
+    /// This is `None` unless [`Http3Settings::enable_webtransport`] was set
+    /// when the paired driver was constructed. Peer negotiation and exact
+    /// Session ID lifecycle are validated when each operation is processed.
+    pub fn webtransport_controller(&self) -> Option<WebTransportController> {
+        self.webtransport.clone()
+    }
+
     /// Gets a mut reference to the [`H3Event`] receiver for the paired
     /// [H3Driver].
     pub fn event_receiver_mut(&mut self) -> &mut UnboundedReceiver<H::Event> {
@@ -1771,5 +2602,30 @@ impl<H: DriverHooks> H3Controller<H> {
             }
             .into(),
         );
+    }
+
+    /// Queues WT_CLOSE_SESSION followed by FIN for an active session.
+    ///
+    /// The session becomes terminal only after H3 accepts the complete capsule
+    /// and FIN. Duplicate, unknown, pending, or already-terminal session IDs
+    /// are ignored by the driver.
+    pub fn close_webtransport_session(
+        &self, session_id: u64, error_code: u32, message: String,
+    ) -> Result<(), WebTransportSessionCloseError> {
+        if message.len() > 1024 {
+            return Err(WebTransportSessionCloseError::MessageTooLong {
+                len: message.len(),
+            });
+        }
+        self.cmd_sender
+            .send(
+                H3Command::CloseWebTransportSession {
+                    session_id,
+                    error_code,
+                    message,
+                }
+                .into(),
+            )
+            .map_err(|_| WebTransportSessionCloseError::DriverGone)
     }
 }

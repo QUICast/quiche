@@ -83,6 +83,38 @@ pub(crate) fn send_h3_dgram(
     conn.dgram_send_buf(h3_dgram_add_quarter_stream_id(quarter_stream_id, dgram)?)
 }
 
+/// Sends one H3 Datagram directly over ordinary unicast QUIC.
+///
+/// The unprefixed payload buffer is returned on every pre-admission error.
+pub(crate) fn send_h3_dgram_unicast(
+    conn: &mut QuicheConnection, quarter_stream_id: u64, dgram: DgramBuffer,
+) -> Result<(), (quiche::Error, DgramBuffer)> {
+    if quarter_stream_id > octets::MAX_VAR_INT {
+        return Err((quiche::Error::InvalidFrame, dgram));
+    }
+    let prefixed = h3_dgram_add_quarter_stream_id(quarter_stream_id, dgram)
+        .expect("validated Quarter Stream ID must encode");
+    match conn.dgram_send_buf_unicast(prefixed) {
+        Ok(()) => Ok(()),
+        Err((err, prefixed)) => {
+            let (_, payload) = h3_dgram_remove_quarter_stream_id(prefixed)
+                .expect("locally encoded H3 Datagram prefix must decode");
+            Err((err, payload))
+        },
+    }
+}
+
+/// Returns the currently usable H3 Datagram payload after its flow prefix.
+pub(crate) fn max_h3_dgram_payload(
+    conn: &QuicheConnection, quarter_stream_id: u64,
+) -> Option<usize> {
+    if quarter_stream_id > octets::MAX_VAR_INT {
+        return None;
+    }
+    conn.dgram_max_writable_len()?
+        .checked_sub(octets::varint_len(quarter_stream_id))
+}
+
 /// Sends an HTTP/3 DATAGRAM as MCQUIC channel data, using unicast fallback
 /// until the channel is proven viable by `MC_ACK`.
 #[inline]
