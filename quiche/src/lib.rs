@@ -6373,6 +6373,7 @@ impl<F: BufFactory> Connection<F> {
         // if complete.
         if let Err(Error::StreamStopped(e)) = stream.send.cap() {
             let local = stream.local;
+            self.streams.remove_send_terminal(stream_id);
             self.streams.remove_writable(&priority_key);
 
             // Only collect the stream if it is complete and not readable.
@@ -6871,6 +6872,7 @@ impl<F: BufFactory> Connection<F> {
                     let collect = stream.is_complete() && !stream.is_readable();
                     let local = stream.local;
 
+                    self.streams.remove_send_terminal(stream_id);
                     self.streams.remove_writable(&priority_key);
 
                     // Only collect the stream if it is complete and not
@@ -7050,6 +7052,22 @@ impl<F: BufFactory> Connection<F> {
     /// [`stream_writable()`]: struct.Connection.html#method.stream_writable
     /// [`writable()`]: struct.Connection.html#method.writable
     pub fn stream_writable_next(&mut self) -> Option<u64> {
+        // STOP_SENDING is terminal even while connection-level send capacity is
+        // exhausted. Its dedicated readiness index avoids scanning every
+        // ordinarily writable stream on blocked driver turns.
+        while let Some(stream_id) = self.streams.pop_send_terminal() {
+            let Some(stream) = self.streams.get(stream_id) else {
+                continue;
+            };
+            if !matches!(stream.send.cap(), Err(Error::StreamStopped(_))) {
+                continue;
+            }
+
+            let priority_key = Arc::clone(&stream.priority_key);
+            self.streams.remove_writable(&priority_key);
+            return Some(stream_id);
+        }
+
         // If there is not enough connection-level send capacity, none of the
         // streams are writable.
         if self.tx_cap == 0 {
@@ -10478,7 +10496,6 @@ impl<F: BufFactory> Connection<F> {
             return Ok(());
         }
 
-        let was_writable = stream.is_writable();
         let priority_key = Arc::clone(&stream.priority_key);
         let buffered_before = stream.send.buffered_bytes();
         let automatic_reliable_size = stream.automatic_reset_reliable_size();
@@ -10544,7 +10561,11 @@ impl<F: BufFactory> Connection<F> {
             None => {},
         }
 
-        if !was_writable {
+        // STOP_SENDING is a terminal send-direction transition even when the
+        // stream was ordinarily writable. Re-arm it once so event-driven
+        // adapters can observe the retained error without issuing a write.
+        if outcome.changed {
+            self.streams.insert_send_terminal(stream_id);
             self.streams.insert_writable(&priority_key);
         }
 

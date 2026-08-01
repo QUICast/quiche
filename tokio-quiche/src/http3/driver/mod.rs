@@ -128,6 +128,7 @@ pub use self::webtransport::WebTransportSessionEvent;
 pub use self::webtransport::WebTransportStreamControlOutcome;
 pub use self::webtransport::WebTransportStreamReadOutcome;
 pub use self::webtransport::WebTransportStreamReadyOutcome;
+pub use self::webtransport::WebTransportStreamSendTerminalOutcome;
 pub use self::webtransport::WebTransportStreamWriteLease;
 pub use self::webtransport::WebTransportStreamWriteLeaseLimit;
 pub use self::webtransport::WebTransportStreamWriteLeaseOperation;
@@ -744,6 +745,10 @@ impl<H: DriverHooks> H3Driver<H> {
                                 .webtransport_max_pending_streams_per_session,
                             max_stream_waiters: http3_settings
                                 .webtransport_max_stream_waiters,
+                            max_send_terminal_waiters: http3_settings
+                                .webtransport_max_send_terminal_waiters,
+                            max_send_terminal_waiters_per_session: http3_settings
+                                .webtransport_max_send_terminal_waiters_per_session,
                             max_datagram_waiters: http3_settings
                                 .webtransport_max_datagram_waiters,
                             max_pending_datagrams: http3_settings

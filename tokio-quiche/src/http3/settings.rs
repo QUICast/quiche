@@ -49,6 +49,8 @@ const SETTINGS_WT_INITIAL_MAX_STREAMS_BIDI: u64 = 0x2b65;
 const DEFAULT_WEBTRANSPORT_MAX_PENDING_STREAMS: usize = 256;
 const DEFAULT_WEBTRANSPORT_MAX_PENDING_STREAMS_PER_SESSION: usize = 64;
 const DEFAULT_WEBTRANSPORT_MAX_STREAM_WAITERS: usize = 256;
+const DEFAULT_WEBTRANSPORT_MAX_SEND_TERMINAL_WAITERS: usize = 256;
+const DEFAULT_WEBTRANSPORT_MAX_SEND_TERMINAL_WAITERS_PER_SESSION: usize = 64;
 const DEFAULT_WEBTRANSPORT_MAX_DATAGRAM_WAITERS: usize = 2;
 const DEFAULT_WEBTRANSPORT_MAX_SESSION_WORK_PER_CALLBACK: usize = 64;
 const DEFAULT_WEBTRANSPORT_COMMAND_CAPACITY: usize = 256;
@@ -118,6 +120,16 @@ pub struct Http3Settings {
     pub webtransport_max_pending_streams_per_session: usize,
     /// Maximum exact-stream readable and writable wait registrations.
     pub webtransport_max_stream_waiters: usize,
+    /// Maximum pending send-terminal waiters and retained terminal facts.
+    ///
+    /// The bound applies independently to waiters and facts. A value of zero
+    /// is clamped to one.
+    pub webtransport_max_send_terminal_waiters: usize,
+    /// Per-session bound for pending send-terminal waiters and retained facts.
+    ///
+    /// The bound applies independently to waiters and facts. A value of zero
+    /// is clamped to one.
+    pub webtransport_max_send_terminal_waiters_per_session: usize,
     /// Maximum exact-session Datagram-readable and send-capacity waiters.
     pub webtransport_max_datagram_waiters: usize,
     /// Work bound used independently by the native WebTransport runtime's
@@ -199,6 +211,10 @@ impl Default for Http3Settings {
                 DEFAULT_WEBTRANSPORT_MAX_PENDING_STREAMS_PER_SESSION,
             webtransport_max_stream_waiters:
                 DEFAULT_WEBTRANSPORT_MAX_STREAM_WAITERS,
+            webtransport_max_send_terminal_waiters:
+                DEFAULT_WEBTRANSPORT_MAX_SEND_TERMINAL_WAITERS,
+            webtransport_max_send_terminal_waiters_per_session:
+                DEFAULT_WEBTRANSPORT_MAX_SEND_TERMINAL_WAITERS_PER_SESSION,
             webtransport_max_datagram_waiters:
                 DEFAULT_WEBTRANSPORT_MAX_DATAGRAM_WAITERS,
             webtransport_max_session_work_per_callback:

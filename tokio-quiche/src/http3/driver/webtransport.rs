@@ -622,6 +622,47 @@ pub enum WebTransportStreamReadyOutcome {
     Rejected(WebTransportSelectionError),
 }
 
+/// Latched terminal state of one selected stream's local send direction.
+///
+/// STOP_SENDING and local send closure are level-triggered: once observed,
+/// repeated waits return the same first terminal state until the owning
+/// WebTransport session is retired. Dropping a pending wait does not consume
+/// the terminal fact. Configured terminal-fact saturation is reported as
+/// [`WebTransportSelectionError::ResourceLimit`] rather than guessing a fact.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WebTransportStreamSendTerminalOutcome {
+    /// The peer sent STOP_SENDING.
+    Stopped {
+        /// Exact physical QUIC stream ID.
+        stream_id: u64,
+        /// Exact HTTP/3 wire error carried by STOP_SENDING.
+        wire_error_code: u64,
+        /// Draft-16-decoded WebTransport application error, when valid.
+        application_error_code: Option<u32>,
+    },
+    /// FIN or a local reset closed the send direction.
+    Closed {
+        /// Exact physical QUIC stream ID.
+        stream_id: u64,
+    },
+    /// The owning WebTransport session terminated before the send direction.
+    SessionTerminated {
+        /// CONNECT stream ID identifying the WebTransport session.
+        session_id: u64,
+        /// Exact physical QUIC stream ID.
+        stream_id: u64,
+    },
+    /// The enclosing QUIC connection terminated while the wait was admitted.
+    ConnectionTerminated {
+        /// CONNECT stream ID identifying the WebTransport session.
+        session_id: u64,
+        /// Exact physical QUIC stream ID.
+        stream_id: u64,
+    },
+    /// Session or associated-stream validation failed before registration.
+    Rejected(WebTransportSelectionError),
+}
+
 /// Why a typed WebTransport Datagram operation was rejected.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WebTransportDatagramError {
@@ -731,6 +772,22 @@ pub struct WebTransportRetentionStats {
     pub provisional_streams: usize,
     /// One-shot stream and Datagram readiness registrations.
     pub waiters: usize,
+    /// Pending selected-stream send-terminal registrations.
+    pub send_terminal_waiters: usize,
+    /// Retained first-terminal send-direction facts.
+    pub send_terminal_states: usize,
+    /// Configured aggregate waiter and retained-fact bound.
+    pub max_send_terminal_waiters: usize,
+    /// Configured per-session waiter and retained-fact bound.
+    pub max_send_terminal_waiters_per_session: usize,
+    /// Sessions whose terminal-fact retention bound was exhausted.
+    pub send_terminal_overloaded_sessions: usize,
+    /// Registration, terminal observation, and teardown-wake work performed.
+    pub send_terminal_waiter_work_total: u64,
+    /// Wait registrations rejected by global, per-session, or duplicate bounds.
+    pub send_terminal_waiter_saturation_total: u64,
+    /// Terminal facts rejected by the retained-state bound.
+    pub send_terminal_state_saturation_total: u64,
     /// Aggregate retained runtime index entries, including duplicate indexes.
     pub metadata_index_entries: usize,
     /// Incoming native/provisional Datagram items retained by the runtime.
@@ -1625,6 +1682,36 @@ impl WebTransportController {
         self.wait_stream(session_id, stream_id, true).await
     }
 
+    /// Waits for one exact selected stream's local send direction to terminate.
+    ///
+    /// Ordinary writability and flow-control blocking do not complete this
+    /// wait. STOP_SENDING and local send closure are retained as one
+    /// level-triggered first-terminal fact, so registration after transport
+    /// delivery and re-registration after cancellation remain race-free.
+    /// Configured waiter or retained-fact saturation returns
+    /// [`WebTransportSelectionError::ResourceLimit`].
+    pub async fn wait_stream_send_terminal(
+        &self, session_id: u64, stream_id: u64,
+    ) -> WebTransportStreamSendTerminalOutcome {
+        let Ok(permit) = self.sender.reserve().await else {
+            return WebTransportStreamSendTerminalOutcome::Rejected(
+                WebTransportSelectionError::ConnectionClosed,
+            );
+        };
+        let (response, recv) = oneshot::channel();
+        permit.send(WebTransportCommand::WaitSendTerminal {
+            session_id,
+            stream_id,
+            response,
+        });
+        recv.await.unwrap_or(
+            WebTransportStreamSendTerminalOutcome::ConnectionTerminated {
+                session_id,
+                stream_id,
+            },
+        )
+    }
+
     async fn wait_stream(
         &self, session_id: u64, stream_id: u64, write: bool,
     ) -> WebTransportStreamReadyOutcome {
@@ -1880,7 +1967,9 @@ impl WebTransportController {
 }
 
 pub(crate) trait ErasedWriteLeaseCommand: Send {
-    fn execute(self: Box<Self>, runtime: &Runtime, qconn: &mut QuicheConnection);
+    fn execute(
+        self: Box<Self>, runtime: &mut Runtime, qconn: &mut QuicheConnection,
+    );
 
     fn reject(self: Box<Self>, error: WebTransportSelectionError);
 }
@@ -1924,7 +2013,7 @@ where
     L: WebTransportStreamWriteLease,
 {
     fn execute(
-        mut self: Box<Self>, runtime: &Runtime, qconn: &mut QuicheConnection,
+        mut self: Box<Self>, runtime: &mut Runtime, qconn: &mut QuicheConnection,
     ) {
         if self
             .response
@@ -2026,6 +2115,7 @@ where
             }
         };
         self.finish(completion, progress);
+        runtime.observe_send_terminal(qconn, self.stream_id);
     }
 
     fn reject(mut self: Box<Self>, error: WebTransportSelectionError) {
@@ -2070,6 +2160,11 @@ pub(crate) enum WebTransportCommand {
         stream_id: u64,
         write: bool,
         response: oneshot::Sender<WebTransportStreamReadyOutcome>,
+    },
+    WaitSendTerminal {
+        session_id: u64,
+        stream_id: u64,
+        response: oneshot::Sender<WebTransportStreamSendTerminalOutcome>,
     },
     Reset {
         session_id: u64,
@@ -2132,6 +2227,18 @@ impl WebTransportCommand {
                 let _ = response.send(WebTransportStreamReadyOutcome::Rejected(
                     WebTransportSelectionError::ConnectionClosed,
                 ));
+            },
+            Self::WaitSendTerminal {
+                session_id,
+                stream_id,
+                response,
+            } => {
+                let _ = response.send(
+                    WebTransportStreamSendTerminalOutcome::ConnectionTerminated {
+                        session_id,
+                        stream_id,
+                    },
+                );
             },
             Self::Reset { response, .. } | Self::Stop { response, .. } => {
                 let _ =
@@ -2426,6 +2533,8 @@ pub(crate) struct RuntimeLimits {
     pub(crate) max_pending_streams: usize,
     pub(crate) max_pending_streams_per_session: usize,
     pub(crate) max_stream_waiters: usize,
+    pub(crate) max_send_terminal_waiters: usize,
+    pub(crate) max_send_terminal_waiters_per_session: usize,
     pub(crate) max_datagram_waiters: usize,
     pub(crate) max_pending_datagrams: usize,
     pub(crate) max_pending_datagrams_per_session: usize,
@@ -2446,6 +2555,44 @@ struct OwnedStream {
     direction: WebTransportStreamDirection,
     local_prefix_len: u64,
     locally_initiated: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SendTerminalState {
+    Stopped {
+        wire_error_code: u64,
+        application_error_code: Option<u32>,
+    },
+    Closed,
+}
+
+impl SendTerminalState {
+    fn outcome(self, stream_id: u64) -> WebTransportStreamSendTerminalOutcome {
+        match self {
+            Self::Stopped {
+                wire_error_code,
+                application_error_code,
+            } => WebTransportStreamSendTerminalOutcome::Stopped {
+                stream_id,
+                wire_error_code,
+                application_error_code,
+            },
+            Self::Closed =>
+                WebTransportStreamSendTerminalOutcome::Closed { stream_id },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LatchedSendTerminal {
+    session_id: u64,
+    state: SendTerminalState,
+}
+
+#[derive(Debug)]
+struct SendTerminalWaiter {
+    session_id: u64,
+    response: oneshot::Sender<WebTransportStreamSendTerminalOutcome>,
 }
 
 #[derive(Debug)]
@@ -2534,6 +2681,14 @@ pub(crate) struct Runtime {
         BTreeMap<u64, oneshot::Sender<WebTransportStreamReadyOutcome>>,
     writable_waiters:
         BTreeMap<u64, oneshot::Sender<WebTransportStreamReadyOutcome>>,
+    send_terminal_waiters: BTreeMap<u64, SendTerminalWaiter>,
+    send_terminal_waiters_per_session: BTreeMap<u64, usize>,
+    send_terminal_states: BTreeMap<u64, LatchedSendTerminal>,
+    send_terminal_states_per_session: BTreeMap<u64, usize>,
+    send_terminal_overloaded_sessions: BTreeSet<u64>,
+    send_terminal_waiter_work_total: u64,
+    send_terminal_waiter_saturation_total: u64,
+    send_terminal_state_saturation_total: u64,
     datagram_readable_waiters:
         BTreeMap<u64, oneshot::Sender<WebTransportDatagramReadyOutcome>>,
     datagram_send_waiters:
@@ -2572,6 +2727,12 @@ impl Runtime {
                 max_session_work_per_callback: limits
                     .max_session_work_per_callback
                     .max(1),
+                max_send_terminal_waiters: limits
+                    .max_send_terminal_waiters
+                    .max(1),
+                max_send_terminal_waiters_per_session: limits
+                    .max_send_terminal_waiters_per_session
+                    .max(1),
                 ..limits
             },
             write_lease_accounting,
@@ -2584,6 +2745,14 @@ impl Runtime {
             opening_by_session: BTreeMap::new(),
             readable_waiters: BTreeMap::new(),
             writable_waiters: BTreeMap::new(),
+            send_terminal_waiters: BTreeMap::new(),
+            send_terminal_waiters_per_session: BTreeMap::new(),
+            send_terminal_states: BTreeMap::new(),
+            send_terminal_states_per_session: BTreeMap::new(),
+            send_terminal_overloaded_sessions: BTreeSet::new(),
+            send_terminal_waiter_work_total: 0,
+            send_terminal_waiter_saturation_total: 0,
+            send_terminal_state_saturation_total: 0,
             datagram_readable_waiters: BTreeMap::new(),
             datagram_send_waiters: BTreeMap::new(),
             datagrams: BTreeMap::new(),
@@ -2726,6 +2895,7 @@ impl Runtime {
             session_id,
             WebTransportSelectionError::TerminalSession,
         );
+        self.finish_send_terminal_session(session_id);
         self.release_datagrams(session_id);
         application_visible
             .then_some(WebTransportSessionEvent::Rejected { session_id, status })
@@ -2878,6 +3048,7 @@ impl Runtime {
             session_id,
             WebTransportSelectionError::TerminalSession,
         );
+        self.finish_send_terminal_session(session_id);
         self.release_datagrams(session_id);
         application_visible
             .then_some(WebTransportSessionEvent::Terminated {
@@ -3168,6 +3339,13 @@ impl Runtime {
                 write,
                 response,
             } => self.wait_stream(qconn, session_id, stream_id, write, response),
+            WebTransportCommand::WaitSendTerminal {
+                session_id,
+                stream_id,
+                response,
+            } => self.wait_stream_send_terminal(
+                qconn, session_id, stream_id, response,
+            ),
             WebTransportCommand::Reset {
                 session_id,
                 stream_id,
@@ -3545,6 +3723,243 @@ impl Runtime {
         }
     }
 
+    fn wait_stream_send_terminal(
+        &mut self, qconn: &QuicheConnection, session_id: u64, stream_id: u64,
+        response: oneshot::Sender<WebTransportStreamSendTerminalOutcome>,
+    ) {
+        self.send_terminal_waiter_work_total =
+            self.send_terminal_waiter_work_total.saturating_add(1);
+        if response.is_closed() {
+            return;
+        }
+        if let Some(error) = self.selection_error(session_id, qconn) {
+            let _ = response
+                .send(WebTransportStreamSendTerminalOutcome::Rejected(error));
+            return;
+        }
+        if let Some(terminal) = self.send_terminal_states.get(&stream_id) {
+            let outcome = if terminal.session_id == session_id {
+                terminal.state.outcome(stream_id)
+            } else {
+                WebTransportStreamSendTerminalOutcome::Rejected(
+                    WebTransportSelectionError::ForeignStream {
+                        owner_session_id: terminal.session_id,
+                    },
+                )
+            };
+            let _ = response.send(outcome);
+            return;
+        }
+        if self.send_terminal_overloaded_sessions.contains(&session_id) {
+            let _ =
+                response.send(WebTransportStreamSendTerminalOutcome::Rejected(
+                    WebTransportSelectionError::ResourceLimit,
+                ));
+            return;
+        }
+        if let Err(error) = self.select_stream(session_id, stream_id, true, qconn)
+        {
+            let _ = response
+                .send(WebTransportStreamSendTerminalOutcome::Rejected(error));
+            return;
+        }
+
+        let terminal = match qconn.stream_send_status(stream_id) {
+            Ok(quiche::StreamSendStatus::Stopped(wire_error_code)) =>
+                Some(SendTerminalState::Stopped {
+                    wire_error_code,
+                    application_error_code: webtransport_error_from_http3(
+                        wire_error_code,
+                    ),
+                }),
+            Ok(quiche::StreamSendStatus::Closed) | Err(_) =>
+                Some(SendTerminalState::Closed),
+            Ok(
+                quiche::StreamSendStatus::Writable(_) |
+                quiche::StreamSendStatus::Blocked,
+            ) => None,
+        };
+        if let Some(terminal) = terminal {
+            let terminal =
+                self.latch_send_terminal(session_id, stream_id, terminal);
+            let _ = response.send(terminal.outcome(stream_id));
+            return;
+        }
+
+        if self
+            .send_terminal_waiters
+            .get(&stream_id)
+            .is_some_and(|waiter| waiter.response.is_closed())
+        {
+            self.remove_send_terminal_waiter(stream_id);
+        }
+        let mut session_waiters = self
+            .send_terminal_waiters_per_session
+            .get(&session_id)
+            .copied()
+            .unwrap_or(0);
+        if self.send_terminal_waiters.len() >=
+            self.limits.max_send_terminal_waiters ||
+            session_waiters >=
+                self.limits.max_send_terminal_waiters_per_session
+        {
+            self.prune_cancelled_send_terminal_waiters();
+            session_waiters = self
+                .send_terminal_waiters_per_session
+                .get(&session_id)
+                .copied()
+                .unwrap_or(0);
+        }
+        if self.send_terminal_waiters.contains_key(&stream_id) ||
+            self.send_terminal_waiters.len() >=
+                self.limits.max_send_terminal_waiters ||
+            session_waiters >=
+                self.limits.max_send_terminal_waiters_per_session
+        {
+            self.send_terminal_waiter_saturation_total =
+                self.send_terminal_waiter_saturation_total.saturating_add(1);
+            let _ =
+                response.send(WebTransportStreamSendTerminalOutcome::Rejected(
+                    WebTransportSelectionError::ResourceLimit,
+                ));
+            return;
+        }
+
+        self.send_terminal_waiters
+            .insert(stream_id, SendTerminalWaiter {
+                session_id,
+                response,
+            });
+        let count = self
+            .send_terminal_waiters_per_session
+            .entry(session_id)
+            .or_default();
+        *count = count.saturating_add(1);
+    }
+
+    fn observe_send_terminal(
+        &mut self, qconn: &QuicheConnection, stream_id: u64,
+    ) {
+        let Some(stream) = self.stream_sessions.get(&stream_id).copied() else {
+            return;
+        };
+        let state = match qconn.stream_send_status(stream_id) {
+            Ok(quiche::StreamSendStatus::Stopped(wire_error_code)) =>
+                SendTerminalState::Stopped {
+                    wire_error_code,
+                    application_error_code: webtransport_error_from_http3(
+                        wire_error_code,
+                    ),
+                },
+            Ok(quiche::StreamSendStatus::Closed) | Err(_) =>
+                SendTerminalState::Closed,
+            Ok(
+                quiche::StreamSendStatus::Writable(_) |
+                quiche::StreamSendStatus::Blocked,
+            ) => return,
+        };
+        self.send_terminal_waiter_work_total =
+            self.send_terminal_waiter_work_total.saturating_add(1);
+        self.latch_send_terminal(stream.session_id, stream_id, state);
+    }
+
+    fn latch_send_terminal(
+        &mut self, session_id: u64, stream_id: u64, state: SendTerminalState,
+    ) -> SendTerminalState {
+        if let Some(terminal) = self.send_terminal_states.get(&stream_id) {
+            return terminal.state;
+        }
+
+        let session_states = self
+            .send_terminal_states_per_session
+            .get(&session_id)
+            .copied()
+            .unwrap_or(0);
+        if self.send_terminal_states.len() >=
+            self.limits.max_send_terminal_waiters ||
+            session_states >= self.limits.max_send_terminal_waiters_per_session
+        {
+            self.send_terminal_state_saturation_total =
+                self.send_terminal_state_saturation_total.saturating_add(1);
+            self.send_terminal_overloaded_sessions.insert(session_id);
+        } else {
+            self.send_terminal_states
+                .insert(stream_id, LatchedSendTerminal { session_id, state });
+            let count = self
+                .send_terminal_states_per_session
+                .entry(session_id)
+                .or_default();
+            *count = count.saturating_add(1);
+        }
+
+        if let Some(waiter) = self.remove_send_terminal_waiter(stream_id) {
+            let _ = waiter.response.send(state.outcome(stream_id));
+        }
+        state
+    }
+
+    fn remove_send_terminal_waiter(
+        &mut self, stream_id: u64,
+    ) -> Option<SendTerminalWaiter> {
+        let waiter = self.send_terminal_waiters.remove(&stream_id)?;
+        decrement_session_count(
+            &mut self.send_terminal_waiters_per_session,
+            waiter.session_id,
+        );
+        Some(waiter)
+    }
+
+    fn prune_cancelled_send_terminal_waiters(&mut self) {
+        let cancelled: Vec<_> = self
+            .send_terminal_waiters
+            .iter()
+            .filter_map(|(&stream_id, waiter)| {
+                waiter.response.is_closed().then_some(stream_id)
+            })
+            .collect();
+        for stream_id in cancelled {
+            self.remove_send_terminal_waiter(stream_id);
+        }
+    }
+
+    fn finish_send_terminal_session(&mut self, session_id: u64) {
+        let waiter_ids: Vec<_> = self
+            .send_terminal_waiters
+            .iter()
+            .filter_map(|(&stream_id, waiter)| {
+                (waiter.session_id == session_id).then_some(stream_id)
+            })
+            .collect();
+        for stream_id in waiter_ids {
+            let Some(waiter) = self.remove_send_terminal_waiter(stream_id) else {
+                continue;
+            };
+            let outcome = self.send_terminal_states.get(&stream_id).map_or(
+                WebTransportStreamSendTerminalOutcome::SessionTerminated {
+                    session_id,
+                    stream_id,
+                },
+                |terminal| terminal.state.outcome(stream_id),
+            );
+            let _ = waiter.response.send(outcome);
+            self.send_terminal_waiter_work_total =
+                self.send_terminal_waiter_work_total.saturating_add(1);
+        }
+
+        let terminal_ids: Vec<_> = self
+            .send_terminal_states
+            .iter()
+            .filter_map(|(&stream_id, terminal)| {
+                (terminal.session_id == session_id).then_some(stream_id)
+            })
+            .collect();
+        for stream_id in terminal_ids {
+            self.send_terminal_states.remove(&stream_id);
+        }
+        self.send_terminal_states_per_session.remove(&session_id);
+        self.send_terminal_overloaded_sessions.remove(&session_id);
+    }
+
     fn wake_stream_waiter(
         &mut self, qconn: &QuicheConnection, stream_id: u64, write: bool,
     ) {
@@ -3746,7 +4161,7 @@ impl Runtime {
     }
 
     fn control_stream(
-        &self, qconn: &mut QuicheConnection, session_id: u64, stream_id: u64,
+        &mut self, qconn: &mut QuicheConnection, session_id: u64, stream_id: u64,
         error_code: u32, reset: bool,
         response: oneshot::Sender<WebTransportStreamControlOutcome>,
     ) {
@@ -3780,6 +4195,9 @@ impl Runtime {
                 WebTransportSelectionError::ConnectionClosed,
             ),
         };
+        if reset {
+            self.observe_send_terminal(qconn, stream_id);
+        }
         let _ = response.send(outcome);
     }
 
@@ -4216,6 +4634,7 @@ impl Runtime {
         let Some(stream) = self.pending_streams.get(&stream_id).copied() else {
             // Active and locally opening streams must leave StreamStopped
             // observable for the selected-I/O command that owns the send side.
+            self.observe_send_terminal(qconn, stream_id);
             self.wake_stream_waiter(qconn, stream_id, true);
             return true;
         };
@@ -4369,6 +4788,9 @@ impl Runtime {
                 let _ = self.remove_pending(stream.session_id, stream_id);
                 continue;
             }
+            if self.stream_sessions.contains_key(&stream_id) {
+                self.observe_send_terminal(qconn, stream_id);
+            }
             if let Some(stream) = self.stream_sessions.remove(&stream_id) {
                 self.close_stream_waiters(stream_id);
                 if let Some(session) = self.sessions.get_mut(&stream.session_id) {
@@ -4461,6 +4883,7 @@ impl Runtime {
             .readable_waiters
             .len()
             .saturating_add(self.writable_waiters.len())
+            .saturating_add(self.send_terminal_waiters.len())
             .saturating_add(self.datagram_readable_waiters.len())
             .saturating_add(self.datagram_send_waiters.len());
 
@@ -4476,6 +4899,10 @@ impl Runtime {
             .saturating_add(self.opening_order.len())
             .saturating_add(self.opening_by_session.len())
             .saturating_add(waiters)
+            .saturating_add(self.send_terminal_waiters_per_session.len())
+            .saturating_add(self.send_terminal_states.len())
+            .saturating_add(self.send_terminal_states_per_session.len())
+            .saturating_add(self.send_terminal_overloaded_sessions.len())
             .saturating_add(self.datagrams.len())
             .saturating_add(self.pending_datagram_count)
             .saturating_add(self.provisional_deadlines.len())
@@ -4493,6 +4920,20 @@ impl Runtime {
             associated_streams,
             provisional_streams,
             waiters,
+            send_terminal_waiters: self.send_terminal_waiters.len(),
+            send_terminal_states: self.send_terminal_states.len(),
+            max_send_terminal_waiters: self.limits.max_send_terminal_waiters,
+            max_send_terminal_waiters_per_session: self
+                .limits
+                .max_send_terminal_waiters_per_session,
+            send_terminal_overloaded_sessions: self
+                .send_terminal_overloaded_sessions
+                .len(),
+            send_terminal_waiter_work_total: self.send_terminal_waiter_work_total,
+            send_terminal_waiter_saturation_total: self
+                .send_terminal_waiter_saturation_total,
+            send_terminal_state_saturation_total: self
+                .send_terminal_state_saturation_total,
             metadata_index_entries,
             pending_datagrams: self.pending_datagram_count,
             pending_datagram_payload_bytes: self.pending_datagram_bytes,
@@ -4552,6 +4993,17 @@ impl Runtime {
                 WebTransportSelectionError::ConnectionClosed,
             ));
         }
+        for (stream_id, waiter) in std::mem::take(&mut self.send_terminal_waiters)
+        {
+            let outcome = self.send_terminal_states.get(&stream_id).map_or(
+                WebTransportStreamSendTerminalOutcome::ConnectionTerminated {
+                    session_id: waiter.session_id,
+                    stream_id,
+                },
+                |terminal| terminal.state.outcome(stream_id),
+            );
+            let _ = waiter.response.send(outcome);
+        }
         for (_, response) in std::mem::take(&mut self.datagram_readable_waiters) {
             let _ = response.send(WebTransportDatagramReadyOutcome::Rejected(
                 WebTransportDatagramError::ConnectionClosed,
@@ -4566,6 +5018,10 @@ impl Runtime {
         self.pending_streams.clear();
         self.pending_by_session.clear();
         self.stream_sessions.clear();
+        self.send_terminal_waiters_per_session.clear();
+        self.send_terminal_states.clear();
+        self.send_terminal_states_per_session.clear();
+        self.send_terminal_overloaded_sessions.clear();
         self.opening_streams.clear();
         self.opening_order.clear();
         self.opening_by_session.clear();
@@ -4589,6 +5045,16 @@ impl Runtime {
         self.deferred_responses.clear();
         self.maintenance_cursor = None;
         events
+    }
+}
+
+fn decrement_session_count(counts: &mut BTreeMap<u64, usize>, session_id: u64) {
+    let Some(count) = counts.get_mut(&session_id) else {
+        return;
+    };
+    *count = count.saturating_sub(1);
+    if *count == 0 {
+        counts.remove(&session_id);
     }
 }
 
@@ -4724,6 +5190,8 @@ mod tests {
             max_pending_streams: global,
             max_pending_streams_per_session: per_session,
             max_stream_waiters: global,
+            max_send_terminal_waiters: global,
+            max_send_terminal_waiters_per_session: per_session,
             max_datagram_waiters: 2,
             max_pending_datagrams: 256,
             max_pending_datagrams_per_session: 64,
@@ -4807,6 +5275,35 @@ mod tests {
             webtransport_error_from_http3(WT_APPLICATION_ERROR_LAST + 1),
             None
         );
+    }
+
+    #[test]
+    fn send_terminal_rejects_a_stream_owned_by_another_active_session() {
+        let pipe = pipe();
+        let mut runtime = Runtime::new(runtime_limits(8, 8, 8));
+        for session_id in [0, 4] {
+            let mut session = Session::pending(false);
+            session.phase = SessionPhase::Active;
+            runtime.sessions.insert(session_id, session);
+        }
+        runtime.stream_sessions.insert(8, OwnedStream {
+            session_id: 0,
+            direction: WebTransportStreamDirection::Bidi,
+            local_prefix_len: 3,
+            locally_initiated: true,
+        });
+
+        let (response, mut outcome) = oneshot::channel();
+        runtime.wait_stream_send_terminal(&pipe.server, 4, 8, response);
+        assert_eq!(
+            outcome.try_recv().unwrap(),
+            WebTransportStreamSendTerminalOutcome::Rejected(
+                WebTransportSelectionError::ForeignStream {
+                    owner_session_id: 0,
+                },
+            )
+        );
+        assert!(runtime.send_terminal_waiters.is_empty());
     }
 
     #[test]

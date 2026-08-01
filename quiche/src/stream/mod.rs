@@ -30,6 +30,7 @@ use std::sync::Arc;
 
 use std::collections::hash_map;
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::HashSet;
 
@@ -372,6 +373,10 @@ pub struct StreamMap<F: BufFactory = DefaultBufFactory> {
     /// of streams.
     pub writable: RBTree<StreamWritablePriorityAdapter>,
 
+    /// Send directions whose first STOP_SENDING transition still needs to be
+    /// reported through the event-driven writable API.
+    send_terminal: BTreeSet<u64>,
+
     /// Set of stream IDs corresponding to streams that are almost out of flow
     /// control credit and need to send MAX_STREAM_DATA. This is used to
     /// generate a `StreamIter` of streams without having to iterate over the
@@ -614,6 +619,18 @@ impl<F: BufFactory> StreamMap<F> {
         c.remove();
     }
 
+    pub(crate) fn insert_send_terminal(&mut self, stream_id: u64) {
+        self.send_terminal.insert(stream_id);
+    }
+
+    pub(crate) fn remove_send_terminal(&mut self, stream_id: u64) {
+        self.send_terminal.remove(&stream_id);
+    }
+
+    pub(crate) fn pop_send_terminal(&mut self) -> Option<u64> {
+        self.send_terminal.pop_first()
+    }
+
     /// Adds the stream ID to the flushable streams set.
     ///
     /// If the stream was already in the list, this does nothing.
@@ -815,6 +832,8 @@ impl<F: BufFactory> StreamMap<F> {
         self.remove_readable(&s.priority_key);
 
         self.remove_writable(&s.priority_key);
+
+        self.send_terminal.remove(&stream_id);
 
         self.remove_flushable(&s.priority_key);
 

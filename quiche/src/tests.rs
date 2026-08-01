@@ -6835,6 +6835,33 @@ fn stop_sending(
     assert_eq!(r.next(), None);
 }
 
+#[test]
+fn stop_sending_wakes_when_connection_send_capacity_is_exhausted() {
+    let mut buf = [0; 65535];
+    let mut pipe = test_utils::Pipe::new("cubic").unwrap();
+    pipe.handshake().unwrap();
+
+    pipe.server.stream_send(1, b"request", false).unwrap();
+    pipe.advance().unwrap();
+    while pipe.server.stream_writable_next().is_some() {}
+
+    let frames = [frame::Frame::StopSending {
+        stream_id: 1,
+        error_code: 42,
+    }];
+    pipe.send_pkt_to_server(Type::Short, &frames, &mut buf)
+        .unwrap();
+
+    // Congestion capacity must not hide the independent terminal transition.
+    pipe.server.tx_cap = 0;
+    assert_eq!(pipe.server.stream_writable_next(), Some(1));
+    assert_eq!(
+        pipe.server.stream_send_status(1),
+        Ok(StreamSendStatus::Stopped(42))
+    );
+    assert_eq!(pipe.server.stream_writable_next(), None);
+}
+
 #[rstest]
 fn stop_sending_fin(
     #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
