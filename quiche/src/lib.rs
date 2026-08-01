@@ -571,6 +571,16 @@ pub enum StreamSendStatus {
     Closed,
 }
 
+/// Direction whose peer stream-count limit increased.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StreamCreditDirection {
+    /// Locally initiated bidirectional streams.
+    Bidirectional,
+
+    /// Locally initiated unidirectional streams.
+    Unidirectional,
+}
+
 /// Qlog logging level.
 #[repr(C)]
 #[cfg(feature = "qlog")]
@@ -1571,6 +1581,9 @@ where
     /// Streams map, indexed by stream ID.
     pub(crate) streams: stream::StreamMap<F>,
 
+    /// Coalesced peer stream-credit transitions, bounded to one per direction.
+    stream_credit_updates: VecDeque<StreamCreditDirection>,
+
     /// Peer's original destination connection ID. Used by the client to
     /// validate the server's transport parameter.
     odcid: Option<ConnectionId<'static>>,
@@ -2349,6 +2362,7 @@ impl<F: BufFactory> Connection<F> {
                 config.local_transport_params.initial_max_streams_uni,
                 config.max_stream_window,
             ),
+            stream_credit_updates: VecDeque::with_capacity(2),
 
             odcid: None,
 
@@ -7243,6 +7257,27 @@ impl<F: BufFactory> Connection<F> {
         self.streams.peer_streams_left_uni()
     }
 
+    /// Returns the next direction whose peer stream-count limit increased.
+    ///
+    /// Updates are generated only by a received MAX_STREAMS frame that raises
+    /// the corresponding limit. Repeated updates for one direction are
+    /// coalesced until consumed, so at most two entries are retained. Callers
+    /// should inspect [`peer_streams_left_bidi()`] or
+    /// [`peer_streams_left_uni()`] after receiving an update because another
+    /// local operation may already have consumed the newly available credit.
+    ///
+    /// [`peer_streams_left_bidi()`]: Self::peer_streams_left_bidi
+    /// [`peer_streams_left_uni()`]: Self::peer_streams_left_uni
+    pub fn stream_credit_next(&mut self) -> Option<StreamCreditDirection> {
+        self.stream_credit_updates.pop_front()
+    }
+
+    fn queue_stream_credit_update(&mut self, direction: StreamCreditDirection) {
+        if !self.stream_credit_updates.contains(&direction) {
+            self.stream_credit_updates.push_back(direction);
+        }
+    }
+
     /// Returns the peer's current server-initiated unidirectional stream count
     /// limit.
     ///
@@ -10959,7 +10994,13 @@ impl<F: BufFactory> Connection<F> {
                     return Err(Error::InvalidFrame);
                 }
 
+                let previous = self.streams.peer_max_streams_bidi();
                 self.streams.update_peer_max_streams_bidi(max);
+                if max > previous {
+                    self.queue_stream_credit_update(
+                        StreamCreditDirection::Bidirectional,
+                    );
+                }
             },
 
             frame::Frame::MaxStreamsUni { max } => {
@@ -10967,7 +11008,13 @@ impl<F: BufFactory> Connection<F> {
                     return Err(Error::InvalidFrame);
                 }
 
+                let previous = self.streams.peer_max_streams_uni();
                 self.streams.update_peer_max_streams_uni(max);
+                if max > previous {
+                    self.queue_stream_credit_update(
+                        StreamCreditDirection::Unidirectional,
+                    );
+                }
             },
 
             frame::Frame::DataBlocked { .. } => {

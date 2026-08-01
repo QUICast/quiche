@@ -5455,6 +5455,55 @@ fn stream_left_uni(
     assert_eq!(MAX_STREAM_ID - 3, pipe.server.peer_streams_left_uni());
 }
 
+#[test]
+fn stream_credit_updates_are_coalesced_and_directional() {
+    let mut buf = [0; 65535];
+    let mut pipe = test_utils::Pipe::new("cubic").unwrap();
+    assert_eq!(pipe.handshake(), Ok(()));
+    assert_eq!(pipe.server.stream_credit_next(), None);
+
+    let frames = [
+        frame::Frame::MaxStreamsBidi { max: 4 },
+        frame::Frame::MaxStreamsBidi { max: 5 },
+        frame::Frame::MaxStreamsUni { max: 4 },
+    ];
+    pipe.send_pkt_to_server(Type::Short, &frames, &mut buf)
+        .unwrap();
+    assert_eq!(
+        pipe.server.stream_credit_next(),
+        Some(StreamCreditDirection::Bidirectional)
+    );
+    assert_eq!(
+        pipe.server.stream_credit_next(),
+        Some(StreamCreditDirection::Unidirectional)
+    );
+    assert_eq!(pipe.server.stream_credit_next(), None);
+
+    let frames = [
+        frame::Frame::MaxStreamsBidi { max: 5 },
+        frame::Frame::MaxStreamsUni { max: 4 },
+    ];
+    pipe.send_pkt_to_server(Type::Short, &frames, &mut buf)
+        .unwrap();
+    assert_eq!(pipe.server.stream_credit_next(), None);
+
+    let frames = [
+        frame::Frame::MaxStreamsUni { max: 5 },
+        frame::Frame::MaxStreamsBidi { max: 6 },
+    ];
+    pipe.send_pkt_to_server(Type::Short, &frames, &mut buf)
+        .unwrap();
+    assert_eq!(
+        pipe.server.stream_credit_next(),
+        Some(StreamCreditDirection::Unidirectional)
+    );
+    assert_eq!(
+        pipe.server.stream_credit_next(),
+        Some(StreamCreditDirection::Bidirectional)
+    );
+    assert_eq!(pipe.server.stream_credit_next(), None);
+}
+
 #[rstest]
 fn stream_limit_bidi(
     #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,

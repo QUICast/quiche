@@ -112,11 +112,12 @@ pub struct Http3Settings {
     /// nonzero session-level flow-control SETTINGS and permits one pending or
     /// active session per HTTP/3 connection.
     pub enable_webtransport: bool,
-    /// Aggregate maximum for optimistic inbound streams and locally opening
-    /// streams whose association prefix has not committed.
+    /// Aggregate maximum for optimistic inbound streams, local opens waiting
+    /// for QUIC MAX_STREAMS credit, and local streams whose association prefix
+    /// has not committed.
     pub webtransport_max_pending_streams: usize,
-    /// Per-session aggregate maximum for optimistic inbound and locally opening
-    /// streams.
+    /// Per-session aggregate maximum for optimistic inbound, credit-waiting,
+    /// and prefix-opening streams.
     pub webtransport_max_pending_streams_per_session: usize,
     /// Maximum exact-stream readable and writable wait registrations.
     pub webtransport_max_stream_waiters: usize,
@@ -136,10 +137,10 @@ pub struct Http3Settings {
     /// selected-I/O, associated-stream maintenance, and Datagram receive
     /// passes.
     ///
-    /// A selected-I/O work unit is one controller command or one opening-prefix
-    /// attempt. A maintenance work unit is one admission, teardown, or closed
-    /// stream inspection. A Datagram work unit is one received QUIC Datagram.
-    /// A value of zero is clamped to one.
+    /// A selected-I/O work unit is one controller command, one credit-waiting
+    /// open attempt, or one opening-prefix attempt. A maintenance work unit is
+    /// one admission, teardown, or closed stream inspection. A Datagram work
+    /// unit is one received QUIC Datagram. A value of zero is clamped to one.
     pub webtransport_max_session_work_per_callback: usize,
     /// Capacity of the dedicated native WebTransport controller command lane.
     /// A value of zero is clamped to one. Buffer-bearing async calls waiting to

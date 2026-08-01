@@ -736,6 +736,8 @@ impl<H: DriverHooks> H3Driver<H> {
                         http3_settings
                             .webtransport_max_stream_write_lease_retained_bytes,
                     ));
+                let open_cancellation_pending =
+                    Arc::new(std::sync::atomic::AtomicBool::new(false));
                 (
                     Some(WebTransportRuntime::new_with_write_lease_accounting(
                         WebTransportRuntimeLimits {
@@ -789,6 +791,7 @@ impl<H: DriverHooks> H3Driver<H> {
                                 .webtransport_max_session_work_per_callback,
                         },
                         Arc::clone(&write_lease_accounting),
+                        Arc::clone(&open_cancellation_pending),
                     )),
                     Some(recv),
                     Some(WebTransportController::new(
@@ -800,6 +803,7 @@ impl<H: DriverHooks> H3Driver<H> {
                         http3_settings
                             .webtransport_max_datagram_send_allocation_bytes,
                         write_lease_accounting,
+                        open_cancellation_pending,
                     )),
                 )
             } else {
@@ -2125,7 +2129,18 @@ impl<H: DriverHooks> H3Driver<H> {
         let Some(runtime) = self.webtransport.as_mut() else {
             return Ok(false);
         };
-        Ok(runtime.process_opening_streams(conn, qconn, 1) != 0)
+        Ok(runtime.process_open_work(conn, qconn, 1) != 0)
+    }
+
+    fn process_webtransport_stream_credit_updates(
+        &mut self, qconn: &mut QuicheConnection,
+    ) {
+        let Some(runtime) = self.webtransport.as_mut() else {
+            return;
+        };
+        while let Some(direction) = qconn.stream_credit_next() {
+            runtime.stream_credit_available(direction);
+        }
     }
 
     fn process_webtransport_io(
@@ -2529,6 +2544,7 @@ impl<H: DriverHooks> ApplicationOverQuic for H3Driver<H> {
         // producing an application event. Synchronize after the poll pass so a
         // client CONNECT waiting on negotiation cannot deadlock.
         self.forward_settings(qconn)?;
+        self.process_webtransport_stream_credit_updates(qconn);
         self.process_webtransport_readable_wakes(qconn);
         self.process_deferred_webtransport_capsules(qconn)?;
         self.process_available_dgrams(qconn)?;

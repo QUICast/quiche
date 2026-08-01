@@ -1582,6 +1582,27 @@ mod server_side_driver {
         .unwrap()
     }
 
+    fn single_server_stream_each_direction_webtransport_pipe() -> DriverPipe {
+        let mut client = default_quiche_config();
+        client.set_initial_max_streams_bidi(1);
+        // The server consumes four unidirectional streams for HTTP/3 control,
+        // QPACK, and grease, leaving exactly one for WebTransport.
+        client.set_initial_max_streams_uni(5);
+        client.set_initial_max_stream_data_bidi_remote(3);
+        client.enable_dgram(true, 10, 10);
+        client.enable_reset_stream_at(true);
+
+        let mut server = default_quiche_config();
+        server.enable_dgram(true, 10, 10);
+        server.enable_reset_stream_at(true);
+
+        quiche::test_utils::Pipe::with_client_and_server_config_and_buf(
+            &mut client,
+            &mut server,
+        )
+        .unwrap()
+    }
+
     fn webtransport_helper(
         settings: Http3Settings,
     ) -> DriverTestHelper<ServerHooks> {
@@ -1979,10 +2000,12 @@ mod server_side_driver {
         tokio::task::yield_now().await;
         for _ in 0..4 {
             helper.work_loop_iter().unwrap();
+            tokio::task::yield_now().await;
             if open.is_finished() {
                 break;
             }
         }
+        assert!(open.is_finished(), "bidirectional stream open stalled");
         assert_matches!(
             open.await.unwrap(),
             WebTransportOpenStreamOutcome::Opened { stream_id } => stream_id
@@ -2000,10 +2023,12 @@ mod server_side_driver {
         tokio::task::yield_now().await;
         for _ in 0..4 {
             helper.work_loop_iter().unwrap();
+            tokio::task::yield_now().await;
             if open.is_finished() {
                 break;
             }
         }
+        assert!(open.is_finished(), "unidirectional stream open stalled");
         assert_matches!(
             open.await.unwrap(),
             WebTransportOpenStreamOutcome::Opened { stream_id } => stream_id
@@ -2036,6 +2061,17 @@ mod server_side_driver {
         })
     }
 
+    fn retire_send_terminal(
+        controller: &WebTransportController, session_id: u64, stream_id: u64,
+    ) -> tokio::task::JoinHandle<WebTransportStreamSendTerminalOutcome> {
+        let controller = controller.clone();
+        tokio::spawn(async move {
+            controller
+                .retire_stream_send_terminal(session_id, stream_id)
+                .await
+        })
+    }
+
     async fn webtransport_retention_stats(
         helper: &mut DriverTestHelper<ServerHooks>,
         controller: &WebTransportController,
@@ -2046,6 +2082,60 @@ mod server_side_driver {
         tokio::task::yield_now().await;
         helper.work_loop_iter().unwrap();
         stats.await.unwrap().unwrap()
+    }
+
+    async fn release_server_webtransport_stream_credit(
+        helper: &mut DriverTestHelper<ServerHooks>,
+        controller: &WebTransportController, session_id: u64, stream_id: u64,
+        direction: WebTransportStreamDirection, application_error: u32,
+    ) {
+        let reset_controller = controller.clone();
+        let reset = tokio::spawn(async move {
+            reset_controller
+                .reset_stream(session_id, stream_id, application_error)
+                .await
+        });
+        let stop = (direction == WebTransportStreamDirection::Bidi).then(|| {
+            let stop_controller = controller.clone();
+            tokio::spawn(async move {
+                stop_controller
+                    .stop_stream(session_id, stream_id, application_error)
+                    .await
+            })
+        });
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+            helper.work_loop_iter().unwrap();
+            if reset.is_finished() &&
+                stop.as_ref()
+                    .is_none_or(tokio::task::JoinHandle::is_finished)
+            {
+                break;
+            }
+        }
+        assert_eq!(
+            reset.await.unwrap(),
+            WebTransportStreamControlOutcome::Applied
+        );
+        if let Some(stop) = stop {
+            assert_eq!(
+                stop.await.unwrap(),
+                WebTransportStreamControlOutcome::Applied
+            );
+        }
+
+        helper.pipe.advance().unwrap();
+        let wire_error = webtransport_error_to_http3(application_error);
+        if direction == WebTransportStreamDirection::Bidi {
+            assert_eq!(
+                helper.pipe.client.stream_capacity(stream_id),
+                Err(quiche::Error::StreamStopped(wire_error))
+            );
+        }
+        assert_eq!(
+            helper.pipe.client.stream_recv(stream_id, &mut [0; 1]),
+            Err(quiche::Error::StreamReset(wire_error))
+        );
     }
 
     #[test]
@@ -3216,6 +3306,115 @@ mod server_side_driver {
     }
 
     #[tokio::test]
+    async fn webtransport_send_terminal_retirement_is_latched_and_reclaims_state()
+    {
+        let mut helper = webtransport_helper(webtransport_settings());
+        start_webtransport_driver(&mut helper);
+        let (session_id, to_client, _from_client) =
+            open_pending_webtransport_session(&mut helper);
+        accept_pending_webtransport_session(&mut helper, session_id, &to_client);
+        let controller = helper
+            .controller
+            .webtransport_controller()
+            .expect("native WebTransport controller");
+
+        // Retirement settles a pending waiter and suppresses a later STOP.
+        let retire_first =
+            open_server_webtransport_bidi(&mut helper, &controller, session_id)
+                .await;
+        receive_server_webtransport_stream(
+            &mut helper,
+            session_id,
+            retire_first,
+            h3::WebTransportStreamDirection::Bidirectional,
+        );
+        let pending =
+            wait_for_send_terminal(&controller, session_id, retire_first);
+        tokio::task::yield_now().await;
+        helper.work_loop_iter().unwrap();
+        assert!(!pending.is_finished());
+        let retirement =
+            retire_send_terminal(&controller, session_id, retire_first);
+        tokio::task::yield_now().await;
+        helper.work_loop_iter().unwrap();
+        let retired = WebTransportStreamSendTerminalOutcome::Retired {
+            session_id,
+            stream_id: retire_first,
+        };
+        assert_eq!(pending.await.unwrap(), retired);
+        assert_eq!(retirement.await.unwrap(), retired);
+
+        let stop_wire = webtransport_error_to_http3(71);
+        helper
+            .pipe
+            .client
+            .stream_shutdown(retire_first, quiche::Shutdown::Read, stop_wire)
+            .unwrap();
+        helper.advance_and_run_loop().unwrap();
+        let stats = webtransport_retention_stats(&mut helper, &controller).await;
+        assert_eq!(stats.send_terminal_waiters, 0);
+        assert_eq!(stats.send_terminal_states, 0);
+        assert_eq!(stats.send_terminal_overloaded_sessions, 0);
+
+        // Retirement remains idempotent while the selected stream is owned,
+        // and re-registration observes the level-triggered retired state.
+        for outcome in [
+            retire_send_terminal(&controller, session_id, retire_first),
+            wait_for_send_terminal(&controller, session_id, retire_first),
+        ] {
+            tokio::task::yield_now().await;
+            helper.work_loop_iter().unwrap();
+            assert_eq!(outcome.await.unwrap(), retired);
+        }
+
+        // A STOP that wins the race is retained until retirement, even after
+        // one waiter has already consumed the reported terminal fact.
+        let stop_first =
+            open_server_webtransport_bidi(&mut helper, &controller, session_id)
+                .await;
+        receive_server_webtransport_stream(
+            &mut helper,
+            session_id,
+            stop_first,
+            h3::WebTransportStreamDirection::Bidirectional,
+        );
+        let stop_wire = webtransport_error_to_http3(73);
+        helper
+            .pipe
+            .client
+            .stream_shutdown(stop_first, quiche::Shutdown::Read, stop_wire)
+            .unwrap();
+        helper.advance_and_run_loop().unwrap();
+        let wait = wait_for_send_terminal(&controller, session_id, stop_first);
+        tokio::task::yield_now().await;
+        helper.work_loop_iter().unwrap();
+        assert_eq!(
+            wait.await.unwrap(),
+            WebTransportStreamSendTerminalOutcome::Stopped {
+                stream_id: stop_first,
+                wire_error_code: stop_wire,
+                application_error_code: Some(73),
+            }
+        );
+        let stats = webtransport_retention_stats(&mut helper, &controller).await;
+        assert_eq!(stats.send_terminal_states, 1);
+
+        let retirement =
+            retire_send_terminal(&controller, session_id, stop_first);
+        tokio::task::yield_now().await;
+        helper.work_loop_iter().unwrap();
+        assert_eq!(
+            retirement.await.unwrap(),
+            WebTransportStreamSendTerminalOutcome::Retired {
+                session_id,
+                stream_id: stop_first,
+            }
+        );
+        let stats = webtransport_retention_stats(&mut helper, &controller).await;
+        assert_eq!(stats.send_terminal_states, 0);
+    }
+
+    #[tokio::test]
     async fn webtransport_send_terminal_waits_through_blocking_and_idle_turns() {
         let mut helper =
             DriverTestHelper::<ServerHooks>::with_pipe_and_http3_settings(
@@ -3418,6 +3617,30 @@ mod server_side_driver {
         assert_eq!(stats.send_terminal_waiter_saturation_total, 1);
         assert_eq!(stats.send_terminal_state_saturation_total, 1);
 
+        let retire = retire_send_terminal(&controller, session_id, second);
+        tokio::task::yield_now().await;
+        helper.work_loop_iter().unwrap();
+        assert_eq!(
+            retire.await.unwrap(),
+            WebTransportStreamSendTerminalOutcome::Retired {
+                session_id,
+                stream_id: second,
+            }
+        );
+        let stats = webtransport_retention_stats(&mut helper, &controller).await;
+        assert_eq!(stats.send_terminal_states, 1);
+        assert_eq!(stats.send_terminal_overloaded_sessions, 0);
+
+        let retire = retire_send_terminal(&controller, session_id, first);
+        tokio::task::yield_now().await;
+        helper.work_loop_iter().unwrap();
+        assert_matches!(
+            retire.await.unwrap(),
+            WebTransportStreamSendTerminalOutcome::Retired { .. }
+        );
+        let stats = webtransport_retention_stats(&mut helper, &controller).await;
+        assert_eq!(stats.send_terminal_states, 0);
+
         helper
             .pipe
             .client
@@ -3454,6 +3677,15 @@ mod server_side_driver {
                 wait.await.unwrap(),
                 WebTransportStreamSendTerminalOutcome::Rejected(error)
             );
+
+            let retire =
+                retire_send_terminal(&controller, selected_session, stream_id);
+            tokio::task::yield_now().await;
+            helper.work_loop_iter().unwrap();
+            assert_eq!(
+                retire.await.unwrap(),
+                WebTransportStreamSendTerminalOutcome::Rejected(error)
+            );
         }
 
         let peer_uni = 18;
@@ -3485,6 +3717,16 @@ mod server_side_driver {
                 WebTransportSelectionError::WrongDirection,
             )
         );
+        let wrong_direction =
+            retire_send_terminal(&controller, session_id, peer_uni);
+        tokio::task::yield_now().await;
+        helper.work_loop_iter().unwrap();
+        assert_eq!(
+            wrong_direction.await.unwrap(),
+            WebTransportStreamSendTerminalOutcome::Rejected(
+                WebTransportSelectionError::WrongDirection,
+            )
+        );
 
         helper.pipe.client.stream_send(peer_uni, &[], true).unwrap();
         for _ in 0..8 {
@@ -3502,6 +3744,205 @@ mod server_side_driver {
             WebTransportStreamSendTerminalOutcome::Rejected(
                 WebTransportSelectionError::StaleStream,
             )
+        );
+        let stale = retire_send_terminal(&controller, session_id, peer_uni);
+        tokio::task::yield_now().await;
+        helper.work_loop_iter().unwrap();
+        assert_eq!(
+            stale.await.unwrap(),
+            WebTransportStreamSendTerminalOutcome::Rejected(
+                WebTransportSelectionError::StaleStream,
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn webtransport_send_terminal_retirement_orders_with_local_closure() {
+        let mut helper = webtransport_helper(webtransport_settings());
+        start_webtransport_driver(&mut helper);
+        let (session_id, to_client, _from_client) =
+            open_pending_webtransport_session(&mut helper);
+        accept_pending_webtransport_session(&mut helper, session_id, &to_client);
+        let controller = helper
+            .controller
+            .webtransport_controller()
+            .expect("native WebTransport controller");
+
+        let fin_first =
+            open_server_webtransport_bidi(&mut helper, &controller, session_id)
+                .await;
+        let fin_wait = wait_for_send_terminal(&controller, session_id, fin_first);
+        tokio::task::yield_now().await;
+        helper.work_loop_iter().unwrap();
+        let write_controller = controller.clone();
+        let fin = tokio::spawn(async move {
+            write_controller
+                .write_stream(session_id, fin_first, Bytes::new(), true)
+                .await
+        });
+        tokio::task::yield_now().await;
+        helper.work_loop_iter().unwrap();
+        assert_matches!(
+            fin.await.unwrap(),
+            WebTransportStreamWriteOutcome::Accepted {
+                accepted: 0,
+                fin_accepted: true,
+                ..
+            }
+        );
+        assert_eq!(
+            fin_wait.await.unwrap(),
+            WebTransportStreamSendTerminalOutcome::Closed {
+                stream_id: fin_first,
+            }
+        );
+        let retirement = retire_send_terminal(&controller, session_id, fin_first);
+        tokio::task::yield_now().await;
+        helper.work_loop_iter().unwrap();
+        assert_eq!(
+            retirement.await.unwrap(),
+            WebTransportStreamSendTerminalOutcome::Retired {
+                session_id,
+                stream_id: fin_first,
+            }
+        );
+
+        let retire_first =
+            open_server_webtransport_bidi(&mut helper, &controller, session_id)
+                .await;
+        let retirement =
+            retire_send_terminal(&controller, session_id, retire_first);
+        tokio::task::yield_now().await;
+        helper.work_loop_iter().unwrap();
+        assert_matches!(
+            retirement.await.unwrap(),
+            WebTransportStreamSendTerminalOutcome::Retired { .. }
+        );
+        let reset_controller = controller.clone();
+        let reset = tokio::spawn(async move {
+            reset_controller
+                .reset_stream(session_id, retire_first, 79)
+                .await
+        });
+        tokio::task::yield_now().await;
+        helper.work_loop_iter().unwrap();
+        assert_eq!(
+            reset.await.unwrap(),
+            WebTransportStreamControlOutcome::Applied
+        );
+        let stats = webtransport_retention_stats(&mut helper, &controller).await;
+        assert_eq!(stats.send_terminal_waiters, 0);
+        assert_eq!(stats.send_terminal_states, 0);
+    }
+
+    #[tokio::test]
+    async fn webtransport_send_terminal_retirement_orders_with_teardown() {
+        let mut helper = webtransport_helper(webtransport_settings());
+        start_webtransport_driver(&mut helper);
+        let (session_id, to_client, _from_client) =
+            open_pending_webtransport_session(&mut helper);
+        accept_pending_webtransport_session(&mut helper, session_id, &to_client);
+        let controller = helper
+            .controller
+            .webtransport_controller()
+            .expect("native WebTransport controller");
+        let stream_id =
+            open_server_webtransport_bidi(&mut helper, &controller, session_id)
+                .await;
+        let wait = wait_for_send_terminal(&controller, session_id, stream_id);
+        tokio::task::yield_now().await;
+        helper.work_loop_iter().unwrap();
+        let retire = retire_send_terminal(&controller, session_id, stream_id);
+        tokio::task::yield_now().await;
+        helper.work_loop_iter().unwrap();
+        let retired = WebTransportStreamSendTerminalOutcome::Retired {
+            session_id,
+            stream_id,
+        };
+        assert_eq!(wait.await.unwrap(), retired);
+        assert_eq!(retire.await.unwrap(), retired);
+        helper
+            .controller
+            .close_webtransport_session(session_id, 3, "closed".to_string())
+            .unwrap();
+        assert_eq!(helper.process_commands().unwrap(), 1);
+
+        let mut helper = webtransport_helper(webtransport_settings());
+        start_webtransport_driver(&mut helper);
+        let (session_id, to_client, _from_client) =
+            open_pending_webtransport_session(&mut helper);
+        accept_pending_webtransport_session(&mut helper, session_id, &to_client);
+        let controller = helper
+            .controller
+            .webtransport_controller()
+            .expect("native WebTransport controller");
+        let stream_id =
+            open_server_webtransport_bidi(&mut helper, &controller, session_id)
+                .await;
+        let wait = wait_for_send_terminal(&controller, session_id, stream_id);
+        tokio::task::yield_now().await;
+        helper.work_loop_iter().unwrap();
+        helper
+            .controller
+            .close_webtransport_session(session_id, 5, "closed".to_string())
+            .unwrap();
+        assert_eq!(helper.process_commands().unwrap(), 1);
+        assert_eq!(
+            wait.await.unwrap(),
+            WebTransportStreamSendTerminalOutcome::SessionTerminated {
+                session_id,
+                stream_id,
+            }
+        );
+        let retire = retire_send_terminal(&controller, session_id, stream_id);
+        tokio::task::yield_now().await;
+        helper.work_loop_iter().unwrap();
+        assert_eq!(
+            retire.await.unwrap(),
+            WebTransportStreamSendTerminalOutcome::Rejected(
+                WebTransportSelectionError::TerminalSession,
+            )
+        );
+
+        let mut helper = webtransport_helper(webtransport_settings());
+        start_webtransport_driver(&mut helper);
+        let (session_id, to_client, _from_client) =
+            open_pending_webtransport_session(&mut helper);
+        accept_pending_webtransport_session(&mut helper, session_id, &to_client);
+        let controller = helper
+            .controller
+            .webtransport_controller()
+            .expect("native WebTransport controller");
+        let stream_id =
+            open_server_webtransport_bidi(&mut helper, &controller, session_id)
+                .await;
+        let retire = retire_send_terminal(&controller, session_id, stream_id);
+        for _ in 0..8 {
+            if helper
+                .driver
+                .webtransport_cmd_recv
+                .as_ref()
+                .is_some_and(|receiver| receiver.len() == 1)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            helper
+                .driver
+                .webtransport_cmd_recv
+                .as_ref()
+                .map(tokio::sync::mpsc::Receiver::len),
+            Some(1)
+        );
+        drop(helper);
+        assert_eq!(
+            retire.await.unwrap(),
+            WebTransportStreamSendTerminalOutcome::ConnectionTerminated {
+                session_id,
+                stream_id,
+            }
         );
     }
 
@@ -3902,7 +4343,7 @@ mod server_side_driver {
     }
 
     #[tokio::test]
-    async fn webtransport_stream_limit_is_retryable_resource_outcome() {
+    async fn webtransport_stream_limit_waits_for_max_streams_credit() {
         let mut helper =
             DriverTestHelper::<ServerHooks>::with_pipe_and_http3_settings(
                 single_server_bidi_webtransport_pipe(),
@@ -3918,10 +4359,15 @@ mod server_side_driver {
             .webtransport_controller()
             .expect("native WebTransport controller");
 
-        assert_eq!(
+        let first =
             open_server_webtransport_bidi(&mut helper, &controller, session_id)
-                .await,
-            1,
+                .await;
+        assert_eq!(first, 1);
+        receive_server_webtransport_stream(
+            &mut helper,
+            session_id,
+            first,
+            h3::WebTransportStreamDirection::Bidirectional,
         );
         let blocked_controller = controller.clone();
         let blocked = tokio::spawn(async move {
@@ -3931,11 +4377,496 @@ mod server_side_driver {
         });
         tokio::task::yield_now().await;
         helper.work_loop_iter().unwrap();
+        assert!(!blocked.is_finished());
+        let before = webtransport_retention_stats(&mut helper, &controller).await;
+        assert_eq!(before.stream_open_waiters, 1);
+        for _ in 0..32 {
+            helper.work_loop_iter().unwrap();
+        }
+        let idle = webtransport_retention_stats(&mut helper, &controller).await;
+        assert_eq!(
+            idle.stream_open_waiter_work_total,
+            before.stream_open_waiter_work_total
+        );
+
+        let reset_controller = controller.clone();
+        let reset = tokio::spawn(async move {
+            reset_controller.reset_stream(session_id, first, 83).await
+        });
+        let stop_controller = controller.clone();
+        let stop = tokio::spawn(async move {
+            stop_controller.stop_stream(session_id, first, 83).await
+        });
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+            helper.work_loop_iter().unwrap();
+            if reset.is_finished() && stop.is_finished() {
+                break;
+            }
+        }
+        assert_eq!(
+            reset.await.unwrap(),
+            WebTransportStreamControlOutcome::Applied
+        );
+        assert_eq!(
+            stop.await.unwrap(),
+            WebTransportStreamControlOutcome::Applied
+        );
+
+        helper.pipe.advance().unwrap();
+        let wire_error = webtransport_error_to_http3(83);
+        assert_eq!(
+            helper.pipe.client.stream_capacity(first),
+            Err(quiche::Error::StreamStopped(wire_error))
+        );
+        assert_eq!(
+            helper.pipe.client.stream_recv(first, &mut [0; 1]),
+            Err(quiche::Error::StreamReset(wire_error))
+        );
+
+        for _ in 0..32 {
+            helper.advance_and_run_loop().unwrap();
+            tokio::task::yield_now().await;
+            if blocked.is_finished() {
+                break;
+            }
+        }
+        assert!(
+            blocked.is_finished(),
+            "MAX_STREAMS did not resume the open: peer_left={} client_closed={} server_closed={}",
+            helper.pipe.server.peer_streams_left_bidi(),
+            helper.pipe.client.stream_closed(first),
+            helper.pipe.server.stream_closed(first),
+        );
         assert_eq!(
             blocked.await.unwrap(),
+            WebTransportOpenStreamOutcome::Opened { stream_id: 5 }
+        );
+        let after = webtransport_retention_stats(&mut helper, &controller).await;
+        assert_eq!(after.stream_open_waiters, 0);
+        assert_eq!(
+            after.stream_open_waiter_work_total,
+            before.stream_open_waiter_work_total + 1
+        );
+    }
+
+    #[tokio::test]
+    async fn webtransport_stream_credit_is_directional_and_fifo() {
+        let mut helper =
+            DriverTestHelper::<ServerHooks>::with_pipe_and_http3_settings(
+                single_server_stream_each_direction_webtransport_pipe(),
+                webtransport_settings(),
+            )
+            .unwrap();
+        start_webtransport_driver(&mut helper);
+        let (session_id, to_client, _from_client) =
+            open_pending_webtransport_session(&mut helper);
+        accept_pending_webtransport_session(&mut helper, session_id, &to_client);
+        let controller = helper
+            .controller
+            .webtransport_controller()
+            .expect("native WebTransport controller");
+
+        let first_bidi =
+            open_server_webtransport_bidi(&mut helper, &controller, session_id)
+                .await;
+        receive_server_webtransport_stream(
+            &mut helper,
+            session_id,
+            first_bidi,
+            h3::WebTransportStreamDirection::Bidirectional,
+        );
+        let first_uni =
+            open_server_webtransport_uni(&mut helper, &controller, session_id)
+                .await;
+        assert_eq!(first_uni, 19);
+        receive_server_webtransport_stream(
+            &mut helper,
+            session_id,
+            first_uni,
+            h3::WebTransportStreamDirection::Unidirectional,
+        );
+
+        let bidi_controller = controller.clone();
+        let first_bidi_waiter = tokio::spawn(async move {
+            bidi_controller.open_bidirectional_stream(session_id).await
+        });
+        let bidi_controller = controller.clone();
+        let second_bidi_waiter = tokio::spawn(async move {
+            bidi_controller.open_bidirectional_stream(session_id).await
+        });
+        let uni_controller = controller.clone();
+        let uni_waiter = tokio::spawn(async move {
+            uni_controller.open_unidirectional_stream(session_id).await
+        });
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+            helper.work_loop_iter().unwrap();
+        }
+        assert!(!first_bidi_waiter.is_finished());
+        assert!(!second_bidi_waiter.is_finished());
+        assert!(!uni_waiter.is_finished());
+        let stats = webtransport_retention_stats(&mut helper, &controller).await;
+        assert_eq!(stats.stream_open_waiters, 3);
+
+        release_server_webtransport_stream_credit(
+            &mut helper,
+            &controller,
+            session_id,
+            first_bidi,
+            WebTransportStreamDirection::Bidi,
+            89,
+        )
+        .await;
+        for _ in 0..32 {
+            helper.advance_and_run_loop().unwrap();
+            tokio::task::yield_now().await;
+            if first_bidi_waiter.is_finished() {
+                break;
+            }
+        }
+        assert!(first_bidi_waiter.is_finished(), "bidi credit wake stalled");
+        assert_eq!(
+            first_bidi_waiter.await.unwrap(),
+            WebTransportOpenStreamOutcome::Opened { stream_id: 5 }
+        );
+        assert!(!second_bidi_waiter.is_finished());
+        assert!(!uni_waiter.is_finished());
+        receive_server_webtransport_stream(
+            &mut helper,
+            session_id,
+            5,
+            h3::WebTransportStreamDirection::Bidirectional,
+        );
+
+        release_server_webtransport_stream_credit(
+            &mut helper,
+            &controller,
+            session_id,
+            first_uni,
+            WebTransportStreamDirection::Uni,
+            97,
+        )
+        .await;
+        for _ in 0..32 {
+            helper.advance_and_run_loop().unwrap();
+            tokio::task::yield_now().await;
+            if uni_waiter.is_finished() {
+                break;
+            }
+        }
+        assert!(uni_waiter.is_finished(), "uni credit wake stalled");
+        assert_eq!(
+            uni_waiter.await.unwrap(),
+            WebTransportOpenStreamOutcome::Opened { stream_id: 23 }
+        );
+        assert!(!second_bidi_waiter.is_finished());
+
+        release_server_webtransport_stream_credit(
+            &mut helper,
+            &controller,
+            session_id,
+            5,
+            WebTransportStreamDirection::Bidi,
+            101,
+        )
+        .await;
+        for _ in 0..32 {
+            helper.advance_and_run_loop().unwrap();
+            tokio::task::yield_now().await;
+            if second_bidi_waiter.is_finished() {
+                break;
+            }
+        }
+        assert!(second_bidi_waiter.is_finished(), "second bidi wake stalled");
+        assert_eq!(
+            second_bidi_waiter.await.unwrap(),
+            WebTransportOpenStreamOutcome::Opened { stream_id: 9 }
+        );
+        let stats = webtransport_retention_stats(&mut helper, &controller).await;
+        assert_eq!(stats.stream_open_waiters, 0);
+        assert_eq!(stats.stream_open_waiter_work_total, 3);
+    }
+
+    #[tokio::test]
+    async fn webtransport_stream_credit_before_registration_is_not_lost() {
+        let mut helper =
+            DriverTestHelper::<ServerHooks>::with_pipe_and_http3_settings(
+                single_server_bidi_webtransport_pipe(),
+                webtransport_settings(),
+            )
+            .unwrap();
+        start_webtransport_driver(&mut helper);
+        let (session_id, to_client, _from_client) =
+            open_pending_webtransport_session(&mut helper);
+        accept_pending_webtransport_session(&mut helper, session_id, &to_client);
+        let controller = helper
+            .controller
+            .webtransport_controller()
+            .expect("native WebTransport controller");
+        let first =
+            open_server_webtransport_bidi(&mut helper, &controller, session_id)
+                .await;
+        receive_server_webtransport_stream(
+            &mut helper,
+            session_id,
+            first,
+            h3::WebTransportStreamDirection::Bidirectional,
+        );
+        release_server_webtransport_stream_credit(
+            &mut helper,
+            &controller,
+            session_id,
+            first,
+            WebTransportStreamDirection::Bidi,
+            103,
+        )
+        .await;
+        for _ in 0..32 {
+            helper.advance_and_run_loop().unwrap();
+            if helper.pipe.server.peer_streams_left_bidi() == 1 {
+                break;
+            }
+        }
+        assert_eq!(helper.pipe.server.peer_streams_left_bidi(), 1);
+
+        assert_eq!(
+            open_server_webtransport_bidi(&mut helper, &controller, session_id)
+                .await,
+            5
+        );
+        let stats = webtransport_retention_stats(&mut helper, &controller).await;
+        assert_eq!(stats.stream_open_waiters, 0);
+        assert_eq!(stats.stream_open_waiter_work_total, 0);
+    }
+
+    #[tokio::test]
+    async fn webtransport_stream_credit_cancellation_bounds_and_teardown() {
+        let mut settings = webtransport_settings();
+        settings.webtransport_max_pending_streams = 1;
+        settings.webtransport_max_pending_streams_per_session = 1;
+        let mut helper =
+            DriverTestHelper::<ServerHooks>::with_pipe_and_http3_settings(
+                single_server_bidi_webtransport_pipe(),
+                settings.clone(),
+            )
+            .unwrap();
+        start_webtransport_driver(&mut helper);
+        let (session_id, to_client, _from_client) =
+            open_pending_webtransport_session(&mut helper);
+        accept_pending_webtransport_session(&mut helper, session_id, &to_client);
+        let controller = helper
+            .controller
+            .webtransport_controller()
+            .expect("native WebTransport controller");
+        let first =
+            open_server_webtransport_bidi(&mut helper, &controller, session_id)
+                .await;
+        receive_server_webtransport_stream(
+            &mut helper,
+            session_id,
+            first,
+            h3::WebTransportStreamDirection::Bidirectional,
+        );
+
+        let cancelled_controller = controller.clone();
+        let cancelled = tokio::spawn(async move {
+            cancelled_controller
+                .open_bidirectional_stream(session_id)
+                .await
+        });
+        tokio::task::yield_now().await;
+        helper.work_loop_iter().unwrap();
+        assert_eq!(
+            webtransport_retention_stats(&mut helper, &controller)
+                .await
+                .stream_open_waiters,
+            1
+        );
+        cancelled.abort();
+        assert!(cancelled.await.unwrap_err().is_cancelled());
+        helper.work_loop_iter().unwrap();
+        assert_eq!(
+            webtransport_retention_stats(&mut helper, &controller)
+                .await
+                .stream_open_waiters,
+            0
+        );
+
+        let replacement_controller = controller.clone();
+        let replacement = tokio::spawn(async move {
+            replacement_controller
+                .open_bidirectional_stream(session_id)
+                .await
+        });
+        tokio::task::yield_now().await;
+        helper.work_loop_iter().unwrap();
+        let saturated_controller = controller.clone();
+        let saturated = tokio::spawn(async move {
+            saturated_controller
+                .open_bidirectional_stream(session_id)
+                .await
+        });
+        tokio::task::yield_now().await;
+        helper.work_loop_iter().unwrap();
+        assert_eq!(
+            saturated.await.unwrap(),
             WebTransportOpenStreamOutcome::Rejected(
                 WebTransportSelectionError::ResourceLimit,
-            ),
+            )
+        );
+        let stats = webtransport_retention_stats(&mut helper, &controller).await;
+        assert_eq!(stats.stream_open_waiters, 1);
+        assert_eq!(stats.stream_open_waiter_saturation_total, 1);
+
+        release_server_webtransport_stream_credit(
+            &mut helper,
+            &controller,
+            session_id,
+            first,
+            WebTransportStreamDirection::Bidi,
+            107,
+        )
+        .await;
+        for _ in 0..32 {
+            helper.advance_and_run_loop().unwrap();
+            tokio::task::yield_now().await;
+            if replacement.is_finished() {
+                break;
+            }
+        }
+        assert_eq!(
+            replacement.await.unwrap(),
+            WebTransportOpenStreamOutcome::Opened { stream_id: 5 }
+        );
+
+        let pending_controller = controller.clone();
+        let pending = tokio::spawn(async move {
+            pending_controller
+                .open_bidirectional_stream(session_id)
+                .await
+        });
+        tokio::task::yield_now().await;
+        helper.work_loop_iter().unwrap();
+        assert!(!pending.is_finished());
+        helper
+            .controller
+            .close_webtransport_session(session_id, 7, "closed".to_string())
+            .unwrap();
+        assert_eq!(helper.process_commands().unwrap(), 1);
+        assert_eq!(
+            pending.await.unwrap(),
+            WebTransportOpenStreamOutcome::Rejected(
+                WebTransportSelectionError::ClosingSession,
+            )
+        );
+
+        let mut helper =
+            DriverTestHelper::<ServerHooks>::with_pipe_and_http3_settings(
+                single_server_bidi_webtransport_pipe(),
+                settings,
+            )
+            .unwrap();
+        start_webtransport_driver(&mut helper);
+        let (session_id, to_client, _from_client) =
+            open_pending_webtransport_session(&mut helper);
+        accept_pending_webtransport_session(&mut helper, session_id, &to_client);
+        let controller = helper
+            .controller
+            .webtransport_controller()
+            .expect("native WebTransport controller");
+        let _first =
+            open_server_webtransport_bidi(&mut helper, &controller, session_id)
+                .await;
+        let pending_controller = controller.clone();
+        let pending = tokio::spawn(async move {
+            pending_controller
+                .open_bidirectional_stream(session_id)
+                .await
+        });
+        tokio::task::yield_now().await;
+        helper.work_loop_iter().unwrap();
+        assert!(!pending.is_finished());
+        drop(helper);
+        assert_eq!(
+            pending.await.unwrap(),
+            WebTransportOpenStreamOutcome::Rejected(
+                WebTransportSelectionError::ConnectionClosed,
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn webtransport_stream_credit_cancellation_survives_a_full_lane() {
+        let mut settings = webtransport_settings();
+        settings.webtransport_command_capacity = 1;
+        settings.webtransport_max_pending_streams = 1;
+        settings.webtransport_max_pending_streams_per_session = 1;
+        let mut helper =
+            DriverTestHelper::<ServerHooks>::with_pipe_and_http3_settings(
+                single_server_bidi_webtransport_pipe(),
+                settings,
+            )
+            .unwrap();
+        start_webtransport_driver(&mut helper);
+        let (session_id, to_client, _from_client) =
+            open_pending_webtransport_session(&mut helper);
+        accept_pending_webtransport_session(&mut helper, session_id, &to_client);
+        let controller = helper
+            .controller
+            .webtransport_controller()
+            .expect("native WebTransport controller");
+        let _first =
+            open_server_webtransport_bidi(&mut helper, &controller, session_id)
+                .await;
+
+        let pending_controller = controller.clone();
+        let pending = tokio::spawn(async move {
+            pending_controller
+                .open_bidirectional_stream(session_id)
+                .await
+        });
+        tokio::task::yield_now().await;
+        helper.work_loop_iter().unwrap();
+        assert_eq!(
+            webtransport_retention_stats(&mut helper, &controller)
+                .await
+                .stream_open_waiters,
+            1
+        );
+
+        let stats_controller = controller.clone();
+        let queued =
+            tokio::spawn(async move { stats_controller.retention_stats().await });
+        for _ in 0..8 {
+            if helper
+                .driver
+                .webtransport_cmd_recv
+                .as_ref()
+                .is_some_and(|receiver| receiver.len() == 1)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            helper
+                .driver
+                .webtransport_cmd_recv
+                .as_ref()
+                .map(tokio::sync::mpsc::Receiver::len),
+            Some(1)
+        );
+        pending.abort();
+        assert!(pending.await.unwrap_err().is_cancelled());
+
+        helper.work_loop_iter().unwrap();
+        assert!(queued.await.unwrap().is_ok());
+        assert_eq!(
+            webtransport_retention_stats(&mut helper, &controller)
+                .await
+                .stream_open_waiters,
+            0
         );
     }
 

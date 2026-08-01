@@ -28,6 +28,8 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::VecDeque;
 use std::fmt;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -252,9 +254,7 @@ pub enum WebTransportSelectionError {
     },
     /// The requested operation is invalid for this stream direction.
     WrongDirection,
-    /// A configured ownership bound or the peer's current stream limit was
-    /// reached. Retrying can succeed after ownership or `MAX_STREAMS` credit is
-    /// released.
+    /// A configured local ownership bound was reached.
     ResourceLimit,
     /// An invariant failed after the physical stream became externally visible.
     InternalFailure,
@@ -645,6 +645,13 @@ pub enum WebTransportStreamSendTerminalOutcome {
         /// Exact physical QUIC stream ID.
         stream_id: u64,
     },
+    /// Selected-API observation ownership was explicitly retired.
+    Retired {
+        /// CONNECT stream ID identifying the WebTransport session.
+        session_id: u64,
+        /// Exact physical QUIC stream ID.
+        stream_id: u64,
+    },
     /// The owning WebTransport session terminated before the send direction.
     SessionTerminated {
         /// CONNECT stream ID identifying the WebTransport session.
@@ -768,9 +775,20 @@ pub struct WebTransportRetentionStats {
     pub sessions: usize,
     /// Associated streams currently owned by native WebTransport.
     pub associated_streams: usize,
-    /// Inbound or locally opening streams awaiting completed association.
+    /// Inbound, credit-waiting, or locally opening streams awaiting completed
+    /// association.
     pub provisional_streams: usize,
-    /// One-shot stream and Datagram readiness registrations.
+    /// Local stream opens waiting for peer MAX_STREAMS credit.
+    pub stream_open_waiters: usize,
+    /// Configured aggregate pending/opening stream bound.
+    pub max_stream_open_waiters: usize,
+    /// Configured per-session pending/opening stream bound.
+    pub max_stream_open_waiters_per_session: usize,
+    /// Pending-open entries examined because credit or cancellation was ready.
+    pub stream_open_waiter_work_total: u64,
+    /// Open requests rejected by configured aggregate or per-session bounds.
+    pub stream_open_waiter_saturation_total: u64,
+    /// Pending local opens plus one-shot stream and Datagram registrations.
     pub waiters: usize,
     /// Pending selected-stream send-terminal registrations.
     pub send_terminal_waiters: usize,
@@ -1364,6 +1382,7 @@ pub enum WebTransportDatagramReadyOutcome {
 #[derive(Clone)]
 pub struct WebTransportController {
     sender: mpsc::Sender<WebTransportCommand>,
+    open_cancellation_pending: Arc<AtomicBool>,
     max_stream_write_bytes: usize,
     max_stream_write_lease_retained_bytes: usize,
     max_stream_read_bytes: usize,
@@ -1378,9 +1397,11 @@ impl WebTransportController {
         max_stream_write_lease_retained_bytes: usize,
         max_stream_read_bytes: usize, max_datagram_send_allocation_bytes: usize,
         write_lease_accounting: Arc<WriteLeaseAccounting>,
+        open_cancellation_pending: Arc<AtomicBool>,
     ) -> Self {
         Self {
             sender,
+            open_cancellation_pending,
             max_stream_write_bytes,
             max_stream_write_lease_retained_bytes,
             max_stream_read_bytes,
@@ -1393,7 +1414,11 @@ impl WebTransportController {
     /// Opens a bidirectional stream for an exact active Session ID.
     ///
     /// The result contains the physical QUIC stream ID after the complete
-    /// draft-16 prefix has been accepted exactly once.
+    /// draft-16 prefix has been accepted exactly once. Temporary peer
+    /// MAX_STREAMS exhaustion keeps this future pending without polling;
+    /// [`WebTransportSelectionError::ResourceLimit`] means a configured local
+    /// pending/opening bound was reached instead. Cancellation releases the
+    /// retained request through the bounded driver command lane.
     pub async fn open_bidirectional_stream(
         &self, session_id: u64,
     ) -> WebTransportOpenStreamOutcome {
@@ -1404,7 +1429,11 @@ impl WebTransportController {
     /// Opens a unidirectional stream for an exact active Session ID.
     ///
     /// The result contains the physical QUIC stream ID after the complete
-    /// draft-16 prefix has been accepted exactly once.
+    /// draft-16 prefix has been accepted exactly once. Temporary peer
+    /// MAX_STREAMS exhaustion keeps this future pending without polling;
+    /// [`WebTransportSelectionError::ResourceLimit`] means a configured local
+    /// pending/opening bound was reached instead. Requests are FIFO within one
+    /// direction and work rotates across directions.
     pub async fn open_unidirectional_stream(
         &self, session_id: u64,
     ) -> WebTransportOpenStreamOutcome {
@@ -1426,10 +1455,17 @@ impl WebTransportController {
             direction,
             response,
         });
-        recv.await
-            .unwrap_or(WebTransportOpenStreamOutcome::Rejected(
-                WebTransportSelectionError::ConnectionClosed,
-            ))
+        let mut cancellation = OpenCancellationWake::new(
+            self.sender.clone(),
+            Arc::clone(&self.open_cancellation_pending),
+        );
+        let outcome =
+            recv.await
+                .unwrap_or(WebTransportOpenStreamOutcome::Rejected(
+                    WebTransportSelectionError::ConnectionClosed,
+                ));
+        cancellation.disarm();
+        outcome
     }
 
     /// Writes one bounded payload suffix and optional FIN to a selected stream.
@@ -1712,6 +1748,38 @@ impl WebTransportController {
         )
     }
 
+    /// Retires selected-API observation of one stream's local send direction.
+    ///
+    /// This is idempotent while the selected stream remains owned. It settles a
+    /// pending terminal wait with
+    /// [`WebTransportStreamSendTerminalOutcome::Retired`] and removes
+    /// retained terminal state, waiter accounting, and overload accounting
+    /// without changing the QUIC stream. Later terminal callbacks are ignored
+    /// for this observation lifetime. After the underlying selected stream is
+    /// collected, the existing stale-stream result replaces idempotence so no
+    /// permanent stream-ID tombstone is retained.
+    pub async fn retire_stream_send_terminal(
+        &self, session_id: u64, stream_id: u64,
+    ) -> WebTransportStreamSendTerminalOutcome {
+        let Ok(permit) = self.sender.reserve().await else {
+            return WebTransportStreamSendTerminalOutcome::Rejected(
+                WebTransportSelectionError::ConnectionClosed,
+            );
+        };
+        let (response, recv) = oneshot::channel();
+        permit.send(WebTransportCommand::RetireSendTerminal {
+            session_id,
+            stream_id,
+            response,
+        });
+        recv.await.unwrap_or(
+            WebTransportStreamSendTerminalOutcome::ConnectionTerminated {
+                session_id,
+                stream_id,
+            },
+        )
+    }
+
     async fn wait_stream(
         &self, session_id: u64, stream_id: u64, write: bool,
     ) -> WebTransportStreamReadyOutcome {
@@ -1966,6 +2034,40 @@ impl WebTransportController {
     }
 }
 
+struct OpenCancellationWake {
+    sender: mpsc::Sender<WebTransportCommand>,
+    pending: Arc<AtomicBool>,
+    armed: bool,
+}
+
+impl OpenCancellationWake {
+    fn new(
+        sender: mpsc::Sender<WebTransportCommand>, pending: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            sender,
+            pending,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for OpenCancellationWake {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.pending.store(true, Ordering::Release);
+        let _ = self
+            .sender
+            .try_send(WebTransportCommand::PruneCancelledOpens);
+    }
+}
+
 pub(crate) trait ErasedWriteLeaseCommand: Send {
     fn execute(
         self: Box<Self>, runtime: &mut Runtime, qconn: &mut QuicheConnection,
@@ -2166,6 +2268,12 @@ pub(crate) enum WebTransportCommand {
         stream_id: u64,
         response: oneshot::Sender<WebTransportStreamSendTerminalOutcome>,
     },
+    RetireSendTerminal {
+        session_id: u64,
+        stream_id: u64,
+        response: oneshot::Sender<WebTransportStreamSendTerminalOutcome>,
+    },
+    PruneCancelledOpens,
     Reset {
         session_id: u64,
         stream_id: u64,
@@ -2240,6 +2348,19 @@ impl WebTransportCommand {
                     },
                 );
             },
+            Self::RetireSendTerminal {
+                session_id,
+                stream_id,
+                response,
+            } => {
+                let _ = response.send(
+                    WebTransportStreamSendTerminalOutcome::ConnectionTerminated {
+                        session_id,
+                        stream_id,
+                    },
+                );
+            },
+            Self::PruneCancelledOpens => {},
             Self::Reset { response, .. } | Self::Stop { response, .. } => {
                 let _ =
                     response.send(WebTransportStreamControlOutcome::Rejected(
@@ -2555,6 +2676,14 @@ struct OwnedStream {
     direction: WebTransportStreamDirection,
     local_prefix_len: u64,
     locally_initiated: bool,
+    send_terminal_observation: SendTerminalObservation,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SendTerminalObservation {
+    Active,
+    Overloaded,
+    Retired,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2601,6 +2730,13 @@ struct OpeningStream {
     prefix_offset: usize,
     reset_after_prefix: Option<u64>,
     response: Option<oneshot::Sender<WebTransportOpenStreamOutcome>>,
+}
+
+#[derive(Debug)]
+struct PendingOpen {
+    session_id: u64,
+    direction: WebTransportStreamDirection,
+    response: oneshot::Sender<WebTransportOpenStreamOutcome>,
 }
 
 #[derive(Debug)]
@@ -2677,6 +2813,16 @@ pub(crate) struct Runtime {
     opening_streams: BTreeMap<u64, OpeningStream>,
     opening_order: VecDeque<u64>,
     opening_by_session: BTreeMap<u64, BTreeSet<u64>>,
+    pending_bidi_opens: VecDeque<PendingOpen>,
+    pending_uni_opens: VecDeque<PendingOpen>,
+    pending_opens_per_session: BTreeMap<u64, usize>,
+    bidi_open_credit_ready: bool,
+    uni_open_credit_ready: bool,
+    pending_open_turn_bidi: bool,
+    open_work_pending_turn: bool,
+    open_cancellation_pending: Arc<AtomicBool>,
+    stream_open_waiter_work_total: u64,
+    stream_open_waiter_saturation_total: u64,
     readable_waiters:
         BTreeMap<u64, oneshot::Sender<WebTransportStreamReadyOutcome>>,
     writable_waiters:
@@ -2685,7 +2831,7 @@ pub(crate) struct Runtime {
     send_terminal_waiters_per_session: BTreeMap<u64, usize>,
     send_terminal_states: BTreeMap<u64, LatchedSendTerminal>,
     send_terminal_states_per_session: BTreeMap<u64, usize>,
-    send_terminal_overloaded_sessions: BTreeSet<u64>,
+    send_terminal_overloaded_sessions: BTreeMap<u64, usize>,
     send_terminal_waiter_work_total: u64,
     send_terminal_waiter_saturation_total: u64,
     send_terminal_state_saturation_total: u64,
@@ -2716,11 +2862,16 @@ impl Runtime {
             limits.command_capacity,
             limits.max_write_lease_retained_bytes_per_lease,
         ));
-        Self::new_with_write_lease_accounting(limits, write_lease_accounting)
+        Self::new_with_write_lease_accounting(
+            limits,
+            write_lease_accounting,
+            Arc::new(AtomicBool::new(false)),
+        )
     }
 
     pub(crate) fn new_with_write_lease_accounting(
         limits: RuntimeLimits, write_lease_accounting: Arc<WriteLeaseAccounting>,
+        open_cancellation_pending: Arc<AtomicBool>,
     ) -> Self {
         Self {
             limits: RuntimeLimits {
@@ -2743,13 +2894,23 @@ impl Runtime {
             opening_streams: BTreeMap::new(),
             opening_order: VecDeque::new(),
             opening_by_session: BTreeMap::new(),
+            pending_bidi_opens: VecDeque::new(),
+            pending_uni_opens: VecDeque::new(),
+            pending_opens_per_session: BTreeMap::new(),
+            bidi_open_credit_ready: false,
+            uni_open_credit_ready: false,
+            pending_open_turn_bidi: true,
+            open_work_pending_turn: true,
+            open_cancellation_pending,
+            stream_open_waiter_work_total: 0,
+            stream_open_waiter_saturation_total: 0,
             readable_waiters: BTreeMap::new(),
             writable_waiters: BTreeMap::new(),
             send_terminal_waiters: BTreeMap::new(),
             send_terminal_waiters_per_session: BTreeMap::new(),
             send_terminal_states: BTreeMap::new(),
             send_terminal_states_per_session: BTreeMap::new(),
-            send_terminal_overloaded_sessions: BTreeSet::new(),
+            send_terminal_overloaded_sessions: BTreeMap::new(),
             send_terminal_waiter_work_total: 0,
             send_terminal_waiter_saturation_total: 0,
             send_terminal_state_saturation_total: 0,
@@ -3109,6 +3270,7 @@ impl Runtime {
         self.pending_streams
             .len()
             .saturating_add(self.opening_streams.len())
+            .saturating_add(self.pending_open_count())
     }
 
     fn provisional_stream_count_for_session(&self, session_id: u64) -> usize {
@@ -3119,6 +3281,12 @@ impl Runtime {
                 self.opening_by_session
                     .get(&session_id)
                     .map_or(0, BTreeSet::len),
+            )
+            .saturating_add(
+                self.pending_opens_per_session
+                    .get(&session_id)
+                    .copied()
+                    .unwrap_or(0),
             )
     }
 
@@ -3136,6 +3304,7 @@ impl Runtime {
             direction: stream.direction,
             local_prefix_len: 0,
             locally_initiated: false,
+            send_terminal_observation: SendTerminalObservation::Active,
         });
         if let Some(session) = self.sessions.get_mut(&stream.session_id) {
             session.streams.insert(stream.stream_id);
@@ -3318,6 +3487,9 @@ impl Runtime {
         qconn: &mut QuicheConnection, command: WebTransportCommand,
         queued_command_items: usize,
     ) {
+        if self.open_cancellation_pending.swap(false, Ordering::AcqRel) {
+            self.prune_cancelled_pending_opens();
+        }
         match command {
             WebTransportCommand::Open {
                 session_id,
@@ -3346,6 +3518,14 @@ impl Runtime {
             } => self.wait_stream_send_terminal(
                 qconn, session_id, stream_id, response,
             ),
+            WebTransportCommand::RetireSendTerminal {
+                session_id,
+                stream_id,
+                response,
+            } => self.retire_stream_send_terminal(
+                qconn, session_id, stream_id, response,
+            ),
+            WebTransportCommand::PruneCancelledOpens => {},
             WebTransportCommand::Reset {
                 session_id,
                 stream_id,
@@ -3406,17 +3586,35 @@ impl Runtime {
             let _ = response.send(WebTransportOpenStreamOutcome::Rejected(error));
             return;
         }
+        self.prune_cancelled_pending_opens();
         if self.provisional_stream_count() >= self.limits.max_pending_streams ||
             self.provisional_stream_count_for_session(session_id) >=
                 self.limits.max_pending_streams_per_session
         {
+            self.stream_open_waiter_saturation_total =
+                self.stream_open_waiter_saturation_total.saturating_add(1);
             let _ = response.send(WebTransportOpenStreamOutcome::Rejected(
                 WebTransportSelectionError::ResourceLimit,
             ));
             return;
         }
 
-        let core_direction = match direction {
+        let request = PendingOpen {
+            session_id,
+            direction,
+            response,
+        };
+        if let Some(request) = self.start_open_request(conn, qconn, request) {
+            self.set_open_credit_ready(direction, false);
+            self.queue_pending_open(request, false);
+        }
+    }
+
+    fn start_open_request(
+        &mut self, conn: &mut quiche::h3::Connection,
+        qconn: &mut QuicheConnection, request: PendingOpen,
+    ) -> Option<PendingOpen> {
+        let core_direction = match request.direction {
             WebTransportStreamDirection::Bidi =>
                 quiche::h3::WebTransportStreamDirection::Bidirectional,
             WebTransportStreamDirection::Uni =>
@@ -3424,29 +3622,28 @@ impl Runtime {
         };
         let reservation = match conn.reserve_webtransport_stream(
             qconn,
-            session_id,
+            request.session_id,
             core_direction,
         ) {
             Ok(reservation) => reservation,
             Err(quiche::h3::Error::SettingsError) => {
-                let _ = response.send(WebTransportOpenStreamOutcome::Rejected(
-                    WebTransportSelectionError::Unsupported,
-                ));
-                return;
+                let _ = request.response.send(
+                    WebTransportOpenStreamOutcome::Rejected(
+                        WebTransportSelectionError::Unsupported,
+                    ),
+                );
+                return None;
             },
             Err(quiche::h3::Error::TransportError(
                 quiche::Error::StreamLimit,
-            )) => {
-                let _ = response.send(WebTransportOpenStreamOutcome::Rejected(
-                    WebTransportSelectionError::ResourceLimit,
-                ));
-                return;
-            },
+            )) => return Some(request),
             Err(_) => {
-                let _ = response.send(WebTransportOpenStreamOutcome::Rejected(
-                    WebTransportSelectionError::ConnectionClosed,
-                ));
-                return;
+                let _ = request.response.send(
+                    WebTransportOpenStreamOutcome::Rejected(
+                        WebTransportSelectionError::ConnectionClosed,
+                    ),
+                );
+                return None;
             },
         };
         let stream_id = reservation.stream_id();
@@ -3454,13 +3651,193 @@ impl Runtime {
             reservation,
             prefix_offset: 0,
             reset_after_prefix: None,
-            response: Some(response),
+            response: Some(request.response),
         });
         self.opening_order.push_back(stream_id);
         self.opening_by_session
-            .entry(session_id)
+            .entry(request.session_id)
             .or_default()
             .insert(stream_id);
+        None
+    }
+
+    pub(crate) fn stream_credit_available(
+        &mut self, direction: quiche::StreamCreditDirection,
+    ) {
+        match direction {
+            quiche::StreamCreditDirection::Bidirectional => {
+                if !self.pending_bidi_opens.is_empty() {
+                    self.bidi_open_credit_ready = true;
+                }
+            },
+            quiche::StreamCreditDirection::Unidirectional => {
+                if !self.pending_uni_opens.is_empty() {
+                    self.uni_open_credit_ready = true;
+                }
+            },
+        }
+    }
+
+    pub(crate) fn process_open_work(
+        &mut self, conn: &mut quiche::h3::Connection,
+        qconn: &mut QuicheConnection, max_work: usize,
+    ) -> usize {
+        let mut work = 0;
+        while work < max_work {
+            let pending_first = self.open_work_pending_turn;
+            let progressed = if pending_first {
+                self.process_pending_open(conn, qconn) ||
+                    self.process_opening_streams(conn, qconn, 1) != 0
+            } else {
+                self.process_opening_streams(conn, qconn, 1) != 0 ||
+                    self.process_pending_open(conn, qconn)
+            };
+            if !progressed {
+                break;
+            }
+            work += 1;
+            self.open_work_pending_turn = !pending_first;
+        }
+        work
+    }
+
+    fn process_pending_open(
+        &mut self, conn: &mut quiche::h3::Connection,
+        qconn: &mut QuicheConnection,
+    ) -> bool {
+        let bidi_ready =
+            self.bidi_open_credit_ready && !self.pending_bidi_opens.is_empty();
+        let uni_ready =
+            self.uni_open_credit_ready && !self.pending_uni_opens.is_empty();
+        let direction = match (bidi_ready, uni_ready) {
+            (true, true) if self.pending_open_turn_bidi =>
+                WebTransportStreamDirection::Bidi,
+            (true, true) => WebTransportStreamDirection::Uni,
+            (true, false) => WebTransportStreamDirection::Bidi,
+            (false, true) => WebTransportStreamDirection::Uni,
+            (false, false) => return false,
+        };
+        self.pending_open_turn_bidi =
+            direction == WebTransportStreamDirection::Uni;
+        let Some(request) = self.pop_pending_open(direction) else {
+            self.set_open_credit_ready(direction, false);
+            return false;
+        };
+        self.stream_open_waiter_work_total =
+            self.stream_open_waiter_work_total.saturating_add(1);
+        if request.response.is_closed() {
+            self.refresh_open_credit(qconn, direction);
+            return true;
+        }
+        if !self.is_active(request.session_id) {
+            let _ =
+                request
+                    .response
+                    .send(WebTransportOpenStreamOutcome::Rejected(
+                        WebTransportSelectionError::TerminalSession,
+                    ));
+            self.refresh_open_credit(qconn, direction);
+            return true;
+        }
+
+        if let Some(request) = self.start_open_request(conn, qconn, request) {
+            self.queue_pending_open(request, true);
+            self.set_open_credit_ready(direction, false);
+        } else {
+            self.refresh_open_credit(qconn, direction);
+        }
+        true
+    }
+
+    fn pending_open_count(&self) -> usize {
+        self.pending_bidi_opens
+            .len()
+            .saturating_add(self.pending_uni_opens.len())
+    }
+
+    fn queue_pending_open(&mut self, request: PendingOpen, front: bool) {
+        let session_id = request.session_id;
+        let queue = match request.direction {
+            WebTransportStreamDirection::Bidi => &mut self.pending_bidi_opens,
+            WebTransportStreamDirection::Uni => &mut self.pending_uni_opens,
+        };
+        if front {
+            queue.push_front(request);
+        } else {
+            queue.push_back(request);
+        }
+        let count = self
+            .pending_opens_per_session
+            .entry(session_id)
+            .or_default();
+        *count = count.saturating_add(1);
+    }
+
+    fn pop_pending_open(
+        &mut self, direction: WebTransportStreamDirection,
+    ) -> Option<PendingOpen> {
+        let request = match direction {
+            WebTransportStreamDirection::Bidi =>
+                self.pending_bidi_opens.pop_front(),
+            WebTransportStreamDirection::Uni =>
+                self.pending_uni_opens.pop_front(),
+        }?;
+        decrement_session_count(
+            &mut self.pending_opens_per_session,
+            request.session_id,
+        );
+        Some(request)
+    }
+
+    fn set_open_credit_ready(
+        &mut self, direction: WebTransportStreamDirection, ready: bool,
+    ) {
+        match direction {
+            WebTransportStreamDirection::Bidi =>
+                self.bidi_open_credit_ready = ready,
+            WebTransportStreamDirection::Uni =>
+                self.uni_open_credit_ready = ready,
+        }
+    }
+
+    fn refresh_open_credit(
+        &mut self, qconn: &QuicheConnection,
+        direction: WebTransportStreamDirection,
+    ) {
+        let has_waiter = match direction {
+            WebTransportStreamDirection::Bidi =>
+                !self.pending_bidi_opens.is_empty(),
+            WebTransportStreamDirection::Uni =>
+                !self.pending_uni_opens.is_empty(),
+        };
+        let has_credit = match direction {
+            WebTransportStreamDirection::Bidi =>
+                qconn.peer_streams_left_bidi() != 0,
+            WebTransportStreamDirection::Uni =>
+                qconn.peer_streams_left_uni() != 0,
+        };
+        self.set_open_credit_ready(direction, has_waiter && has_credit);
+    }
+
+    fn prune_cancelled_pending_opens(&mut self) {
+        for direction in [
+            WebTransportStreamDirection::Bidi,
+            WebTransportStreamDirection::Uni,
+        ] {
+            let count = match direction {
+                WebTransportStreamDirection::Bidi =>
+                    self.pending_bidi_opens.len(),
+                WebTransportStreamDirection::Uni => self.pending_uni_opens.len(),
+            };
+            for _ in 0..count {
+                let Some(request) = self.pop_pending_open(direction) else {
+                    break;
+                };
+                if !request.response.is_closed() {
+                    self.queue_pending_open(request, false);
+                }
+            }
+        }
     }
 
     pub(crate) fn process_opening_streams(
@@ -3603,6 +3980,7 @@ impl Runtime {
                 },
                 local_prefix_len: opening.reservation.prefix_len() as u64,
                 locally_initiated: true,
+                send_terminal_observation: SendTerminalObservation::Active,
             };
             self.stream_sessions.insert(stream_id, owned);
             if let Some(session) = self.sessions.get_mut(&session_id) {
@@ -3750,17 +4128,43 @@ impl Runtime {
             let _ = response.send(outcome);
             return;
         }
-        if self.send_terminal_overloaded_sessions.contains(&session_id) {
+        let stream = match self.select_stream(session_id, stream_id, true, qconn)
+        {
+            Ok(stream) => stream,
+            Err(error) => {
+                let _ = response
+                    .send(WebTransportStreamSendTerminalOutcome::Rejected(error));
+                return;
+            },
+        };
+        match stream.send_terminal_observation {
+            SendTerminalObservation::Retired => {
+                let _ = response.send(
+                    WebTransportStreamSendTerminalOutcome::Retired {
+                        session_id,
+                        stream_id,
+                    },
+                );
+                return;
+            },
+            SendTerminalObservation::Overloaded => {
+                let _ = response.send(
+                    WebTransportStreamSendTerminalOutcome::Rejected(
+                        WebTransportSelectionError::ResourceLimit,
+                    ),
+                );
+                return;
+            },
+            SendTerminalObservation::Active => {},
+        }
+        if self
+            .send_terminal_overloaded_sessions
+            .contains_key(&session_id)
+        {
             let _ =
                 response.send(WebTransportStreamSendTerminalOutcome::Rejected(
                     WebTransportSelectionError::ResourceLimit,
                 ));
-            return;
-        }
-        if let Err(error) = self.select_stream(session_id, stream_id, true, qconn)
-        {
-            let _ = response
-                .send(WebTransportStreamSendTerminalOutcome::Rejected(error));
             return;
         }
 
@@ -3843,6 +4247,9 @@ impl Runtime {
         let Some(stream) = self.stream_sessions.get(&stream_id).copied() else {
             return;
         };
+        if stream.send_terminal_observation != SendTerminalObservation::Active {
+            return;
+        }
         let state = match qconn.stream_send_status(stream_id) {
             Ok(quiche::StreamSendStatus::Stopped(wire_error_code)) =>
                 SendTerminalState::Stopped {
@@ -3881,7 +4288,26 @@ impl Runtime {
         {
             self.send_terminal_state_saturation_total =
                 self.send_terminal_state_saturation_total.saturating_add(1);
-            self.send_terminal_overloaded_sessions.insert(session_id);
+            let mark_overloaded = self
+                .stream_sessions
+                .get_mut(&stream_id)
+                .is_some_and(|stream| {
+                    if stream.send_terminal_observation !=
+                        SendTerminalObservation::Active
+                    {
+                        return false;
+                    }
+                    stream.send_terminal_observation =
+                        SendTerminalObservation::Overloaded;
+                    true
+                });
+            if mark_overloaded {
+                let count = self
+                    .send_terminal_overloaded_sessions
+                    .entry(session_id)
+                    .or_default();
+                *count = count.saturating_add(1);
+            }
         } else {
             self.send_terminal_states
                 .insert(stream_id, LatchedSendTerminal { session_id, state });
@@ -3896,6 +4322,96 @@ impl Runtime {
             let _ = waiter.response.send(state.outcome(stream_id));
         }
         state
+    }
+
+    fn retire_stream_send_terminal(
+        &mut self, qconn: &QuicheConnection, session_id: u64, stream_id: u64,
+        response: oneshot::Sender<WebTransportStreamSendTerminalOutcome>,
+    ) {
+        if let Some(error) = self.selection_error(session_id, qconn) {
+            let _ = response
+                .send(WebTransportStreamSendTerminalOutcome::Rejected(error));
+            return;
+        }
+
+        let latched_owner = self
+            .send_terminal_states
+            .get(&stream_id)
+            .map(|terminal| terminal.session_id);
+        let selected = self.stream_sessions.get(&stream_id).copied();
+        let owner = selected.map(|stream| stream.session_id).or(latched_owner);
+        let Some(owner_session_id) = owner else {
+            let error = if qconn.stream_closed(stream_id) {
+                WebTransportSelectionError::StaleStream
+            } else {
+                WebTransportSelectionError::UnknownStream
+            };
+            let _ = response
+                .send(WebTransportStreamSendTerminalOutcome::Rejected(error));
+            return;
+        };
+        if owner_session_id != session_id {
+            let _ =
+                response.send(WebTransportStreamSendTerminalOutcome::Rejected(
+                    WebTransportSelectionError::ForeignStream {
+                        owner_session_id,
+                    },
+                ));
+            return;
+        }
+        if let Some(stream) = selected {
+            let direction_allowed = stream.direction ==
+                WebTransportStreamDirection::Bidi ||
+                stream.locally_initiated;
+            if !direction_allowed {
+                let _ = response.send(
+                    WebTransportStreamSendTerminalOutcome::Rejected(
+                        WebTransportSelectionError::WrongDirection,
+                    ),
+                );
+                return;
+            }
+            self.retire_send_terminal_observation(stream_id, stream);
+        }
+
+        self.remove_send_terminal_state(stream_id);
+        let outcome = WebTransportStreamSendTerminalOutcome::Retired {
+            session_id,
+            stream_id,
+        };
+        if let Some(waiter) = self.remove_send_terminal_waiter(stream_id) {
+            let _ = waiter.response.send(outcome);
+        }
+        let _ = response.send(outcome);
+    }
+
+    fn retire_send_terminal_observation(
+        &mut self, stream_id: u64, stream: OwnedStream,
+    ) {
+        if stream.send_terminal_observation == SendTerminalObservation::Retired {
+            return;
+        }
+        if stream.send_terminal_observation == SendTerminalObservation::Overloaded
+        {
+            decrement_session_count(
+                &mut self.send_terminal_overloaded_sessions,
+                stream.session_id,
+            );
+        }
+        if let Some(stream) = self.stream_sessions.get_mut(&stream_id) {
+            stream.send_terminal_observation = SendTerminalObservation::Retired;
+        }
+    }
+
+    fn remove_send_terminal_state(
+        &mut self, stream_id: u64,
+    ) -> Option<LatchedSendTerminal> {
+        let terminal = self.send_terminal_states.remove(&stream_id)?;
+        decrement_session_count(
+            &mut self.send_terminal_states_per_session,
+            terminal.session_id,
+        );
+        Some(terminal)
     }
 
     fn remove_send_terminal_waiter(
@@ -3954,9 +4470,8 @@ impl Runtime {
             })
             .collect();
         for stream_id in terminal_ids {
-            self.send_terminal_states.remove(&stream_id);
+            self.remove_send_terminal_state(stream_id);
         }
-        self.send_terminal_states_per_session.remove(&session_id);
         self.send_terminal_overloaded_sessions.remove(&session_id);
     }
 
@@ -4040,6 +4555,7 @@ impl Runtime {
         &mut self, session_id: u64, error_code: u64,
         selection_error: WebTransportSelectionError,
     ) {
+        self.reject_pending_open_requests(session_id, selection_error);
         let stream_ids: Vec<_> = self
             .opening_by_session
             .get(&session_id)
@@ -4057,6 +4573,42 @@ impl Runtime {
                 ));
             }
             opening.reset_after_prefix = Some(error_code);
+        }
+    }
+
+    fn reject_pending_open_requests(
+        &mut self, session_id: u64, error: WebTransportSelectionError,
+    ) {
+        for direction in [
+            WebTransportStreamDirection::Bidi,
+            WebTransportStreamDirection::Uni,
+        ] {
+            let count = match direction {
+                WebTransportStreamDirection::Bidi =>
+                    self.pending_bidi_opens.len(),
+                WebTransportStreamDirection::Uni => self.pending_uni_opens.len(),
+            };
+            for _ in 0..count {
+                let Some(request) = self.pop_pending_open(direction) else {
+                    break;
+                };
+                if request.session_id == session_id {
+                    let _ = request
+                        .response
+                        .send(WebTransportOpenStreamOutcome::Rejected(error));
+                } else {
+                    self.queue_pending_open(request, false);
+                }
+            }
+            let empty = match direction {
+                WebTransportStreamDirection::Bidi =>
+                    self.pending_bidi_opens.is_empty(),
+                WebTransportStreamDirection::Uni =>
+                    self.pending_uni_opens.is_empty(),
+            };
+            if empty {
+                self.set_open_credit_ready(direction, false);
+            }
         }
     }
 
@@ -4649,7 +5201,12 @@ impl Runtime {
     }
 
     pub(crate) fn has_work(&self) -> bool {
-        !self.work.is_empty()
+        !self.work.is_empty() || self.has_ready_pending_open()
+    }
+
+    fn has_ready_pending_open(&self) -> bool {
+        (self.bidi_open_credit_ready && !self.pending_bidi_opens.is_empty()) ||
+            (self.uni_open_credit_ready && !self.pending_uni_opens.is_empty())
     }
 
     pub(crate) fn process_work(
@@ -4792,6 +5349,14 @@ impl Runtime {
                 self.observe_send_terminal(qconn, stream_id);
             }
             if let Some(stream) = self.stream_sessions.remove(&stream_id) {
+                if stream.send_terminal_observation ==
+                    SendTerminalObservation::Overloaded
+                {
+                    decrement_session_count(
+                        &mut self.send_terminal_overloaded_sessions,
+                        stream.session_id,
+                    );
+                }
                 self.close_stream_waiters(stream_id);
                 if let Some(session) = self.sessions.get_mut(&stream.session_id) {
                     session.streams.remove(&stream_id);
@@ -4878,12 +5443,14 @@ impl Runtime {
         let provisional_streams = self
             .pending_streams
             .len()
-            .saturating_add(self.opening_streams.len());
+            .saturating_add(self.opening_streams.len())
+            .saturating_add(self.pending_open_count());
         let waiters = self
             .readable_waiters
             .len()
             .saturating_add(self.writable_waiters.len())
             .saturating_add(self.send_terminal_waiters.len())
+            .saturating_add(self.pending_open_count())
             .saturating_add(self.datagram_readable_waiters.len())
             .saturating_add(self.datagram_send_waiters.len());
 
@@ -4898,6 +5465,8 @@ impl Runtime {
             .saturating_add(self.opening_streams.len().saturating_mul(2))
             .saturating_add(self.opening_order.len())
             .saturating_add(self.opening_by_session.len())
+            .saturating_add(self.pending_open_count())
+            .saturating_add(self.pending_opens_per_session.len())
             .saturating_add(waiters)
             .saturating_add(self.send_terminal_waiters_per_session.len())
             .saturating_add(self.send_terminal_states.len())
@@ -4919,6 +5488,14 @@ impl Runtime {
             sessions: self.sessions.len(),
             associated_streams,
             provisional_streams,
+            stream_open_waiters: self.pending_open_count(),
+            max_stream_open_waiters: self.limits.max_pending_streams,
+            max_stream_open_waiters_per_session: self
+                .limits
+                .max_pending_streams_per_session,
+            stream_open_waiter_work_total: self.stream_open_waiter_work_total,
+            stream_open_waiter_saturation_total: self
+                .stream_open_waiter_saturation_total,
             waiters,
             send_terminal_waiters: self.send_terminal_waiters.len(),
             send_terminal_states: self.send_terminal_states.len(),
@@ -4983,6 +5560,16 @@ impl Runtime {
                 ));
             }
         }
+        let pending_bidi = std::mem::take(&mut self.pending_bidi_opens);
+        let pending_uni = std::mem::take(&mut self.pending_uni_opens);
+        for request in pending_bidi.into_iter().chain(pending_uni) {
+            let _ =
+                request
+                    .response
+                    .send(WebTransportOpenStreamOutcome::Rejected(
+                        WebTransportSelectionError::ConnectionClosed,
+                    ));
+        }
         for (_, response) in std::mem::take(&mut self.readable_waiters) {
             let _ = response.send(WebTransportStreamReadyOutcome::Rejected(
                 WebTransportSelectionError::ConnectionClosed,
@@ -5025,6 +5612,9 @@ impl Runtime {
         self.opening_streams.clear();
         self.opening_order.clear();
         self.opening_by_session.clear();
+        self.pending_opens_per_session.clear();
+        self.bidi_open_credit_ready = false;
+        self.uni_open_credit_ready = false;
         self.datagram_stats.terminal_datagrams = self
             .datagram_stats
             .terminal_datagrams
@@ -5291,6 +5881,7 @@ mod tests {
             direction: WebTransportStreamDirection::Bidi,
             local_prefix_len: 3,
             locally_initiated: true,
+            send_terminal_observation: SendTerminalObservation::Active,
         });
 
         let (response, mut outcome) = oneshot::channel();
@@ -5304,6 +5895,76 @@ mod tests {
             )
         );
         assert!(runtime.send_terminal_waiters.is_empty());
+    }
+
+    #[test]
+    fn send_terminal_retirement_reuses_bounded_fact_capacity() {
+        let pipe = pipe();
+        let mut runtime = Runtime::new(runtime_limits(256, 64, 8));
+        let mut session = Session::pending(false);
+        session.phase = SessionPhase::Active;
+        runtime.sessions.insert(0, session);
+
+        for ordinal in 0..4_096 {
+            let stream_id = ordinal * 4 + 1;
+            runtime.stream_sessions.insert(stream_id, OwnedStream {
+                session_id: 0,
+                direction: WebTransportStreamDirection::Bidi,
+                local_prefix_len: 3,
+                locally_initiated: true,
+                send_terminal_observation: SendTerminalObservation::Active,
+            });
+            runtime
+                .sessions
+                .get_mut(&0)
+                .unwrap()
+                .streams
+                .insert(stream_id);
+
+            let (wait_response, mut waited) = oneshot::channel();
+            runtime.wait_stream_send_terminal(
+                &pipe.server,
+                0,
+                stream_id,
+                wait_response,
+            );
+            assert_eq!(
+                waited.try_recv().unwrap(),
+                WebTransportStreamSendTerminalOutcome::Closed { stream_id }
+            );
+            assert_eq!(runtime.send_terminal_states.len(), 1);
+
+            let (retire_response, mut retired) = oneshot::channel();
+            runtime.retire_stream_send_terminal(
+                &pipe.server,
+                0,
+                stream_id,
+                retire_response,
+            );
+            assert_eq!(
+                retired.try_recv().unwrap(),
+                WebTransportStreamSendTerminalOutcome::Retired {
+                    session_id: 0,
+                    stream_id,
+                }
+            );
+            assert!(runtime.send_terminal_states.is_empty());
+            assert!(runtime.send_terminal_states_per_session.is_empty());
+            assert!(runtime.send_terminal_waiters.is_empty());
+            assert!(runtime.send_terminal_waiters_per_session.is_empty());
+            assert!(runtime.send_terminal_overloaded_sessions.is_empty());
+
+            runtime.stream_sessions.remove(&stream_id);
+            runtime
+                .sessions
+                .get_mut(&0)
+                .unwrap()
+                .streams
+                .remove(&stream_id);
+        }
+
+        assert_eq!(runtime.send_terminal_state_saturation_total, 0);
+        assert_eq!(runtime.send_terminal_waiter_saturation_total, 0);
     }
 
     #[test]
