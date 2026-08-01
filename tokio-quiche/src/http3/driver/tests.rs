@@ -435,6 +435,31 @@ mod client_side_driver {
     }
 
     #[test]
+    fn client_rejects_second_session_without_consuming_a_stream_id() {
+        let mut helper = webtransport_helper();
+        start_webtransport_driver(&mut helper);
+        let (_session_id, _body) =
+            open_pending_webtransport_session(&mut helper, 21);
+
+        helper.driver_enqueue_request(22, webtransport_request_headers(), None);
+        assert_eq!(helper.process_commands().unwrap(), 1);
+        assert_matches!(
+            helper.driver_recv_client_event().unwrap(),
+            ClientH3Event::WebTransportRequestRejected { request_id: 22 }
+        );
+
+        helper.driver_enqueue_request(23, make_request_headers("GET"), None);
+        assert_eq!(helper.process_commands().unwrap(), 1);
+        assert_matches!(
+            helper.driver_recv_client_event().unwrap(),
+            ClientH3Event::NewOutboundRequest {
+                stream_id: 4,
+                request_id: 23,
+            }
+        );
+    }
+
+    #[test]
     fn client_webtransport_buffers_associated_stream_until_response() {
         let mut helper = webtransport_helper();
         start_webtransport_driver(&mut helper);
@@ -528,6 +553,14 @@ mod client_side_driver {
             helper.controller.event_receiver_mut().try_recv(),
             Err(tokio::sync::mpsc::error::TryRecvError::Empty)
         );
+
+        helper.driver_enqueue_request(14, webtransport_request_headers(), None);
+        assert_eq!(helper.process_commands().unwrap(), 1);
+        assert_matches!(
+            helper.driver_recv_client_event().unwrap(),
+            ClientH3Event::WebTransportRequestRejected { request_id: 14 }
+        );
+        assert_eq!(helper.driver.hooks.queued_webtransport_request_count(), 1);
 
         helper.pipe.advance().unwrap();
         helper
@@ -1465,6 +1498,13 @@ mod server_side_driver {
         quiche::test_utils::Pipe::with_config_and_buf(&mut config).unwrap()
     }
 
+    fn single_dgram_queue_webtransport_pipe() -> DriverPipe {
+        let mut config = default_quiche_config();
+        config.enable_dgram(true, 10, 1);
+        config.enable_reset_stream_at(true);
+        quiche::test_utils::Pipe::with_config_and_buf(&mut config).unwrap()
+    }
+
     fn backpressured_webtransport_pipe() -> DriverPipe {
         let mut config = default_quiche_config();
         config.set_initial_max_stream_data_bidi_local(64);
@@ -1476,6 +1516,23 @@ mod server_side_driver {
     fn prefix_backpressured_webtransport_pipe() -> DriverPipe {
         let mut client = default_quiche_config();
         client.set_initial_max_stream_data_bidi_remote(2);
+        client.enable_dgram(true, 10, 10);
+        client.enable_reset_stream_at(true);
+
+        let mut server = default_quiche_config();
+        server.enable_dgram(true, 10, 10);
+        server.enable_reset_stream_at(true);
+
+        quiche::test_utils::Pipe::with_client_and_server_config_and_buf(
+            &mut client,
+            &mut server,
+        )
+        .unwrap()
+    }
+
+    fn payload_backpressured_webtransport_pipe() -> DriverPipe {
+        let mut client = default_quiche_config();
+        client.set_initial_max_stream_data_bidi_remote(64);
         client.enable_dgram(true, 10, 10);
         client.enable_reset_stream_at(true);
 
@@ -1539,6 +1596,115 @@ mod server_side_driver {
         <crate::buf_factory::BufFactory as quiche::BufFactory>::dgram_buf_from_slice(
             data,
         )
+    }
+
+    #[derive(Clone, Debug, Default)]
+    struct MockWriteLeaseLog {
+        exposures: usize,
+        exposed_pointers: Vec<usize>,
+        abandonments: Vec<WebTransportStreamWriteLeaseProgress>,
+        drops: usize,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum MockWriteLeaseError {
+        Unavailable,
+    }
+
+    struct MockWriteLease {
+        id: u64,
+        payload: Box<[u8]>,
+        declared_len: usize,
+        retained_bytes: usize,
+        fail_exposure: bool,
+        log: std::sync::Arc<std::sync::Mutex<MockWriteLeaseLog>>,
+    }
+
+    impl fmt::Debug for MockWriteLease {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter
+                .debug_struct("MockWriteLease")
+                .field("id", &self.id)
+                .field("payload_len", &self.payload.len())
+                .field("declared_len", &self.declared_len)
+                .field("retained_bytes", &self.retained_bytes)
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl WebTransportStreamWriteLease for MockWriteLease {
+        type Error = MockWriteLeaseError;
+
+        fn payload_len(&self) -> usize {
+            self.declared_len
+        }
+
+        fn retained_bytes(&self) -> usize {
+            self.retained_bytes
+        }
+
+        fn as_slice(&mut self) -> Result<&[u8], Self::Error> {
+            if self.fail_exposure {
+                return Err(MockWriteLeaseError::Unavailable);
+            }
+            let mut log = self
+                .log
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            log.exposures += 1;
+            log.exposed_pointers.push(self.payload.as_ptr() as usize);
+            drop(log);
+            Ok(&self.payload)
+        }
+
+        fn on_write_abandoned(
+            &mut self, progress: WebTransportStreamWriteLeaseProgress,
+        ) {
+            self.log
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .abandonments
+                .push(progress);
+        }
+    }
+
+    impl Drop for MockWriteLease {
+        fn drop(&mut self) {
+            self.log
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .drops += 1;
+        }
+    }
+
+    fn mock_write_lease(
+        id: u64, payload: &[u8],
+    ) -> (
+        MockWriteLease,
+        std::sync::Arc<std::sync::Mutex<MockWriteLeaseLog>>,
+    ) {
+        let log = std::sync::Arc::new(std::sync::Mutex::new(
+            MockWriteLeaseLog::default(),
+        ));
+        (
+            MockWriteLease {
+                id,
+                payload: payload.into(),
+                declared_len: payload.len(),
+                retained_bytes: payload.len(),
+                fail_exposure: false,
+                log: std::sync::Arc::clone(&log),
+            },
+            log,
+        )
+    }
+
+    fn mock_write_lease_log(
+        log: &std::sync::Arc<std::sync::Mutex<MockWriteLeaseLog>>,
+    ) -> MockWriteLeaseLog {
+        log.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     fn multicast_ack(channel_id: &[u8]) -> quiche::multicast::Ack {
@@ -1838,6 +2004,56 @@ mod server_side_driver {
     }
 
     #[test]
+    fn webtransport_request_waits_for_client_settings_before_app_admission() {
+        let mut helper = webtransport_helper(webtransport_settings());
+        helper
+            .driver
+            .on_conn_established(
+                &mut helper.pipe.server,
+                &HandshakeInfo::new(Instant::now(), None),
+            )
+            .unwrap();
+        assert!(helper
+            .driver
+            .conn
+            .as_ref()
+            .unwrap()
+            .peer_settings_raw()
+            .is_none());
+
+        <ServerHooks as DriverHooks>::headers_received(
+            &mut helper.driver,
+            &mut helper.pipe.server,
+            InboundHeaders {
+                stream_id: 0,
+                headers: make_webtransport_request_headers(),
+                has_body: true,
+            },
+        )
+        .unwrap();
+        assert!(helper.driver.hooks.has_deferred_webtransport_request());
+        assert!(helper.driver.webtransport.as_ref().unwrap().is_pending(0));
+        assert_no_driver_event(&mut helper);
+
+        helper.pipe.advance().unwrap();
+        helper
+            .driver
+            .process_reads(&mut helper.pipe.server)
+            .unwrap();
+        assert_matches!(
+            helper.driver_recv_core_event().unwrap(),
+            H3Event::IncomingSettings { .. }
+        );
+        expect_session_pending(&mut helper, 0);
+        assert_matches!(
+            helper.driver_recv_server_event().unwrap(),
+            ServerH3Event::Headers { incoming_headers, .. }
+                if incoming_headers.stream_id == 0
+        );
+        assert!(!helper.driver.hooks.has_deferred_webtransport_request());
+    }
+
+    #[test]
     fn webtransport_response_header_flush_accepts_session() {
         let mut helper = webtransport_helper(webtransport_settings());
         let (_to_client, _from_client) = accept_webtransport_session(&mut helper);
@@ -1951,6 +2167,675 @@ mod server_side_driver {
         assert_eq!(&payload[..16], b"selected payload");
         assert!(helper.driver.flow_map.is_empty());
         assert!(!helper.driver.raw_streams.contains(&stream_id));
+    }
+
+    #[tokio::test]
+    async fn webtransport_write_lease_preflight_and_lane_rejections_preserve_owner(
+    ) {
+        let mut settings = webtransport_settings();
+        settings.webtransport_command_capacity = 1;
+        settings.webtransport_max_stream_write_bytes = 4;
+        settings.webtransport_max_stream_write_lease_retained_bytes = 4;
+        let mut helper = webtransport_helper(settings);
+        start_webtransport_driver(&mut helper);
+        let controller = helper
+            .controller
+            .webtransport_controller()
+            .expect("native WebTransport controller");
+
+        let (oversized, oversized_log) = mock_write_lease(1, b"12345");
+        let oversized = assert_matches!(
+            controller.try_write_stream_lease(0, 1, oversized, true),
+            Err(outcome) => outcome
+        );
+        assert_eq!(
+            oversized.progress(),
+            WebTransportStreamWriteLeaseProgress::NeverExposed
+        );
+        let oversized = assert_matches!(
+            oversized,
+            WebTransportStreamWriteLeaseOutcome::TooLarge {
+                limit: WebTransportStreamWriteLeaseLimit::Payload,
+                max: 4,
+                actual: 5,
+                lease,
+                fin: true,
+            } => lease
+        );
+        assert_eq!(oversized.id, 1);
+        assert_eq!(mock_write_lease_log(&oversized_log).exposures, 0);
+        drop(oversized);
+
+        let (mut retained_oversized, retained_oversized_log) =
+            mock_write_lease(2, b"x");
+        retained_oversized.retained_bytes = 5;
+        let retained_oversized = assert_matches!(
+            controller.try_write_stream_lease(
+                0,
+                1,
+                retained_oversized,
+                false,
+            ),
+            Err(WebTransportStreamWriteLeaseOutcome::TooLarge {
+                limit: WebTransportStreamWriteLeaseLimit::RetainedBytes,
+                max: 4,
+                actual: 5,
+                lease,
+                fin: false,
+            }) => lease
+        );
+        assert_eq!(retained_oversized.id, 2);
+        assert_eq!(mock_write_lease_log(&retained_oversized_log).exposures, 0);
+        drop(retained_oversized);
+
+        let (held, held_log) = mock_write_lease(3, b"held");
+        let held = controller.try_write_stream_lease(0, 1, held, true).unwrap();
+        assert_eq!(
+            helper.driver.webtransport_cmd_recv.as_ref().unwrap().len(),
+            1
+        );
+
+        let (waiting, waiting_log) = mock_write_lease(4, b"wait");
+        let waiting_controller = controller.clone();
+        let waiting_task = tokio::spawn(async move {
+            waiting_controller
+                .write_stream_lease(0, 1, waiting, false)
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(!waiting_task.is_finished());
+        waiting_task.abort();
+        assert!(waiting_task.await.unwrap_err().is_cancelled());
+        let waiting_log = mock_write_lease_log(&waiting_log);
+        assert_eq!(waiting_log.exposures, 0);
+        assert_eq!(waiting_log.drops, 1);
+        assert_eq!(waiting_log.abandonments, [
+            WebTransportStreamWriteLeaseProgress::NeverExposed
+        ]);
+
+        let (full, full_log) = mock_write_lease(5, b"full");
+        let full = assert_matches!(
+            controller.try_write_stream_lease(0, 1, full, false),
+            Err(WebTransportStreamWriteLeaseOutcome::QueueFull {
+                lease,
+                fin: false,
+            }) => lease
+        );
+        assert_eq!(full.id, 5);
+        assert_eq!(mock_write_lease_log(&full_log).exposures, 0);
+        drop(full);
+
+        helper.work_loop_iter().unwrap();
+        let held = assert_matches!(
+            held.outcome().await,
+            WebTransportStreamWriteLeaseOutcome::Rejected {
+                error: WebTransportSelectionError::UnknownSession,
+                lease,
+                fin: true,
+            } => lease
+        );
+        assert_eq!(held.id, 3);
+        assert_eq!(mock_write_lease_log(&held_log).exposures, 0);
+        drop(held);
+
+        let stats_controller = controller.clone();
+        let stats =
+            tokio::spawn(async move { stats_controller.retention_stats().await });
+        tokio::task::yield_now().await;
+        helper.work_loop_iter().unwrap();
+        let stats = stats.await.unwrap().unwrap();
+        assert_eq!(stats.write_leases, 0);
+        assert_eq!(stats.write_lease_admitted_total, 1);
+        assert_eq!(stats.write_lease_queue_full_total, 1);
+        assert_eq!(stats.write_lease_resource_limit_total, 0);
+        assert_eq!(stats.write_lease_too_large_total, 2);
+
+        helper.driver.close_webtransport_command_lane();
+
+        let (closed, closed_log) = mock_write_lease(6, b"shut");
+        let closed = assert_matches!(
+            controller.try_write_stream_lease(0, 1, closed, false),
+            Err(WebTransportStreamWriteLeaseOutcome::Rejected {
+                error: WebTransportSelectionError::ConnectionClosed,
+                lease,
+                fin: false,
+            }) => lease
+        );
+        assert_eq!(closed.id, 6);
+        assert_eq!(mock_write_lease_log(&closed_log).exposures, 0);
+    }
+
+    #[tokio::test]
+    async fn webtransport_write_lease_is_byte_exact_without_prewrite_copy() {
+        let mut settings = webtransport_settings();
+        settings.webtransport_max_stream_write_bytes = 8;
+        settings.webtransport_max_stream_write_lease_retained_bytes = 8;
+        let mut helper = webtransport_helper(settings);
+        start_webtransport_driver(&mut helper);
+        let (session_id, to_client, _from_client) =
+            open_pending_webtransport_session(&mut helper);
+        accept_pending_webtransport_session(&mut helper, session_id, &to_client);
+        let controller = helper
+            .controller
+            .webtransport_controller()
+            .expect("native WebTransport controller");
+        let stream_id =
+            open_server_webtransport_bidi(&mut helper, &controller, session_id)
+                .await;
+        helper.pipe.advance().unwrap();
+        assert_matches!(
+            helper.peer_client_poll(),
+            Ok((id, h3::Event::WebTransportStream { .. })) if id == stream_id
+        );
+
+        let (too_large, too_large_log) = mock_write_lease(10, b"123456789");
+        let too_large = assert_matches!(
+            controller.try_write_stream_lease(
+                session_id,
+                stream_id,
+                too_large,
+                true,
+            ),
+            Err(WebTransportStreamWriteLeaseOutcome::TooLarge {
+                limit: WebTransportStreamWriteLeaseLimit::Payload,
+                max: 8,
+                actual: 9,
+                lease,
+                fin: true,
+            }) => lease
+        );
+        assert_eq!(mock_write_lease_log(&too_large_log).exposures, 0);
+        drop(too_large);
+
+        let (mut unavailable, unavailable_log) = mock_write_lease(13, b"unready");
+        unavailable.fail_exposure = true;
+        let unavailable = controller
+            .try_write_stream_lease(session_id, stream_id, unavailable, false)
+            .unwrap();
+        helper.work_loop_iter().unwrap();
+        let unavailable = assert_matches!(
+            unavailable.outcome().await,
+            WebTransportStreamWriteLeaseOutcome::LeaseError {
+                error: MockWriteLeaseError::Unavailable,
+                lease,
+                fin: false,
+            } => lease
+        );
+        assert_eq!(unavailable.id, 13);
+        assert_eq!(mock_write_lease_log(&unavailable_log).exposures, 0);
+        drop(unavailable);
+
+        let (mut invalid_length, invalid_length_log) =
+            mock_write_lease(14, b"12345678");
+        invalid_length.declared_len = 7;
+        let invalid_length = controller
+            .try_write_stream_lease(session_id, stream_id, invalid_length, false)
+            .unwrap();
+        helper.work_loop_iter().unwrap();
+        let invalid_length = assert_matches!(
+            invalid_length.outcome().await,
+            WebTransportStreamWriteLeaseOutcome::InvalidLength {
+                declared: 7,
+                actual: 8,
+                lease,
+                fin: false,
+            } => lease
+        );
+        assert_eq!(invalid_length.id, 14);
+        assert_eq!(mock_write_lease_log(&invalid_length_log).exposures, 1);
+        drop(invalid_length);
+
+        let (lease, log) = mock_write_lease(11, b"12345678");
+        let original_pointer = lease.payload.as_ptr() as usize;
+        let operation = controller
+            .try_write_stream_lease(session_id, stream_id, lease, true)
+            .unwrap();
+        assert_eq!(operation.retained_bytes(), 8);
+        assert_eq!(mock_write_lease_log(&log).exposures, 0);
+        helper.work_loop_iter().unwrap();
+        let outcome = operation.outcome().await;
+        assert_eq!(
+            outcome.progress(),
+            WebTransportStreamWriteLeaseProgress::AcceptedComplete {
+                accepted: 8,
+                fin_accepted: true,
+            }
+        );
+        let lease = assert_matches!(
+            outcome,
+            WebTransportStreamWriteLeaseOutcome::Accepted {
+                lease,
+                accepted: 8,
+                complete: true,
+                fin_accepted: true,
+            } => lease
+        );
+        assert_eq!(lease.id, 11);
+        assert_eq!(lease.payload.as_ptr() as usize, original_pointer);
+        let snapshot = mock_write_lease_log(&log);
+        assert_eq!(snapshot.exposures, 1);
+        assert_eq!(snapshot.exposed_pointers, [original_pointer]);
+        assert!(snapshot.abandonments.is_empty());
+        assert_eq!(snapshot.drops, 0);
+        drop(lease);
+        assert_eq!(mock_write_lease_log(&log).drops, 1);
+
+        helper.pipe.advance().unwrap();
+        let mut payload = [0; 16];
+        assert_eq!(
+            helper.pipe.client.stream_recv(stream_id, &mut payload),
+            Ok((8, true))
+        );
+        assert_eq!(&payload[..8], b"12345678");
+
+        let fin_stream =
+            open_server_webtransport_bidi(&mut helper, &controller, session_id)
+                .await;
+        helper.pipe.advance().unwrap();
+        assert_matches!(
+            helper.peer_client_poll(),
+            Ok((id, h3::Event::WebTransportStream { .. })) if id == fin_stream
+        );
+        let (fin_only, fin_log) = mock_write_lease(12, b"");
+        let fin_only = controller
+            .try_write_stream_lease(session_id, fin_stream, fin_only, true)
+            .unwrap();
+        helper.work_loop_iter().unwrap();
+        let fin_only = assert_matches!(
+            fin_only.outcome().await,
+            WebTransportStreamWriteLeaseOutcome::Accepted {
+                lease,
+                accepted: 0,
+                complete: true,
+                fin_accepted: true,
+            } => lease
+        );
+        assert_eq!(fin_only.id, 12);
+        assert_eq!(mock_write_lease_log(&fin_log).exposures, 1);
+        drop(fin_only);
+        helper.pipe.advance().unwrap();
+        assert_eq!(
+            helper.pipe.client.stream_recv(fin_stream, &mut payload),
+            Ok((0, true))
+        );
+    }
+
+    #[tokio::test]
+    async fn webtransport_write_lease_partial_retry_and_wakeup_are_fair() {
+        let mut settings = webtransport_settings();
+        settings.webtransport_command_capacity = 4;
+        settings.webtransport_max_session_work_per_callback = 1;
+        settings.webtransport_max_stream_write_bytes = 128;
+        settings.webtransport_max_stream_write_lease_retained_bytes = 128;
+        let mut helper =
+            DriverTestHelper::<ServerHooks>::with_pipe_and_http3_settings(
+                payload_backpressured_webtransport_pipe(),
+                settings,
+            )
+            .unwrap();
+        start_webtransport_driver(&mut helper);
+        let (session_id, to_client, _from_client) =
+            open_pending_webtransport_session(&mut helper);
+        accept_pending_webtransport_session(&mut helper, session_id, &to_client);
+        let controller = helper
+            .controller
+            .webtransport_controller()
+            .expect("native WebTransport controller");
+
+        let blocked_stream =
+            open_server_webtransport_bidi(&mut helper, &controller, session_id)
+                .await;
+        helper.pipe.advance().unwrap();
+        assert_matches!(
+            helper.peer_client_poll(),
+            Ok((id, h3::Event::WebTransportStream { prefix_len: 3, .. }))
+                if id == blocked_stream
+        );
+        let healthy_stream =
+            open_server_webtransport_bidi(&mut helper, &controller, session_id)
+                .await;
+        helper.pipe.advance().unwrap();
+        assert_matches!(
+            helper.peer_client_poll(),
+            Ok((id, h3::Event::WebTransportStream { prefix_len: 3, .. }))
+                if id == healthy_stream
+        );
+
+        let payload: Vec<u8> = (0..80).collect();
+        let (first_lease, first_log) = mock_write_lease(20, &payload);
+        let first_pointer = first_lease.payload.as_ptr() as usize;
+        let first = controller
+            .try_write_stream_lease(session_id, blocked_stream, first_lease, true)
+            .unwrap();
+        let (healthy_lease, healthy_log) = mock_write_lease(21, b"healthy");
+        let healthy = controller
+            .try_write_stream_lease(
+                session_id,
+                healthy_stream,
+                healthy_lease,
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            helper.driver.webtransport_cmd_recv.as_ref().unwrap().len(),
+            2
+        );
+
+        helper
+            .driver
+            .process_writes(&mut helper.pipe.server)
+            .unwrap();
+        assert_eq!(
+            helper.driver.webtransport_cmd_recv.as_ref().unwrap().len(),
+            1
+        );
+        assert_eq!(mock_write_lease_log(&healthy_log).exposures, 0);
+        let first_lease = assert_matches!(
+            first.outcome().await,
+            WebTransportStreamWriteLeaseOutcome::Accepted {
+                lease,
+                accepted: 61,
+                complete: false,
+                fin_accepted: false,
+            } => lease
+        );
+        assert_eq!(first_lease.payload.as_ptr() as usize, first_pointer);
+        assert_eq!(mock_write_lease_log(&first_log).exposed_pointers, [
+            first_pointer
+        ]);
+        drop(first_lease);
+
+        helper
+            .driver
+            .process_writes(&mut helper.pipe.server)
+            .unwrap();
+        let healthy_lease = assert_matches!(
+            healthy.outcome().await,
+            WebTransportStreamWriteLeaseOutcome::Accepted {
+                lease,
+                accepted: 7,
+                complete: true,
+                fin_accepted: true,
+            } => lease
+        );
+        assert_eq!(healthy_lease.id, 21);
+        assert_eq!(mock_write_lease_log(&healthy_log).exposures, 1);
+        drop(healthy_lease);
+
+        let wait_controller = controller.clone();
+        let writable = tokio::spawn(async move {
+            wait_controller
+                .wait_stream_writable(session_id, blocked_stream)
+                .await
+        });
+        tokio::task::yield_now().await;
+        helper.work_loop_iter().unwrap();
+        assert!(!writable.is_finished());
+
+        helper.pipe.advance().unwrap();
+        let mut received = [0; 128];
+        assert_eq!(
+            helper
+                .pipe
+                .client
+                .stream_recv(blocked_stream, &mut received),
+            Ok((61, false))
+        );
+        assert_eq!(&received[..61], &payload[..61]);
+        let mut healthy_payload = [0; 16];
+        assert_eq!(
+            helper
+                .pipe
+                .client
+                .stream_recv(healthy_stream, &mut healthy_payload),
+            Ok((7, true))
+        );
+        assert_eq!(&healthy_payload[..7], b"healthy");
+
+        helper.pipe.advance().unwrap();
+        for _ in 0..16 {
+            helper.work_loop_iter().unwrap();
+            if writable.is_finished() {
+                break;
+            }
+            helper.pipe.advance().unwrap();
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            writable.await.unwrap(),
+            WebTransportStreamReadyOutcome::Ready
+        );
+
+        let (retry_lease, retry_log) = mock_write_lease(22, &payload[61..]);
+        let retry = controller
+            .try_write_stream_lease(session_id, blocked_stream, retry_lease, true)
+            .unwrap();
+        helper.work_loop_iter().unwrap();
+        let retry_lease = assert_matches!(
+            retry.outcome().await,
+            WebTransportStreamWriteLeaseOutcome::Accepted {
+                lease,
+                accepted: 19,
+                complete: true,
+                fin_accepted: true,
+            } => lease
+        );
+        assert_eq!(retry_lease.id, 22);
+        assert_eq!(mock_write_lease_log(&retry_log).exposures, 1);
+        drop(retry_lease);
+        helper.pipe.advance().unwrap();
+        assert_eq!(
+            helper
+                .pipe
+                .client
+                .stream_recv(blocked_stream, &mut received),
+            Ok((19, true))
+        );
+        assert_eq!(&received[..19], &payload[61..]);
+    }
+
+    #[tokio::test]
+    async fn webtransport_write_lease_cancellation_settles_exact_progress() {
+        let mut helper =
+            DriverTestHelper::<ServerHooks>::with_pipe_and_http3_settings(
+                exact_prefix_capacity_webtransport_pipe(),
+                webtransport_settings(),
+            )
+            .unwrap();
+        start_webtransport_driver(&mut helper);
+        let (session_id, to_client, _from_client) =
+            open_pending_webtransport_session(&mut helper);
+        accept_pending_webtransport_session(&mut helper, session_id, &to_client);
+        let controller = helper
+            .controller
+            .webtransport_controller()
+            .expect("native WebTransport controller");
+        let stream_id =
+            open_server_webtransport_bidi(&mut helper, &controller, session_id)
+                .await;
+
+        let (unexposed, unexposed_log) = mock_write_lease(30, b"unexposed");
+        let unexposed = controller
+            .try_write_stream_lease(session_id, stream_id, unexposed, false)
+            .unwrap();
+        drop(unexposed);
+        helper.work_loop_iter().unwrap();
+        let unexposed_log = mock_write_lease_log(&unexposed_log);
+        assert_eq!(unexposed_log.exposures, 0);
+        assert_eq!(unexposed_log.drops, 1);
+        assert_eq!(unexposed_log.abandonments, [
+            WebTransportStreamWriteLeaseProgress::NeverExposed
+        ]);
+
+        let (blocked, blocked_log) = mock_write_lease(31, b"blocked");
+        let blocked = controller
+            .try_write_stream_lease(session_id, stream_id, blocked, false)
+            .unwrap();
+        helper.work_loop_iter().unwrap();
+        drop(blocked);
+        let blocked_log = mock_write_lease_log(&blocked_log);
+        assert_eq!(blocked_log.exposures, 1);
+        assert_eq!(blocked_log.drops, 1);
+        assert_eq!(blocked_log.abandonments, [
+            WebTransportStreamWriteLeaseProgress::ExposedKnownZero
+        ]);
+
+        let stats_controller = controller.clone();
+        let stats =
+            tokio::spawn(async move { stats_controller.retention_stats().await });
+        tokio::task::yield_now().await;
+        helper.work_loop_iter().unwrap();
+        let stats = stats.await.unwrap().unwrap();
+        assert_eq!(stats.write_lease_abandoned_unexposed_total, 1);
+        assert_eq!(stats.write_lease_abandoned_zero_total, 1);
+        assert_eq!(stats.write_lease_abandoned_unknown_total, 0);
+
+        let mut helper = webtransport_helper(webtransport_settings());
+        start_webtransport_driver(&mut helper);
+        let (session_id, to_client, _from_client) =
+            open_pending_webtransport_session(&mut helper);
+        accept_pending_webtransport_session(&mut helper, session_id, &to_client);
+        let controller = helper
+            .controller
+            .webtransport_controller()
+            .expect("native WebTransport controller");
+        let stream_id =
+            open_server_webtransport_bidi(&mut helper, &controller, session_id)
+                .await;
+        helper.pipe.advance().unwrap();
+        assert_matches!(
+            helper.peer_client_poll(),
+            Ok((id, h3::Event::WebTransportStream { .. })) if id == stream_id
+        );
+        let (accepted, accepted_log) = mock_write_lease(32, b"accepted");
+        let accepted = controller
+            .try_write_stream_lease(session_id, stream_id, accepted, false)
+            .unwrap();
+        helper.work_loop_iter().unwrap();
+        drop(accepted);
+        let accepted_log = mock_write_lease_log(&accepted_log);
+        assert_eq!(accepted_log.exposures, 1);
+        assert_eq!(accepted_log.drops, 1);
+        assert_eq!(accepted_log.abandonments, [
+            WebTransportStreamWriteLeaseProgress::Unknowable
+        ]);
+        helper.pipe.advance().unwrap();
+        let mut payload = [0; 16];
+        assert_eq!(
+            helper.pipe.client.stream_recv(stream_id, &mut payload),
+            Ok((8, false))
+        );
+        assert_eq!(&payload[..8], b"accepted");
+
+        let stats_controller = controller.clone();
+        let stats =
+            tokio::spawn(async move { stats_controller.retention_stats().await });
+        tokio::task::yield_now().await;
+        helper.work_loop_iter().unwrap();
+        let stats = stats.await.unwrap().unwrap();
+        assert_eq!(stats.write_lease_abandoned_unknown_total, 1);
+    }
+
+    #[tokio::test]
+    async fn webtransport_write_lease_retention_is_bounded_until_owner_return() {
+        let mut settings = webtransport_settings();
+        settings.webtransport_command_capacity = 2;
+        settings.webtransport_max_stream_write_bytes = 8;
+        settings.webtransport_max_stream_write_lease_retained_bytes = 8;
+        let mut helper = webtransport_helper(settings);
+        start_webtransport_driver(&mut helper);
+        let controller = helper
+            .controller
+            .webtransport_controller()
+            .expect("native WebTransport controller");
+
+        let (first, first_log) = mock_write_lease(40, b"aaaa");
+        let first = controller
+            .try_write_stream_lease(99, 1, first, false)
+            .unwrap();
+        let (second, second_log) = mock_write_lease(41, b"bbbb");
+        let second = controller
+            .try_write_stream_lease(99, 5, second, false)
+            .unwrap();
+        helper.work_loop_iter().unwrap();
+        assert_eq!(
+            helper.driver.webtransport_cmd_recv.as_ref().unwrap().len(),
+            0
+        );
+
+        let (limited, limited_log) = mock_write_lease(42, b"cccc");
+        let limited = assert_matches!(
+            controller.try_write_stream_lease(99, 9, limited, false),
+            Err(WebTransportStreamWriteLeaseOutcome::ResourceLimit {
+                lease,
+                fin: false,
+            }) => lease
+        );
+        assert_eq!(limited.id, 42);
+        assert_eq!(mock_write_lease_log(&limited_log).exposures, 0);
+        drop(limited);
+
+        let stats_controller = controller.clone();
+        let stats =
+            tokio::spawn(async move { stats_controller.retention_stats().await });
+        tokio::task::yield_now().await;
+        helper.work_loop_iter().unwrap();
+        let stats = stats.await.unwrap().unwrap();
+        assert_eq!(stats.write_leases, 2);
+        assert_eq!(stats.write_lease_retained_bytes, 8);
+        assert_eq!(stats.max_write_leases, 2);
+        assert_eq!(stats.max_write_lease_retained_bytes, 16);
+        assert_eq!(stats.write_lease_admitted_total, 2);
+        assert_eq!(stats.write_lease_resource_limit_total, 1);
+        assert!(stats.write_leases <= stats.max_write_leases);
+        assert!(
+            stats.write_lease_retained_bytes <=
+                stats.max_write_lease_retained_bytes
+        );
+
+        let first = assert_matches!(
+            first.outcome().await,
+            WebTransportStreamWriteLeaseOutcome::Rejected {
+                error: WebTransportSelectionError::UnknownSession,
+                lease,
+                fin: false,
+            } => lease
+        );
+        assert_eq!(first.id, 40);
+        assert_eq!(mock_write_lease_log(&first_log).exposures, 0);
+        drop(first);
+
+        let (replacement, replacement_log) = mock_write_lease(43, b"dddd");
+        let replacement = controller
+            .try_write_stream_lease(99, 9, replacement, false)
+            .unwrap();
+        helper.driver.on_conn_close(
+            &mut helper.pipe.server,
+            &TestMetrics::default(),
+            &Ok(()),
+        );
+        let replacement = assert_matches!(
+            replacement.outcome().await,
+            WebTransportStreamWriteLeaseOutcome::Rejected {
+                error: WebTransportSelectionError::ConnectionClosed,
+                lease,
+                fin: false,
+            } => lease
+        );
+        assert_eq!(replacement.id, 43);
+        assert_eq!(mock_write_lease_log(&replacement_log).exposures, 0);
+        drop(replacement);
+
+        let second = assert_matches!(
+            second.outcome().await,
+            WebTransportStreamWriteLeaseOutcome::Rejected {
+                error: WebTransportSelectionError::UnknownSession,
+                lease,
+                fin: false,
+            } => lease
+        );
+        assert_eq!(second.id, 41);
+        assert_eq!(mock_write_lease_log(&second_log).exposures, 0);
     }
 
     #[tokio::test]
@@ -2202,6 +3087,7 @@ mod server_side_driver {
     {
         let mut settings = webtransport_settings();
         settings.webtransport_command_capacity = 2;
+        settings.webtransport_max_datagram_send_allocation_bytes = 64;
         let mut helper = webtransport_helper(settings);
         let controller = helper
             .controller
@@ -2215,6 +3101,17 @@ mod server_side_driver {
                 max: datagram_socket::MAX_DATAGRAM_SIZE,
                 datagram,
             }) if datagram.as_slice() == oversized
+        );
+
+        let allocation_oversized =
+            datagram_socket::DgramBuffer::with_capacity(65);
+        assert_matches!(
+            controller.try_send_datagram(0, allocation_oversized),
+            Err(WebTransportDatagramSendOutcome::AllocationTooLarge {
+                max: 64,
+                allocated,
+                datagram,
+            }) if allocated >= 65 && datagram.allocated_capacity() == allocated
         );
 
         let write = controller
@@ -2615,7 +3512,7 @@ mod server_side_driver {
     }
 
     #[tokio::test]
-    async fn webtransport_blocked_prefix_does_not_starve_another_session() {
+    async fn webtransport_blocked_prefix_does_not_starve_another_stream() {
         let mut settings = webtransport_settings();
         settings.webtransport_max_session_work_per_callback = 2;
         let mut helper =
@@ -2632,14 +3529,6 @@ mod server_side_driver {
             blocked_session,
             &blocked_response,
         );
-        let (healthy_session, healthy_response, _healthy_body) =
-            open_pending_webtransport_session(&mut helper);
-        accept_pending_webtransport_session(
-            &mut helper,
-            healthy_session,
-            &healthy_response,
-        );
-
         let controller = helper
             .controller
             .webtransport_controller()
@@ -2653,7 +3542,7 @@ mod server_side_driver {
         let healthy_controller = controller.clone();
         let healthy = tokio::spawn(async move {
             healthy_controller
-                .open_unidirectional_stream(healthy_session)
+                .open_unidirectional_stream(blocked_session)
                 .await
         });
         for _ in 0..8 {
@@ -2686,7 +3575,7 @@ mod server_side_driver {
         assert_eq!(
             helper.peer_client_poll(),
             Ok((stream_id, h3::Event::WebTransportStream {
-                session_id: healthy_session,
+                session_id: blocked_session,
                 direction: h3::WebTransportStreamDirection::Unidirectional,
                 prefix_len: 3,
             }))
@@ -3085,6 +3974,212 @@ mod server_side_driver {
     }
 
     #[tokio::test]
+    async fn webtransport_datagram_readable_wait_is_level_and_terminal_safe() {
+        let mut helper = webtransport_helper(webtransport_settings());
+        start_webtransport_driver(&mut helper);
+        let (session_id, to_client, _from_client) =
+            open_pending_webtransport_session(&mut helper);
+        accept_pending_webtransport_session(&mut helper, session_id, &to_client);
+        let controller = helper
+            .controller
+            .webtransport_controller()
+            .expect("native WebTransport controller");
+
+        let waiting_controller = controller.clone();
+        let waiting = tokio::spawn(async move {
+            waiting_controller.wait_datagram_readable(session_id).await
+        });
+        tokio::task::yield_now().await;
+        helper.work_loop_iter().unwrap();
+        assert!(!waiting.is_finished());
+
+        helper.pipe.client.dgram_send(b"\0ready").unwrap();
+        helper.advance_and_run_loop().unwrap();
+        assert_eq!(
+            waiting.await.unwrap(),
+            WebTransportDatagramReadyOutcome::Ready
+        );
+
+        let level_controller = controller.clone();
+        let level = tokio::spawn(async move {
+            level_controller.wait_datagram_readable(session_id).await
+        });
+        tokio::task::yield_now().await;
+        helper.work_loop_iter().unwrap();
+        assert_eq!(
+            level.await.unwrap(),
+            WebTransportDatagramReadyOutcome::Ready
+        );
+
+        let receive_controller = controller.clone();
+        let receive = tokio::spawn(async move {
+            receive_controller.receive_datagram(session_id).await
+        });
+        tokio::task::yield_now().await;
+        helper.work_loop_iter().unwrap();
+        assert_matches!(
+            receive.await.unwrap(),
+            WebTransportDatagramReadOutcome::Datagram(datagram)
+                if datagram.as_slice() == b"ready"
+        );
+
+        let terminal_controller = controller.clone();
+        let terminal = tokio::spawn(async move {
+            terminal_controller.wait_datagram_readable(session_id).await
+        });
+        tokio::task::yield_now().await;
+        helper.work_loop_iter().unwrap();
+        assert!(!terminal.is_finished());
+
+        let duplicate_controller = controller.clone();
+        let duplicate = tokio::spawn(async move {
+            duplicate_controller
+                .wait_datagram_readable(session_id)
+                .await
+        });
+        tokio::task::yield_now().await;
+        helper.work_loop_iter().unwrap();
+        assert_eq!(
+            duplicate.await.unwrap(),
+            WebTransportDatagramReadyOutcome::ResourceLimit
+        );
+
+        helper.peer_client_send_body(session_id, &[], true).unwrap();
+        helper.advance_and_run_loop().unwrap();
+        expect_session_terminated(
+            &mut helper,
+            session_id,
+            WebTransportSessionCloseReason::Clean,
+        );
+        assert_eq!(
+            terminal.await.unwrap(),
+            WebTransportDatagramReadyOutcome::Rejected(
+                WebTransportDatagramError::TerminalSession,
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn webtransport_datagram_send_wait_survives_capacity_race() {
+        let mut helper =
+            DriverTestHelper::<ServerHooks>::with_pipe_and_http3_settings(
+                single_dgram_queue_webtransport_pipe(),
+                webtransport_settings(),
+            )
+            .unwrap();
+        start_webtransport_driver(&mut helper);
+        let (session_id, to_client, _from_client) =
+            open_pending_webtransport_session(&mut helper);
+        accept_pending_webtransport_session(&mut helper, session_id, &to_client);
+        let controller = helper
+            .controller
+            .webtransport_controller()
+            .expect("native WebTransport controller");
+
+        let send_controller = controller.clone();
+        let send = tokio::spawn(async move {
+            send_controller
+                .send_datagram(session_id, dgram_buf(b"fill"))
+                .await
+        });
+        tokio::task::yield_now().await;
+        helper.work_loop_iter().unwrap();
+        assert_matches!(
+            send.await.unwrap(),
+            WebTransportDatagramSendOutcome::Accepted
+        );
+        assert!(helper.pipe.server.is_dgram_send_queue_full());
+
+        let waiting_controller = controller.clone();
+        let waiting = tokio::spawn(async move {
+            waiting_controller
+                .wait_datagram_send_capacity(session_id)
+                .await
+        });
+        tokio::task::yield_now().await;
+        helper.work_loop_iter().unwrap();
+        assert!(!waiting.is_finished());
+
+        let duplicate_controller = controller.clone();
+        let duplicate = tokio::spawn(async move {
+            duplicate_controller
+                .wait_datagram_send_capacity(session_id)
+                .await
+        });
+        tokio::task::yield_now().await;
+        helper.work_loop_iter().unwrap();
+        assert_eq!(
+            duplicate.await.unwrap(),
+            WebTransportDatagramReadyOutcome::ResourceLimit
+        );
+
+        helper.pipe.advance().unwrap();
+        assert!(!helper.pipe.server.is_dgram_send_queue_full());
+        assert!(
+            helper
+                .driver
+                .wait_for_data(&mut helper.pipe.server)
+                .now_or_never()
+                .is_some(),
+            "send-capacity readiness must make the wait predicate runnable"
+        );
+        helper.work_loop_iter().unwrap();
+        assert_eq!(
+            waiting.await.unwrap(),
+            WebTransportDatagramReadyOutcome::Ready
+        );
+
+        let level_controller = controller.clone();
+        let level = tokio::spawn(async move {
+            level_controller
+                .wait_datagram_send_capacity(session_id)
+                .await
+        });
+        tokio::task::yield_now().await;
+        helper.work_loop_iter().unwrap();
+        assert_eq!(
+            level.await.unwrap(),
+            WebTransportDatagramReadyOutcome::Ready
+        );
+
+        let refill_controller = controller.clone();
+        let refill = tokio::spawn(async move {
+            refill_controller
+                .send_datagram(session_id, dgram_buf(b"refill"))
+                .await
+        });
+        tokio::task::yield_now().await;
+        helper.work_loop_iter().unwrap();
+        assert_matches!(
+            refill.await.unwrap(),
+            WebTransportDatagramSendOutcome::Accepted
+        );
+        let terminal_controller = controller.clone();
+        let terminal = tokio::spawn(async move {
+            terminal_controller
+                .wait_datagram_send_capacity(session_id)
+                .await
+        });
+        tokio::task::yield_now().await;
+        helper.work_loop_iter().unwrap();
+        assert!(!terminal.is_finished());
+
+        helper.peer_client_send_body(session_id, &[], true).unwrap();
+        helper.advance_and_run_loop().unwrap();
+        expect_session_terminated(
+            &mut helper,
+            session_id,
+            WebTransportSessionCloseReason::Clean,
+        );
+        assert_eq!(
+            terminal.await.unwrap(),
+            WebTransportDatagramReadyOutcome::Rejected(
+                WebTransportDatagramError::TerminalSession,
+            )
+        );
+    }
+
+    #[tokio::test]
     async fn webtransport_datagram_before_connect_is_classified_exactly_once() {
         let mut settings = webtransport_settings();
         settings.webtransport_max_pending_datagram_age =
@@ -3170,68 +4265,35 @@ mod server_side_driver {
     }
 
     #[tokio::test]
-    async fn webtransport_datagrams_are_isolated_and_released_per_session() {
+    async fn webtransport_datagrams_are_released_on_session_termination() {
         let mut helper = webtransport_helper(webtransport_settings());
         start_webtransport_driver(&mut helper);
-        let (first_session, first_response, _first_body) =
+        let (session_id, response, _body) =
             open_pending_webtransport_session(&mut helper);
-        accept_pending_webtransport_session(
-            &mut helper,
-            first_session,
-            &first_response,
-        );
-        let (second_session, second_response, _second_body) =
-            open_pending_webtransport_session(&mut helper);
-        accept_pending_webtransport_session(
-            &mut helper,
-            second_session,
-            &second_response,
-        );
+        accept_pending_webtransport_session(&mut helper, session_id, &response);
         let controller = helper
             .controller
             .webtransport_controller()
             .expect("native WebTransport controller");
 
-        let first_send_controller = controller.clone();
-        let first_send = tokio::spawn(async move {
-            first_send_controller
-                .send_datagram(first_session, dgram_buf(b"out-first"))
-                .await
-        });
-        let second_send_controller = controller.clone();
-        let second_send = tokio::spawn(async move {
-            second_send_controller
-                .send_datagram(second_session, dgram_buf(b"out-second"))
+        let send_controller = controller.clone();
+        let send = tokio::spawn(async move {
+            send_controller
+                .send_datagram(session_id, dgram_buf(b"outbound"))
                 .await
         });
         tokio::task::yield_now().await;
         helper.work_loop_iter().unwrap();
         assert_matches!(
-            first_send.await.unwrap(),
-            WebTransportDatagramSendOutcome::Accepted
-        );
-        assert_matches!(
-            second_send.await.unwrap(),
+            send.await.unwrap(),
             WebTransportDatagramSendOutcome::Accepted
         );
         helper.pipe.advance().unwrap();
-        assert_next_client_raw_h3_dgram(
-            &mut helper,
-            first_session / 4,
-            b"out-first",
-        );
-        assert_next_client_raw_h3_dgram(
-            &mut helper,
-            second_session / 4,
-            b"out-second",
-        );
+        assert_next_client_raw_h3_dgram(&mut helper, session_id / 4, b"outbound");
         assert_client_no_raw_h3_dgram(&mut helper);
 
-        for (flow_id, payload) in [
-            (first_session / 4, b"first".as_slice()),
-            (second_session / 4, b"second".as_slice()),
-        ] {
-            let mut wire = vec![flow_id as u8];
+        for payload in [b"first".as_slice(), b"still".as_slice()] {
+            let mut wire = vec![(session_id / 4) as u8];
             wire.extend_from_slice(payload);
             helper.pipe.client.dgram_send(&wire).unwrap();
         }
@@ -3243,45 +4305,19 @@ mod server_side_driver {
                 .as_ref()
                 .unwrap()
                 .pending_datagram_usage(),
-            (2, 11)
+            (2, 10)
         );
 
-        let second_receive_controller = controller.clone();
-        let second_receive = tokio::spawn(async move {
-            second_receive_controller
-                .receive_datagram(second_session)
-                .await
+        let receive_controller = controller.clone();
+        let receive = tokio::spawn(async move {
+            receive_controller.receive_datagram(session_id).await
         });
         tokio::task::yield_now().await;
         helper.work_loop_iter().unwrap();
         assert_matches!(
-            second_receive.await.unwrap(),
+            receive.await.unwrap(),
             WebTransportDatagramReadOutcome::Datagram(datagram)
-                if datagram.as_slice() == b"second"
-        );
-
-        let mut retained_second = vec![(second_session / 4) as u8];
-        retained_second.extend_from_slice(b"still");
-        helper.pipe.client.dgram_send(&retained_second).unwrap();
-        helper.advance_and_run_loop().unwrap();
-        assert_eq!(
-            helper
-                .driver
-                .webtransport
-                .as_ref()
-                .unwrap()
-                .pending_datagram_usage(),
-            (2, 10)
-        );
-
-        helper
-            .peer_client_send_body(first_session, &[], true)
-            .unwrap();
-        helper.advance_and_run_loop().unwrap();
-        expect_session_terminated(
-            &mut helper,
-            first_session,
-            WebTransportSessionCloseReason::Clean,
+                if datagram.as_slice() == b"first"
         );
         assert_eq!(
             helper
@@ -3293,22 +4329,40 @@ mod server_side_driver {
             (1, 5)
         );
 
-        let retained_controller = controller.clone();
-        let retained = tokio::spawn(async move {
-            retained_controller.receive_datagram(second_session).await
+        helper.peer_client_send_body(session_id, &[], true).unwrap();
+        helper.advance_and_run_loop().unwrap();
+        expect_session_terminated(
+            &mut helper,
+            session_id,
+            WebTransportSessionCloseReason::Clean,
+        );
+        assert_eq!(
+            helper
+                .driver
+                .webtransport
+                .as_ref()
+                .unwrap()
+                .pending_datagram_usage(),
+            (0, 0)
+        );
+
+        let terminal_controller = controller.clone();
+        let terminal = tokio::spawn(async move {
+            terminal_controller.receive_datagram(session_id).await
         });
         tokio::task::yield_now().await;
         helper.work_loop_iter().unwrap();
         assert_matches!(
-            retained.await.unwrap(),
-            WebTransportDatagramReadOutcome::Datagram(datagram)
-                if datagram.as_slice() == b"still"
+            terminal.await.unwrap(),
+            WebTransportDatagramReadOutcome::Rejected(
+                WebTransportDatagramError::TerminalSession
+            )
         );
         assert!(helper.driver.flow_map.is_empty());
     }
 
     #[tokio::test]
-    async fn webtransport_selected_streams_enforce_direction_and_session() {
+    async fn webtransport_selected_streams_enforce_direction_and_staleness() {
         let mut helper = webtransport_helper(webtransport_settings());
         start_webtransport_driver(&mut helper);
         let (first_session, first_response, _first_body) =
@@ -3318,15 +4372,7 @@ mod server_side_driver {
             first_session,
             &first_response,
         );
-        let (second_session, second_response, _second_body) =
-            open_pending_webtransport_session(&mut helper);
-        accept_pending_webtransport_session(
-            &mut helper,
-            second_session,
-            &second_response,
-        );
         assert_eq!(first_session, 0);
-        assert_eq!(second_session, 4);
 
         let controller = helper
             .controller
@@ -3368,51 +4414,6 @@ mod server_side_driver {
             WebTransportStreamReadOutcome::Rejected(
                 WebTransportSelectionError::WrongDirection,
             )
-        );
-
-        let bidi_controller = controller.clone();
-        let bidi = tokio::spawn(async move {
-            bidi_controller
-                .open_bidirectional_stream(second_session)
-                .await
-        });
-        tokio::task::yield_now().await;
-        helper.work_loop_iter().unwrap();
-        let second_stream = assert_matches!(
-            bidi.await.unwrap(),
-            WebTransportOpenStreamOutcome::Opened { stream_id } => stream_id
-        );
-        helper.pipe.advance().unwrap();
-        assert_matches!(
-            helper.peer_client_poll(),
-            Ok((id, h3::Event::WebTransportStream {
-                session_id,
-                ..
-            })) if id == second_stream && session_id == second_session
-        );
-
-        let foreign_controller = controller.clone();
-        let foreign = tokio::spawn(async move {
-            foreign_controller
-                .write_stream(
-                    first_session,
-                    second_stream,
-                    Bytes::from_static(b"not yours"),
-                    false,
-                )
-                .await
-        });
-        tokio::task::yield_now().await;
-        helper.work_loop_iter().unwrap();
-        assert_eq!(
-            foreign.await.unwrap(),
-            WebTransportStreamWriteOutcome::Rejected {
-                error: WebTransportSelectionError::ForeignStream {
-                    owner_session_id: second_session,
-                },
-                data: Bytes::from_static(b"not yours"),
-                fin: false,
-            }
         );
 
         let write_controller = controller.clone();
@@ -3528,6 +4529,235 @@ mod server_side_driver {
         );
     }
 
+    #[test]
+    fn webtransport_h3_command_lane_reports_capacity_and_returns_close() {
+        let mut settings = webtransport_settings();
+        settings.command_capacity = 1;
+        let helper = webtransport_helper(settings);
+
+        assert_eq!(
+            helper.controller.send_goaway(),
+            H3CommandAdmission::Accepted
+        );
+        assert_eq!(
+            helper
+                .controller
+                .shutdown_stream(4, StreamShutdown::Write { error_code: 7 },),
+            H3CommandAdmission::QueueFull
+        );
+
+        let message = "queue-full close".to_string();
+        assert_eq!(
+            helper
+                .controller
+                .close_webtransport_session(0, 9, message.clone()),
+            Err(WebTransportSessionCloseError::QueueFull {
+                session_id: 0,
+                error_code: 9,
+                message: message.clone(),
+            })
+        );
+
+        drop(helper.driver);
+        assert_eq!(
+            helper
+                .controller
+                .close_webtransport_session(0, 9, message.clone()),
+            Err(WebTransportSessionCloseError::DriverGone {
+                session_id: 0,
+                error_code: 9,
+                message,
+            })
+        );
+        assert_eq!(
+            helper.controller.send_goaway(),
+            H3CommandAdmission::DriverGone
+        );
+    }
+
+    #[tokio::test]
+    async fn webtransport_retention_snapshot_covers_all_bounded_queues() {
+        let mut settings = webtransport_settings();
+        settings.webtransport_command_capacity = 4;
+        settings.webtransport_max_stream_write_bytes = 32;
+        settings.webtransport_max_stream_write_lease_retained_bytes = 32;
+        settings.webtransport_max_datagram_send_allocation_bytes = 64;
+        let mut helper = webtransport_helper(settings);
+        let (_to_client, _from_client) = accept_webtransport_session(&mut helper);
+        let controller = helper
+            .controller
+            .webtransport_controller()
+            .expect("native WebTransport controller");
+
+        let mut backing = Vec::with_capacity(64);
+        backing.extend_from_slice(b"retained");
+        let allocation = backing.capacity();
+        assert!(helper
+            .driver
+            .webtransport
+            .as_mut()
+            .unwrap()
+            .route_datagram(
+                &helper.pipe.server,
+                0,
+                datagram_socket::DgramBuffer::from(backing),
+            )
+            .is_none());
+
+        let stats_controller = controller.clone();
+        let stats =
+            tokio::spawn(async move { stats_controller.retention_stats().await });
+        tokio::task::yield_now().await;
+        assert_eq!(
+            helper.driver.webtransport_cmd_recv.as_ref().unwrap().len(),
+            1
+        );
+
+        let first = controller
+            .try_write_stream(0, 999, Bytes::from_static(b"first"), false)
+            .unwrap();
+        let second = controller
+            .try_write_stream(0, 999, Bytes::from_static(b"second"), false)
+            .unwrap();
+        helper.work_loop_iter().unwrap();
+
+        let stats = stats.await.unwrap().unwrap();
+        assert_eq!(stats.sessions, 1);
+        assert_eq!(stats.pending_datagrams, 1);
+        assert_eq!(stats.pending_datagram_payload_bytes, 8);
+        assert_eq!(stats.pending_datagram_allocation_bytes, allocation);
+        assert_eq!(stats.command_capacity, 4);
+        assert_eq!(stats.queued_commands, 2);
+        assert_eq!(
+            stats.queued_command_payload_bytes_upper_bound,
+            2 * webtransport::MAX_CLOSE_MESSAGE_LEN
+        );
+        assert_eq!(stats.write_leases, 2);
+        assert_eq!(stats.write_lease_retained_bytes, 11);
+        assert_eq!(stats.max_write_leases, 4);
+        assert_eq!(stats.max_write_lease_retained_bytes, 128);
+        assert_eq!(stats.write_lease_admitted_total, 2);
+        assert_eq!(stats.write_lease_queue_full_total, 0);
+        assert_eq!(stats.write_lease_resource_limit_total, 0);
+        assert_eq!(stats.write_lease_too_large_total, 0);
+        assert!(stats.metadata_index_entries >= 3);
+        assert_eq!(
+            stats.adapter_bytes_upper_bound(),
+            (allocation + 2 * webtransport::MAX_CLOSE_MESSAGE_LEN + 11) as u64
+        );
+        assert_eq!(
+            stats.transport_queued_bytes(),
+            stats.transport_stream_send_bytes as u64 +
+                stats.transport_stream_receive_bytes +
+                stats.transport_datagram_send_bytes as u64 +
+                stats.transport_datagram_receive_bytes as u64
+        );
+
+        assert_matches!(
+            first.outcome().await,
+            WebTransportStreamWriteOutcome::Rejected {
+                error: WebTransportSelectionError::UnknownStream,
+                ..
+            }
+        );
+        assert_matches!(
+            second.outcome().await,
+            WebTransportStreamWriteOutcome::Rejected {
+                error: WebTransportSelectionError::UnknownStream,
+                ..
+            }
+        );
+    }
+
+    #[test]
+    fn webtransport_never_polled_event_lane_fails_with_excessive_load() {
+        let mut settings = webtransport_settings();
+        settings.event_capacity = 1;
+        let mut helper = webtransport_helper(settings);
+        start_webtransport_driver(&mut helper);
+
+        helper
+            .peer_client_send_request(make_webtransport_request_headers(), false)
+            .unwrap();
+        helper.pipe.advance().unwrap();
+
+        let error = helper
+            .driver
+            .process_reads(&mut helper.pipe.server)
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<H3ConnectionError>(),
+            Some(&H3ConnectionError::EventQueueOverloaded)
+        );
+        assert_eq!(helper.controller.event_queue_stats(), H3EventQueueStats {
+            capacity: 1,
+            admitted_total: 1,
+            overload_total: 1,
+            receiver_closed_total: 0,
+            overloaded: true,
+        });
+        assert_matches!(
+            helper.controller.event_receiver_mut().try_recv(),
+            Ok(ServerH3Event::Core(H3Event::WebTransportSession(
+                WebTransportSessionEvent::Pending { session_id: 0 }
+            )))
+        );
+
+        let wait_error = tokio::task::unconstrained(
+            helper.driver.wait_for_data(&mut helper.pipe.server),
+        )
+        .now_or_never()
+        .expect("terminal overload must remain immediately runnable")
+        .unwrap_err();
+        assert_eq!(
+            wait_error.downcast_ref::<H3ConnectionError>(),
+            Some(&H3ConnectionError::EventQueueOverloaded)
+        );
+
+        let work_error: crate::QuicResult<()> =
+            Err(H3ConnectionError::EventQueueOverloaded.into());
+        helper.driver.on_conn_close(
+            &mut helper.pipe.server,
+            &TestMetrics::default(),
+            &work_error,
+        );
+        let local_error = helper.pipe.server.local_error().unwrap();
+        assert!(local_error.is_app);
+        assert_eq!(
+            local_error.error_code,
+            h3::WireErrorCode::ExcessiveLoad as u64
+        );
+    }
+
+    #[test]
+    fn webtransport_closed_event_receiver_is_not_reported_as_overload() {
+        let mut settings = webtransport_settings();
+        settings.event_capacity = 1;
+        let mut helper = webtransport_helper(settings);
+        start_webtransport_driver(&mut helper);
+        drop(helper.controller.take_event_receiver());
+
+        helper
+            .peer_client_send_request(make_webtransport_request_headers(), false)
+            .unwrap();
+        helper.pipe.advance().unwrap();
+        let error = helper
+            .driver
+            .process_reads(&mut helper.pipe.server)
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<H3ConnectionError>(),
+            Some(&H3ConnectionError::ControllerWentAway)
+        );
+        assert_eq!(helper.controller.event_queue_stats(), H3EventQueueStats {
+            capacity: 1,
+            admitted_total: 0,
+            overload_total: 0,
+            receiver_closed_total: 1,
+            overloaded: false,
+        });
+    }
+
     #[tokio::test]
     async fn webtransport_selected_apis_reject_pending_terminal_and_stale_ids() {
         let mut helper = webtransport_helper(webtransport_settings());
@@ -3538,6 +4768,40 @@ mod server_side_driver {
             .controller
             .webtransport_controller()
             .expect("native WebTransport controller");
+
+        let (unknown_lease, unknown_log) = mock_write_lease(50, b"unknown");
+        let unknown = controller
+            .try_write_stream_lease(session_id + 4, 1, unknown_lease, false)
+            .unwrap();
+        helper.work_loop_iter().unwrap();
+        let unknown_lease = assert_matches!(
+            unknown.outcome().await,
+            WebTransportStreamWriteLeaseOutcome::Rejected {
+                error: WebTransportSelectionError::UnknownSession,
+                lease,
+                fin: false,
+            } => lease
+        );
+        assert_eq!(unknown_lease.id, 50);
+        assert_eq!(mock_write_lease_log(&unknown_log).exposures, 0);
+        drop(unknown_lease);
+
+        let (pending_lease, pending_log) = mock_write_lease(51, b"pending");
+        let pending = controller
+            .try_write_stream_lease(session_id, 1, pending_lease, false)
+            .unwrap();
+        helper.work_loop_iter().unwrap();
+        let pending_lease = assert_matches!(
+            pending.outcome().await,
+            WebTransportStreamWriteLeaseOutcome::Rejected {
+                error: WebTransportSelectionError::PendingSession,
+                lease,
+                fin: false,
+            } => lease
+        );
+        assert_eq!(pending_lease.id, 51);
+        assert_eq!(mock_write_lease_log(&pending_log).exposures, 0);
+        drop(pending_lease);
 
         let pending_open_controller = controller.clone();
         let pending_open = tokio::spawn(async move {
@@ -3607,6 +4871,22 @@ mod server_side_driver {
                 datagram,
             } if datagram.as_slice() == b"terminal"
         );
+        let (terminal_lease, terminal_log) = mock_write_lease(52, b"terminal");
+        let terminal_lease = controller
+            .try_write_stream_lease(session_id, 1, terminal_lease, false)
+            .unwrap();
+        helper.work_loop_iter().unwrap();
+        let terminal_lease = assert_matches!(
+            terminal_lease.outcome().await,
+            WebTransportStreamWriteLeaseOutcome::Rejected {
+                error: WebTransportSelectionError::TerminalSession,
+                lease,
+                fin: false,
+            } => lease
+        );
+        assert_eq!(terminal_lease.id, 52);
+        assert_eq!(mock_write_lease_log(&terminal_log).exposures, 0);
+        drop(terminal_lease);
 
         helper
             .peer
@@ -3652,6 +4932,21 @@ mod server_side_driver {
                 datagram,
             } if datagram.as_slice() == b"stale"
         );
+        let (stale_lease, stale_log) = mock_write_lease(53, b"stale");
+        let stale_lease = controller
+            .try_write_stream_lease(session_id, 1, stale_lease, false)
+            .unwrap();
+        helper.work_loop_iter().unwrap();
+        let stale_lease = assert_matches!(
+            stale_lease.outcome().await,
+            WebTransportStreamWriteLeaseOutcome::Rejected {
+                error: WebTransportSelectionError::StaleSession,
+                lease,
+                fin: false,
+            } => lease
+        );
+        assert_eq!(stale_lease.id, 53);
+        assert_eq!(mock_write_lease_log(&stale_log).exposures, 0);
     }
 
     #[tokio::test]
@@ -3718,6 +5013,10 @@ mod server_side_driver {
                 .open_unidirectional_stream(session_id)
                 .await
         });
+        let (closing_lease, closing_log) = mock_write_lease(54, b"closing");
+        let closing_lease = controller
+            .try_write_stream_lease(session_id, stream_id, closing_lease, false)
+            .unwrap();
         tokio::task::yield_now().await;
         helper.work_loop_iter().unwrap();
 
@@ -3742,6 +5041,16 @@ mod server_side_driver {
                 WebTransportSelectionError::ClosingSession,
             )
         );
+        let closing_lease = assert_matches!(
+            closing_lease.outcome().await,
+            WebTransportStreamWriteLeaseOutcome::Rejected {
+                error: WebTransportSelectionError::ClosingSession,
+                lease,
+                fin: false,
+            } => lease
+        );
+        assert_eq!(closing_lease.id, 54);
+        assert_eq!(mock_write_lease_log(&closing_log).exposures, 0);
     }
 
     #[test]
@@ -4062,22 +5371,28 @@ mod server_side_driver {
             )
             .unwrap();
         start_webtransport_driver(&mut helper);
-        let (stream_id, to_client, _from_client) =
-            open_pending_webtransport_session(&mut helper);
-
-        send_response_status(&to_client, 200);
+        let stream_id = helper
+            .peer_client_send_request(make_webtransport_request_headers(), false)
+            .unwrap();
         helper.advance_and_run_loop().unwrap();
-        expect_session_terminated(
-            &mut helper,
-            stream_id,
-            WebTransportSessionCloseReason::AdmissionFailed,
+        assert_no_driver_event(&mut helper);
+        assert_eq!(
+            helper.pipe.client.stream_capacity(stream_id),
+            Err(quiche::Error::StreamStopped(
+                h3::WireErrorCode::MessageError as u64,
+            ))
         );
-        assert!(!helper
-            .driver
-            .webtransport
-            .as_ref()
-            .unwrap()
-            .is_active(stream_id));
+        assert_eq!(
+            helper.peer_client_poll(),
+            Ok((
+                stream_id,
+                h3::Event::Reset(h3::WireErrorCode::MessageError as u64),
+            ))
+        );
+        assert_eq!(
+            helper.driver.webtransport.as_ref().unwrap().session_count(),
+            0
+        );
     }
 
     #[test]
@@ -4109,6 +5424,69 @@ mod server_side_driver {
             helper.pipe.server.stream_recv(4, &mut received).unwrap();
         assert_eq!(&received[..len], payload);
         assert!(fin);
+    }
+
+    #[test]
+    fn webtransport_optimistic_capsule_is_deferred_until_2xx() {
+        let mut helper = webtransport_helper(webtransport_settings());
+        start_webtransport_driver(&mut helper);
+        let (stream_id, to_client, mut from_client) =
+            open_pending_webtransport_session(&mut helper);
+        let close = webtransport_close_capsule(7, "optimistic");
+
+        helper
+            .peer_client_send_body(stream_id, &close, false)
+            .unwrap();
+        helper.advance_and_run_loop().unwrap();
+        assert_no_driver_event(&mut helper);
+        assert_matches!(
+            from_client.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        );
+
+        accept_pending_webtransport_session(&mut helper, stream_id, &to_client);
+        expect_session_terminated(
+            &mut helper,
+            stream_id,
+            WebTransportSessionCloseReason::Peer {
+                error_code: 7,
+                message: "optimistic".to_string(),
+            },
+        );
+        assert_matches!(
+            from_client.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        );
+        assert!(helper.driver.deferred_webtransport_capsule_reads.is_empty());
+    }
+
+    #[test]
+    fn webtransport_optimistic_capsule_is_discarded_after_rejection() {
+        let mut helper = webtransport_helper(webtransport_settings());
+        start_webtransport_driver(&mut helper);
+        let (stream_id, to_client, mut from_client) =
+            open_pending_webtransport_session(&mut helper);
+        let close = webtransport_close_capsule(8, "discard me");
+
+        helper
+            .peer_client_send_body(stream_id, &close, false)
+            .unwrap();
+        helper.advance_and_run_loop().unwrap();
+        assert_no_driver_event(&mut helper);
+
+        send_response_status(&to_client, 403);
+        helper.advance_and_run_loop().unwrap();
+        expect_session_rejected(&mut helper, stream_id, 403);
+        assert_matches!(
+            helper.peer_client_poll(),
+            Ok((id, h3::Event::Headers { .. })) if id == stream_id
+        );
+        assert_matches!(
+            from_client.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        );
+        assert!(helper.driver.deferred_webtransport_capsule_reads.is_empty());
+        assert_no_webtransport_session_event(&mut helper);
     }
 
     #[test]
@@ -4195,48 +5573,55 @@ mod server_side_driver {
     }
 
     #[test]
-    fn webtransport_concurrent_sessions_remain_strictly_isolated() {
+    fn webtransport_excessive_session_is_reset_without_app_admission() {
         let mut helper = webtransport_helper(webtransport_settings());
         start_webtransport_driver(&mut helper);
         let (first_id, first_send, _first_recv) =
             open_pending_webtransport_session(&mut helper);
-        let (second_id, second_send, _second_recv) =
-            open_pending_webtransport_session(&mut helper);
-        assert_eq!((first_id, second_id), (0, 4));
+        assert_eq!(first_id, 0);
 
-        let first = webtransport_stream_data(
+        let excessive_stream = webtransport_stream_data(
             WEBTRANSPORT_BIDI_STREAM_TYPE,
-            first_id,
-            b"first",
+            4,
+            b"excessive",
         );
-        let second = webtransport_stream_data(
-            WEBTRANSPORT_BIDI_STREAM_TYPE,
-            second_id,
-            b"second",
-        );
-        helper.pipe.client.stream_send(8, &first, false).unwrap();
-        helper.pipe.client.stream_send(12, &second, false).unwrap();
+        helper
+            .pipe
+            .client
+            .stream_send(8, &excessive_stream, false)
+            .unwrap();
         helper.advance_and_run_loop().unwrap();
         assert_no_driver_event(&mut helper);
 
-        accept_pending_webtransport_session(&mut helper, first_id, &first_send);
-        expect_associated_stream(
-            &mut helper,
-            first_id,
-            8,
-            WebTransportStreamDirection::Bidi,
-            first.len() - b"first".len(),
-        );
-
-        send_response_status(&second_send, 403);
+        let second_id = helper
+            .peer_client_send_request(make_webtransport_request_headers(), false)
+            .unwrap();
+        assert_eq!(second_id, 4);
         helper.advance_and_run_loop().unwrap();
-        expect_session_rejected(&mut helper, second_id, 403);
+        assert_no_driver_event(&mut helper);
+        helper.pipe.advance().unwrap();
         assert_eq!(
-            helper.pipe.client.stream_capacity(12),
+            helper.peer_client_poll(),
+            Ok((
+                second_id,
+                h3::Event::Reset(h3::WireErrorCode::RequestRejected as u64),
+            ))
+        );
+        assert_eq!(
+            helper.pipe.client.stream_capacity(8),
             Err(quiche::Error::StreamStopped(
                 webtransport::WT_BUFFERED_STREAM_REJECTED
             ))
         );
+        assert_eq!(
+            helper.peer_client_poll(),
+            Ok((
+                8,
+                h3::Event::Reset(webtransport::WT_BUFFERED_STREAM_REJECTED),
+            ))
+        );
+
+        accept_pending_webtransport_session(&mut helper, first_id, &first_send);
         assert!(helper
             .driver
             .webtransport
@@ -4249,12 +5634,12 @@ mod server_side_driver {
             first_id,
             b"still active",
         );
-        helper.pipe.client.stream_send(16, &later, true).unwrap();
+        helper.pipe.client.stream_send(12, &later, true).unwrap();
         helper.advance_and_run_loop().unwrap();
         expect_associated_stream(
             &mut helper,
             first_id,
-            16,
+            12,
             WebTransportStreamDirection::Bidi,
             later.len() - b"still active".len(),
         );
@@ -4538,7 +5923,10 @@ mod server_side_driver {
             helper
                 .controller
                 .close_webtransport_session(0, 1, "x".repeat(1025),),
-            Err(WebTransportSessionCloseError::MessageTooLong { len: 1025 })
+            Err(WebTransportSessionCloseError::MessageTooLong {
+                len: 1025,
+                message: "x".repeat(1025),
+            })
         );
         assert_eq!(helper.process_commands().unwrap(), 0);
         assert!(helper.driver.webtransport.as_ref().unwrap().is_active(0));

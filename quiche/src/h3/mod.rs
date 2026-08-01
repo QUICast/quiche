@@ -263,19 +263,19 @@
 //!
 //! ## WebTransport stream classification
 //!
-//! When [`Config::set_additional_settings()`] advertises a nonzero
+//! When [`Config::set_additional_settings()`] advertises a value of `1` for
 //! [`SETTINGS_WT_ENABLED`] value and
 //! [`Config::enable_webtransport_stream_classification()`] is enabled,
-//! [`poll()`] recognizes the draft-ietf-webtrans-http3-15 bidirectional `0x41`
+//! [`poll()`] recognizes the draft-ietf-webtrans-http3-16 bidirectional `0x41`
 //! signal and unidirectional `0x54` stream type. Classification starts only
 //! after the peer's SETTINGS frame selects this draft with the same setting at
-//! a nonzero value.
+//! a value of `1`.
 //!
 //! A candidate that arrives before peer SETTINGS retains its already-decoded
 //! signal or stream type, but does not consume a Session ID or detach the QUIC
 //! stream. Once negotiation succeeds, the classifier incrementally consumes
 //! the Session ID and returns [`Event::WebTransportStream`]. Classification is
-//! syntactic and can happen before session admission because draft-15 permits
+//! syntactic and can happen before session admission because draft-16 permits
 //! optimistic streams in the same flight as the CONNECT request. The caller
 //! remains responsible for bounded session admission. A Session ID that is not
 //! a client-initiated bidirectional stream closes the connection with
@@ -384,13 +384,13 @@ pub const PRIORITY_UPDATE_FRAME_PAYLOAD_MAX_SIZE_DEFAULT: u64 = 256;
 /// See <https://datatracker.ietf.org/doc/html/rfc9114#section-4.2.2>.
 pub const SETTINGS_MAX_FIELD_SECTION_SIZE_DEFAULT: u64 = 32_768;
 
-/// WebTransport support setting from draft-ietf-webtrans-http3-15.
+/// WebTransport support setting from draft-ietf-webtrans-http3-16.
 pub const SETTINGS_WT_ENABLED: u64 = 0x2c7c_f000;
 
-/// Bidirectional WebTransport stream signal from draft-15.
+/// Bidirectional WebTransport stream signal from draft-16.
 pub const WEBTRANSPORT_BIDI_STREAM_SIGNAL: u64 = 0x41;
 
-/// Unidirectional WebTransport stream type from draft-15.
+/// Unidirectional WebTransport stream type from draft-16.
 pub const WEBTRANSPORT_UNI_STREAM_TYPE: u64 = 0x54;
 
 #[cfg(feature = "qlog")]
@@ -729,7 +729,12 @@ impl Config {
         let dedup_settings: HashSet<u64> =
             additional_settings.iter().map(|(key, _)| *key).collect();
 
+        let invalid_webtransport_value = additional_settings
+            .iter()
+            .any(|(key, value)| *key == SETTINGS_WT_ENABLED && *value > 1);
+
         if dedup_settings.len() != additional_settings.len() ||
+            invalid_webtransport_value ||
             !explicit_quiche_settings.is_disjoint(&dedup_settings)
         {
             return Err(Error::SettingsError);
@@ -738,12 +743,12 @@ impl Config {
         Ok(())
     }
 
-    /// Enables native draft-15 WebTransport stream-prefix classification.
+    /// Enables native draft-16 WebTransport stream-prefix classification.
     ///
     /// The default is `false`. This only activates classification when this
-    /// configuration also advertises a nonzero [`SETTINGS_WT_ENABLED`] value
-    /// and the peer later sends the same draft-specific setting with a nonzero
-    /// value. Advertising the setting alone does not transfer stream ownership
+    /// configuration also advertises a [`SETTINGS_WT_ENABLED`] value of `1`
+    /// and the peer later sends the same draft-specific setting with value `1`.
+    /// Advertising the setting alone does not transfer stream ownership
     /// out of HTTP/3.
     ///
     /// Applications must consume every [`Event::WebTransportStream`] and take
@@ -894,7 +899,7 @@ pub enum Event {
     /// consumed. Any payload remains readable through the ordinary QUIC stream
     /// APIs at the returned stream ID. This event is only emitted when native
     /// classification was explicitly enabled and both endpoints advertised a
-    /// nonzero draft-15 [`SETTINGS_WT_ENABLED`] value.
+    /// draft-16 [`SETTINGS_WT_ENABLED`] value of `1`.
     WebTransportStream {
         /// The client-initiated bidirectional stream identifying the session.
         session_id: u64,
@@ -935,7 +940,7 @@ pub enum WebTransportStreamDirection {
     Unidirectional,
 }
 
-/// A locally reserved draft-15 WebTransport stream and its encoded prefix.
+/// A locally reserved draft-16 WebTransport stream and its encoded prefix.
 ///
 /// The reservation consumes the physical stream ID from HTTP/3's shared local
 /// stream namespace immediately. This prevents a later request or extension
@@ -1198,7 +1203,7 @@ impl Connection {
         let local_webtransport_support =
             config.additional_settings.as_ref().is_some_and(|settings| {
                 settings.iter().any(|(identifier, value)| {
-                    *identifier == SETTINGS_WT_ENABLED && *value > 0
+                    *identifier == SETTINGS_WT_ENABLED && *value == 1
                 })
             });
 
@@ -2002,7 +2007,7 @@ impl Connection {
         self.peer_settings.connect_protocol_enabled == Some(1)
     }
 
-    /// Reserves the next local stream ID and encodes its draft-15
+    /// Reserves the next local stream ID and encodes its draft-16
     /// WebTransport prefix.
     ///
     /// Bidirectional client reservations share the request-stream allocator;
@@ -2011,8 +2016,8 @@ impl Connection {
     /// space. The selected ID is consumed only after the transport reserves
     /// its mandatory reliable prefix.
     ///
-    /// Both endpoints must have advertised nonzero [`SETTINGS_WT_ENABLED`]
-    /// values, and `session_id` must identify a client-initiated
+    /// Both endpoints must have advertised [`SETTINGS_WT_ENABLED`] with value
+    /// `1`, and `session_id` must identify a client-initiated
     /// bidirectional stream.
     pub fn reserve_webtransport_stream<F: BufFactory>(
         &mut self, conn: &mut super::Connection<F>, session_id: u64,
@@ -3237,7 +3242,7 @@ impl Connection {
                                 }
 
                                 // The eventual outcome is connection-wide if
-                                // draft-15 is selected, so ordinary parsing can
+                                // draft-16 is selected, so ordinary parsing can
                                 // continue without retaining this stream.
                                 self.pending_invalid_webtransport_signal = true;
                             },
@@ -3617,12 +3622,25 @@ impl Connection {
                 raw,
                 ..
             } => {
+                let peer_webtransport_value = raw.as_ref().and_then(|settings| {
+                    settings.iter().find_map(|(identifier, value)| {
+                        (*identifier == SETTINGS_WT_ENABLED).then_some(*value)
+                    })
+                });
+                if !self.is_server &&
+                    peer_webtransport_value.is_some_and(|value| value > 1)
+                {
+                    conn.close(
+                        true,
+                        Error::SettingsError.to_wire(),
+                        b"SETTINGS_WT_ENABLED value exceeds 1",
+                    )?;
+
+                    return Err(Error::SettingsError);
+                }
+
                 let peer_webtransport_support =
-                    if raw.as_ref().is_some_and(|settings| {
-                        settings.iter().any(|(identifier, value)| {
-                            *identifier == SETTINGS_WT_ENABLED && *value > 0
-                        })
-                    }) {
+                    if peer_webtransport_value == Some(1) {
                         WebTransportPeerSupport::Enabled
                     } else {
                         WebTransportPeerSupport::Disabled
@@ -4410,6 +4428,14 @@ mod tests {
         session
             .client
             .send_settings(&mut session.pipe.client)
+            .unwrap();
+        session.advance().unwrap();
+    }
+
+    fn send_server_settings(session: &mut Session) {
+        session
+            .server
+            .send_settings(&mut session.pipe.server)
             .unwrap();
         session.advance().unwrap();
     }
@@ -7906,6 +7932,31 @@ mod tests {
     }
 
     #[test]
+    fn webtransport_local_setting_requires_zero_or_one_without_mutation() {
+        let mut config = Config::new().unwrap();
+        config
+            .set_additional_settings(vec![(42, 43), (SETTINGS_WT_ENABLED, 0)])
+            .unwrap();
+
+        assert_eq!(
+            config.set_additional_settings(vec![(SETTINGS_WT_ENABLED, 2)]),
+            Err(Error::SettingsError)
+        );
+        assert_eq!(
+            config.additional_settings.as_deref(),
+            Some(&[(42, 43), (SETTINGS_WT_ENABLED, 0)][..])
+        );
+
+        config
+            .set_additional_settings(vec![(SETTINGS_WT_ENABLED, 1)])
+            .unwrap();
+        assert_eq!(
+            config.additional_settings.as_deref(),
+            Some(&[(SETTINGS_WT_ENABLED, 1)][..])
+        );
+    }
+
+    #[test]
     /// Send a single DATAGRAM.
     fn single_dgram() {
         let mut buf = [0; 65535];
@@ -9856,8 +9907,31 @@ mod tests {
     }
 
     #[test]
-    fn webtransport_nonzero_setting_other_than_one_negotiates() {
-        let mut s = webtransport_session_without_h3_handshake_with_setting(2);
+    fn webtransport_client_rejects_server_setting_above_one() {
+        let mut s = webtransport_session_without_h3_handshake();
+        s.server.local_settings.additional_settings =
+            Some(vec![(SETTINGS_WT_ENABLED, 2)]);
+        send_server_settings(&mut s);
+
+        assert_eq!(s.poll_client(), Err(Error::SettingsError));
+        assert_eq!(
+            s.pipe.client.local_error(),
+            Some(&crate::ConnectionError {
+                is_app: true,
+                error_code: WireErrorCode::SettingsError as u64,
+                reason: b"SETTINGS_WT_ENABLED value exceeds 1".to_vec(),
+            })
+        );
+        assert_eq!(
+            s.client.peer_webtransport_support,
+            WebTransportPeerSupport::Pending
+        );
+        assert!(s.client.peer_settings_raw().is_none());
+    }
+
+    #[test]
+    fn webtransport_server_treats_client_setting_above_one_as_unsupported() {
+        let mut s = webtransport_session_without_h3_handshake();
         let stream_id = take_client_uni_stream(&mut s);
         let prefix = webtransport_prefix(WEBTRANSPORT_UNI_STREAM_TYPE, 0);
 
@@ -9868,16 +9942,20 @@ mod tests {
         s.advance().unwrap();
         assert_eq!(s.poll_server(), Err(Error::Done));
 
+        s.client.local_settings.additional_settings =
+            Some(vec![(SETTINGS_WT_ENABLED, 2)]);
         send_client_settings(&mut s);
 
+        assert_eq!(s.poll_server(), Err(Error::Done));
+        assert!(s.pipe.server.local_error().is_none());
         assert_eq!(
-            s.poll_server(),
-            Ok((stream_id, Event::WebTransportStream {
-                session_id: 0,
-                direction: WebTransportStreamDirection::Unidirectional,
-                prefix_len: prefix.len(),
-            })),
+            s.server.peer_webtransport_support,
+            WebTransportPeerSupport::Disabled
         );
+        assert!(s.server.peer_settings_raw().is_some_and(|settings| {
+            settings.contains(&(SETTINGS_WT_ENABLED, 2))
+        }));
+        assert!(!s.pipe.server.stream_is_detached_from_app_proto(stream_id));
     }
 
     #[test]

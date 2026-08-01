@@ -78,8 +78,7 @@ impl FlowControl {
     }
 
     /// Returns the consumed bytes by the receiver.
-    #[cfg(test)]
-    pub fn consumed(&self) -> u64 {
+    pub(crate) fn consumed(&self) -> u64 {
         self.consumed
     }
 

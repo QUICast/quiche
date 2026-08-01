@@ -7467,6 +7467,20 @@ impl<F: BufFactory> Connection<F> {
         self.dgram_recv_queue.peek_front_len()
     }
 
+    /// Returns logical application bytes retained by QUIC stream receive
+    /// buffers across this connection.
+    #[inline]
+    pub fn stream_recv_queue_byte_size(&self) -> u64 {
+        self.rx_data.saturating_sub(self.flow_control.consumed())
+    }
+
+    /// Returns logical application bytes retained by QUIC stream send buffers
+    /// across this connection.
+    #[inline]
+    pub fn stream_send_queue_byte_size(&self) -> usize {
+        self.streams.tx_buffered()
+    }
+
     /// Returns the number of items in the DATAGRAM receive queue.
     #[inline]
     pub fn dgram_recv_queue_len(&self) -> usize {

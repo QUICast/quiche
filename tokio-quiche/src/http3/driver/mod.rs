@@ -44,6 +44,9 @@ use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
 use std::marker::PhantomData;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -62,8 +65,6 @@ use tokio::select;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::mpsc::error::TrySendError;
-use tokio::sync::mpsc::UnboundedReceiver;
-use tokio::sync::mpsc::UnboundedSender;
 use tokio_stream::StreamExt;
 use tokio_util::sync::PollSender;
 
@@ -79,6 +80,7 @@ use self::streams::WaitForStream;
 use self::streams::WaitForUpstreamCapacity;
 use self::webtransport::AssociatedStream;
 use self::webtransport::CapsuleError;
+use self::webtransport::CapsuleReadMode;
 use self::webtransport::CloseCapsule;
 use self::webtransport::Runtime as WebTransportRuntime;
 use self::webtransport::RuntimeLimits as WebTransportRuntimeLimits;
@@ -113,10 +115,12 @@ pub use self::webtransport::webtransport_error_to_http3;
 pub use self::webtransport::WebTransportController;
 pub use self::webtransport::WebTransportDatagramError;
 pub use self::webtransport::WebTransportDatagramReadOutcome;
+pub use self::webtransport::WebTransportDatagramReadyOutcome;
 pub use self::webtransport::WebTransportDatagramSendOperation;
 pub use self::webtransport::WebTransportDatagramSendOutcome;
 pub use self::webtransport::WebTransportDatagramStats;
 pub use self::webtransport::WebTransportOpenStreamOutcome;
+pub use self::webtransport::WebTransportRetentionStats;
 pub use self::webtransport::WebTransportSelectionError;
 pub use self::webtransport::WebTransportSessionCloseError;
 pub use self::webtransport::WebTransportSessionCloseReason;
@@ -124,6 +128,11 @@ pub use self::webtransport::WebTransportSessionEvent;
 pub use self::webtransport::WebTransportStreamControlOutcome;
 pub use self::webtransport::WebTransportStreamReadOutcome;
 pub use self::webtransport::WebTransportStreamReadyOutcome;
+pub use self::webtransport::WebTransportStreamWriteLease;
+pub use self::webtransport::WebTransportStreamWriteLeaseLimit;
+pub use self::webtransport::WebTransportStreamWriteLeaseOperation;
+pub use self::webtransport::WebTransportStreamWriteLeaseOutcome;
+pub use self::webtransport::WebTransportStreamWriteLeaseProgress;
 pub use self::webtransport::WebTransportStreamWriteOperation;
 pub use self::webtransport::WebTransportStreamWriteOutcome;
 
@@ -280,7 +289,7 @@ fn webtransport_requirements(
 
     let peer_wt = settings
         .iter()
-        .any(|(id, value)| *id == h3::SETTINGS_WT_ENABLED && *value != 0);
+        .any(|(id, value)| *id == h3::SETTINGS_WT_ENABLED && *value == 1);
     let endpoint_settings_met = if qconn.is_server() {
         peer_wt
     } else {
@@ -329,6 +338,8 @@ pub enum H3ConnectionError {
     /// The server's post-accept timeout was hit.
     /// The timeout can be configured in [`Http3Settings`].
     PostAcceptTimeout,
+    /// The bounded application event lane was saturated.
+    EventQueueOverloaded,
 }
 
 impl From<h3::Error> for H3ConnectionError {
@@ -352,6 +363,7 @@ impl fmt::Display for H3ConnectionError {
             Self::H3(e) => e,
             Self::NonexistentStream => &"nonexistent stream",
             Self::PostAcceptTimeout => &"post accept timeout hit",
+            Self::EventQueueOverloaded => &"H3 event queue overloaded",
         };
 
         write!(f, "H3ConnectionError: {s}")
@@ -359,6 +371,97 @@ impl fmt::Display for H3ConnectionError {
 }
 
 type H3ConnectionResult<T> = Result<T, H3ConnectionError>;
+
+/// Monotonic accounting for the bounded HTTP/3 application event lane.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct H3EventQueueStats {
+    /// Configured maximum queued event count.
+    pub capacity: usize,
+    /// Events admitted since driver construction.
+    pub admitted_total: u64,
+    /// Events rejected because the lane was full.
+    pub overload_total: u64,
+    /// Events rejected because the receiver was closed.
+    pub receiver_closed_total: u64,
+    /// Whether saturation has latched terminal connection overload.
+    pub overloaded: bool,
+}
+
+struct H3EventLaneState {
+    capacity: usize,
+    admitted_total: AtomicU64,
+    overload_total: AtomicU64,
+    receiver_closed_total: AtomicU64,
+    overloaded: AtomicBool,
+}
+
+impl H3EventLaneState {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            admitted_total: AtomicU64::new(0),
+            overload_total: AtomicU64::new(0),
+            receiver_closed_total: AtomicU64::new(0),
+            overloaded: AtomicBool::new(false),
+        }
+    }
+
+    fn stats(&self) -> H3EventQueueStats {
+        H3EventQueueStats {
+            capacity: self.capacity,
+            admitted_total: self.admitted_total.load(Ordering::Relaxed),
+            overload_total: self.overload_total.load(Ordering::Relaxed),
+            receiver_closed_total: self
+                .receiver_closed_total
+                .load(Ordering::Relaxed),
+            overloaded: self.overloaded.load(Ordering::Acquire),
+        }
+    }
+}
+
+struct H3EventSender<E> {
+    sender: mpsc::Sender<E>,
+    state: Arc<H3EventLaneState>,
+}
+
+impl<E> Clone for H3EventSender<E> {
+    fn clone(&self) -> Self {
+        Self {
+            sender: self.sender.clone(),
+            state: Arc::clone(&self.state),
+        }
+    }
+}
+
+impl<E> H3EventSender<E> {
+    fn send(&self, event: E) -> H3ConnectionResult<()> {
+        match self.sender.try_send(event) {
+            Ok(()) => {
+                self.state.admitted_total.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            },
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.state.overload_total.fetch_add(1, Ordering::Relaxed);
+                self.state.overloaded.store(true, Ordering::Release);
+                Err(H3ConnectionError::EventQueueOverloaded)
+            },
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.state
+                    .receiver_closed_total
+                    .fetch_add(1, Ordering::Relaxed);
+                Err(H3ConnectionError::ControllerWentAway)
+            },
+        }
+    }
+
+    async fn closed(&self) {
+        self.sender.closed().await;
+    }
+
+    fn overloaded(&self) -> bool {
+        self.state.overloaded.load(Ordering::Acquire)
+    }
+}
 
 /// HTTP/3 headers that were received on a stream.
 ///
@@ -546,13 +649,13 @@ pub struct H3Driver<H: DriverHooks> {
     /// State required by the client/server hooks.
     hooks: H,
     /// Sends [`H3Event`]s to the [H3Controller] paired with this driver.
-    h3_event_sender: mpsc::UnboundedSender<H::Event>,
+    h3_event_sender: H3EventSender<H::Event>,
     /// Receives [`H3Command`]s from the [H3Controller] paired with this driver.
-    cmd_recv: mpsc::UnboundedReceiver<H::Command>,
+    cmd_recv: mpsc::Receiver<H::Command>,
     /// A sender that feeds back into `cmd_recv`. Used by hooks that need to
     /// re-queue commands (e.g. retrying blocked requests) without access to
     /// the [H3Controller]'s copy of the sender.
-    cmd_sender: mpsc::UnboundedSender<H::Command>,
+    cmd_sender: mpsc::Sender<H::Command>,
 
     /// A map of stream IDs to their [StreamCtx]. This is mainly used to
     /// retrieve the internal Tokio channels associated with the stream.
@@ -578,7 +681,7 @@ pub struct H3Driver<H: DriverHooks> {
     raw_streams: BTreeSet<u64>,
     /// Scratch space for receiving raw QUIC stream data.
     raw_stream_recv_buf: Vec<u8>,
-    /// Native draft-15 session owner, present only when explicitly enabled.
+    /// Native draft-16 session owner, present only when explicitly enabled.
     webtransport: Option<WebTransportRuntime>,
     /// Bounded native WebTransport selected-I/O command receiver.
     webtransport_cmd_recv: Option<mpsc::Receiver<WebTransportCommand>>,
@@ -586,6 +689,10 @@ pub struct H3Driver<H: DriverHooks> {
     webtransport_command_turn: bool,
     /// Rotates native Datagram work across ingress, legacy release, and expiry.
     webtransport_datagram_turn: u8,
+    /// CONNECT streams whose optimistic capsule bytes await final admission.
+    deferred_webtransport_capsule_reads: BTreeSet<u64>,
+    /// Deferred CONNECT FINs that arrived before draft-version SETTINGS.
+    deferred_webtransport_fins: BTreeSet<u64>,
 
     /// The maximum HTTP/3 stream ID seen on this connection.
     max_stream_seen: u64,
@@ -606,8 +713,15 @@ impl<H: DriverHooks> H3Driver<H> {
     /// method.
     pub fn new(http3_settings: Http3Settings) -> (Self, H3Controller<H>) {
         let (dgram_send, dgram_recv) = mpsc::channel(FLOW_CAPACITY);
-        let (cmd_sender, cmd_recv) = mpsc::unbounded_channel();
-        let (h3_event_sender, h3_event_recv) = mpsc::unbounded_channel();
+        let command_capacity = http3_settings.command_capacity.max(1);
+        let event_capacity = http3_settings.event_capacity.max(1);
+        let (cmd_sender, cmd_recv) = mpsc::channel(command_capacity);
+        let (event_sender, h3_event_recv) = mpsc::channel(event_capacity);
+        let h3_event_state = Arc::new(H3EventLaneState::new(event_capacity));
+        let h3_event_sender = H3EventSender {
+            sender: event_sender,
+            state: Arc::clone(&h3_event_state),
+        };
         let multicast_datagram_channel_id =
             http3_settings.multicast_datagram_channel_id.clone();
         let (webtransport, webtransport_cmd_recv, webtransport_controller) =
@@ -615,32 +729,72 @@ impl<H: DriverHooks> H3Driver<H> {
                 let (sender, recv) = mpsc::channel(
                     http3_settings.webtransport_command_capacity.max(1),
                 );
+                let write_lease_accounting =
+                    Arc::new(webtransport::WriteLeaseAccounting::new(
+                        http3_settings.webtransport_command_capacity,
+                        http3_settings
+                            .webtransport_max_stream_write_lease_retained_bytes,
+                    ));
                 (
-                    Some(WebTransportRuntime::new(WebTransportRuntimeLimits {
-                        max_pending_streams: http3_settings
-                            .webtransport_max_pending_streams,
-                        max_pending_streams_per_session: http3_settings
-                            .webtransport_max_pending_streams_per_session,
-                        max_stream_waiters: http3_settings
-                            .webtransport_max_stream_waiters,
-                        max_pending_datagrams: http3_settings
-                            .webtransport_max_pending_datagrams,
-                        max_pending_datagrams_per_session: http3_settings
-                            .webtransport_max_pending_datagrams_per_session,
-                        max_pending_datagram_bytes: http3_settings
-                            .webtransport_max_pending_datagram_bytes,
-                        max_pending_datagram_bytes_per_session: http3_settings
-                            .webtransport_max_pending_datagram_bytes_per_session,
-                        max_pending_datagram_age: http3_settings
-                            .webtransport_max_pending_datagram_age,
-                        max_session_work_per_callback: http3_settings
-                            .webtransport_max_session_work_per_callback,
-                    })),
+                    Some(WebTransportRuntime::new_with_write_lease_accounting(
+                        WebTransportRuntimeLimits {
+                            max_pending_streams: http3_settings
+                                .webtransport_max_pending_streams,
+                            max_pending_streams_per_session: http3_settings
+                                .webtransport_max_pending_streams_per_session,
+                            max_stream_waiters: http3_settings
+                                .webtransport_max_stream_waiters,
+                            max_datagram_waiters: http3_settings
+                                .webtransport_max_datagram_waiters,
+                            max_pending_datagrams: http3_settings
+                                .webtransport_max_pending_datagrams,
+                            max_pending_datagrams_per_session: http3_settings
+                                .webtransport_max_pending_datagrams_per_session,
+                            max_pending_datagram_bytes: http3_settings
+                                .webtransport_max_pending_datagram_bytes,
+                            max_pending_datagram_bytes_per_session:
+                                http3_settings
+                                    .webtransport_max_pending_datagram_bytes_per_session,
+                            max_pending_datagram_allocation_bytes:
+                                http3_settings
+                                    .webtransport_max_pending_datagram_allocation_bytes,
+                            max_pending_datagram_allocation_bytes_per_session:
+                                http3_settings
+                                    .webtransport_max_pending_datagram_allocation_bytes_per_session,
+                            max_pending_datagram_age: http3_settings
+                                .webtransport_max_pending_datagram_age,
+                            command_capacity: http3_settings
+                                .webtransport_command_capacity
+                                .max(1),
+                            max_command_payload_bytes: http3_settings
+                                .webtransport_max_stream_write_bytes
+                                .max(
+                                    http3_settings
+                                        .webtransport_max_stream_write_lease_retained_bytes,
+                                )
+                                .max(
+                                    http3_settings
+                                        .webtransport_max_datagram_send_allocation_bytes,
+                                )
+                                .max(webtransport::MAX_CLOSE_MESSAGE_LEN),
+                            max_write_lease_retained_bytes_per_lease:
+                                http3_settings
+                                    .webtransport_max_stream_write_lease_retained_bytes,
+                            max_session_work_per_callback: http3_settings
+                                .webtransport_max_session_work_per_callback,
+                        },
+                        Arc::clone(&write_lease_accounting),
+                    )),
                     Some(recv),
                     Some(WebTransportController::new(
                         sender,
                         http3_settings.webtransport_max_stream_write_bytes,
+                        http3_settings
+                            .webtransport_max_stream_write_lease_retained_bytes,
                         http3_settings.webtransport_max_stream_read_bytes,
+                        http3_settings
+                            .webtransport_max_datagram_send_allocation_bytes,
+                        write_lease_accounting,
                     )),
                 )
             } else {
@@ -670,6 +824,8 @@ impl<H: DriverHooks> H3Driver<H> {
                 webtransport_cmd_recv,
                 webtransport_command_turn: true,
                 webtransport_datagram_turn: 0,
+                deferred_webtransport_capsule_reads: BTreeSet::new(),
+                deferred_webtransport_fins: BTreeSet::new(),
 
                 waiting_streams: FuturesUnordered::new(),
 
@@ -679,6 +835,7 @@ impl<H: DriverHooks> H3Driver<H> {
             H3Controller {
                 cmd_sender,
                 h3_event_recv: Some(h3_event_recv),
+                h3_event_state,
                 webtransport: webtransport_controller,
             },
         )
@@ -689,8 +846,15 @@ impl<H: DriverHooks> H3Driver<H> {
     /// Hooks that need to re-queue commands (e.g. retrying a request that
     /// was temporarily blocked) can use this sender without needing access
     /// to the paired [H3Controller].
-    pub(crate) fn self_cmd_sender(&self) -> &mpsc::UnboundedSender<H::Command> {
+    pub(crate) fn self_cmd_sender(&self) -> &mpsc::Sender<H::Command> {
         &self.cmd_sender
+    }
+
+    fn ensure_event_lane_available(&self) -> H3ConnectionResult<()> {
+        if self.h3_event_sender.overloaded() {
+            return Err(H3ConnectionError::EventQueueOverloaded);
+        }
+        Ok(())
     }
 
     /// Retrieve the [FlowCtx] associated with the given `flow_id`. If no
@@ -708,9 +872,7 @@ impl<H: DriverHooks> H3Driver<H> {
                     recv,
                     send: self.dgram_send.clone(),
                 };
-                self.h3_event_sender
-                    .send(flow_req.into())
-                    .map_err(|_| H3ConnectionError::ControllerWentAway)?;
+                self.h3_event_sender.send(flow_req.into())?;
                 e.insert(flow)
             },
             Entry::Occupied(e) => e.into_mut(),
@@ -728,14 +890,82 @@ impl<H: DriverHooks> H3Driver<H> {
     fn process_h3_data(
         &mut self, qconn: &mut QuicheConnection, stream_id: u64,
     ) -> H3ConnectionResult<()> {
-        if self
+        let mode = self
             .webtransport
             .as_ref()
-            .is_some_and(|runtime| runtime.capsules_negotiated(stream_id))
-        {
-            return self.process_webtransport_capsules(qconn, stream_id);
+            .map_or(CapsuleReadMode::Regular, |runtime| {
+                runtime.capsule_read_mode(stream_id)
+            });
+        match mode {
+            CapsuleReadMode::Regular =>
+                self.process_regular_h3_data(qconn, stream_id),
+            CapsuleReadMode::Defer => {
+                self.deferred_webtransport_capsule_reads.insert(stream_id);
+                Ok(())
+            },
+            CapsuleReadMode::Parse =>
+                self.process_webtransport_capsules(qconn, stream_id),
+            CapsuleReadMode::Discard =>
+                self.discard_webtransport_capsules(qconn, stream_id),
         }
-        self.process_regular_h3_data(qconn, stream_id)
+    }
+
+    fn process_deferred_webtransport_capsules(
+        &mut self, qconn: &mut QuicheConnection,
+    ) -> H3ConnectionResult<()> {
+        let stream_ids: Vec<_> = self
+            .deferred_webtransport_capsule_reads
+            .iter()
+            .copied()
+            .collect();
+        for stream_id in stream_ids {
+            let mode = self
+                .webtransport
+                .as_ref()
+                .map_or(CapsuleReadMode::Discard, |runtime| {
+                    runtime.capsule_read_mode(stream_id)
+                });
+            match mode {
+                CapsuleReadMode::Defer => continue,
+                CapsuleReadMode::Parse => {
+                    self.deferred_webtransport_capsule_reads.remove(&stream_id);
+                    self.process_webtransport_capsules(qconn, stream_id)?;
+                    if self.deferred_webtransport_fins.remove(&stream_id) &&
+                        self.stream_map.contains_key(&stream_id)
+                    {
+                        self.process_h3_fin(qconn, stream_id)?;
+                    }
+                },
+                CapsuleReadMode::Regular | CapsuleReadMode::Discard => {
+                    self.deferred_webtransport_capsule_reads.remove(&stream_id);
+                    self.discard_webtransport_capsules(qconn, stream_id)?;
+                    if self.deferred_webtransport_fins.remove(&stream_id) &&
+                        self.stream_map.contains_key(&stream_id)
+                    {
+                        self.process_h3_fin(qconn, stream_id)?;
+                    }
+                },
+            }
+        }
+        Ok(())
+    }
+
+    fn discard_webtransport_capsules(
+        &mut self, qconn: &mut QuicheConnection, stream_id: u64,
+    ) -> H3ConnectionResult<()> {
+        let mut buf = [0; 4096];
+        loop {
+            match self.conn_mut()?.recv_body(qconn, stream_id, &mut buf) {
+                Ok(0) | Err(h3::Error::Done) => break,
+                Ok(_) => {},
+                Err(h3::Error::TransportError(
+                    quiche::Error::StreamReset(_) |
+                    quiche::Error::InvalidStreamState(_),
+                )) => break,
+                Err(error) => return Err(H3ConnectionError::from(error)),
+            }
+        }
+        Ok(())
     }
 
     fn process_webtransport_capsules(
@@ -807,8 +1037,7 @@ impl<H: DriverHooks> H3Driver<H> {
                         ctx.handle_recvd_reset(error_code);
                     }
                     self.h3_event_sender
-                        .send(H3Event::ResetStream { stream_id }.into())
-                        .map_err(|_| H3ConnectionError::ControllerWentAway)?;
+                        .send(H3Event::ResetStream { stream_id }.into())?;
                     return Ok(());
                 },
                 Err(err) => return Err(H3ConnectionError::from(err)),
@@ -994,8 +1223,7 @@ impl<H: DriverHooks> H3Driver<H> {
                 debug_assert!(ctx.send.is_some());
                 ctx.handle_recvd_reset(wire_err_code);
                 self.h3_event_sender
-                    .send(H3Event::ResetStream { stream_id }.into())
-                    .map_err(|_| H3ConnectionError::ControllerWentAway)?;
+                    .send(H3Event::ResetStream { stream_id }.into())?;
                 if ctx.both_directions_done() {
                     return self.cleanup_stream(qconn, stream_id);
                 }
@@ -1095,9 +1323,23 @@ impl<H: DriverHooks> H3Driver<H> {
                 }),
 
             h3::Event::Data => self.process_h3_data(qconn, stream_id),
-            h3::Event::Finished => self.process_h3_fin(qconn, stream_id),
+            h3::Event::Finished => {
+                let deferred = !self.stream_map.contains_key(&stream_id) &&
+                    self.webtransport.as_ref().is_some_and(|runtime| {
+                        runtime.capsule_read_mode(stream_id) ==
+                            CapsuleReadMode::Defer
+                    });
+                if deferred {
+                    self.deferred_webtransport_capsule_reads.insert(stream_id);
+                    self.deferred_webtransport_fins.insert(stream_id);
+                    return Ok(());
+                }
+                self.process_h3_fin(qconn, stream_id)
+            },
 
             h3::Event::Reset(code) => {
+                let application_visible =
+                    self.stream_map.contains_key(&stream_id);
                 if self
                     .webtransport
                     .as_ref()
@@ -1114,11 +1356,15 @@ impl<H: DriverHooks> H3Driver<H> {
                         },
                     );
                     events.extend(runtime.mark_connect_recv_closed(stream_id));
-                    Self::emit_webtransport_events(
-                        &self.h3_event_sender,
-                        events,
-                    )?;
+                    if application_visible {
+                        Self::emit_webtransport_events(
+                            &self.h3_event_sender,
+                            events,
+                        )?;
+                    }
                 }
+                self.deferred_webtransport_capsule_reads.remove(&stream_id);
+                self.deferred_webtransport_fins.remove(&stream_id);
                 if let Some(ctx) = self.stream_map.get_mut(&stream_id) {
                     ctx.handle_recvd_reset(code);
                     // See if we are waiting on this stream and close the channel
@@ -1139,8 +1385,7 @@ impl<H: DriverHooks> H3Driver<H> {
                     }
 
                     self.h3_event_sender
-                        .send(H3Event::ResetStream { stream_id }.into())
-                        .map_err(|_| H3ConnectionError::ControllerWentAway)?;
+                        .send(H3Event::ResetStream { stream_id }.into())?;
                     if ctx.both_directions_done() {
                         return self.cleanup_stream(qconn, stream_id);
                     }
@@ -1179,8 +1424,7 @@ impl<H: DriverHooks> H3Driver<H> {
             },
             h3::Event::GoAway => {
                 self.h3_event_sender
-                    .send(H3Event::GoAway { id: stream_id }.into())
-                    .map_err(|_| H3ConnectionError::ControllerWentAway)?;
+                    .send(H3Event::GoAway { id: stream_id }.into())?;
                 Ok(())
             },
         }
@@ -1204,9 +1448,7 @@ impl<H: DriverHooks> H3Driver<H> {
                 settings: settings.to_vec(),
             };
 
-            self.h3_event_sender
-                .send(incoming_settings.into())
-                .map_err(|_| H3ConnectionError::ControllerWentAway)?;
+            self.h3_event_sender.send(incoming_settings.into())?;
 
             self.settings_received_and_forwarded = true;
             H::settings_received(self, qconn)?;
@@ -1221,7 +1463,7 @@ impl<H: DriverHooks> H3Driver<H> {
     /// this method in a loop for each stream to send all writable packets.
     fn process_write_frame(
         conn: &mut h3::Connection, qconn: &mut QuicheConnection,
-        ctx: &mut StreamCtx, h3_event_sender: &UnboundedSender<H::Event>,
+        ctx: &mut StreamCtx, h3_event_sender: &H3EventSender<H::Event>,
         emit_h3_headers_flushed: bool,
         mut webtransport: Option<&mut WebTransportRuntime>,
     ) -> H3ConnectionResult<()> {
@@ -1443,12 +1685,10 @@ impl<H: DriverHooks> H3Driver<H> {
     }
 
     fn emit_webtransport_events(
-        sender: &UnboundedSender<H::Event>, events: Vec<WebTransportSessionEvent>,
+        sender: &H3EventSender<H::Event>, events: Vec<WebTransportSessionEvent>,
     ) -> H3ConnectionResult<()> {
         for event in events {
-            sender
-                .send(H3Event::WebTransportSession(event).into())
-                .map_err(|_| H3ConnectionError::ControllerWentAway)?;
+            sender.send(H3Event::WebTransportSession(event).into())?;
         }
         Ok(())
     }
@@ -1818,9 +2058,7 @@ impl<H: DriverHooks> H3Driver<H> {
                             for event in H::raw_stream_data_received(
                                 self, stream_id, data, fin,
                             )? {
-                                self.h3_event_sender.send(event.into()).map_err(
-                                    |_| H3ConnectionError::ControllerWentAway,
-                                )?;
+                                self.h3_event_sender.send(event.into())?;
                             }
                         }
 
@@ -1847,12 +2085,16 @@ impl<H: DriverHooks> H3Driver<H> {
     fn handle_webtransport_command(
         &mut self, qconn: &mut QuicheConnection, command: WebTransportCommand,
     ) -> H3ConnectionResult<()> {
+        let queued_command_items = self
+            .webtransport_cmd_recv
+            .as_ref()
+            .map_or(0, mpsc::Receiver::len);
         let conn = self.conn.as_mut().ok_or(Self::connection_not_present())?;
         let runtime = self
             .webtransport
             .as_mut()
             .ok_or(H3ConnectionError::H3(h3::Error::InternalError))?;
-        runtime.handle_command(conn, qconn, command);
+        runtime.handle_command(conn, qconn, command, queued_command_items);
         Ok(())
     }
 
@@ -2245,6 +2487,7 @@ impl<H: DriverHooks> ApplicationOverQuic for H3Driver<H> {
         self.conn = Some(conn);
 
         H::conn_established(self, quiche_conn, handshake_info)?;
+        self.ensure_event_lane_available()?;
         Ok(())
     }
 
@@ -2259,6 +2502,7 @@ impl<H: DriverHooks> ApplicationOverQuic for H3Driver<H> {
     ///
     /// If a DATAGRAM is found, it is sent to the receiver on its channel.
     fn process_reads(&mut self, qconn: &mut QuicheConnection) -> QuicResult<()> {
+        self.ensure_event_lane_available()?;
         self.process_raw_stream_reads(qconn)?;
 
         loop {
@@ -2281,7 +2525,12 @@ impl<H: DriverHooks> ApplicationOverQuic for H3Driver<H> {
         // client CONNECT waiting on negotiation cannot deadlock.
         self.forward_settings(qconn)?;
         self.process_webtransport_readable_wakes(qconn);
+        self.process_deferred_webtransport_capsules(qconn)?;
         self.process_available_dgrams(qconn)?;
+        if let Some(runtime) = self.webtransport.as_mut() {
+            runtime.process_datagram_waiters(qconn);
+        }
+        self.ensure_event_lane_available()?;
         Ok(())
     }
 
@@ -2289,6 +2538,11 @@ impl<H: DriverHooks> ApplicationOverQuic for H3Driver<H> {
     /// all sources. This will attempt to write any queued frames into their
     /// respective streams, if writable.
     fn process_writes(&mut self, qconn: &mut QuicheConnection) -> QuicResult<()> {
+        self.ensure_event_lane_available()?;
+        if let Some(runtime) = self.webtransport.as_mut() {
+            runtime.process_datagram_waiters(qconn);
+        }
+
         let retry_deferred = self
             .webtransport
             .as_ref()
@@ -2329,6 +2583,12 @@ impl<H: DriverHooks> ApplicationOverQuic for H3Driver<H> {
             self.upstream_ready(qconn, ready)?;
         }
 
+        self.process_deferred_webtransport_capsules(qconn)?;
+        if let Some(runtime) = self.webtransport.as_mut() {
+            runtime.process_datagram_waiters(qconn);
+        }
+
+        self.ensure_event_lane_available()?;
         Ok(())
     }
 
@@ -2350,6 +2610,15 @@ impl<H: DriverHooks> ApplicationOverQuic for H3Driver<H> {
             let _ = Self::emit_webtransport_events(&self.h3_event_sender, events);
         }
         self.close_webtransport_command_lane();
+
+        if self.h3_event_sender.overloaded() {
+            let _ = quiche_conn.close(
+                true,
+                WireErrorCode::ExcessiveLoad as u64,
+                b"H3 application event queue overloaded",
+            );
+            return;
+        }
 
         let Err(work_loop_error) = work_loop_result else {
             return;
@@ -2384,6 +2653,7 @@ impl<H: DriverHooks> ApplicationOverQuic for H3Driver<H> {
             self.webtransport.as_ref().is_some_and(|runtime| {
                 runtime.has_work() ||
                     runtime.has_legacy_datagrams() ||
+                    runtime.has_ready_datagram_waiter(qconn) ||
                     (runtime.has_deferred_responses() &&
                         self.conn.as_ref().is_some_and(|conn| {
                             webtransport_requirements(conn, qconn) !=
@@ -2397,6 +2667,9 @@ impl<H: DriverHooks> ApplicationOverQuic for H3Driver<H> {
             .and_then(WebTransportRuntime::next_provisional_datagram_deadline);
         select! {
             biased;
+            _ = std::future::ready(()), if self.h3_event_sender.overloaded() => {
+                Err(H3ConnectionError::EventQueueOverloaded)
+            },
             _ = std::future::ready(()), if webtransport_work => Ok(()),
             Some(ready) = self.waiting_streams.next() => self.upstream_ready(qconn, ready),
             Some(dgram) = self.dgram_recv.recv() => self.dgram_ready(qconn, dgram),
@@ -2473,6 +2746,17 @@ pub enum H3Command {
     },
 }
 
+/// Result of admitting a non-buffer-bearing command to the H3 driver.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum H3CommandAdmission {
+    /// The command was admitted to the bounded queue.
+    Accepted,
+    /// The bounded command queue has no capacity.
+    QueueFull,
+    /// The paired H3 driver is no longer accepting commands.
+    DriverGone,
+}
+
 /// Specifies which direction(s) of a stream to shut down.
 ///
 /// Used with [`H3Controller::shutdown_stream`] and the internal
@@ -2501,17 +2785,19 @@ pub enum StreamShutdown {
 /// Sends [`H3Command`]s to an [H3Driver]. The sender is typed and internally
 /// wraps instances of `T` in the appropriate `H3Command` variant.
 pub struct RequestSender<C, T> {
-    sender: UnboundedSender<C>,
+    sender: mpsc::Sender<C>,
     // Required to work around dangling type parameter
     _r: PhantomData<fn() -> T>,
 }
 
 impl<C, T: Into<C>> RequestSender<C, T> {
-    /// Send a request to the [H3Driver]. This can only fail if the driver is
-    /// gone.
+    /// Attempts to admit a request without waiting.
+    ///
+    /// A full or closed lane returns the converted command and all ownership
+    /// it contains.
     #[inline(always)]
-    pub fn send(&self, v: T) -> Result<(), mpsc::error::SendError<C>> {
-        self.sender.send(v.into())
+    pub fn send(&self, v: T) -> Result<(), mpsc::error::TrySendError<C>> {
+        self.sender.try_send(v.into())
     }
 }
 
@@ -2534,16 +2820,17 @@ impl<C, T> Clone for RequestSender<C, T> {
 pub struct H3Controller<H: DriverHooks> {
     /// Sends [`H3Command`]s to the [H3Driver], like [`QuicCommand`]s or
     /// outbound HTTP requests.
-    cmd_sender: UnboundedSender<H::Command>,
+    cmd_sender: mpsc::Sender<H::Command>,
     /// Receives [`H3Event`]s from the [H3Driver]. Can be extracted and
     /// used independently of the [H3Controller].
-    h3_event_recv: Option<UnboundedReceiver<H::Event>>,
-    /// Native selected-I/O controller when draft-15 support is enabled.
+    h3_event_recv: Option<mpsc::Receiver<H::Event>>,
+    h3_event_state: Arc<H3EventLaneState>,
+    /// Native selected-I/O controller when draft-16 support is enabled.
     webtransport: Option<WebTransportController>,
 }
 
 impl<H: DriverHooks> H3Controller<H> {
-    /// Returns a clone of the native draft-15 selected-I/O controller.
+    /// Returns a clone of the native draft-16 selected-I/O controller.
     ///
     /// This is `None` unless [`Http3Settings::enable_webtransport`] was set
     /// when the paired driver was constructed. Peer negotiation and exact
@@ -2554,17 +2841,22 @@ impl<H: DriverHooks> H3Controller<H> {
 
     /// Gets a mut reference to the [`H3Event`] receiver for the paired
     /// [H3Driver].
-    pub fn event_receiver_mut(&mut self) -> &mut UnboundedReceiver<H::Event> {
+    pub fn event_receiver_mut(&mut self) -> &mut mpsc::Receiver<H::Event> {
         self.h3_event_recv
             .as_mut()
             .expect("No event receiver on H3Controller")
     }
 
     /// Takes the [`H3Event`] receiver for the paired [H3Driver].
-    pub fn take_event_receiver(&mut self) -> UnboundedReceiver<H::Event> {
+    pub fn take_event_receiver(&mut self) -> mpsc::Receiver<H::Event> {
         self.h3_event_recv
             .take()
             .expect("No event receiver on H3Controller")
+    }
+
+    /// Returns monotonic bounded-event-lane accounting.
+    pub fn event_queue_stats(&self) -> H3EventQueueStats {
+        self.h3_event_state.stats()
     }
 
     /// Creates a [`QuicCommand`] sender for the paired [H3Driver].
@@ -2576,8 +2868,17 @@ impl<H: DriverHooks> H3Controller<H> {
     }
 
     /// Sends a GOAWAY frame to initiate a graceful connection shutdown.
-    pub fn send_goaway(&self) {
-        let _ = self.cmd_sender.send(H3Command::GoAway.into());
+    pub fn send_goaway(&self) -> H3CommandAdmission {
+        match self.cmd_sender.try_reserve() {
+            Ok(permit) => {
+                permit.send(H3Command::GoAway.into());
+                H3CommandAdmission::Accepted
+            },
+            Err(mpsc::error::TrySendError::Full(())) =>
+                H3CommandAdmission::QueueFull,
+            Err(mpsc::error::TrySendError::Closed(())) =>
+                H3CommandAdmission::DriverGone,
+        }
     }
 
     /// Creates an [`H3Command`] sender for the paired [H3Driver].
@@ -2594,14 +2895,25 @@ impl<H: DriverHooks> H3Controller<H> {
     /// This removes the stream from local state and sends a `RESET_STREAM`
     /// frame (for write direction) and/or a `STOP_SENDING` frame (for read
     /// direction) to the peer, depending on the [`StreamShutdown`] variant.
-    pub fn shutdown_stream(&self, stream_id: u64, shutdown: StreamShutdown) {
-        let _ = self.cmd_sender.send(
-            H3Command::ShutdownStream {
-                stream_id,
-                shutdown,
-            }
-            .into(),
-        );
+    pub fn shutdown_stream(
+        &self, stream_id: u64, shutdown: StreamShutdown,
+    ) -> H3CommandAdmission {
+        match self.cmd_sender.try_reserve() {
+            Ok(permit) => {
+                permit.send(
+                    H3Command::ShutdownStream {
+                        stream_id,
+                        shutdown,
+                    }
+                    .into(),
+                );
+                H3CommandAdmission::Accepted
+            },
+            Err(mpsc::error::TrySendError::Full(())) =>
+                H3CommandAdmission::QueueFull,
+            Err(mpsc::error::TrySendError::Closed(())) =>
+                H3CommandAdmission::DriverGone,
+        }
     }
 
     /// Queues WT_CLOSE_SESSION followed by FIN for an active session.
@@ -2612,20 +2924,38 @@ impl<H: DriverHooks> H3Controller<H> {
     pub fn close_webtransport_session(
         &self, session_id: u64, error_code: u32, message: String,
     ) -> Result<(), WebTransportSessionCloseError> {
-        if message.len() > 1024 {
+        if message.len() > webtransport::MAX_CLOSE_MESSAGE_LEN {
             return Err(WebTransportSessionCloseError::MessageTooLong {
                 len: message.len(),
+                message,
             });
         }
-        self.cmd_sender
-            .send(
-                H3Command::CloseWebTransportSession {
+        match self.cmd_sender.try_reserve() {
+            Ok(permit) => {
+                let mut message = message;
+                message.shrink_to_fit();
+                permit.send(
+                    H3Command::CloseWebTransportSession {
+                        session_id,
+                        error_code,
+                        message,
+                    }
+                    .into(),
+                );
+                Ok(())
+            },
+            Err(mpsc::error::TrySendError::Full(())) =>
+                Err(WebTransportSessionCloseError::QueueFull {
                     session_id,
                     error_code,
                     message,
-                }
-                .into(),
-            )
-            .map_err(|_| WebTransportSessionCloseError::DriverGone)
+                }),
+            Err(mpsc::error::TrySendError::Closed(())) =>
+                Err(WebTransportSessionCloseError::DriverGone {
+                    session_id,
+                    error_code,
+                    message,
+                }),
+        }
     }
 }

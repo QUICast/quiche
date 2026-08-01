@@ -162,6 +162,13 @@ impl DgramBuffer {
         self.data.capacity() - self.data.len()
     }
 
+    /// Returns the allocated capacity of the underlying byte vector.
+    ///
+    /// This includes readable bytes, consumed prefix bytes, and spare capacity.
+    pub fn allocated_capacity(&self) -> usize {
+        self.data.capacity()
+    }
+
     /// Consumes the buffer and returns the inner `Vec<u8>` and the current
     /// read position as `(data, pos)`.
     pub fn into_parts(self) -> (Vec<u8>, usize) {
@@ -277,6 +284,7 @@ mod tests {
         let b = DgramBuffer::with_capacity_and_headroom(16, 4);
         assert_eq!(b.as_slice(), &[]);
         assert_eq!(b.len(), 0);
+        assert_eq!(b.allocated_capacity(), 16);
         assert_eq!(b.spare_capacity(), 12);
     }
 

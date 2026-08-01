@@ -38,37 +38,52 @@ use tokio_util::time::delay_queue::{
     self,
 };
 
-const SETTINGS_ENABLE_WEBTRANSPORT_LEGACY: u64 = 0x2b60_3742;
 const SETTINGS_WT_ENABLED: u64 = 0x2c7c_f000;
-const SETTINGS_H3_DATAGRAM_DRAFT04: u64 = 0xffd277;
-const SETTINGS_WEBTRANSPORT_MAX_SESSIONS_DRAFT07: u64 = 0xc671_706a;
-const SETTINGS_WEBTRANSPORT_MAX_SESSIONS: u64 = 0x14e9_cd29;
+#[cfg(test)]
 const SETTINGS_WT_INITIAL_MAX_DATA: u64 = 0x2b61;
+#[cfg(test)]
 const SETTINGS_WT_INITIAL_MAX_STREAMS_UNI: u64 = 0x2b64;
+#[cfg(test)]
 const SETTINGS_WT_INITIAL_MAX_STREAMS_BIDI: u64 = 0x2b65;
-
-const WT_INITIAL_MAX_DATA: u64 = 8_388_608;
-const WT_INITIAL_MAX_STREAMS_UNI: u64 = 100;
-const WT_INITIAL_MAX_STREAMS_BIDI: u64 = 100;
 
 const DEFAULT_WEBTRANSPORT_MAX_PENDING_STREAMS: usize = 256;
 const DEFAULT_WEBTRANSPORT_MAX_PENDING_STREAMS_PER_SESSION: usize = 64;
 const DEFAULT_WEBTRANSPORT_MAX_STREAM_WAITERS: usize = 256;
+const DEFAULT_WEBTRANSPORT_MAX_DATAGRAM_WAITERS: usize = 2;
 const DEFAULT_WEBTRANSPORT_MAX_SESSION_WORK_PER_CALLBACK: usize = 64;
 const DEFAULT_WEBTRANSPORT_COMMAND_CAPACITY: usize = 256;
 const DEFAULT_WEBTRANSPORT_MAX_STREAM_IO_BYTES: usize = 64 * 1024;
+const DEFAULT_WEBTRANSPORT_MAX_STREAM_WRITE_LEASE_RETAINED_BYTES: usize =
+    64 * 1024;
+const DEFAULT_WEBTRANSPORT_MAX_DATAGRAM_SEND_ALLOCATION_BYTES: usize = 64 * 1024;
 const DEFAULT_WEBTRANSPORT_MAX_PENDING_DATAGRAMS: usize = 256;
 const DEFAULT_WEBTRANSPORT_MAX_PENDING_DATAGRAMS_PER_SESSION: usize = 64;
 const DEFAULT_WEBTRANSPORT_MAX_PENDING_DATAGRAM_BYTES: usize = 1024 * 1024;
 const DEFAULT_WEBTRANSPORT_MAX_PENDING_DATAGRAM_BYTES_PER_SESSION: usize =
     256 * 1024;
+const DEFAULT_WEBTRANSPORT_MAX_PENDING_DATAGRAM_ALLOCATION_BYTES: usize =
+    1024 * 1024;
+const DEFAULT_WEBTRANSPORT_MAX_PENDING_DATAGRAM_ALLOCATION_BYTES_PER_SESSION:
+    usize = 256 * 1024;
 const DEFAULT_WEBTRANSPORT_MAX_PENDING_DATAGRAM_AGE: Duration =
     Duration::from_secs(5);
+const DEFAULT_H3_COMMAND_CAPACITY: usize = 256;
+const DEFAULT_H3_EVENT_CAPACITY: usize = 256;
 
 /// Unified configuration parameters for
 /// [H3Driver](crate::http3::driver::H3Driver)s.
 #[derive(Clone, Debug)]
 pub struct Http3Settings {
+    /// Capacity of the per-connection HTTP/3 command lane.
+    ///
+    /// Admission is nonblocking and returns ownership when full. A value of
+    /// zero is clamped to one.
+    pub command_capacity: usize,
+    /// Capacity of the per-connection HTTP/3 application event lane.
+    ///
+    /// The QUIC driver never awaits this lane. Saturation closes the
+    /// connection with `H3_EXCESSIVE_LOAD`. A value of zero is clamped to one.
+    pub event_capacity: usize,
     /// Maximum number of requests a
     /// [ServerH3Driver](crate::http3::driver::ServerH3Driver) allows per
     /// connection.
@@ -90,9 +105,10 @@ pub struct Http3Settings {
     pub enable_extended_connect: bool,
     /// Set the WebTransport-over-HTTP/3 SETTINGS_ENABLE_WEB_TRANSPORT setting.
     ///
-    /// Chrome requires this in addition to extended CONNECT before it considers
-    /// WebTransport sessions negotiated. Enabling it also transfers native
-    /// draft-15 stream classification to the Tokio H3 driver.
+    /// Enabling this draft-16 V2 profile also transfers native stream
+    /// classification to the Tokio H3 driver. The profile deliberately omits
+    /// nonzero session-level flow-control SETTINGS and permits one pending or
+    /// active session per HTTP/3 connection.
     pub enable_webtransport: bool,
     /// Aggregate maximum for optimistic inbound streams and locally opening
     /// streams whose association prefix has not committed.
@@ -102,6 +118,8 @@ pub struct Http3Settings {
     pub webtransport_max_pending_streams_per_session: usize,
     /// Maximum exact-stream readable and writable wait registrations.
     pub webtransport_max_stream_waiters: usize,
+    /// Maximum exact-session Datagram-readable and send-capacity waiters.
+    pub webtransport_max_datagram_waiters: usize,
     /// Work bound used independently by the native WebTransport runtime's
     /// selected-I/O, associated-stream maintenance, and Datagram receive
     /// passes.
@@ -119,8 +137,17 @@ pub struct Http3Settings {
     pub webtransport_command_capacity: usize,
     /// Maximum payload bytes accepted by one selected-stream write command.
     pub webtransport_max_stream_write_bytes: usize,
+    /// Maximum owner-declared bytes retained by one generic write lease.
+    ///
+    /// Outstanding leases, including completed results not yet consumed, are
+    /// also bounded in count by `webtransport_command_capacity` and in bytes by
+    /// that capacity multiplied by this value.
+    pub webtransport_max_stream_write_lease_retained_bytes: usize,
     /// Maximum payload bytes returned by one selected-stream read command.
     pub webtransport_max_stream_read_bytes: usize,
+    /// Maximum physical `DgramBuffer` allocation accepted by one outgoing
+    /// native WebTransport Datagram command.
+    pub webtransport_max_datagram_send_allocation_bytes: usize,
     /// Maximum queued incoming native WebTransport Datagrams per connection.
     pub webtransport_max_pending_datagrams: usize,
     /// Maximum queued incoming native WebTransport Datagrams per session.
@@ -130,6 +157,12 @@ pub struct Http3Settings {
     pub webtransport_max_pending_datagram_bytes: usize,
     /// Maximum queued incoming native WebTransport Datagram bytes per session.
     pub webtransport_max_pending_datagram_bytes_per_session: usize,
+    /// Maximum physical allocation retained by queued incoming native
+    /// WebTransport Datagrams per connection.
+    pub webtransport_max_pending_datagram_allocation_bytes: usize,
+    /// Maximum physical allocation retained by queued incoming native
+    /// WebTransport Datagrams per session.
+    pub webtransport_max_pending_datagram_allocation_bytes_per_session: usize,
     /// Maximum time an incoming Datagram may await CONNECT classification.
     pub webtransport_max_pending_datagram_age: Duration,
     /// QUIC multicast channel ID used for HTTP/3 DATAGRAM unicast fallback.
@@ -151,6 +184,8 @@ pub struct Http3Settings {
 impl Default for Http3Settings {
     fn default() -> Self {
         Self {
+            command_capacity: DEFAULT_H3_COMMAND_CAPACITY,
+            event_capacity: DEFAULT_H3_EVENT_CAPACITY,
             max_requests_per_connection: None,
             max_header_list_size: None,
             qpack_max_table_capacity: None,
@@ -164,13 +199,19 @@ impl Default for Http3Settings {
                 DEFAULT_WEBTRANSPORT_MAX_PENDING_STREAMS_PER_SESSION,
             webtransport_max_stream_waiters:
                 DEFAULT_WEBTRANSPORT_MAX_STREAM_WAITERS,
+            webtransport_max_datagram_waiters:
+                DEFAULT_WEBTRANSPORT_MAX_DATAGRAM_WAITERS,
             webtransport_max_session_work_per_callback:
                 DEFAULT_WEBTRANSPORT_MAX_SESSION_WORK_PER_CALLBACK,
             webtransport_command_capacity: DEFAULT_WEBTRANSPORT_COMMAND_CAPACITY,
             webtransport_max_stream_write_bytes:
                 DEFAULT_WEBTRANSPORT_MAX_STREAM_IO_BYTES,
+            webtransport_max_stream_write_lease_retained_bytes:
+                DEFAULT_WEBTRANSPORT_MAX_STREAM_WRITE_LEASE_RETAINED_BYTES,
             webtransport_max_stream_read_bytes:
                 DEFAULT_WEBTRANSPORT_MAX_STREAM_IO_BYTES,
+            webtransport_max_datagram_send_allocation_bytes:
+                DEFAULT_WEBTRANSPORT_MAX_DATAGRAM_SEND_ALLOCATION_BYTES,
             webtransport_max_pending_datagrams:
                 DEFAULT_WEBTRANSPORT_MAX_PENDING_DATAGRAMS,
             webtransport_max_pending_datagrams_per_session:
@@ -179,6 +220,10 @@ impl Default for Http3Settings {
                 DEFAULT_WEBTRANSPORT_MAX_PENDING_DATAGRAM_BYTES,
             webtransport_max_pending_datagram_bytes_per_session:
                 DEFAULT_WEBTRANSPORT_MAX_PENDING_DATAGRAM_BYTES_PER_SESSION,
+            webtransport_max_pending_datagram_allocation_bytes:
+                DEFAULT_WEBTRANSPORT_MAX_PENDING_DATAGRAM_ALLOCATION_BYTES,
+            webtransport_max_pending_datagram_allocation_bytes_per_session:
+                DEFAULT_WEBTRANSPORT_MAX_PENDING_DATAGRAM_ALLOCATION_BYTES_PER_SESSION,
             webtransport_max_pending_datagram_age:
                 DEFAULT_WEBTRANSPORT_MAX_PENDING_DATAGRAM_AGE,
             multicast_datagram_channel_id: None,
@@ -210,22 +255,7 @@ impl From<&Http3Settings> for quiche::h3::Config {
         if value.enable_webtransport {
             config.enable_webtransport_stream_classification(true);
             config
-                .set_additional_settings(vec![
-                    (SETTINGS_ENABLE_WEBTRANSPORT_LEGACY, 1),
-                    (SETTINGS_WT_ENABLED, 1),
-                    (SETTINGS_H3_DATAGRAM_DRAFT04, 1),
-                    (SETTINGS_WEBTRANSPORT_MAX_SESSIONS_DRAFT07, 1),
-                    (SETTINGS_WEBTRANSPORT_MAX_SESSIONS, 1),
-                    (SETTINGS_WT_INITIAL_MAX_DATA, WT_INITIAL_MAX_DATA),
-                    (
-                        SETTINGS_WT_INITIAL_MAX_STREAMS_UNI,
-                        WT_INITIAL_MAX_STREAMS_UNI,
-                    ),
-                    (
-                        SETTINGS_WT_INITIAL_MAX_STREAMS_BIDI,
-                        WT_INITIAL_MAX_STREAMS_BIDI,
-                    ),
-                ])
+                .set_additional_settings(vec![(SETTINGS_WT_ENABLED, 1)])
                 .expect("WebTransport setting must not conflict with built-in H3 settings");
         }
 
@@ -392,8 +422,10 @@ mod tests {
     }
 
     #[test]
-    fn enable_webtransport_emits_all_webtransport_settings() -> TestResult {
+    fn enable_webtransport_emits_only_the_draft16_v2_profile() -> TestResult {
         let mut quic_config = h3_quiche_config()?;
+        quic_config.enable_dgram(true, 10, 10);
+        quic_config.enable_reset_stream_at(true);
         let mut pipe = quiche::test_utils::Pipe::with_config(&mut quic_config)?;
         pipe.handshake()?;
 
@@ -423,20 +455,9 @@ mod tests {
             .expect("peer settings must be received");
 
         for (id, value) in [
-            (SETTINGS_ENABLE_WEBTRANSPORT_LEGACY, 1),
-            (SETTINGS_WT_ENABLED, 1),
-            (SETTINGS_H3_DATAGRAM_DRAFT04, 1),
-            (SETTINGS_WEBTRANSPORT_MAX_SESSIONS_DRAFT07, 1),
-            (SETTINGS_WEBTRANSPORT_MAX_SESSIONS, 1),
-            (SETTINGS_WT_INITIAL_MAX_DATA, WT_INITIAL_MAX_DATA),
-            (
-                SETTINGS_WT_INITIAL_MAX_STREAMS_UNI,
-                WT_INITIAL_MAX_STREAMS_UNI,
-            ),
-            (
-                SETTINGS_WT_INITIAL_MAX_STREAMS_BIDI,
-                WT_INITIAL_MAX_STREAMS_BIDI,
-            ),
+            (quiche::h3::SETTINGS_WT_ENABLED, 1),
+            (quiche::h3::frame::SETTINGS_ENABLE_CONNECT_PROTOCOL, 1),
+            (quiche::h3::frame::SETTINGS_H3_DATAGRAM, 1),
         ] {
             let received_value = received_settings.iter().find_map(
                 |(received_id, received_value)| {
@@ -448,6 +469,19 @@ mod tests {
                 received_value,
                 Some(value),
                 "missing WebTransport setting {id:#x}"
+            );
+        }
+
+        for id in [
+            SETTINGS_WT_INITIAL_MAX_DATA,
+            SETTINGS_WT_INITIAL_MAX_STREAMS_UNI,
+            SETTINGS_WT_INITIAL_MAX_STREAMS_BIDI,
+        ] {
+            assert!(
+                received_settings
+                    .iter()
+                    .all(|(received_id, _)| *received_id != id),
+                "unexpected session-level flow-control setting {id:#x}"
             );
         }
 

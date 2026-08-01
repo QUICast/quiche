@@ -33,6 +33,7 @@ use datagram_socket::StreamClosureKind;
 use foundations::telemetry::log;
 use quiche::h3;
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::oneshot;
 
 use super::datagram;
@@ -70,7 +71,7 @@ pub type ClientH3Controller = H3Controller<ClientHooks>;
 /// Receives [`ClientH3Event`]s from a [ClientH3Driver]. This is the control
 /// stream which describes what is happening on the connection, but does not
 /// transfer data.
-pub type ClientEventStream = mpsc::UnboundedReceiver<ClientH3Event>;
+pub type ClientEventStream = mpsc::Receiver<ClientH3Event>;
 /// A [RequestSender] to send HTTP requests over a [ClientH3Driver]'s
 /// connection.
 pub type ClientRequestSender = RequestSender<ClientH3Command, NewClientRequest>;
@@ -99,7 +100,7 @@ pub enum ClientH3Event {
         request_id: u64,
     },
     /// A native WebTransport CONNECT was not sent because the peer or local
-    /// transport did not satisfy draft-15's required negotiation settings.
+    /// transport did not satisfy draft-16's required negotiation settings.
     WebTransportRequestRejected {
         /// User-provided request identifier from [`NewClientRequest`].
         request_id: u64,
@@ -168,10 +169,15 @@ pub struct ClientHooks {
     ///
     /// Initialised in `conn_established`; `None` before the connection
     /// is established.
-    self_cmd_sender: Option<mpsc::UnboundedSender<ClientH3Command>>,
+    self_cmd_sender: Option<mpsc::Sender<ClientH3Command>>,
 }
 
 impl ClientHooks {
+    #[cfg(test)]
+    pub(crate) fn queued_webtransport_request_count(&self) -> usize {
+        self.queued_webtransport_requests.len()
+    }
+
     /// Returns `true` when `err` from `h3::Connection::send_request` means the
     /// request should be retried after a short delay rather than treated as a
     /// fatal connection error.
@@ -208,6 +214,31 @@ impl ClientHooks {
         let is_webtransport = driver.webtransport.is_some() &&
             webtransport::is_connect(&request.headers);
         if is_webtransport {
+            let queued_candidate =
+                !driver.hooks.queued_webtransport_requests.is_empty() ||
+                    driver.hooks.queued_requests.iter().any(|queued| {
+                        webtransport::is_connect(&queued.headers)
+                    });
+            if queued_candidate {
+                driver.h3_event_sender.send(
+                    ClientH3Event::WebTransportRequestRejected {
+                        request_id: request.request_id,
+                    },
+                )?;
+                return Ok(());
+            }
+            if !driver
+                .webtransport
+                .as_ref()
+                .is_some_and(webtransport::Runtime::can_start_session)
+            {
+                driver.h3_event_sender.send(
+                    ClientH3Event::WebTransportRequestRejected {
+                        request_id: request.request_id,
+                    },
+                )?;
+                return Ok(());
+            }
             match webtransport_requirements(
                 driver
                     .conn
@@ -220,12 +251,11 @@ impl ClientHooks {
                     return Ok(());
                 },
                 WebTransportRequirements::Failed => {
-                    driver
-                        .h3_event_sender
-                        .send(ClientH3Event::WebTransportRequestRejected {
+                    driver.h3_event_sender.send(
+                        ClientH3Event::WebTransportRequestRejected {
                             request_id: request.request_id,
-                        })
-                        .map_err(|_| H3ConnectionError::ControllerWentAway)?;
+                        },
+                    )?;
                     return Ok(());
                 },
                 WebTransportRequirements::Met => {},
@@ -293,7 +323,18 @@ impl ClientHooks {
             .insert(stream_id, PendingClientRequest { send, recv });
 
         if let Some(runtime) = driver.webtransport.as_mut() {
-            let mut events = runtime.observe_request(stream_id, is_webtransport);
+            let mut events =
+                match runtime.observe_request(stream_id, is_webtransport) {
+                    webtransport::RequestObservation::Observed(events) => events,
+                    webtransport::RequestObservation::Excessive => {
+                        let _ = driver.h3_event_sender.send(
+                            ClientH3Event::WebTransportRequestRejected {
+                                request_id: request.request_id,
+                            },
+                        );
+                        return Ok(());
+                    },
+                };
             if is_webtransport && body_finished {
                 events.extend(
                     runtime.terminate(
@@ -350,7 +391,6 @@ impl ClientHooks {
         driver
             .h3_event_sender
             .send(H3Event::IncomingHeaders(headers).into())
-            .map_err(|_| H3ConnectionError::ControllerWentAway)
     }
 }
 
@@ -449,29 +489,50 @@ impl DriverHooks for ClientHooks {
                 .ok_or_else(H3Driver::<Self>::connection_not_present)?,
             qconn,
         );
-        let requests: Vec<_> = driver
-            .hooks
-            .queued_webtransport_requests
-            .drain(..)
-            .collect();
-        for request in requests {
+        let mut requests =
+            std::mem::take(&mut driver.hooks.queued_webtransport_requests);
+        while let Some(request) = requests.pop_front() {
             match requirements {
                 WebTransportRequirements::Met => {
                     let Some(sender) = &driver.hooks.self_cmd_sender else {
                         continue;
                     };
-                    let _ = sender.send(ClientH3Command::ClientRequest(request));
+                    match sender.try_send(ClientH3Command::ClientRequest(request))
+                    {
+                        Ok(()) => {},
+                        Err(TrySendError::Full(
+                            ClientH3Command::ClientRequest(request),
+                        )) => {
+                            driver
+                                .hooks
+                                .queued_webtransport_requests
+                                .push_back(request);
+                            driver
+                                .hooks
+                                .queued_webtransport_requests
+                                .append(&mut requests);
+                            break;
+                        },
+                        Err(TrySendError::Closed(_)) =>
+                            return Err(H3ConnectionError::ControllerWentAway),
+                        Err(TrySendError::Full(ClientH3Command::Core(_))) =>
+                            unreachable!("a client request changed variant"),
+                    }
                 },
                 WebTransportRequirements::Pending => {
                     driver.hooks.queued_webtransport_requests.push_back(request);
+                    driver
+                        .hooks
+                        .queued_webtransport_requests
+                        .append(&mut requests);
+                    break;
                 },
                 WebTransportRequirements::Failed => {
-                    driver
-                        .h3_event_sender
-                        .send(ClientH3Event::WebTransportRequestRejected {
+                    driver.h3_event_sender.send(
+                        ClientH3Event::WebTransportRequestRejected {
                             request_id: request.request_id,
-                        })
-                        .map_err(|_| H3ConnectionError::ControllerWentAway)?;
+                        },
+                    )?;
                 },
             }
         }
@@ -505,7 +566,7 @@ impl DriverHooks for ClientHooks {
         // re-queueing requests that would immediately fail.
         tokio::time::sleep(BLOCKED_RETRY_DELAY).await;
 
-        let Some(sender) = &self.self_cmd_sender else {
+        let Some(sender) = self.self_cmd_sender.clone() else {
             // Should not happen: `conn_established` always sets this.
             return Ok(());
         };
@@ -513,12 +574,22 @@ impl DriverHooks for ClientHooks {
         let streams_left = qconn.peer_streams_left_bidi() as usize;
         let to_drain = streams_left.min(self.queued_requests.len());
 
-        for request in self.queued_requests.drain(..to_drain) {
+        for _ in 0..to_drain {
+            let permit = match sender.try_reserve() {
+                Ok(permit) => permit,
+                Err(mpsc::error::TrySendError::Full(())) => break,
+                Err(mpsc::error::TrySendError::Closed(())) =>
+                    return Err(H3ConnectionError::ControllerWentAway),
+            };
+            let request = self
+                .queued_requests
+                .pop_front()
+                .expect("the retry count is bounded by the queue length");
             log::debug!(
                 "retrying queued request after stream-blocked delay";
                 "request_id" => request.request_id,
             );
-            let _ = sender.send(ClientH3Command::ClientRequest(request));
+            permit.send(ClientH3Command::ClientRequest(request));
         }
 
         Ok(())

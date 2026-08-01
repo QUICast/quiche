@@ -104,6 +104,11 @@ fn transport_params() {
 
 #[test]
 fn transport_params_reset_stream_at_roundtrip() {
+    assert_eq!(
+        transport_params::RESET_STREAM_AT_TRANSPORT_PARAMETER_ID,
+        0x1d
+    );
+
     let tp = TransportParams {
         reset_stream_at: true,
         ..Default::default()
@@ -114,6 +119,17 @@ fn transport_params_reset_stream_at_roundtrip() {
     let decoded = TransportParams::decode(raw_params, false, None).unwrap();
 
     assert!(decoded.reset_stream_at);
+
+    let mut old_params = [0; 16];
+    let old_params_len = {
+        let mut b = octets::OctetsMut::with_slice(&mut old_params);
+        TransportParams::encode_param(&mut b, 0x17f7586d2cb571, 0).unwrap();
+        b.off()
+    };
+    let old_decoded =
+        TransportParams::decode(&old_params[..old_params_len], false, None)
+            .unwrap();
+    assert!(!old_decoded.reset_stream_at);
 
     let mut bad_params = [0; 16];
     let bad_params_len = {
@@ -807,6 +823,35 @@ fn reset_stream_at_progresses_after_flow_control_credit() {
 }
 
 #[test]
+fn reset_stream_at_receive_enforces_stream_and_connection_flow_control() {
+    let mut buf = [0; 1280];
+    let reset = [frame::Frame::ResetStreamAt {
+        stream_id: 2,
+        error_code: 17,
+        final_size: 6,
+        reliable_size: 3,
+    }];
+
+    let mut stream_limited = reset_stream_at_pipe(5);
+    assert_eq!(
+        stream_limited.send_pkt_to_server(Type::Short, &reset, &mut buf),
+        Err(Error::FlowControl)
+    );
+
+    let mut config = test_utils::Pipe::default_config("cubic").unwrap();
+    config.enable_reset_stream_at(true);
+    config.set_initial_max_data(5);
+    config.set_initial_max_stream_data_uni(64);
+    let mut connection_limited =
+        test_utils::Pipe::with_config(&mut config).unwrap();
+    connection_limited.handshake().unwrap();
+    assert_eq!(
+        connection_limited.send_pkt_to_server(Type::Short, &reset, &mut buf),
+        Err(Error::FlowControl)
+    );
+}
+
+#[test]
 fn reset_stream_at_invalid_calls_are_transactional() {
     let mut unnegotiated = test_utils::Pipe::new("cubic").unwrap();
     unnegotiated.handshake().unwrap();
@@ -890,7 +935,7 @@ fn reset_stream_at_invalid_calls_are_transactional() {
 }
 
 #[test]
-fn reset_stream_at_conflicting_fin_uses_stream_state_error() {
+fn reset_stream_at_conflicting_final_size_uses_final_size_error() {
     let mut pipe = reset_stream_at_pipe(64);
     let mut buf = [0; 1280];
     let stream_id = 2;
@@ -922,6 +967,33 @@ fn reset_stream_at_conflicting_fin_uses_stream_state_error() {
     }];
     assert_eq!(
         pipe.send_pkt_to_server(Type::Short, &conflicting_fin, &mut buf),
+        Err(Error::FinalSize)
+    );
+}
+
+#[test]
+fn reset_stream_at_conflicting_error_code_uses_stream_state_error() {
+    let mut pipe = reset_stream_at_pipe(64);
+    let mut buf = [0; 1280];
+    let stream_id = 2;
+    let reset = [frame::Frame::ResetStreamAt {
+        stream_id,
+        error_code: 7,
+        final_size: 5,
+        reliable_size: 3,
+    }];
+    assert!(pipe
+        .send_pkt_to_server(Type::Short, &reset, &mut buf)
+        .is_ok());
+
+    let conflicting = [frame::Frame::ResetStreamAt {
+        stream_id,
+        error_code: 8,
+        final_size: 5,
+        reliable_size: 2,
+    }];
+    assert_eq!(
+        pipe.send_pkt_to_server(Type::Short, &conflicting, &mut buf),
         Err(Error::InvalidStreamState(stream_id))
     );
 }

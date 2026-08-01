@@ -36,7 +36,7 @@ use crate::Error;
 use crate::Result;
 use crate::MAX_STREAM_ID;
 
-pub const RESET_STREAM_AT_TRANSPORT_PARAMETER_ID: u64 = 0x17f7586d2cb571;
+pub const RESET_STREAM_AT_TRANSPORT_PARAMETER_ID: u64 = 0x1d;
 
 #[cfg(feature = "qlog")]
 use crate::crypto;

@@ -322,7 +322,7 @@ impl Stream {
         self.state_transition(State::WebTransportNegotiation, 0, false)
     }
 
-    /// Resolves a retained candidate as a draft-15 WebTransport stream.
+    /// Resolves a retained candidate as a draft-16 WebTransport stream.
     pub fn resolve_webtransport_candidate(&mut self) -> Result<()> {
         assert_eq!(self.state, State::WebTransportNegotiation);
 

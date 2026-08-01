@@ -32,6 +32,7 @@ use tokio::sync::mpsc;
 
 use super::datagram;
 use super::webtransport;
+use super::webtransport_requirements;
 use super::DriverHooks;
 use super::H3Command;
 use super::H3ConnectionError;
@@ -42,6 +43,7 @@ use super::H3Event;
 use super::InboundHeaders;
 use super::IncomingH3Headers;
 use super::StreamCtx;
+use super::WebTransportRequirements;
 use super::STREAM_CAPACITY;
 use crate::http3::settings::Http3Settings;
 use crate::http3::settings::Http3SettingsEnforcer;
@@ -61,7 +63,7 @@ pub type ServerH3Controller = H3Controller<ServerHooks>;
 /// Receives [`ServerH3Event`]s from a [ServerH3Driver]. This is the control
 /// stream which describes what is happening on the connection, but does not
 /// transfer data.
-pub type ServerEventStream = mpsc::UnboundedReceiver<ServerH3Event>;
+pub type ServerEventStream = mpsc::Receiver<ServerH3Event>;
 
 #[derive(Clone, Debug)]
 pub struct RawPriorityValue(Vec<u8>);
@@ -171,9 +173,16 @@ pub struct ServerHooks {
     /// Whether the extended CONNECT protocol is enabled. When disabled,
     /// skip DATAGRAM flow creation for `:protocol` requests.
     extended_connect_enabled: bool,
+    /// One draft-16 CONNECT retained until the client's SETTINGS arrive.
+    deferred_webtransport_request: Option<InboundHeaders>,
 }
 
 impl ServerHooks {
+    #[cfg(test)]
+    pub(crate) fn has_deferred_webtransport_request(&self) -> bool {
+        self.deferred_webtransport_request.is_some()
+    }
+
     /// Handles a new request, creating a stream context, checking for a
     /// potential DATAGRAM flow (CONNECT-{UDP,IP}) and sending a relevant
     /// [`H3Event`] to the [ServerH3Controller] for application-level
@@ -188,6 +197,15 @@ impl ServerHooks {
             has_body,
         } = headers;
 
+        if driver
+            .hooks
+            .deferred_webtransport_request
+            .as_ref()
+            .is_some_and(|request| request.stream_id == stream_id)
+        {
+            return Ok(());
+        }
+
         // Multiple HEADERS frames can be received on a single stream, but only
         // the first one is an actual request. For now ignore any additional
         // HEADERS (e.g. "trailers").
@@ -197,8 +215,88 @@ impl ServerHooks {
 
         let is_webtransport =
             driver.webtransport.is_some() && webtransport::is_connect(&headers);
+        if is_webtransport {
+            let requirements = webtransport_requirements(
+                driver
+                    .conn
+                    .as_ref()
+                    .ok_or_else(H3Driver::<Self>::connection_not_present)?,
+                qconn,
+            );
+            match requirements {
+                WebTransportRequirements::Pending => {
+                    let observation = driver
+                        .webtransport
+                        .as_mut()
+                        .expect("WebTransport request requires a runtime")
+                        .observe_deferred_request(stream_id);
+                    if matches!(
+                        observation,
+                        webtransport::RequestObservation::Excessive
+                    ) {
+                        let error =
+                            quiche::h3::WireErrorCode::RequestRejected as u64;
+                        let _ = qconn.stream_shutdown(
+                            stream_id,
+                            quiche::Shutdown::Write,
+                            error,
+                        );
+                        let _ = qconn.stream_shutdown(
+                            stream_id,
+                            quiche::Shutdown::Read,
+                            error,
+                        );
+                        return Ok(());
+                    }
+                    driver.hooks.deferred_webtransport_request =
+                        Some(InboundHeaders {
+                            stream_id,
+                            headers,
+                            has_body,
+                        });
+                    return Ok(());
+                },
+                WebTransportRequirements::Failed => {
+                    driver
+                        .webtransport
+                        .as_mut()
+                        .expect("WebTransport request requires a runtime")
+                        .reject_unadmitted_request(stream_id);
+                    let error = quiche::h3::WireErrorCode::MessageError as u64;
+                    let _ = qconn.stream_shutdown(
+                        stream_id,
+                        quiche::Shutdown::Write,
+                        error,
+                    );
+                    let _ = qconn.stream_shutdown(
+                        stream_id,
+                        quiche::Shutdown::Read,
+                        error,
+                    );
+                    return Ok(());
+                },
+                WebTransportRequirements::Met => {},
+            }
+        }
         if let Some(runtime) = driver.webtransport.as_mut() {
-            let events = runtime.observe_request(stream_id, is_webtransport);
+            let events = match runtime.observe_request(stream_id, is_webtransport)
+            {
+                webtransport::RequestObservation::Observed(events) => events,
+                webtransport::RequestObservation::Excessive => {
+                    let error = quiche::h3::WireErrorCode::RequestRejected as u64;
+                    let _ = qconn.stream_shutdown(
+                        stream_id,
+                        quiche::Shutdown::Write,
+                        error,
+                    );
+                    let _ = qconn.stream_shutdown(
+                        stream_id,
+                        quiche::Shutdown::Read,
+                        error,
+                    );
+                    return Ok(());
+                },
+            };
             H3Driver::<Self>::emit_webtransport_events(
                 &driver.h3_event_sender,
                 events,
@@ -261,14 +359,11 @@ impl ServerHooks {
             .push(stream_ctx.wait_for_recv(stream_id));
         driver.insert_stream(stream_id, stream_ctx);
 
-        driver
-            .h3_event_sender
-            .send(ServerH3Event::Headers {
-                incoming_headers: headers,
-                priority: latest_priority_update,
-                is_in_early_data: IsInEarlyData::new(qconn.is_in_early_data()),
-            })
-            .map_err(|_| H3ConnectionError::ControllerWentAway)?;
+        driver.h3_event_sender.send(ServerH3Event::Headers {
+            incoming_headers: headers,
+            priority: latest_priority_update,
+            is_in_early_data: IsInEarlyData::new(qconn.is_in_early_data()),
+        })?;
         driver.hooks.requests += 1;
 
         Ok(())
@@ -292,11 +387,68 @@ impl DriverHooks for ServerHooks {
             post_accept_timeout: None,
             extended_connect_enabled: settings.enable_extended_connect ||
                 settings.enable_webtransport,
+            deferred_webtransport_request: None,
         }
     }
 
     fn extended_connect_enabled(&self) -> bool {
         self.extended_connect_enabled
+    }
+
+    fn settings_received(
+        driver: &mut H3Driver<Self>, qconn: &mut QuicheConnection,
+    ) -> H3ConnectionResult<()> {
+        let Some(request) = driver.hooks.deferred_webtransport_request.take()
+        else {
+            return Ok(());
+        };
+        let session_id = request.stream_id;
+        let requirements = webtransport_requirements(
+            driver
+                .conn
+                .as_ref()
+                .ok_or_else(H3Driver::<Self>::connection_not_present)?,
+            qconn,
+        );
+        match requirements {
+            WebTransportRequirements::Pending => {
+                driver.hooks.deferred_webtransport_request = Some(request);
+            },
+            WebTransportRequirements::Failed => {
+                let runtime = driver
+                    .webtransport
+                    .as_mut()
+                    .expect("a deferred request requires a runtime");
+                let _ = runtime.admission_failed(session_id);
+                let error = quiche::h3::WireErrorCode::MessageError as u64;
+                let _ = qconn.stream_shutdown(
+                    session_id,
+                    quiche::Shutdown::Write,
+                    error,
+                );
+                let _ = qconn.stream_shutdown(
+                    session_id,
+                    quiche::Shutdown::Read,
+                    error,
+                );
+            },
+            WebTransportRequirements::Met => {
+                let runtime = driver
+                    .webtransport
+                    .as_mut()
+                    .expect("a deferred request requires a runtime");
+                if !runtime.is_pending(session_id) {
+                    return Ok(());
+                }
+                let events = runtime.make_application_visible(session_id);
+                H3Driver::<Self>::emit_webtransport_events(
+                    &driver.h3_event_sender,
+                    events,
+                )?;
+                Self::handle_request(driver, qconn, request)?;
+            },
+        }
+        Ok(())
     }
 
     fn conn_established(

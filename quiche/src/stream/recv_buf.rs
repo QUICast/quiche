@@ -104,15 +104,6 @@ impl RecvBuf {
         }
 
         if let Some(fin_off) = self.fin_off {
-            // Once RESET_STREAM_AT participates in termination, a conflicting
-            // FIN is a STREAM_STATE_ERROR even when it also exceeds Final Size.
-            if buf.fin() &&
-                fin_off != buf.max_off() &&
-                self.reset.is_some_and(|reset| reset.reliable_semantics)
-            {
-                return Err(Error::InvalidState);
-            }
-
             // Stream's size is known, forbid data beyond that point.
             if buf.max_off() > fin_off {
                 return Err(Error::FinalSize);
@@ -120,12 +111,7 @@ impl RecvBuf {
 
             // Stream's size is already known, forbid changing it.
             if buf.fin() && fin_off != buf.max_off() {
-                return if self.reset.is_some_and(|reset| reset.reliable_semantics)
-                {
-                    Err(Error::InvalidState)
-                } else {
-                    Err(Error::FinalSize)
-                };
+                return Err(Error::FinalSize);
             }
         }
 
@@ -349,18 +335,11 @@ impl RecvBuf {
             return Err(Error::FlowControl);
         }
 
-        // A FIN or earlier reset fixes the termination tuple. draft-07
-        // requires STREAM_STATE_ERROR when a later termination signal changes
-        // it, rather than RFC 9000's more general FINAL_SIZE_ERROR.
+        // A FIN or earlier reset fixes Final Size. draft-09 uses
+        // FINAL_SIZE_ERROR when a later termination signal changes it.
         if let Some(fin_off) = self.fin_off {
             if fin_off != final_size {
-                return if reliable_semantics ||
-                    self.reset.is_some_and(|reset| reset.reliable_semantics)
-                {
-                    Err(Error::InvalidState)
-                } else {
-                    Err(Error::FinalSize)
-                };
+                return Err(Error::FinalSize);
             }
         }
 
@@ -371,11 +350,11 @@ impl RecvBuf {
 
         if let Some(current) = self.reset {
             let enforce_tuple = reliable_semantics || current.reliable_semantics;
-            if enforce_tuple &&
-                (current.error_code != error_code ||
-                    current.final_size != final_size)
-            {
+            if enforce_tuple && current.error_code != error_code {
                 return Err(Error::InvalidState);
+            }
+            if enforce_tuple && current.final_size != final_size {
+                return Err(Error::FinalSize);
             }
 
             if !enforce_tuple {
@@ -937,21 +916,21 @@ mod tests {
         let mut recv =
             RecvBuf::new(20, DEFAULT_STREAM_WINDOW, DEFAULT_STREAM_WINDOW);
         recv.write(RangeBuf::from(b"hello", 0, true)).unwrap();
-        assert_eq!(recv.reset_at(1, 6, 5), Err(Error::InvalidState));
+        assert_eq!(recv.reset_at(1, 6, 5), Err(Error::FinalSize));
 
         let mut recv =
             RecvBuf::new(20, DEFAULT_STREAM_WINDOW, DEFAULT_STREAM_WINDOW);
         recv.reset_at(1, 5, 3).unwrap();
         assert_eq!(
             recv.write(RangeBuf::from(b"x", 3, true)),
-            Err(Error::InvalidState)
+            Err(Error::FinalSize)
         );
         assert_eq!(
             recv.write(RangeBuf::from(b"xxxx", 3, true)),
-            Err(Error::InvalidState)
+            Err(Error::FinalSize)
         );
         assert_eq!(recv.reset_at(2, 5, 2), Err(Error::InvalidState));
-        assert_eq!(recv.reset_at(1, 4, 2), Err(Error::InvalidState));
+        assert_eq!(recv.reset_at(1, 4, 2), Err(Error::FinalSize));
 
         let mut recv =
             RecvBuf::new(20, DEFAULT_STREAM_WINDOW, DEFAULT_STREAM_WINDOW);

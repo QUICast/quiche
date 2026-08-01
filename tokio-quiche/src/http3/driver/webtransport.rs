@@ -28,6 +28,8 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::VecDeque;
 use std::fmt;
+use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -46,18 +48,18 @@ pub(crate) const WT_BUFFERED_STREAM_REJECTED: u64 = 0x3994_bd84;
 pub(crate) const WT_SESSION_GONE: u64 = 0x170d_7b68;
 pub(crate) const WT_CLOSE_SESSION: u64 = 0x2843;
 
-const MAX_CLOSE_MESSAGE_LEN: usize = 1024;
+pub(super) const MAX_CLOSE_MESSAGE_LEN: usize = 1024;
 const MAX_CLOSE_CAPSULE_PAYLOAD_LEN: usize = 4 + MAX_CLOSE_MESSAGE_LEN;
 const WT_APPLICATION_ERROR_FIRST: u64 = 0x52e4_a40f_a8db;
 const WT_APPLICATION_ERROR_LAST: u64 = 0x52e5_ac98_3162;
 
-/// Maps a 32-bit WebTransport application error to draft-15's HTTP/3 range.
+/// Maps a 32-bit WebTransport application error to draft-16's HTTP/3 range.
 pub const fn webtransport_error_to_http3(error_code: u32) -> u64 {
     let error_code = error_code as u64;
     WT_APPLICATION_ERROR_FIRST + error_code + error_code / 0x1e
 }
 
-/// Maps a draft-15 HTTP/3 WebTransport error to its application error.
+/// Maps a draft-16 HTTP/3 WebTransport error to its application error.
 ///
 /// Returns `None` for values outside the reserved range and for HTTP/3 grease
 /// values skipped by the draft's mapping.
@@ -180,23 +182,44 @@ pub enum WebTransportSessionEvent {
 /// Error returned before a local WebTransport close command is queued.
 #[derive(Debug, Eq, PartialEq)]
 pub enum WebTransportSessionCloseError {
-    /// The UTF-8 close message exceeds draft-15's 1024-byte limit.
+    /// The UTF-8 close message exceeds draft-16's 1024-byte limit.
     MessageTooLong {
         /// Actual encoded message length.
         len: usize,
+        /// Original close message.
+        message: String,
+    },
+    /// The bounded H3 command lane has no capacity.
+    QueueFull {
+        /// CONNECT stream ID and WebTransport Session ID.
+        session_id: u64,
+        /// Application-defined close code.
+        error_code: u32,
+        /// Original close message.
+        message: String,
     },
     /// The paired H3 driver is no longer accepting commands.
-    DriverGone,
+    DriverGone {
+        /// CONNECT stream ID and WebTransport Session ID.
+        session_id: u64,
+        /// Application-defined close code.
+        error_code: u32,
+        /// Original close message.
+        message: String,
+    },
 }
 
 impl fmt::Display for WebTransportSessionCloseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::MessageTooLong { len } => write!(
+            Self::MessageTooLong { len, .. } => write!(
                 f,
                 "WebTransport close message is {len} bytes; maximum is {MAX_CLOSE_MESSAGE_LEN}",
             ),
-            Self::DriverGone => f.write_str("WebTransport H3 driver is gone"),
+            Self::QueueFull { .. } =>
+                f.write_str("WebTransport H3 command queue is full"),
+            Self::DriverGone { .. } =>
+                f.write_str("WebTransport H3 driver is gone"),
         }
     }
 }
@@ -239,7 +262,7 @@ pub enum WebTransportSelectionError {
     ConnectionClosed,
 }
 
-/// Outcome of opening a native draft-15 WebTransport stream.
+/// Outcome of opening a native draft-16 WebTransport stream.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WebTransportOpenStreamOutcome {
     /// The prefix was accepted exactly once and the stream is
@@ -324,6 +347,224 @@ pub enum WebTransportStreamWriteOutcome {
     },
 }
 
+/// Transport progress made while processing one selected-stream write lease.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WebTransportStreamWriteLeaseProgress {
+    /// The driver never requested a payload slice from the owner.
+    NeverExposed,
+    /// The driver borrowed the payload, but core reported known zero progress.
+    ExposedKnownZero,
+    /// Core accepted a strict payload prefix without accepting the full lease.
+    AcceptedPartial {
+        /// Exact number of payload bytes accepted by core.
+        accepted: usize,
+    },
+    /// Core accepted the complete payload and possibly FIN.
+    AcceptedComplete {
+        /// Exact number of payload bytes accepted by core.
+        accepted: usize,
+        /// Whether the requested FIN committed with the complete payload.
+        fin_accepted: bool,
+    },
+    /// The result consumer disappeared after possible transport mutation.
+    ///
+    /// The owner must conservatively settle or reset its source transaction;
+    /// it must not assume zero accepted bytes.
+    Unknowable,
+}
+
+/// Configured bound that rejected a selected-stream write lease.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WebTransportStreamWriteLeaseLimit {
+    /// The declared payload length exceeded the per-write payload bound.
+    Payload,
+    /// The owner-declared retained bytes exceeded the per-lease memory bound.
+    RetainedBytes,
+}
+
+/// An owned payload that can be borrowed for one synchronous stream write.
+///
+/// Implementations remain concrete and non-cloneable. `as_slice()` is called
+/// at most once and its borrow is not retained after the core write returns.
+/// Returning `Err` from `as_slice()` means no payload slice was exposed.
+/// Declared lengths must remain stable, and all methods must complete without
+/// blocking or panicking on the QUIC driver thread.
+pub trait WebTransportStreamWriteLease: Send + 'static {
+    /// Error returned when the owner cannot expose its payload.
+    type Error: Send + 'static;
+
+    /// Returns the exact payload length without exposing the payload bytes.
+    fn payload_len(&self) -> usize;
+
+    /// Returns a conservative byte count retained by this owner.
+    ///
+    /// Shared backing allocations that are already counted by the application
+    /// should be counted once there and represented here by the retained slice
+    /// length. Owner-specific metadata not counted elsewhere must be included.
+    fn retained_bytes(&self) -> usize;
+
+    /// Borrows the payload for one synchronous core stream-write attempt.
+    fn as_slice(&mut self) -> Result<&[u8], Self::Error>;
+
+    /// Records deterministic settlement when the result consumer disappears.
+    ///
+    /// The default relies on the owner's `Drop` behavior. Transactional owners
+    /// can use this notification to distinguish safe zero-progress release
+    /// from a required fail-closed reset. This callback runs synchronously
+    /// during owner drop and must not block.
+    fn on_write_abandoned(
+        &mut self, _progress: WebTransportStreamWriteLeaseProgress,
+    ) {
+    }
+}
+
+/// Outcome of one generic selected-stream write-lease operation.
+#[derive(Debug)]
+pub enum WebTransportStreamWriteLeaseOutcome<L>
+where
+    L: WebTransportStreamWriteLease,
+{
+    /// Core accepted some or all payload bytes, and possibly FIN.
+    Accepted {
+        /// The exact original owner.
+        lease: L,
+        /// Number of payload bytes accepted by core.
+        accepted: usize,
+        /// Whether the complete declared payload was accepted.
+        complete: bool,
+        /// Whether FIN committed with the complete payload.
+        fin_accepted: bool,
+    },
+    /// Flow control prevented progress after one payload exposure.
+    Blocked {
+        /// The exact original owner.
+        lease: L,
+        /// Whether FIN remains requested.
+        fin: bool,
+    },
+    /// The bounded command lane was full before payload exposure.
+    QueueFull {
+        /// The exact original owner.
+        lease: L,
+        /// Whether FIN remains requested.
+        fin: bool,
+    },
+    /// The configured aggregate outstanding-lease bound was full.
+    ResourceLimit {
+        /// The exact original owner.
+        lease: L,
+        /// Whether FIN remains requested.
+        fin: bool,
+    },
+    /// A declared per-lease bound was exceeded before payload exposure.
+    TooLarge {
+        /// Bound that rejected the owner.
+        limit: WebTransportStreamWriteLeaseLimit,
+        /// Configured maximum.
+        max: usize,
+        /// Owner-declared value.
+        actual: usize,
+        /// The exact original owner.
+        lease: L,
+        /// Whether FIN remains requested.
+        fin: bool,
+    },
+    /// The selected stream's send side was closed after known zero progress.
+    Closed {
+        /// The exact original owner.
+        lease: L,
+        /// Whether FIN remains requested.
+        fin: bool,
+    },
+    /// STOP_SENDING requires a reliable WebTransport-prefix reset.
+    ResetRequired {
+        /// HTTP/3 wire error received in STOP_SENDING.
+        wire_error_code: u64,
+        /// Decoded WebTransport application error, when valid.
+        application_error_code: Option<u32>,
+        /// The exact original owner.
+        lease: L,
+        /// Whether FIN remains requested.
+        fin: bool,
+    },
+    /// Session or stream selection failed before payload exposure.
+    Rejected {
+        /// Selection failure.
+        error: WebTransportSelectionError,
+        /// The exact original owner.
+        lease: L,
+        /// Whether FIN remains requested.
+        fin: bool,
+    },
+    /// The owner could not expose its payload; no core write was attempted.
+    LeaseError {
+        /// Owner-defined exposure error.
+        error: L::Error,
+        /// The exact original owner.
+        lease: L,
+        /// Whether FIN remains requested.
+        fin: bool,
+    },
+    /// The exposed slice length differed from the preflight declaration.
+    InvalidLength {
+        /// Length returned before payload exposure.
+        declared: usize,
+        /// Length of the exposed slice.
+        actual: usize,
+        /// The exact original owner.
+        lease: L,
+        /// Whether FIN remains requested.
+        fin: bool,
+    },
+    /// An internal result path disappeared after possible transport mutation.
+    ///
+    /// The exact owner is returned, but the caller must fail closed and must
+    /// not assume zero progress.
+    ProgressUnknowable {
+        /// The exact original owner.
+        lease: L,
+        /// Whether FIN was requested.
+        fin: bool,
+    },
+}
+
+impl<L> WebTransportStreamWriteLeaseOutcome<L>
+where
+    L: WebTransportStreamWriteLease,
+{
+    /// Returns the exact transport exposure/progress classification.
+    pub fn progress(&self) -> WebTransportStreamWriteLeaseProgress {
+        match self {
+            Self::Accepted {
+                accepted,
+                complete: true,
+                fin_accepted,
+                ..
+            } => WebTransportStreamWriteLeaseProgress::AcceptedComplete {
+                accepted: *accepted,
+                fin_accepted: *fin_accepted,
+            },
+            Self::Accepted { accepted, .. } =>
+                WebTransportStreamWriteLeaseProgress::AcceptedPartial {
+                    accepted: *accepted,
+                },
+            Self::Blocked { .. } |
+            Self::Closed { .. } |
+            Self::ResetRequired { .. } |
+            Self::InvalidLength { .. } =>
+                WebTransportStreamWriteLeaseProgress::ExposedKnownZero,
+            Self::ProgressUnknowable { .. } =>
+                WebTransportStreamWriteLeaseProgress::Unknowable,
+            Self::QueueFull { .. } |
+            Self::ResourceLimit { .. } |
+            Self::TooLarge { .. } |
+            Self::Rejected { .. } |
+            Self::LeaseError { .. } =>
+                WebTransportStreamWriteLeaseProgress::NeverExposed,
+        }
+    }
+}
+
 /// Outcome of one bounded selected-stream read.
 #[derive(Debug, Eq, PartialEq)]
 pub enum WebTransportStreamReadOutcome {
@@ -384,7 +625,7 @@ pub enum WebTransportStreamReadyOutcome {
 /// Why a typed WebTransport Datagram operation was rejected.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WebTransportDatagramError {
-    /// QUIC DATAGRAM or draft-15 WebTransport support was not negotiated.
+    /// QUIC DATAGRAM or draft-16 WebTransport support was not negotiated.
     Unsupported,
     /// The Session ID is unknown on this connection.
     UnknownSession,
@@ -409,12 +650,21 @@ pub enum WebTransportDatagramSendOutcome {
     Blocked(DgramBuffer),
     /// The bounded controller command lane has no free slot.
     QueueFull(DgramBuffer),
-    /// The payload exceeds the currently usable draft-15 payload size.
+    /// The payload exceeds the currently usable draft-16 payload size.
     TooLarge {
         /// Maximum accepted by the rejecting controller or connection layer.
         /// Use [`WebTransportController::max_datagram_payload()`] for the
         /// current connection-specific value.
         max: usize,
+        /// Unaccepted Datagram payload.
+        datagram: DgramBuffer,
+    },
+    /// The backing allocation exceeds the configured command-retention bound.
+    AllocationTooLarge {
+        /// Maximum accepted backing allocation.
+        max: usize,
+        /// Actual backing allocation.
+        allocated: usize,
         /// Unaccepted Datagram payload.
         datagram: DgramBuffer,
     },
@@ -432,6 +682,18 @@ pub enum WebTransportDatagramSendOutcome {
 /// Aggregate accounting for incoming native WebTransport Datagram ownership.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct WebTransportDatagramStats {
+    /// Datagram items currently retained for native or provisional delivery.
+    pub retained_datagrams: usize,
+    /// Readable payload bytes currently retained.
+    pub retained_payload_bytes: usize,
+    /// Physical `Vec` allocation bytes currently retained.
+    pub retained_allocation_bytes: usize,
+    /// Configured aggregate retained-item limit.
+    pub max_retained_datagrams: usize,
+    /// Configured aggregate readable-payload byte limit.
+    pub max_retained_payload_bytes: usize,
+    /// Configured aggregate physical-allocation byte limit.
+    pub max_retained_allocation_bytes: usize,
     /// Datagram items dropped because configured item or byte limits were full.
     pub overflow_datagrams: u64,
     /// Datagram bytes dropped because configured item or byte limits were full.
@@ -452,32 +714,530 @@ pub struct WebTransportDatagramStats {
     pub terminal_bytes: u64,
 }
 
-/// Awaitable result of a successfully admitted selected-stream write command.
+/// Point-in-time native WebTransport retention accounting.
+///
+/// Byte counters distinguish physical `DgramBuffer` allocation from logical
+/// QUIC queue bytes. `metadata_index_entries` counts retained map/set/queue
+/// entries rather than estimating allocator overhead. A process memory policy
+/// can combine these values with its per-entry metadata budget and any shared
+/// `Bytes` source allocations retained by the application.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct WebTransportRetentionStats {
+    /// Pending, active, closing, or terminal session records.
+    pub sessions: usize,
+    /// Associated streams currently owned by native WebTransport.
+    pub associated_streams: usize,
+    /// Inbound or locally opening streams awaiting completed association.
+    pub provisional_streams: usize,
+    /// One-shot stream and Datagram readiness registrations.
+    pub waiters: usize,
+    /// Aggregate retained runtime index entries, including duplicate indexes.
+    pub metadata_index_entries: usize,
+    /// Incoming native/provisional Datagram items retained by the runtime.
+    pub pending_datagrams: usize,
+    /// Readable bytes in retained incoming Datagrams.
+    pub pending_datagram_payload_bytes: usize,
+    /// Physical backing allocations for retained incoming Datagrams.
+    pub pending_datagram_allocation_bytes: usize,
+    /// Configured selected-I/O command capacity.
+    pub command_capacity: usize,
+    /// Selected-I/O commands queued behind this snapshot command.
+    pub queued_commands: usize,
+    /// Conservative logical payload bound for those queued commands.
+    pub queued_command_payload_bytes_upper_bound: usize,
+    /// Outstanding generic write leases in commands or unconsumed results.
+    pub write_leases: usize,
+    /// Owner-declared bytes retained by outstanding generic write leases.
+    pub write_lease_retained_bytes: usize,
+    /// Configured outstanding generic write-lease count bound.
+    pub max_write_leases: usize,
+    /// Configured aggregate generic write-lease retained-byte bound.
+    pub max_write_lease_retained_bytes: usize,
+    /// Generic write leases admitted since driver construction.
+    pub write_lease_admitted_total: u64,
+    /// Generic write leases rejected because the command lane was full.
+    pub write_lease_queue_full_total: u64,
+    /// Generic write leases rejected by the aggregate outstanding bound.
+    pub write_lease_resource_limit_total: u64,
+    /// Generic write leases rejected by a per-owner size bound.
+    pub write_lease_too_large_total: u64,
+    /// Admitted, never-exposed owners abandoned after caller cancellation.
+    pub write_lease_abandoned_unexposed_total: u64,
+    /// Admitted, exposed known-zero owners abandoned after cancellation.
+    pub write_lease_abandoned_zero_total: u64,
+    /// Admitted owners abandoned with unknowable settlement progress.
+    pub write_lease_abandoned_unknown_total: u64,
+    /// Logical bytes retained by QUIC stream send buffers.
+    pub transport_stream_send_bytes: usize,
+    /// Logical bytes retained by QUIC stream receive buffers.
+    pub transport_stream_receive_bytes: u64,
+    /// Logical bytes retained by the QUIC Datagram send queue.
+    pub transport_datagram_send_bytes: usize,
+    /// Logical bytes retained by the QUIC Datagram receive queue.
+    pub transport_datagram_receive_bytes: usize,
+}
+
+impl WebTransportRetentionStats {
+    /// Returns adapter/runtime retained bytes covered directly by byte bounds.
+    ///
+    /// This includes physical incoming Datagram allocation, the conservative
+    /// logical payload bound for queued selected-I/O commands, and exact
+    /// owner-declared bytes for admitted write leases. Shared backing already
+    /// counted by the application must still be counted only once there.
+    pub fn adapter_bytes_upper_bound(&self) -> u64 {
+        (self.pending_datagram_allocation_bytes as u64)
+            .saturating_add(self.queued_command_payload_bytes_upper_bound as u64)
+            .saturating_add(self.write_lease_retained_bytes as u64)
+    }
+
+    /// Returns logical application bytes currently queued by QUIC.
+    pub fn transport_queued_bytes(&self) -> u64 {
+        (self.transport_stream_send_bytes as u64)
+            .saturating_add(self.transport_stream_receive_bytes)
+            .saturating_add(self.transport_datagram_send_bytes as u64)
+            .saturating_add(self.transport_datagram_receive_bytes as u64)
+    }
+}
+
+#[derive(Debug, Default)]
+struct WriteLeaseAccountingState {
+    current: usize,
+    retained_bytes: usize,
+    admitted_total: u64,
+    queue_full_total: u64,
+    resource_limit_total: u64,
+    too_large_total: u64,
+    abandoned_unexposed_total: u64,
+    abandoned_zero_total: u64,
+    abandoned_unknown_total: u64,
+}
+
+#[derive(Debug)]
+pub(crate) struct WriteLeaseAccounting {
+    max_count: usize,
+    max_retained_bytes: usize,
+    state: Mutex<WriteLeaseAccountingState>,
+}
+
+impl WriteLeaseAccounting {
+    pub(crate) fn new(
+        max_count: usize, max_retained_bytes_per_lease: usize,
+    ) -> Self {
+        let max_count = max_count.max(1);
+        Self {
+            max_count,
+            max_retained_bytes: max_count
+                .saturating_mul(max_retained_bytes_per_lease),
+            state: Mutex::new(WriteLeaseAccountingState::default()),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, WriteLeaseAccountingState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn try_admit(
+        self: &Arc<Self>, retained_bytes: usize,
+    ) -> Option<WriteLeaseAccountingGuard> {
+        let mut state = self.lock();
+        let Some(next_bytes) = state.retained_bytes.checked_add(retained_bytes)
+        else {
+            state.resource_limit_total =
+                state.resource_limit_total.saturating_add(1);
+            return None;
+        };
+        if state.current >= self.max_count || next_bytes > self.max_retained_bytes
+        {
+            state.resource_limit_total =
+                state.resource_limit_total.saturating_add(1);
+            return None;
+        }
+
+        state.current += 1;
+        state.retained_bytes = next_bytes;
+        state.admitted_total = state.admitted_total.saturating_add(1);
+        drop(state);
+        Some(WriteLeaseAccountingGuard {
+            accounting: Arc::clone(self),
+            retained_bytes,
+        })
+    }
+
+    fn record_queue_full(&self) {
+        let mut state = self.lock();
+        state.queue_full_total = state.queue_full_total.saturating_add(1);
+    }
+
+    fn record_too_large(&self) {
+        let mut state = self.lock();
+        state.too_large_total = state.too_large_total.saturating_add(1);
+    }
+
+    fn record_abandonment(&self, progress: WebTransportStreamWriteLeaseProgress) {
+        let mut state = self.lock();
+        match progress {
+            WebTransportStreamWriteLeaseProgress::NeverExposed => {
+                state.abandoned_unexposed_total =
+                    state.abandoned_unexposed_total.saturating_add(1);
+            },
+            WebTransportStreamWriteLeaseProgress::ExposedKnownZero => {
+                state.abandoned_zero_total =
+                    state.abandoned_zero_total.saturating_add(1);
+            },
+            WebTransportStreamWriteLeaseProgress::AcceptedPartial { .. } |
+            WebTransportStreamWriteLeaseProgress::AcceptedComplete { .. } |
+            WebTransportStreamWriteLeaseProgress::Unknowable => {
+                state.abandoned_unknown_total =
+                    state.abandoned_unknown_total.saturating_add(1);
+            },
+        }
+    }
+
+    fn snapshot(&self) -> WriteLeaseAccountingSnapshot {
+        let state = self.lock();
+        WriteLeaseAccountingSnapshot {
+            current: state.current,
+            retained_bytes: state.retained_bytes,
+            max_count: self.max_count,
+            max_retained_bytes: self.max_retained_bytes,
+            admitted_total: state.admitted_total,
+            queue_full_total: state.queue_full_total,
+            resource_limit_total: state.resource_limit_total,
+            too_large_total: state.too_large_total,
+            abandoned_unexposed_total: state.abandoned_unexposed_total,
+            abandoned_zero_total: state.abandoned_zero_total,
+            abandoned_unknown_total: state.abandoned_unknown_total,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct WriteLeaseAccountingSnapshot {
+    current: usize,
+    retained_bytes: usize,
+    max_count: usize,
+    max_retained_bytes: usize,
+    admitted_total: u64,
+    queue_full_total: u64,
+    resource_limit_total: u64,
+    too_large_total: u64,
+    abandoned_unexposed_total: u64,
+    abandoned_zero_total: u64,
+    abandoned_unknown_total: u64,
+}
+
+#[derive(Debug)]
+struct WriteLeaseAccountingGuard {
+    accounting: Arc<WriteLeaseAccounting>,
+    retained_bytes: usize,
+}
+
+impl Drop for WriteLeaseAccountingGuard {
+    fn drop(&mut self) {
+        let mut state = self.accounting.lock();
+        state.current = state.current.saturating_sub(1);
+        state.retained_bytes =
+            state.retained_bytes.saturating_sub(self.retained_bytes);
+    }
+}
+
+enum WriteLeaseCompletion<E> {
+    Accepted {
+        accepted: usize,
+        complete: bool,
+        fin_accepted: bool,
+    },
+    Blocked,
+    Closed,
+    ResetRequired {
+        wire_error_code: u64,
+        application_error_code: Option<u32>,
+    },
+    Rejected(WebTransportSelectionError),
+    LeaseError(E),
+    InvalidLength {
+        declared: usize,
+        actual: usize,
+    },
+    ProgressUnknowable,
+}
+
+struct WriteLeaseOwner<L>
+where
+    L: WebTransportStreamWriteLease,
+{
+    lease: Option<L>,
+    progress: WebTransportStreamWriteLeaseProgress,
+    accounting: Option<WriteLeaseAccountingGuard>,
+}
+
+impl<L> WriteLeaseOwner<L>
+where
+    L: WebTransportStreamWriteLease,
+{
+    fn take(&mut self) -> L {
+        self.accounting.take();
+        self.lease
+            .take()
+            .expect("write-lease owner must be returned exactly once")
+    }
+}
+
+impl<L> Drop for WriteLeaseOwner<L>
+where
+    L: WebTransportStreamWriteLease,
+{
+    fn drop(&mut self) {
+        let Some(lease) = self.lease.as_mut() else {
+            return;
+        };
+        let progress = match self.progress {
+            WebTransportStreamWriteLeaseProgress::AcceptedPartial {
+                accepted,
+            } if accepted != 0 =>
+                WebTransportStreamWriteLeaseProgress::Unknowable,
+            WebTransportStreamWriteLeaseProgress::AcceptedComplete {
+                accepted,
+                fin_accepted,
+            } if accepted != 0 || fin_accepted =>
+                WebTransportStreamWriteLeaseProgress::Unknowable,
+            progress => progress,
+        };
+        lease.on_write_abandoned(progress);
+        if let Some(accounting) = self.accounting.as_ref() {
+            accounting.accounting.record_abandonment(progress);
+        }
+    }
+}
+
+struct WriteLeaseShared<L>
+where
+    L: WebTransportStreamWriteLease,
+{
+    owner: WriteLeaseOwner<L>,
+    completion: Option<WriteLeaseCompletion<L::Error>>,
+    declared_len: usize,
+    fin: bool,
+}
+
+impl<L> WriteLeaseShared<L>
+where
+    L: WebTransportStreamWriteLease,
+{
+    fn outcome(&mut self) -> WebTransportStreamWriteLeaseOutcome<L> {
+        let completion = self.completion.take().unwrap_or_else(|| {
+            self.owner.progress =
+                WebTransportStreamWriteLeaseProgress::Unknowable;
+            WriteLeaseCompletion::ProgressUnknowable
+        });
+        let lease = self.owner.take();
+        match completion {
+            WriteLeaseCompletion::Accepted {
+                accepted,
+                complete,
+                fin_accepted,
+            } => WebTransportStreamWriteLeaseOutcome::Accepted {
+                lease,
+                accepted,
+                complete,
+                fin_accepted,
+            },
+            WriteLeaseCompletion::Blocked =>
+                WebTransportStreamWriteLeaseOutcome::Blocked {
+                    lease,
+                    fin: self.fin,
+                },
+            WriteLeaseCompletion::Closed =>
+                WebTransportStreamWriteLeaseOutcome::Closed {
+                    lease,
+                    fin: self.fin,
+                },
+            WriteLeaseCompletion::ResetRequired {
+                wire_error_code,
+                application_error_code,
+            } => WebTransportStreamWriteLeaseOutcome::ResetRequired {
+                wire_error_code,
+                application_error_code,
+                lease,
+                fin: self.fin,
+            },
+            WriteLeaseCompletion::Rejected(error) =>
+                WebTransportStreamWriteLeaseOutcome::Rejected {
+                    error,
+                    lease,
+                    fin: self.fin,
+                },
+            WriteLeaseCompletion::LeaseError(error) =>
+                WebTransportStreamWriteLeaseOutcome::LeaseError {
+                    error,
+                    lease,
+                    fin: self.fin,
+                },
+            WriteLeaseCompletion::InvalidLength { declared, actual } =>
+                WebTransportStreamWriteLeaseOutcome::InvalidLength {
+                    declared,
+                    actual,
+                    lease,
+                    fin: self.fin,
+                },
+            WriteLeaseCompletion::ProgressUnknowable =>
+                WebTransportStreamWriteLeaseOutcome::ProgressUnknowable {
+                    lease,
+                    fin: self.fin,
+                },
+        }
+    }
+}
+
+/// Awaitable result of one admitted generic selected-stream write lease.
+pub struct WebTransportStreamWriteLeaseOperation<L>
+where
+    L: WebTransportStreamWriteLease,
+{
+    response: oneshot::Receiver<()>,
+    shared: Arc<Mutex<WriteLeaseShared<L>>>,
+    retained_bytes: usize,
+}
+
+impl<L> fmt::Debug for WebTransportStreamWriteLeaseOperation<L>
+where
+    L: WebTransportStreamWriteLease,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WebTransportStreamWriteLeaseOperation")
+            .field("retained_bytes", &self.retained_bytes)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<L> WebTransportStreamWriteLeaseOperation<L>
+where
+    L: WebTransportStreamWriteLease,
+{
+    /// Returns owner-declared bytes retained until this operation is settled.
+    pub fn retained_bytes(&self) -> usize {
+        self.retained_bytes
+    }
+
+    /// Waits for one synchronous core write attempt and returns the same owner.
+    pub async fn outcome(self) -> WebTransportStreamWriteLeaseOutcome<L> {
+        let Self {
+            response, shared, ..
+        } = self;
+        let _ = response.await;
+        let outcome = shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .outcome();
+        outcome
+    }
+}
+
+struct BytesWriteLease(Bytes);
+
+impl WebTransportStreamWriteLease for BytesWriteLease {
+    type Error = std::convert::Infallible;
+
+    fn payload_len(&self) -> usize {
+        self.0.len()
+    }
+
+    fn retained_bytes(&self) -> usize {
+        self.0.len()
+    }
+
+    fn as_slice(&mut self) -> Result<&[u8], Self::Error> {
+        Ok(&self.0)
+    }
+}
+
+fn bytes_write_outcome(
+    outcome: WebTransportStreamWriteLeaseOutcome<BytesWriteLease>,
+) -> WebTransportStreamWriteOutcome {
+    match outcome {
+        WebTransportStreamWriteLeaseOutcome::Accepted {
+            lease: BytesWriteLease(mut data),
+            accepted,
+            fin_accepted,
+            ..
+        } => {
+            let remaining =
+                (accepted < data.len()).then(|| data.split_off(accepted));
+            WebTransportStreamWriteOutcome::Accepted {
+                accepted,
+                remaining,
+                fin_accepted,
+            }
+        },
+        WebTransportStreamWriteLeaseOutcome::Blocked {
+            lease: BytesWriteLease(data),
+            fin,
+        } => WebTransportStreamWriteOutcome::Blocked { data, fin },
+        WebTransportStreamWriteLeaseOutcome::QueueFull {
+            lease: BytesWriteLease(data),
+            fin,
+        } |
+        WebTransportStreamWriteLeaseOutcome::ResourceLimit {
+            lease: BytesWriteLease(data),
+            fin,
+        } => WebTransportStreamWriteOutcome::QueueFull { data, fin },
+        WebTransportStreamWriteLeaseOutcome::TooLarge {
+            max,
+            lease: BytesWriteLease(data),
+            fin,
+            ..
+        } => WebTransportStreamWriteOutcome::TooLarge { max, data, fin },
+        WebTransportStreamWriteLeaseOutcome::Closed {
+            lease: BytesWriteLease(data),
+            fin,
+        } => WebTransportStreamWriteOutcome::Closed { data, fin },
+        WebTransportStreamWriteLeaseOutcome::ResetRequired {
+            wire_error_code,
+            application_error_code,
+            lease: BytesWriteLease(data),
+            fin,
+        } => WebTransportStreamWriteOutcome::ResetRequired {
+            wire_error_code,
+            application_error_code,
+            data,
+            fin,
+        },
+        WebTransportStreamWriteLeaseOutcome::Rejected {
+            error,
+            lease: BytesWriteLease(data),
+            fin,
+        } => WebTransportStreamWriteOutcome::Rejected { error, data, fin },
+        WebTransportStreamWriteLeaseOutcome::LeaseError { error, .. } =>
+            match error {},
+        WebTransportStreamWriteLeaseOutcome::InvalidLength {
+            lease: BytesWriteLease(data),
+            fin,
+            ..
+        } |
+        WebTransportStreamWriteLeaseOutcome::ProgressUnknowable {
+            lease: BytesWriteLease(data),
+            fin,
+        } => WebTransportStreamWriteOutcome::Rejected {
+            error: WebTransportSelectionError::ConnectionClosed,
+            data,
+            fin,
+        },
+    }
+}
+
+/// Awaitable result of a successfully admitted selected-stream `Bytes` write.
 #[derive(Debug)]
 pub struct WebTransportStreamWriteOperation {
-    response: oneshot::Receiver<WebTransportStreamWriteOutcome>,
-    fallback: Bytes,
-    fin: bool,
+    inner: WebTransportStreamWriteLeaseOperation<BytesWriteLease>,
 }
 
 impl WebTransportStreamWriteOperation {
     /// Waits for the transport admission attempt to complete.
-    ///
-    /// An unexpected result-channel loss returns the byte-identical, zero-copy
-    /// fallback `Bytes` handle retained when the command was admitted.
     pub async fn outcome(self) -> WebTransportStreamWriteOutcome {
-        let Self {
-            response,
-            fallback,
-            fin,
-        } = self;
-        response.await.unwrap_or_else(|_| {
-            WebTransportStreamWriteOutcome::Rejected {
-                error: WebTransportSelectionError::ConnectionClosed,
-                data: fallback,
-                fin,
-            }
-        })
+        bytes_write_outcome(self.inner.outcome().await)
     }
 }
 
@@ -516,46 +1276,67 @@ pub enum WebTransportDatagramReadOutcome {
     Rejected(WebTransportDatagramError),
 }
 
+/// Outcome of waiting for exact-session Datagram readiness.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WebTransportDatagramReadyOutcome {
+    /// A receive or atomic send attempt can make progress now.
+    Ready,
+    /// The configured aggregate Datagram waiter bound is full, or this exact
+    /// session already has a waiter for the same readiness kind.
+    ResourceLimit,
+    /// Session selection or negotiation failed.
+    Rejected(WebTransportDatagramError),
+}
+
 /// A cloneable, bounded command boundary for one native WebTransport driver.
 ///
 /// Calls wait asynchronously for space in the configured command lane, without
 /// blocking the QUIC event loop. Once admitted, the driver owns each supplied
 /// buffer until it returns an outcome. Stream-open commands internally retry
-/// only the draft-15 prefix; payload writes and Datagrams make one transport
+/// only the draft-16 prefix; payload writes and Datagrams make one transport
 /// admission attempt and return unaccepted ownership to the caller. Connection
 /// teardown resolves every admitted command with a terminal outcome.
 ///
 /// Buffer-bearing async calls retain their buffer in the caller-owned future
 /// while waiting for lane admission. Adapters requiring a hard aggregate bound
-/// should use [`Self::try_write_stream()`] and [`Self::try_send_datagram()`],
-/// which return `QueueFull` and the original owner without waiting.
-/// Admitted payload is bounded by the command capacity times the larger of the
-/// configured stream-write limit and `datagram_socket::MAX_DATAGRAM_SIZE`.
+/// should use [`Self::try_write_stream()`],
+/// [`Self::try_write_stream_lease()`], and [`Self::try_send_datagram()`], which
+/// return `QueueFull` and the original owner without waiting. Generic leases
+/// remain bounded until their result is consumed or dropped, even after their
+/// command leaves the lane.
 #[derive(Clone)]
 pub struct WebTransportController {
     sender: mpsc::Sender<WebTransportCommand>,
     max_stream_write_bytes: usize,
+    max_stream_write_lease_retained_bytes: usize,
     max_stream_read_bytes: usize,
     max_datagram_send_bytes: usize,
+    max_datagram_send_allocation_bytes: usize,
+    write_lease_accounting: Arc<WriteLeaseAccounting>,
 }
 
 impl WebTransportController {
     pub(crate) fn new(
         sender: mpsc::Sender<WebTransportCommand>, max_stream_write_bytes: usize,
-        max_stream_read_bytes: usize,
+        max_stream_write_lease_retained_bytes: usize,
+        max_stream_read_bytes: usize, max_datagram_send_allocation_bytes: usize,
+        write_lease_accounting: Arc<WriteLeaseAccounting>,
     ) -> Self {
         Self {
             sender,
             max_stream_write_bytes,
+            max_stream_write_lease_retained_bytes,
             max_stream_read_bytes,
             max_datagram_send_bytes: datagram_socket::MAX_DATAGRAM_SIZE,
+            max_datagram_send_allocation_bytes,
+            write_lease_accounting,
         }
     }
 
     /// Opens a bidirectional stream for an exact active Session ID.
     ///
     /// The result contains the physical QUIC stream ID after the complete
-    /// draft-15 prefix has been accepted exactly once.
+    /// draft-16 prefix has been accepted exactly once.
     pub async fn open_bidirectional_stream(
         &self, session_id: u64,
     ) -> WebTransportOpenStreamOutcome {
@@ -566,7 +1347,7 @@ impl WebTransportController {
     /// Opens a unidirectional stream for an exact active Session ID.
     ///
     /// The result contains the physical QUIC stream ID after the complete
-    /// draft-15 prefix has been accepted exactly once.
+    /// draft-16 prefix has been accepted exactly once.
     pub async fn open_unidirectional_stream(
         &self, session_id: u64,
     ) -> WebTransportOpenStreamOutcome {
@@ -602,23 +1383,15 @@ impl WebTransportController {
     pub async fn write_stream(
         &self, session_id: u64, stream_id: u64, data: Bytes, fin: bool,
     ) -> WebTransportStreamWriteOutcome {
-        if data.len() > self.max_stream_write_bytes {
-            return WebTransportStreamWriteOutcome::TooLarge {
-                max: self.max_stream_write_bytes,
-                data,
+        bytes_write_outcome(
+            self.write_stream_lease(
+                session_id,
+                stream_id,
+                BytesWriteLease(data),
                 fin,
-            };
-        }
-        let Ok(permit) = self.sender.reserve().await else {
-            return WebTransportStreamWriteOutcome::Rejected {
-                error: WebTransportSelectionError::ConnectionClosed,
-                data,
-                fin,
-            };
-        };
-        self.admit_stream_write(permit, session_id, stream_id, data, fin)
-            .outcome()
-            .await
+            )
+            .await,
+        )
     }
 
     /// Attempts immediate command-lane admission for one selected-stream write.
@@ -630,49 +1403,184 @@ impl WebTransportController {
         &self, session_id: u64, stream_id: u64, data: Bytes, fin: bool,
     ) -> Result<WebTransportStreamWriteOperation, WebTransportStreamWriteOutcome>
     {
-        if data.len() > self.max_stream_write_bytes {
-            return Err(WebTransportStreamWriteOutcome::TooLarge {
-                max: self.max_stream_write_bytes,
-                data,
-                fin,
-            });
+        match self.try_write_stream_lease(
+            session_id,
+            stream_id,
+            BytesWriteLease(data),
+            fin,
+        ) {
+            Ok(inner) => Ok(WebTransportStreamWriteOperation { inner }),
+            Err(outcome) => Err(bytes_write_outcome(outcome)),
         }
+    }
+
+    /// Writes one generic owned lease to an exact selected stream.
+    ///
+    /// The owner remains caller-owned while waiting for bounded command-lane
+    /// capacity. Once admitted, the driver calls `L::as_slice()` at most once,
+    /// borrows it only for one synchronous core `stream_send()` call, and
+    /// returns the same concrete owner with exact progress.
+    pub async fn write_stream_lease<L>(
+        &self, session_id: u64, stream_id: u64, lease: L, fin: bool,
+    ) -> WebTransportStreamWriteLeaseOutcome<L>
+    where
+        L: WebTransportStreamWriteLease,
+    {
+        let preflight = match self.preflight_write_lease(&lease) {
+            Ok(preflight) => preflight,
+            Err((limit, max, actual)) =>
+                return WebTransportStreamWriteLeaseOutcome::TooLarge {
+                    limit,
+                    max,
+                    actual,
+                    lease,
+                    fin,
+                },
+        };
+        let retained_bytes = preflight.1;
+        let mut owner = WriteLeaseOwner {
+            lease: Some(lease),
+            progress: WebTransportStreamWriteLeaseProgress::NeverExposed,
+            accounting: None,
+        };
+        let Ok(permit) = self.sender.reserve().await else {
+            return WebTransportStreamWriteLeaseOutcome::Rejected {
+                error: WebTransportSelectionError::ConnectionClosed,
+                lease: owner.take(),
+                fin,
+            };
+        };
+        let Some(accounting) =
+            self.write_lease_accounting.try_admit(retained_bytes)
+        else {
+            return WebTransportStreamWriteLeaseOutcome::ResourceLimit {
+                lease: owner.take(),
+                fin,
+            };
+        };
+        owner.accounting = Some(accounting);
+        self.admit_stream_write_lease(
+            permit, session_id, stream_id, owner, preflight, fin,
+        )
+        .outcome()
+        .await
+    }
+
+    /// Attempts immediate admission of one generic selected-stream write lease.
+    ///
+    /// Every pre-admission failure returns the exact concrete owner without
+    /// exposing its payload bytes.
+    pub fn try_write_stream_lease<L>(
+        &self, session_id: u64, stream_id: u64, lease: L, fin: bool,
+    ) -> Result<
+        WebTransportStreamWriteLeaseOperation<L>,
+        WebTransportStreamWriteLeaseOutcome<L>,
+    >
+    where
+        L: WebTransportStreamWriteLease,
+    {
+        let preflight = match self.preflight_write_lease(&lease) {
+            Ok(preflight) => preflight,
+            Err((limit, max, actual)) =>
+                return Err(WebTransportStreamWriteLeaseOutcome::TooLarge {
+                    limit,
+                    max,
+                    actual,
+                    lease,
+                    fin,
+                }),
+        };
+        let retained_bytes = preflight.1;
         let permit = match self.sender.try_reserve() {
             Ok(permit) => permit,
             Err(mpsc::error::TrySendError::Full(())) => {
-                return Err(WebTransportStreamWriteOutcome::QueueFull {
-                    data,
+                self.write_lease_accounting.record_queue_full();
+                return Err(WebTransportStreamWriteLeaseOutcome::QueueFull {
+                    lease,
                     fin,
                 });
             },
             Err(mpsc::error::TrySendError::Closed(())) => {
-                return Err(WebTransportStreamWriteOutcome::Rejected {
+                return Err(WebTransportStreamWriteLeaseOutcome::Rejected {
                     error: WebTransportSelectionError::ConnectionClosed,
-                    data,
+                    lease,
                     fin,
                 });
             },
         };
-        Ok(self.admit_stream_write(permit, session_id, stream_id, data, fin))
+        let Some(accounting) =
+            self.write_lease_accounting.try_admit(retained_bytes)
+        else {
+            return Err(WebTransportStreamWriteLeaseOutcome::ResourceLimit {
+                lease,
+                fin,
+            });
+        };
+        let owner = WriteLeaseOwner {
+            lease: Some(lease),
+            progress: WebTransportStreamWriteLeaseProgress::NeverExposed,
+            accounting: Some(accounting),
+        };
+        Ok(self.admit_stream_write_lease(
+            permit, session_id, stream_id, owner, preflight, fin,
+        ))
     }
 
-    fn admit_stream_write(
+    fn preflight_write_lease<L>(
+        &self, lease: &L,
+    ) -> Result<(usize, usize), (WebTransportStreamWriteLeaseLimit, usize, usize)>
+    where
+        L: WebTransportStreamWriteLease,
+    {
+        let payload_len = lease.payload_len();
+        if payload_len > self.max_stream_write_bytes {
+            self.write_lease_accounting.record_too_large();
+            return Err((
+                WebTransportStreamWriteLeaseLimit::Payload,
+                self.max_stream_write_bytes,
+                payload_len,
+            ));
+        }
+        let retained_bytes = lease.retained_bytes();
+        if retained_bytes > self.max_stream_write_lease_retained_bytes {
+            self.write_lease_accounting.record_too_large();
+            return Err((
+                WebTransportStreamWriteLeaseLimit::RetainedBytes,
+                self.max_stream_write_lease_retained_bytes,
+                retained_bytes,
+            ));
+        }
+        Ok((payload_len, retained_bytes))
+    }
+
+    fn admit_stream_write_lease<L>(
         &self, permit: mpsc::Permit<'_, WebTransportCommand>, session_id: u64,
-        stream_id: u64, data: Bytes, fin: bool,
-    ) -> WebTransportStreamWriteOperation {
+        stream_id: u64, owner: WriteLeaseOwner<L>, preflight: (usize, usize),
+        fin: bool,
+    ) -> WebTransportStreamWriteLeaseOperation<L>
+    where
+        L: WebTransportStreamWriteLease,
+    {
+        let (declared_len, retained_bytes) = preflight;
         let (response, recv) = oneshot::channel();
-        let fallback = data.clone();
-        permit.send(WebTransportCommand::Write {
-            session_id,
-            stream_id,
-            data,
+        let shared = Arc::new(Mutex::new(WriteLeaseShared {
+            owner,
+            completion: None,
+            declared_len,
             fin,
-            response,
-        });
-        WebTransportStreamWriteOperation {
+        }));
+        permit.send(WebTransportCommand::WriteLease(Box::new(
+            WriteLeaseCommand {
+                session_id,
+                stream_id,
+                shared: Arc::clone(&shared),
+                response: Some(response),
+            },
+        )));
+        WebTransportStreamWriteLeaseOperation {
             response: recv,
-            fallback,
-            fin,
+            shared,
+            retained_bytes,
         }
     }
 
@@ -738,7 +1646,7 @@ impl WebTransportController {
             ))
     }
 
-    /// Sends RESET_STREAM_AT using the draft-15 application-error mapping.
+    /// Sends RESET_STREAM_AT using the draft-16 application-error mapping.
     pub async fn reset_stream(
         &self, session_id: u64, stream_id: u64, error_code: u32,
     ) -> WebTransportStreamControlOutcome {
@@ -746,7 +1654,7 @@ impl WebTransportController {
             .await
     }
 
-    /// Sends STOP_SENDING using the draft-15 application-error mapping.
+    /// Sends STOP_SENDING using the draft-16 application-error mapping.
     pub async fn stop_stream(
         &self, session_id: u64, stream_id: u64, error_code: u32,
     ) -> WebTransportStreamControlOutcome {
@@ -800,6 +1708,14 @@ impl WebTransportController {
                 datagram,
             };
         }
+        if datagram.allocated_capacity() > self.max_datagram_send_allocation_bytes
+        {
+            return WebTransportDatagramSendOutcome::AllocationTooLarge {
+                max: self.max_datagram_send_allocation_bytes,
+                allocated: datagram.allocated_capacity(),
+                datagram,
+            };
+        }
         let Ok(permit) = self.sender.reserve().await else {
             return WebTransportDatagramSendOutcome::Rejected {
                 error: WebTransportDatagramError::ConnectionClosed,
@@ -822,6 +1738,14 @@ impl WebTransportController {
         if datagram.as_slice().len() > self.max_datagram_send_bytes {
             return Err(WebTransportDatagramSendOutcome::TooLarge {
                 max: self.max_datagram_send_bytes,
+                datagram,
+            });
+        }
+        if datagram.allocated_capacity() > self.max_datagram_send_allocation_bytes
+        {
+            return Err(WebTransportDatagramSendOutcome::AllocationTooLarge {
+                max: self.max_datagram_send_allocation_bytes,
+                allocated: datagram.allocated_capacity(),
                 datagram,
             });
         }
@@ -876,6 +1800,42 @@ impl WebTransportController {
             ))
     }
 
+    /// Waits without polling for an exact session to have a queued Datagram or
+    /// overflow notification.
+    pub async fn wait_datagram_readable(
+        &self, session_id: u64,
+    ) -> WebTransportDatagramReadyOutcome {
+        self.wait_datagram(session_id, false).await
+    }
+
+    /// Waits without polling for an exact session to have QUIC Datagram send
+    /// capacity.
+    pub async fn wait_datagram_send_capacity(
+        &self, session_id: u64,
+    ) -> WebTransportDatagramReadyOutcome {
+        self.wait_datagram(session_id, true).await
+    }
+
+    async fn wait_datagram(
+        &self, session_id: u64, send: bool,
+    ) -> WebTransportDatagramReadyOutcome {
+        let Ok(permit) = self.sender.reserve().await else {
+            return WebTransportDatagramReadyOutcome::Rejected(
+                WebTransportDatagramError::ConnectionClosed,
+            );
+        };
+        let (response, recv) = oneshot::channel();
+        permit.send(WebTransportCommand::WaitDatagram {
+            session_id,
+            send,
+            response,
+        });
+        recv.await
+            .unwrap_or(WebTransportDatagramReadyOutcome::Rejected(
+                WebTransportDatagramError::ConnectionClosed,
+            ))
+    }
+
     /// Returns the current maximum Datagram payload for one active session.
     pub async fn max_datagram_payload(
         &self, session_id: u64,
@@ -904,6 +1864,192 @@ impl WebTransportController {
         recv.await
             .unwrap_or(Err(WebTransportDatagramError::ConnectionClosed))
     }
+
+    /// Returns bounded runtime, adapter-lane, and QUIC queue accounting.
+    pub async fn retention_stats(
+        &self,
+    ) -> Result<WebTransportRetentionStats, WebTransportDatagramError> {
+        let Ok(permit) = self.sender.reserve().await else {
+            return Err(WebTransportDatagramError::ConnectionClosed);
+        };
+        let (response, recv) = oneshot::channel();
+        permit.send(WebTransportCommand::RetentionStats { response });
+        recv.await
+            .unwrap_or(Err(WebTransportDatagramError::ConnectionClosed))
+    }
+}
+
+pub(crate) trait ErasedWriteLeaseCommand: Send {
+    fn execute(self: Box<Self>, runtime: &Runtime, qconn: &mut QuicheConnection);
+
+    fn reject(self: Box<Self>, error: WebTransportSelectionError);
+}
+
+struct WriteLeaseCommand<L>
+where
+    L: WebTransportStreamWriteLease,
+{
+    session_id: u64,
+    stream_id: u64,
+    shared: Arc<Mutex<WriteLeaseShared<L>>>,
+    response: Option<oneshot::Sender<()>>,
+}
+
+impl<L> WriteLeaseCommand<L>
+where
+    L: WebTransportStreamWriteLease,
+{
+    fn finish(
+        &mut self, completion: WriteLeaseCompletion<L::Error>,
+        progress: WebTransportStreamWriteLeaseProgress,
+    ) {
+        {
+            let mut shared = self
+                .shared
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if shared.completion.is_none() {
+                shared.owner.progress = progress;
+                shared.completion = Some(completion);
+            }
+        }
+        if let Some(response) = self.response.take() {
+            let _ = response.send(());
+        }
+    }
+}
+
+impl<L> ErasedWriteLeaseCommand for WriteLeaseCommand<L>
+where
+    L: WebTransportStreamWriteLease,
+{
+    fn execute(
+        mut self: Box<Self>, runtime: &Runtime, qconn: &mut QuicheConnection,
+    ) {
+        if self
+            .response
+            .as_ref()
+            .is_none_or(oneshot::Sender::is_closed)
+        {
+            return;
+        }
+        if let Err(error) =
+            runtime.select_stream(self.session_id, self.stream_id, true, qconn)
+        {
+            self.finish(
+                WriteLeaseCompletion::Rejected(error),
+                WebTransportStreamWriteLeaseProgress::NeverExposed,
+            );
+            return;
+        }
+        if self
+            .response
+            .as_ref()
+            .is_none_or(oneshot::Sender::is_closed)
+        {
+            return;
+        }
+
+        let (completion, progress) = {
+            let mut shared = self
+                .shared
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let declared = shared.declared_len;
+            let fin = shared.fin;
+            let result = {
+                let lease = shared
+                    .owner
+                    .lease
+                    .as_mut()
+                    .expect("admitted write lease must retain its owner");
+                match lease.as_slice() {
+                    Ok(data) if data.len() != declared => Err((
+                        WriteLeaseCompletion::InvalidLength {
+                            declared,
+                            actual: data.len(),
+                        },
+                        WebTransportStreamWriteLeaseProgress::ExposedKnownZero,
+                    )),
+                    Ok(data) => Ok((
+                        data.len(),
+                        qconn.stream_send(self.stream_id, data, fin),
+                    )),
+                    Err(error) => Err((
+                        WriteLeaseCompletion::LeaseError(error),
+                        WebTransportStreamWriteLeaseProgress::NeverExposed,
+                    )),
+                }
+            };
+
+            match result {
+                Err(result) => result,
+                Ok((actual, Ok(accepted))) => {
+                    let complete = accepted == actual;
+                    let fin_accepted = fin && complete;
+                    let progress = if complete {
+                        WebTransportStreamWriteLeaseProgress::AcceptedComplete {
+                            accepted,
+                            fin_accepted,
+                        }
+                    } else {
+                        WebTransportStreamWriteLeaseProgress::AcceptedPartial {
+                            accepted,
+                        }
+                    };
+                    (
+                        WriteLeaseCompletion::Accepted {
+                            accepted,
+                            complete,
+                            fin_accepted,
+                        },
+                        progress,
+                    )
+                },
+                Ok((_, Err(quiche::Error::Done))) => (
+                    WriteLeaseCompletion::Blocked,
+                    WebTransportStreamWriteLeaseProgress::ExposedKnownZero,
+                ),
+                Ok((_, Err(quiche::Error::StreamStopped(error_code)))) => (
+                    WriteLeaseCompletion::ResetRequired {
+                        wire_error_code: error_code,
+                        application_error_code: webtransport_error_from_http3(
+                            error_code,
+                        ),
+                    },
+                    WebTransportStreamWriteLeaseProgress::ExposedKnownZero,
+                ),
+                Ok((_, Err(_))) => (
+                    WriteLeaseCompletion::Closed,
+                    WebTransportStreamWriteLeaseProgress::ExposedKnownZero,
+                ),
+            }
+        };
+        self.finish(completion, progress);
+    }
+
+    fn reject(mut self: Box<Self>, error: WebTransportSelectionError) {
+        self.finish(
+            WriteLeaseCompletion::Rejected(error),
+            WebTransportStreamWriteLeaseProgress::NeverExposed,
+        );
+    }
+}
+
+impl<L> Drop for WriteLeaseCommand<L>
+where
+    L: WebTransportStreamWriteLease,
+{
+    fn drop(&mut self) {
+        if self.response.is_some() {
+            self.finish(
+                WriteLeaseCompletion::Rejected(
+                    WebTransportSelectionError::ConnectionClosed,
+                ),
+                WebTransportStreamWriteLeaseProgress::NeverExposed,
+            );
+        }
+    }
 }
 
 pub(crate) enum WebTransportCommand {
@@ -912,13 +2058,7 @@ pub(crate) enum WebTransportCommand {
         direction: WebTransportStreamDirection,
         response: oneshot::Sender<WebTransportOpenStreamOutcome>,
     },
-    Write {
-        session_id: u64,
-        stream_id: u64,
-        data: Bytes,
-        fin: bool,
-        response: oneshot::Sender<WebTransportStreamWriteOutcome>,
-    },
+    WriteLease(Box<dyn ErasedWriteLeaseCommand>),
     Read {
         session_id: u64,
         stream_id: u64,
@@ -952,6 +2092,11 @@ pub(crate) enum WebTransportCommand {
         session_id: u64,
         response: oneshot::Sender<WebTransportDatagramReadOutcome>,
     },
+    WaitDatagram {
+        session_id: u64,
+        send: bool,
+        response: oneshot::Sender<WebTransportDatagramReadyOutcome>,
+    },
     MaxDatagramPayload {
         session_id: u64,
         response: oneshot::Sender<Result<usize, WebTransportDatagramError>>,
@@ -959,6 +2104,11 @@ pub(crate) enum WebTransportCommand {
     DatagramStats {
         response: oneshot::Sender<
             Result<WebTransportDatagramStats, WebTransportDatagramError>,
+        >,
+    },
+    RetentionStats {
+        response: oneshot::Sender<
+            Result<WebTransportRetentionStats, WebTransportDatagramError>,
         >,
     },
 }
@@ -971,18 +2121,8 @@ impl WebTransportCommand {
                     WebTransportSelectionError::ConnectionClosed,
                 ));
             },
-            Self::Write {
-                data,
-                fin,
-                response,
-                ..
-            } => {
-                let _ = response.send(WebTransportStreamWriteOutcome::Rejected {
-                    error: WebTransportSelectionError::ConnectionClosed,
-                    data,
-                    fin,
-                });
-            },
+            Self::WriteLease(command) =>
+                command.reject(WebTransportSelectionError::ConnectionClosed),
             Self::Read { response, .. } => {
                 let _ = response.send(WebTransportStreamReadOutcome::Rejected(
                     WebTransportSelectionError::ConnectionClosed,
@@ -1013,11 +2153,21 @@ impl WebTransportCommand {
                     WebTransportDatagramError::ConnectionClosed,
                 ));
             },
+            Self::WaitDatagram { response, .. } => {
+                let _ =
+                    response.send(WebTransportDatagramReadyOutcome::Rejected(
+                        WebTransportDatagramError::ConnectionClosed,
+                    ));
+            },
             Self::MaxDatagramPayload { response, .. } => {
                 let _ = response
                     .send(Err(WebTransportDatagramError::ConnectionClosed));
             },
             Self::DatagramStats { response } => {
+                let _ = response
+                    .send(Err(WebTransportDatagramError::ConnectionClosed));
+            },
+            Self::RetentionStats { response } => {
                 let _ = response
                     .send(Err(WebTransportDatagramError::ConnectionClosed));
             },
@@ -1033,6 +2183,20 @@ pub(crate) struct AssociatedStream {
     pub(crate) prefix_len: usize,
 }
 
+#[derive(Debug)]
+pub(crate) enum RequestObservation {
+    Observed(Vec<WebTransportSessionEvent>),
+    Excessive,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CapsuleReadMode {
+    Regular,
+    Defer,
+    Parse,
+    Discard,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CloseCapsule {
     pub(crate) error_code: u32,
@@ -1046,6 +2210,7 @@ impl CloseCapsule {
         if message.len() > MAX_CLOSE_MESSAGE_LEN {
             return Err(WebTransportSessionCloseError::MessageTooLong {
                 len: message.len(),
+                message,
             });
         }
         Ok(Self {
@@ -1261,11 +2426,17 @@ pub(crate) struct RuntimeLimits {
     pub(crate) max_pending_streams: usize,
     pub(crate) max_pending_streams_per_session: usize,
     pub(crate) max_stream_waiters: usize,
+    pub(crate) max_datagram_waiters: usize,
     pub(crate) max_pending_datagrams: usize,
     pub(crate) max_pending_datagrams_per_session: usize,
     pub(crate) max_pending_datagram_bytes: usize,
     pub(crate) max_pending_datagram_bytes_per_session: usize,
+    pub(crate) max_pending_datagram_allocation_bytes: usize,
+    pub(crate) max_pending_datagram_allocation_bytes_per_session: usize,
     pub(crate) max_pending_datagram_age: Duration,
+    pub(crate) command_capacity: usize,
+    pub(crate) max_command_payload_bytes: usize,
+    pub(crate) max_write_lease_retained_bytes_per_lease: usize,
     pub(crate) max_session_work_per_callback: usize,
 }
 
@@ -1295,6 +2466,7 @@ struct QueuedDatagram {
 struct SessionDatagrams {
     queue: VecDeque<QueuedDatagram>,
     bytes: usize,
+    allocation_bytes: usize,
     dropped_datagrams: u64,
     dropped_bytes: u64,
 }
@@ -1313,6 +2485,7 @@ enum SessionPhase {
 #[derive(Debug)]
 struct Session {
     phase: SessionPhase,
+    application_visible: bool,
     parser: CapsuleParser,
     streams: BTreeSet<u64>,
     capsules_negotiated: bool,
@@ -1324,9 +2497,10 @@ struct Session {
 }
 
 impl Session {
-    fn pending() -> Self {
+    fn pending(application_visible: bool) -> Self {
         Self {
             phase: SessionPhase::Pending,
+            application_visible,
             parser: CapsuleParser::default(),
             streams: BTreeSet::new(),
             capsules_negotiated: false,
@@ -1348,6 +2522,7 @@ enum SessionWork {
 #[derive(Debug)]
 pub(crate) struct Runtime {
     limits: RuntimeLimits,
+    write_lease_accounting: Arc<WriteLeaseAccounting>,
     sessions: BTreeMap<u64, Session>,
     pending_streams: BTreeMap<u64, AssociatedStream>,
     pending_by_session: BTreeMap<u64, BTreeSet<u64>>,
@@ -1359,12 +2534,17 @@ pub(crate) struct Runtime {
         BTreeMap<u64, oneshot::Sender<WebTransportStreamReadyOutcome>>,
     writable_waiters:
         BTreeMap<u64, oneshot::Sender<WebTransportStreamReadyOutcome>>,
+    datagram_readable_waiters:
+        BTreeMap<u64, oneshot::Sender<WebTransportDatagramReadyOutcome>>,
+    datagram_send_waiters:
+        BTreeMap<u64, oneshot::Sender<WebTransportDatagramReadyOutcome>>,
     datagrams: BTreeMap<u64, SessionDatagrams>,
     provisional_deadlines: BTreeSet<(Instant, u64)>,
     legacy_sessions: VecDeque<u64>,
     legacy_session_set: BTreeSet<u64>,
     pending_datagram_count: usize,
     pending_datagram_bytes: usize,
+    pending_datagram_allocation_bytes: usize,
     datagram_stats: WebTransportDatagramStats,
     non_session_requests: BTreeSet<u64>,
     work: VecDeque<SessionWork>,
@@ -1375,7 +2555,18 @@ pub(crate) struct Runtime {
 }
 
 impl Runtime {
+    #[cfg(test)]
     pub(crate) fn new(limits: RuntimeLimits) -> Self {
+        let write_lease_accounting = Arc::new(WriteLeaseAccounting::new(
+            limits.command_capacity,
+            limits.max_write_lease_retained_bytes_per_lease,
+        ));
+        Self::new_with_write_lease_accounting(limits, write_lease_accounting)
+    }
+
+    pub(crate) fn new_with_write_lease_accounting(
+        limits: RuntimeLimits, write_lease_accounting: Arc<WriteLeaseAccounting>,
+    ) -> Self {
         Self {
             limits: RuntimeLimits {
                 max_session_work_per_callback: limits
@@ -1383,6 +2574,7 @@ impl Runtime {
                     .max(1),
                 ..limits
             },
+            write_lease_accounting,
             sessions: BTreeMap::new(),
             pending_streams: BTreeMap::new(),
             pending_by_session: BTreeMap::new(),
@@ -1392,12 +2584,15 @@ impl Runtime {
             opening_by_session: BTreeMap::new(),
             readable_waiters: BTreeMap::new(),
             writable_waiters: BTreeMap::new(),
+            datagram_readable_waiters: BTreeMap::new(),
+            datagram_send_waiters: BTreeMap::new(),
             datagrams: BTreeMap::new(),
             provisional_deadlines: BTreeSet::new(),
             legacy_sessions: VecDeque::new(),
             legacy_session_set: BTreeSet::new(),
             pending_datagram_count: 0,
             pending_datagram_bytes: 0,
+            pending_datagram_allocation_bytes: 0,
             datagram_stats: WebTransportDatagramStats::default(),
             non_session_requests: BTreeSet::new(),
             work: VecDeque::new(),
@@ -1410,20 +2605,78 @@ impl Runtime {
 
     pub(crate) fn observe_request(
         &mut self, session_id: u64, is_webtransport: bool,
-    ) -> Vec<WebTransportSessionEvent> {
+    ) -> RequestObservation {
+        self.observe_request_with_visibility(session_id, is_webtransport, true)
+    }
+
+    pub(crate) fn observe_deferred_request(
+        &mut self, session_id: u64,
+    ) -> RequestObservation {
+        self.observe_request_with_visibility(session_id, true, false)
+    }
+
+    fn observe_request_with_visibility(
+        &mut self, session_id: u64, is_webtransport: bool,
+        application_visible: bool,
+    ) -> RequestObservation {
         if !is_webtransport {
             self.non_session_requests.insert(session_id);
             self.reject_orphaned_pending(session_id);
             self.release_provisional_to_legacy(session_id);
-            return Vec::new();
+            return RequestObservation::Observed(Vec::new());
         }
 
         if self.sessions.contains_key(&session_id) {
-            return Vec::new();
+            return RequestObservation::Observed(Vec::new());
         }
 
-        self.sessions.insert(session_id, Session::pending());
+        if !self.can_start_session() {
+            self.reject_unadmitted_request(session_id);
+            return RequestObservation::Excessive;
+        }
+
+        self.sessions
+            .insert(session_id, Session::pending(application_visible));
+        let events = application_visible
+            .then_some(WebTransportSessionEvent::Pending { session_id })
+            .into_iter()
+            .collect();
+        RequestObservation::Observed(events)
+    }
+
+    pub(crate) fn can_start_session(&self) -> bool {
+        self.sessions
+            .values()
+            .all(|session| matches!(session.phase, SessionPhase::Terminal))
+    }
+
+    pub(crate) fn make_application_visible(
+        &mut self, session_id: u64,
+    ) -> Vec<WebTransportSessionEvent> {
+        let Some(session) = self.sessions.get_mut(&session_id) else {
+            return Vec::new();
+        };
+        if session.phase != SessionPhase::Pending || session.application_visible {
+            return Vec::new();
+        }
+        session.application_visible = true;
         vec![WebTransportSessionEvent::Pending { session_id }]
+    }
+
+    pub(crate) fn reject_unadmitted_request(&mut self, session_id: u64) {
+        self.reject_orphaned_pending(session_id);
+        self.release_datagrams(session_id);
+    }
+
+    pub(crate) fn capsule_read_mode(&self, session_id: u64) -> CapsuleReadMode {
+        match self.sessions.get(&session_id) {
+            Some(session) if session.phase == SessionPhase::Pending =>
+                CapsuleReadMode::Defer,
+            Some(session) if session.capsules_negotiated =>
+                CapsuleReadMode::Parse,
+            Some(_) => CapsuleReadMode::Discard,
+            None => CapsuleReadMode::Regular,
+        }
     }
 
     pub(crate) fn activate(
@@ -1435,13 +2688,17 @@ impl Runtime {
         if session.phase != SessionPhase::Pending {
             return Vec::new();
         }
+        let application_visible = session.application_visible;
         session.phase = SessionPhase::Active;
         session.capsules_negotiated = true;
         self.remove_provisional_deadline(session_id);
         if self.pending_by_session.contains_key(&session_id) {
             self.work.push_back(SessionWork::Admit(session_id));
         }
-        vec![WebTransportSessionEvent::Accepted { session_id }]
+        application_visible
+            .then_some(WebTransportSessionEvent::Accepted { session_id })
+            .into_iter()
+            .collect()
     }
 
     pub(crate) fn reject(
@@ -1453,6 +2710,7 @@ impl Runtime {
         if session.phase != SessionPhase::Pending {
             return Vec::new();
         }
+        let application_visible = session.application_visible;
         session.phase = SessionPhase::Terminal;
         session.terminal_stream_error = WT_BUFFERED_STREAM_REJECTED;
         self.work.push_back(SessionWork::Terminate {
@@ -1469,7 +2727,10 @@ impl Runtime {
             WebTransportSelectionError::TerminalSession,
         );
         self.release_datagrams(session_id);
-        vec![WebTransportSessionEvent::Rejected { session_id, status }]
+        application_visible
+            .then_some(WebTransportSessionEvent::Rejected { session_id, status })
+            .into_iter()
+            .collect()
     }
 
     pub(crate) fn response_accepted(
@@ -1593,6 +2854,7 @@ impl Runtime {
         if session.phase == SessionPhase::Terminal {
             return Vec::new();
         }
+        let application_visible = session.application_visible;
         let error_code = if session.phase == SessionPhase::Pending {
             WT_BUFFERED_STREAM_REJECTED
         } else {
@@ -1617,7 +2879,13 @@ impl Runtime {
             WebTransportSelectionError::TerminalSession,
         );
         self.release_datagrams(session_id);
-        vec![WebTransportSessionEvent::Terminated { session_id, reason }]
+        application_visible
+            .then_some(WebTransportSessionEvent::Terminated {
+                session_id,
+                reason,
+            })
+            .into_iter()
+            .collect()
     }
 
     pub(crate) fn classify(
@@ -1877,6 +3145,7 @@ impl Runtime {
     pub(crate) fn handle_command(
         &mut self, conn: &mut quiche::h3::Connection,
         qconn: &mut QuicheConnection, command: WebTransportCommand,
+        queued_command_items: usize,
     ) {
         match command {
             WebTransportCommand::Open {
@@ -1884,14 +3153,8 @@ impl Runtime {
                 direction,
                 response,
             } => self.open_stream(conn, qconn, session_id, direction, response),
-            WebTransportCommand::Write {
-                session_id,
-                stream_id,
-                data,
-                fin,
-                response,
-            } => self
-                .write_stream(qconn, session_id, stream_id, data, fin, response),
+            WebTransportCommand::WriteLease(command) =>
+                command.execute(self, qconn),
             WebTransportCommand::Read {
                 session_id,
                 stream_id,
@@ -1930,6 +3193,11 @@ impl Runtime {
                 session_id,
                 response,
             } => self.receive_datagram(qconn, session_id, response),
+            WebTransportCommand::WaitDatagram {
+                session_id,
+                send,
+                response,
+            } => self.wait_datagram(qconn, session_id, send, response),
             WebTransportCommand::MaxDatagramPayload {
                 session_id,
                 response,
@@ -1938,7 +3206,11 @@ impl Runtime {
                     response.send(self.max_datagram_payload(qconn, session_id));
             },
             WebTransportCommand::DatagramStats { response } => {
-                let _ = response.send(Ok(self.datagram_stats));
+                let _ = response.send(Ok(self.datagram_stats()));
+            },
+            WebTransportCommand::RetentionStats { response } => {
+                let _ = response
+                    .send(Ok(self.retention_stats(qconn, queued_command_items)));
             },
         }
     }
@@ -2327,6 +3599,16 @@ impl Runtime {
         for stream_id in stream_ids {
             self.reject_stream_waiters(stream_id, error);
         }
+
+        let datagram_error = datagram_error_from_selection(error);
+        let outcome = WebTransportDatagramReadyOutcome::Rejected(datagram_error);
+        if let Some(response) = self.datagram_readable_waiters.remove(&session_id)
+        {
+            let _ = response.send(outcome);
+        }
+        if let Some(response) = self.datagram_send_waiters.remove(&session_id) {
+            let _ = response.send(outcome);
+        }
     }
 
     pub(crate) fn process_owned_readable(
@@ -2381,6 +3663,9 @@ impl Runtime {
             .saturating_sub(datagrams.queue.len());
         self.pending_datagram_bytes =
             self.pending_datagram_bytes.saturating_sub(datagrams.bytes);
+        self.pending_datagram_allocation_bytes = self
+            .pending_datagram_allocation_bytes
+            .saturating_sub(datagrams.allocation_bytes);
     }
 
     fn release_provisional_to_legacy(&mut self, session_id: u64) {
@@ -2422,51 +3707,6 @@ impl Runtime {
             .checked_add(self.limits.max_pending_datagram_age)
             .unwrap_or(received_at);
         self.provisional_deadlines.insert((deadline, session_id));
-    }
-
-    fn write_stream(
-        &self, qconn: &mut QuicheConnection, session_id: u64, stream_id: u64,
-        data: Bytes, fin: bool,
-        response: oneshot::Sender<WebTransportStreamWriteOutcome>,
-    ) {
-        if response.is_closed() {
-            return;
-        }
-        if let Err(error) = self.select_stream(session_id, stream_id, true, qconn)
-        {
-            let _ = response.send(WebTransportStreamWriteOutcome::Rejected {
-                error,
-                data,
-                fin,
-            });
-            return;
-        }
-
-        let backup = data.clone();
-        let outcome = match qconn.stream_send_zc(stream_id, data, fin) {
-            Ok((accepted, remaining)) => {
-                let fin_accepted = fin && remaining.is_none();
-                WebTransportStreamWriteOutcome::Accepted {
-                    accepted,
-                    remaining,
-                    fin_accepted,
-                }
-            },
-            Err(quiche::Error::Done) =>
-                WebTransportStreamWriteOutcome::Blocked { data: backup, fin },
-            Err(quiche::Error::StreamStopped(error_code)) =>
-                WebTransportStreamWriteOutcome::ResetRequired {
-                    wire_error_code: error_code,
-                    application_error_code: webtransport_error_from_http3(
-                        error_code,
-                    ),
-                    data: backup,
-                    fin,
-                },
-            Err(_) =>
-                WebTransportStreamWriteOutcome::Closed { data: backup, fin },
-        };
-        let _ = response.send(outcome);
     }
 
     fn read_stream(
@@ -2617,16 +3857,132 @@ impl Runtime {
             }
         } else if let Some(queued) = queue.queue.pop_front() {
             let len = queued.datagram.as_slice().len();
+            let allocation = queued.datagram.allocated_capacity();
             queue.bytes = queue.bytes.saturating_sub(len);
+            queue.allocation_bytes =
+                queue.allocation_bytes.saturating_sub(allocation);
             self.pending_datagram_count =
                 self.pending_datagram_count.saturating_sub(1);
             self.pending_datagram_bytes =
                 self.pending_datagram_bytes.saturating_sub(len);
+            self.pending_datagram_allocation_bytes = self
+                .pending_datagram_allocation_bytes
+                .saturating_sub(allocation);
             WebTransportDatagramReadOutcome::Datagram(queued.datagram)
         } else {
             WebTransportDatagramReadOutcome::Blocked
         };
         let _ = response.send(outcome);
+    }
+
+    fn wake_datagram_readable(
+        &mut self, qconn: &QuicheConnection, session_id: u64,
+    ) {
+        let Some(outcome) = self.datagram_ready_outcome(qconn, session_id, false)
+        else {
+            return;
+        };
+        if let Some(response) = self.datagram_readable_waiters.remove(&session_id)
+        {
+            let _ = response.send(outcome);
+        }
+    }
+
+    fn wait_datagram(
+        &mut self, qconn: &QuicheConnection, session_id: u64, send: bool,
+        response: oneshot::Sender<WebTransportDatagramReadyOutcome>,
+    ) {
+        if response.is_closed() {
+            return;
+        }
+        if let Some(outcome) =
+            self.datagram_ready_outcome(qconn, session_id, send)
+        {
+            let _ = response.send(outcome);
+            return;
+        }
+
+        let waiter_count = self
+            .datagram_readable_waiters
+            .len()
+            .saturating_add(self.datagram_send_waiters.len());
+        let duplicate = if send {
+            self.datagram_send_waiters.contains_key(&session_id)
+        } else {
+            self.datagram_readable_waiters.contains_key(&session_id)
+        };
+        if waiter_count >= self.limits.max_datagram_waiters || duplicate {
+            let _ =
+                response.send(WebTransportDatagramReadyOutcome::ResourceLimit);
+            return;
+        }
+        let waiters = if send {
+            &mut self.datagram_send_waiters
+        } else {
+            &mut self.datagram_readable_waiters
+        };
+        waiters.insert(session_id, response);
+    }
+
+    fn datagram_ready_outcome(
+        &self, qconn: &QuicheConnection, session_id: u64, send: bool,
+    ) -> Option<WebTransportDatagramReadyOutcome> {
+        if let Some(error) = self.datagram_error(session_id, qconn) {
+            return Some(WebTransportDatagramReadyOutcome::Rejected(error));
+        }
+
+        let ready = if send {
+            self.max_datagram_payload(qconn, session_id).is_ok() &&
+                !qconn.is_dgram_send_queue_full()
+        } else {
+            self.datagrams.get(&session_id).is_some_and(|queue| {
+                queue.dropped_datagrams != 0 || !queue.queue.is_empty()
+            })
+        };
+        ready.then_some(WebTransportDatagramReadyOutcome::Ready)
+    }
+
+    pub(crate) fn has_ready_datagram_waiter(
+        &self, qconn: &QuicheConnection,
+    ) -> bool {
+        self.datagram_readable_waiters.keys().any(|session_id| {
+            self.datagram_ready_outcome(qconn, *session_id, false)
+                .is_some()
+        }) || self.datagram_send_waiters.keys().any(|session_id| {
+            self.datagram_ready_outcome(qconn, *session_id, true)
+                .is_some()
+        })
+    }
+
+    pub(crate) fn process_datagram_waiters(&mut self, qconn: &QuicheConnection) {
+        let readable: Vec<_> =
+            self.datagram_readable_waiters.keys().copied().collect();
+        for session_id in readable {
+            let Some(outcome) =
+                self.datagram_ready_outcome(qconn, session_id, false)
+            else {
+                continue;
+            };
+            if let Some(response) =
+                self.datagram_readable_waiters.remove(&session_id)
+            {
+                let _ = response.send(outcome);
+            }
+        }
+
+        let writable: Vec<_> =
+            self.datagram_send_waiters.keys().copied().collect();
+        for session_id in writable {
+            let Some(outcome) =
+                self.datagram_ready_outcome(qconn, session_id, true)
+            else {
+                continue;
+            };
+            if let Some(response) = self.datagram_send_waiters.remove(&session_id)
+            {
+                let _ = response.send(outcome);
+            }
+        }
     }
 
     pub(crate) fn route_datagram(
@@ -2658,17 +4014,24 @@ impl Runtime {
         };
 
         let len = datagram.as_slice().len();
-        let (session_datagrams, session_bytes) = self
-            .datagrams
-            .get(&session_id)
-            .map_or((0, 0), |queue| (queue.queue.len(), queue.bytes));
+        let allocation = datagram.allocated_capacity();
+        let (session_datagrams, session_bytes, session_allocation_bytes) =
+            self.datagrams.get(&session_id).map_or((0, 0, 0), |queue| {
+                (queue.queue.len(), queue.bytes, queue.allocation_bytes)
+            });
         let full = self.pending_datagram_count >=
             self.limits.max_pending_datagrams ||
             session_datagrams >= self.limits.max_pending_datagrams_per_session ||
             self.pending_datagram_bytes.saturating_add(len) >
                 self.limits.max_pending_datagram_bytes ||
             session_bytes.saturating_add(len) >
-                self.limits.max_pending_datagram_bytes_per_session;
+                self.limits.max_pending_datagram_bytes_per_session ||
+            self.pending_datagram_allocation_bytes
+                .saturating_add(allocation) >
+                self.limits.max_pending_datagram_allocation_bytes ||
+            session_allocation_bytes.saturating_add(allocation) >
+                self.limits
+                    .max_pending_datagram_allocation_bytes_per_session;
         if full {
             if let Some(queue) = self.datagrams.get_mut(&session_id) {
                 queue.dropped_datagrams =
@@ -2686,6 +4049,7 @@ impl Runtime {
                 .datagram_stats
                 .overflow_bytes
                 .saturating_add(len as u64);
+            self.wake_datagram_readable(qconn, session_id);
             return None;
         }
 
@@ -2696,11 +4060,14 @@ impl Runtime {
             datagram,
         });
         queue.bytes += len;
+        queue.allocation_bytes += allocation;
         self.pending_datagram_count += 1;
         self.pending_datagram_bytes += len;
+        self.pending_datagram_allocation_bytes += allocation;
         if index_deadline {
             self.index_provisional_deadline(session_id);
         }
+        self.wake_datagram_readable(qconn, session_id);
         None
     }
 
@@ -2735,11 +4102,17 @@ impl Runtime {
                 continue;
             };
             let len = queued.datagram.as_slice().len();
+            let allocation = queued.datagram.allocated_capacity();
             queue.bytes = queue.bytes.saturating_sub(len);
+            queue.allocation_bytes =
+                queue.allocation_bytes.saturating_sub(allocation);
             self.pending_datagram_count =
                 self.pending_datagram_count.saturating_sub(1);
             self.pending_datagram_bytes =
                 self.pending_datagram_bytes.saturating_sub(len);
+            self.pending_datagram_allocation_bytes = self
+                .pending_datagram_allocation_bytes
+                .saturating_sub(allocation);
             self.datagram_stats.expired_datagrams =
                 self.datagram_stats.expired_datagrams.saturating_add(1);
             self.datagram_stats.expired_bytes =
@@ -2774,11 +4147,17 @@ impl Runtime {
             .expect("legacy session index references a non-empty queue");
         let datagram = queued.datagram;
         let len = datagram.as_slice().len();
+        let allocation = datagram.allocated_capacity();
         queue.bytes = queue.bytes.saturating_sub(len);
+        queue.allocation_bytes =
+            queue.allocation_bytes.saturating_sub(allocation);
         self.pending_datagram_count =
             self.pending_datagram_count.saturating_sub(1);
         self.pending_datagram_bytes =
             self.pending_datagram_bytes.saturating_sub(len);
+        self.pending_datagram_allocation_bytes = self
+            .pending_datagram_allocation_bytes
+            .saturating_sub(allocation);
         if queue.queue.is_empty() {
             self.datagrams.remove(&session_id);
         } else {
@@ -3056,11 +4435,101 @@ impl Runtime {
         (self.pending_datagram_count, self.pending_datagram_bytes)
     }
 
+    fn datagram_stats(&self) -> WebTransportDatagramStats {
+        WebTransportDatagramStats {
+            retained_datagrams: self.pending_datagram_count,
+            retained_payload_bytes: self.pending_datagram_bytes,
+            retained_allocation_bytes: self.pending_datagram_allocation_bytes,
+            max_retained_datagrams: self.limits.max_pending_datagrams,
+            max_retained_payload_bytes: self.limits.max_pending_datagram_bytes,
+            max_retained_allocation_bytes: self
+                .limits
+                .max_pending_datagram_allocation_bytes,
+            ..self.datagram_stats
+        }
+    }
+
+    fn retention_stats(
+        &self, qconn: &QuicheConnection, queued_command_items: usize,
+    ) -> WebTransportRetentionStats {
+        let associated_streams = self.stream_sessions.len();
+        let provisional_streams = self
+            .pending_streams
+            .len()
+            .saturating_add(self.opening_streams.len());
+        let waiters = self
+            .readable_waiters
+            .len()
+            .saturating_add(self.writable_waiters.len())
+            .saturating_add(self.datagram_readable_waiters.len())
+            .saturating_add(self.datagram_send_waiters.len());
+
+        // Count each retained index entry. Nested per-session stream sets have
+        // one entry per corresponding aggregate stream map entry.
+        let metadata_index_entries = self
+            .sessions
+            .len()
+            .saturating_add(self.pending_streams.len().saturating_mul(2))
+            .saturating_add(self.pending_by_session.len())
+            .saturating_add(self.stream_sessions.len().saturating_mul(2))
+            .saturating_add(self.opening_streams.len().saturating_mul(2))
+            .saturating_add(self.opening_order.len())
+            .saturating_add(self.opening_by_session.len())
+            .saturating_add(waiters)
+            .saturating_add(self.datagrams.len())
+            .saturating_add(self.pending_datagram_count)
+            .saturating_add(self.provisional_deadlines.len())
+            .saturating_add(self.legacy_sessions.len())
+            .saturating_add(self.legacy_session_set.len())
+            .saturating_add(self.non_session_requests.len())
+            .saturating_add(self.work.len())
+            .saturating_add(self.deferred_responses.len());
+        let queued_commands =
+            queued_command_items.min(self.limits.command_capacity);
+        let write_leases = self.write_lease_accounting.snapshot();
+
+        WebTransportRetentionStats {
+            sessions: self.sessions.len(),
+            associated_streams,
+            provisional_streams,
+            waiters,
+            metadata_index_entries,
+            pending_datagrams: self.pending_datagram_count,
+            pending_datagram_payload_bytes: self.pending_datagram_bytes,
+            pending_datagram_allocation_bytes: self
+                .pending_datagram_allocation_bytes,
+            command_capacity: self.limits.command_capacity,
+            queued_commands,
+            queued_command_payload_bytes_upper_bound: queued_commands
+                .saturating_mul(self.limits.max_command_payload_bytes),
+            write_leases: write_leases.current,
+            write_lease_retained_bytes: write_leases.retained_bytes,
+            max_write_leases: write_leases.max_count,
+            max_write_lease_retained_bytes: write_leases.max_retained_bytes,
+            write_lease_admitted_total: write_leases.admitted_total,
+            write_lease_queue_full_total: write_leases.queue_full_total,
+            write_lease_resource_limit_total: write_leases.resource_limit_total,
+            write_lease_too_large_total: write_leases.too_large_total,
+            write_lease_abandoned_unexposed_total: write_leases
+                .abandoned_unexposed_total,
+            write_lease_abandoned_zero_total: write_leases.abandoned_zero_total,
+            write_lease_abandoned_unknown_total: write_leases
+                .abandoned_unknown_total,
+            transport_stream_send_bytes: qconn.stream_send_queue_byte_size(),
+            transport_stream_receive_bytes: qconn.stream_recv_queue_byte_size(),
+            transport_datagram_send_bytes: qconn.dgram_send_queue_byte_size(),
+            transport_datagram_receive_bytes: qconn.dgram_recv_queue_byte_size(),
+        }
+    }
+
     pub(crate) fn clear(&mut self) -> Vec<WebTransportSessionEvent> {
         let events = self
             .sessions
             .iter()
-            .filter(|(_, session)| session.phase != SessionPhase::Terminal)
+            .filter(|(_, session)| {
+                session.application_visible &&
+                    session.phase != SessionPhase::Terminal
+            })
             .map(|(&session_id, _)| WebTransportSessionEvent::Terminated {
                 session_id,
                 reason: WebTransportSessionCloseReason::ConnectionClosed,
@@ -3081,6 +4550,16 @@ impl Runtime {
         for (_, response) in std::mem::take(&mut self.writable_waiters) {
             let _ = response.send(WebTransportStreamReadyOutcome::Rejected(
                 WebTransportSelectionError::ConnectionClosed,
+            ));
+        }
+        for (_, response) in std::mem::take(&mut self.datagram_readable_waiters) {
+            let _ = response.send(WebTransportDatagramReadyOutcome::Rejected(
+                WebTransportDatagramError::ConnectionClosed,
+            ));
+        }
+        for (_, response) in std::mem::take(&mut self.datagram_send_waiters) {
+            let _ = response.send(WebTransportDatagramReadyOutcome::Rejected(
+                WebTransportDatagramError::ConnectionClosed,
             ));
         }
         self.sessions.clear();
@@ -3104,6 +4583,7 @@ impl Runtime {
         self.legacy_session_set.clear();
         self.pending_datagram_count = 0;
         self.pending_datagram_bytes = 0;
+        self.pending_datagram_allocation_bytes = 0;
         self.non_session_requests.clear();
         self.work.clear();
         self.deferred_responses.clear();
@@ -3123,6 +4603,28 @@ fn next_key_strictly_after<V>(
             .next()
             .map(|(&id, _)| id),
         None => map.first_key_value().map(|(&id, _)| id),
+    }
+}
+
+fn datagram_error_from_selection(
+    error: WebTransportSelectionError,
+) -> WebTransportDatagramError {
+    match error {
+        WebTransportSelectionError::UnknownSession =>
+            WebTransportDatagramError::UnknownSession,
+        WebTransportSelectionError::StaleSession =>
+            WebTransportDatagramError::StaleSession,
+        WebTransportSelectionError::PendingSession =>
+            WebTransportDatagramError::PendingSession,
+        WebTransportSelectionError::ClosingSession =>
+            WebTransportDatagramError::ClosingSession,
+        WebTransportSelectionError::TerminalSession =>
+            WebTransportDatagramError::TerminalSession,
+        WebTransportSelectionError::Unsupported =>
+            WebTransportDatagramError::Unsupported,
+        WebTransportSelectionError::ConnectionClosed =>
+            WebTransportDatagramError::ConnectionClosed,
+        _ => WebTransportDatagramError::UnknownSession,
     }
 }
 
@@ -3222,11 +4724,17 @@ mod tests {
             max_pending_streams: global,
             max_pending_streams_per_session: per_session,
             max_stream_waiters: global,
+            max_datagram_waiters: 2,
             max_pending_datagrams: 256,
             max_pending_datagrams_per_session: 64,
             max_pending_datagram_bytes: 1024 * 1024,
             max_pending_datagram_bytes_per_session: 256 * 1024,
+            max_pending_datagram_allocation_bytes: 1024 * 1024,
+            max_pending_datagram_allocation_bytes_per_session: 256 * 1024,
             max_pending_datagram_age: Duration::from_secs(5),
+            command_capacity: 256,
+            max_command_payload_bytes: 64 * 1024,
+            max_write_lease_retained_bytes_per_lease: 64 * 1024,
             max_session_work_per_callback: work,
         }
     }
@@ -3336,9 +4844,13 @@ mod tests {
             .route_datagram_at(&pipe.server, 0, datagram(b"native"), now)
             .is_none());
         assert_eq!(runtime.pending_datagram_usage(), (1, 6));
-        assert_eq!(runtime.observe_request(0, true), vec![
-            WebTransportSessionEvent::Pending { session_id: 0 }
-        ]);
+        assert!(matches!(
+            runtime.observe_request(0, true),
+            RequestObservation::Observed(events)
+                if events == vec![WebTransportSessionEvent::Pending {
+                    session_id: 0,
+                }]
+        ));
         assert_eq!(runtime.activate(0), vec![
             WebTransportSessionEvent::Accepted { session_id: 0 }
         ]);
@@ -3355,7 +4867,10 @@ mod tests {
         assert!(runtime
             .route_datagram_at(&pipe.server, 4, datagram(b"legacy"), now)
             .is_none());
-        assert!(runtime.observe_request(4, false).is_empty());
+        assert!(matches!(
+            runtime.observe_request(4, false),
+            RequestObservation::Observed(events) if events.is_empty()
+        ));
         let (flow_id, legacy) = runtime.pop_legacy_datagram().unwrap();
         assert_eq!(flow_id, 1);
         assert_eq!(legacy.as_slice(), b"legacy");
@@ -3372,13 +4887,18 @@ mod tests {
             1,
         );
 
-        assert!(runtime
+        let mut reject_runtime = Runtime::new(limits);
+        assert!(reject_runtime
             .route_datagram_at(&pipe.server, 12, datagram(b"reject"), now)
             .is_none());
-        assert_eq!(runtime.observe_request(12, true), vec![
-            WebTransportSessionEvent::Pending { session_id: 12 }
-        ]);
-        assert_eq!(runtime.reject(12, 403), vec![
+        assert!(matches!(
+            reject_runtime.observe_request(12, true),
+            RequestObservation::Observed(events)
+                if events == vec![WebTransportSessionEvent::Pending {
+                    session_id: 12,
+                }]
+        ));
+        assert_eq!(reject_runtime.reject(12, 403), vec![
             WebTransportSessionEvent::Rejected {
                 session_id: 12,
                 status: 403,
@@ -3391,6 +4911,10 @@ mod tests {
             expired_bytes: 6,
             legacy_datagrams: 1,
             legacy_bytes: 6,
+            ..WebTransportDatagramStats::default()
+        });
+        assert_eq!(reject_runtime.pending_datagram_usage(), (0, 0));
+        assert_eq!(reject_runtime.datagram_stats, WebTransportDatagramStats {
             terminal_datagrams: 1,
             terminal_bytes: 6,
             ..WebTransportDatagramStats::default()
@@ -3445,6 +4969,38 @@ mod tests {
     }
 
     #[test]
+    fn datagram_physical_allocation_limit_is_independent_of_payload() {
+        let pipe = pipe();
+        let mut limits = runtime_limits(8, 8, 8);
+        limits.max_pending_datagram_allocation_bytes = 8;
+        limits.max_pending_datagram_allocation_bytes_per_session = 8;
+        let mut runtime = Runtime::new(limits);
+
+        let mut backing = Vec::with_capacity(9);
+        backing.push(1);
+        let allocation = backing.capacity();
+        assert!(allocation > 8);
+        assert!(runtime
+            .route_datagram(&pipe.server, 0, DgramBuffer::from(backing),)
+            .is_none());
+        let stats = runtime.datagram_stats();
+        assert_eq!(stats.retained_datagrams, 0);
+        assert_eq!(stats.retained_payload_bytes, 0);
+        assert_eq!(stats.retained_allocation_bytes, 0);
+        assert_eq!(stats.max_retained_allocation_bytes, 8);
+        assert_eq!(stats.overflow_datagrams, 1);
+        assert_eq!(stats.overflow_bytes, 1);
+
+        let accepted = DgramBuffer::from_slice(&[1]);
+        assert!(accepted.allocated_capacity() <= 8);
+        assert!(runtime.route_datagram(&pipe.server, 0, accepted).is_none());
+        let stats = runtime.datagram_stats();
+        assert_eq!(stats.retained_datagrams, 1);
+        assert_eq!(stats.retained_payload_bytes, 1);
+        assert!(stats.retained_allocation_bytes <= 8);
+    }
+
+    #[test]
     fn legacy_datagram_release_is_one_item_per_fair_work_unit() {
         let pipe = pipe();
         let now = Instant::now();
@@ -3462,8 +5018,14 @@ mod tests {
                 )
                 .is_none());
         }
-        assert!(runtime.observe_request(0, false).is_empty());
-        assert!(runtime.observe_request(4, false).is_empty());
+        assert!(matches!(
+            runtime.observe_request(0, false),
+            RequestObservation::Observed(events) if events.is_empty()
+        ));
+        assert!(matches!(
+            runtime.observe_request(4, false),
+            RequestObservation::Observed(events) if events.is_empty()
+        ));
         assert_eq!(runtime.pending_datagram_usage(), (4, 8));
         assert_eq!(runtime.legacy_sessions.len(), 2);
 
@@ -3496,6 +5058,28 @@ mod tests {
             close = parser.consume(chunk).unwrap().or(close);
         }
         assert_eq!(close.unwrap().error_code, 7);
+        assert_eq!(parser.finish(), Ok(()));
+    }
+
+    #[test]
+    fn v2_profile_ignores_all_flow_control_capsules() {
+        let mut encoded = BytesMut::new();
+        for capsule_type in [
+            0x190b_4d3d, // WT_MAX_DATA
+            0x190b_4d3f, // WT_MAX_STREAMS_BIDI
+            0x190b_4d40, // WT_MAX_STREAMS_UNI
+            0x190b_4d41, // WT_DATA_BLOCKED
+            0x190b_4d43, // WT_STREAMS_BLOCKED_BIDI
+            0x190b_4d44, // WT_STREAMS_BLOCKED_UNI
+        ] {
+            put_varint(&mut encoded, capsule_type);
+            put_varint(&mut encoded, 1);
+            encoded.put_u8(0);
+        }
+        encoded.extend_from_slice(&close_bytes(7, "done"));
+
+        let mut parser = CapsuleParser::default();
+        assert_eq!(parser.consume(&encoded).unwrap().unwrap().error_code, 7);
         assert_eq!(parser.finish(), Ok(()));
     }
 
@@ -3580,9 +5164,13 @@ mod tests {
                 .is_empty());
         }
         assert_eq!(runtime.pending_stream_count(), 3);
-        assert_eq!(runtime.observe_request(0, true), vec![
-            WebTransportSessionEvent::Pending { session_id: 0 }
-        ]);
+        assert!(matches!(
+            runtime.observe_request(0, true),
+            RequestObservation::Observed(events)
+                if events == vec![WebTransportSessionEvent::Pending {
+                    session_id: 0,
+                }]
+        ));
         assert_eq!(runtime.activate(0), vec![
             WebTransportSessionEvent::Accepted { session_id: 0 }
         ]);
