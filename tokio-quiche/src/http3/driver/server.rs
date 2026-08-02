@@ -44,7 +44,6 @@ use super::InboundHeaders;
 use super::IncomingH3Headers;
 use super::StreamCtx;
 use super::WebTransportRequirements;
-use super::STREAM_CAPACITY;
 use crate::http3::settings::Http3Settings;
 use crate::http3::settings::Http3SettingsEnforcer;
 use crate::http3::settings::Http3TimeoutType;
@@ -215,6 +214,22 @@ impl ServerHooks {
 
         let is_webtransport =
             driver.webtransport.is_some() && webtransport::is_connect(&headers);
+        if let Some(limits) = driver.bounded_connect_header_limits() {
+            if limits.validate(&headers).is_err() || !is_webtransport {
+                let error = quiche::h3::WireErrorCode::MessageError as u64;
+                let _ = qconn.stream_shutdown(
+                    stream_id,
+                    quiche::Shutdown::Write,
+                    error,
+                );
+                let _ = qconn.stream_shutdown(
+                    stream_id,
+                    quiche::Shutdown::Read,
+                    error,
+                );
+                return Ok(());
+            }
+        }
         if is_webtransport {
             let requirements = webtransport_requirements(
                 driver
@@ -311,7 +326,7 @@ impl ServerHooks {
         }
 
         let (mut stream_ctx, send, recv) =
-            StreamCtx::new(stream_id, STREAM_CAPACITY);
+            StreamCtx::new(stream_id, driver.stream_channel_capacity());
 
         // When Extended CONNECT is enabled, extract the datagram flow ID
         // from the request headers and register it in flow_map. This

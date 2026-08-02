@@ -33,6 +33,7 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::mem::size_of;
 
 use intrusive_collections::intrusive_adapter;
 use intrusive_collections::KeyAdapter;
@@ -157,11 +158,15 @@ impl CollectedStreamIds {
 struct CollectedStreamSpace {
     contiguous_end: Option<u64>,
     chunks: BTreeMap<u64, CollectedStreamChunk>,
+    full_chunk_ranges: BTreeMap<u64, u64>,
 }
 
 impl CollectedStreamSpace {
     fn contains(&self, sequence: u64) -> bool {
         self.contiguous_end.is_some_and(|end| sequence <= end) ||
+            self.full_chunk_range_contains(
+                sequence / COLLECTED_STREAM_CHUNK_BITS,
+            ) ||
             self.chunks
                 .get(&(sequence / COLLECTED_STREAM_CHUNK_BITS))
                 .is_some_and(|chunk| {
@@ -186,6 +191,9 @@ impl CollectedStreamSpace {
 
         let chunk_index = sequence / COLLECTED_STREAM_CHUNK_BITS;
         let chunk_bit = (sequence % COLLECTED_STREAM_CHUNK_BITS) as u16;
+        if self.full_chunk_range_contains(chunk_index) {
+            return;
+        }
         if !self
             .chunks
             .entry(chunk_index)
@@ -193,6 +201,14 @@ impl CollectedStreamSpace {
             .insert(chunk_bit)
         {
             return;
+        }
+        if self
+            .chunks
+            .get(&chunk_index)
+            .is_some_and(CollectedStreamChunk::is_full)
+        {
+            self.chunks.remove(&chunk_index);
+            self.insert_full_chunk(chunk_index);
         }
         self.promote_contiguous();
     }
@@ -207,6 +223,18 @@ impl CollectedStreamSpace {
             };
             let chunk_index = expected / COLLECTED_STREAM_CHUNK_BITS;
             let chunk_bit = (expected % COLLECTED_STREAM_CHUNK_BITS) as u16;
+            if chunk_bit == 0 {
+                if let Some(end_chunk) =
+                    self.full_chunk_ranges.remove(&chunk_index)
+                {
+                    self.contiguous_end = Some(
+                        end_chunk
+                            .saturating_mul(COLLECTED_STREAM_CHUNK_BITS)
+                            .saturating_sub(1),
+                    );
+                    continue;
+                }
+            }
             let Some(chunk) = self.chunks.get_mut(&chunk_index) else {
                 return;
             };
@@ -224,7 +252,42 @@ impl CollectedStreamSpace {
 
     #[cfg(test)]
     fn storage_units(&self) -> usize {
-        self.chunks.len() + usize::from(self.contiguous_end.is_some())
+        self.chunks.len() +
+            self.full_chunk_ranges.len() +
+            usize::from(self.contiguous_end.is_some())
+    }
+
+    fn full_chunk_range_contains(&self, chunk_index: u64) -> bool {
+        self.full_chunk_ranges
+            .range(..=chunk_index)
+            .next_back()
+            .is_some_and(|(_, end)| chunk_index < *end)
+    }
+
+    fn insert_full_chunk(&mut self, chunk_index: u64) {
+        let mut start = chunk_index;
+        let mut end = chunk_index + 1;
+
+        if let Some((&previous_start, &previous_end)) =
+            self.full_chunk_ranges.range(..=chunk_index).next_back()
+        {
+            if previous_end >= chunk_index {
+                start = previous_start;
+                end = end.max(previous_end);
+                self.full_chunk_ranges.remove(&previous_start);
+            }
+        }
+
+        if let Some((&next_start, &next_end)) =
+            self.full_chunk_ranges.range(start..).next()
+        {
+            if next_start <= end {
+                end = end.max(next_end);
+                self.full_chunk_ranges.remove(&next_start);
+            }
+        }
+
+        self.full_chunk_ranges.insert(start, end);
     }
 }
 
@@ -306,10 +369,32 @@ impl CollectedStreamChunk {
             Self::Dense(words) => words.iter().all(|word| *word == 0),
         }
     }
+
+    fn is_full(&self) -> bool {
+        match self {
+            Self::Sparse(_) => false,
+            Self::Dense(words) => words.iter().all(|word| *word == u64::MAX),
+        }
+    }
 }
 
 fn stream_type(stream_id: u64) -> usize {
     (stream_id & 0x3) as usize
+}
+
+pub(crate) const fn retained_send_chunk_metadata_size<F: BufFactory>() -> usize {
+    send_buf::retained_chunk_metadata_size::<F>()
+}
+
+pub(crate) const fn retained_receive_fragment_metadata_size() -> usize {
+    recv_buf::retained_fragment_metadata_size()
+}
+
+pub(crate) const fn live_stream_metadata_size<F: BufFactory>() -> usize {
+    // The stream-map value plus conservative membership/index storage for the
+    // flushable, readable, writable, terminal, blocked, reset, and stopped
+    // collections.
+    size_of::<u64>() + size_of::<Stream<F>>() + 16 * size_of::<usize>()
 }
 
 /// Keeps track of QUIC streams and enforces stream limits.
@@ -401,11 +486,29 @@ pub struct StreamMap<F: BufFactory = DefaultBufFactory> {
 
     /// Total number of bytes in send buffers across all streams.
     tx_buffered: usize,
+
+    /// Hard transport-owned stream-send retention accounting.
+    send_retention: Arc<send_buf::StreamSendRetention>,
 }
 
 impl<F: BufFactory> StreamMap<F> {
+    #[cfg(test)]
     pub fn new(
         max_streams_bidi: u64, max_streams_uni: u64, max_stream_window: u64,
+    ) -> Self {
+        Self::new_with_send_retention(
+            max_streams_bidi,
+            max_streams_uni,
+            max_stream_window,
+            send_buf::StreamSendRetention::new(
+                StreamSendRetentionLimits::default(),
+            ),
+        )
+    }
+
+    pub(crate) fn new_with_send_retention(
+        max_streams_bidi: u64, max_streams_uni: u64, max_stream_window: u64,
+        send_retention: Arc<send_buf::StreamSendRetention>,
     ) -> Self {
         StreamMap {
             local_max_streams_bidi: max_streams_bidi,
@@ -417,9 +520,22 @@ impl<F: BufFactory> StreamMap<F> {
             initial_max_streams_uni: max_streams_uni,
 
             max_stream_window,
+            send_retention,
 
             ..StreamMap::default()
         }
+    }
+
+    pub(crate) fn new_with_send_retention_limits(
+        max_streams_bidi: u64, max_streams_uni: u64, max_stream_window: u64,
+        limits: StreamSendRetentionLimits,
+    ) -> Self {
+        Self::new_with_send_retention(
+            max_streams_bidi,
+            max_streams_uni,
+            max_stream_window,
+            send_buf::StreamSendRetention::new(limits),
+        )
     }
 
     /// Returns the stream with the given ID if it exists.
@@ -541,13 +657,14 @@ impl<F: BufFactory> StreamMap<F> {
                 };
 
                 let initial_window = max_rx_data;
-                let s = Stream::new(
+                let s = Stream::new_with_send_retention(
                     id,
                     max_rx_data,
                     max_tx_data,
                     local,
                     initial_window,
                     self.max_stream_window,
+                    Arc::clone(&self.send_retention),
                 );
 
                 let is_writable = s.is_writable();
@@ -810,6 +927,11 @@ impl<F: BufFactory> StreamMap<F> {
         self.peer_max_streams_uni - self.local_opened_streams_uni
     }
 
+    /// Returns the configured maximum receive-flow-control window per stream.
+    pub fn max_stream_window(&self) -> u64 {
+        self.max_stream_window
+    }
+
     /// Drops completed stream.
     ///
     /// This should only be called when Stream::is_complete() returns true for
@@ -949,6 +1071,20 @@ impl<F: BufFactory> StreamMap<F> {
         self.tx_buffered
     }
 
+    pub(crate) fn send_retention_stats(&self) -> StreamSendRetentionStats {
+        self.send_retention.stats()
+    }
+
+    pub(crate) fn send_retention_limits(&self) -> StreamSendRetentionLimits {
+        self.send_retention.limits()
+    }
+
+    pub(crate) fn set_send_retention_limits(
+        &self, limits: StreamSendRetentionLimits,
+    ) -> Result<()> {
+        self.send_retention.set_limits(limits)
+    }
+
     /// Computes the actual number of bytes in send buffers by summing across
     /// all streams. This is used for debugging to verify that tx_buffered
     /// is accurate.
@@ -1048,6 +1184,24 @@ impl<F: BufFactory> Stream<F> {
         id: u64, max_rx_data: u64, max_tx_data: u64, local: bool,
         initial_window: u64, max_window: u64,
     ) -> Self {
+        Self::new_with_send_retention(
+            id,
+            max_rx_data,
+            max_tx_data,
+            local,
+            initial_window,
+            max_window,
+            send_buf::StreamSendRetention::new(
+                StreamSendRetentionLimits::default(),
+            ),
+        )
+    }
+
+    pub(crate) fn new_with_send_retention(
+        id: u64, max_rx_data: u64, max_tx_data: u64, local: bool,
+        initial_window: u64, max_window: u64,
+        send_retention: Arc<send_buf::StreamSendRetention>,
+    ) -> Self {
         let priority_key = Arc::new(StreamPriorityKey {
             id,
             ..Default::default()
@@ -1055,7 +1209,10 @@ impl<F: BufFactory> Stream<F> {
 
         Stream {
             recv: recv_buf::RecvBuf::new(max_rx_data, initial_window, max_window),
-            send: send_buf::SendBuf::new(max_tx_data),
+            send: send_buf::SendBuf::new_with_retention(
+                max_tx_data,
+                send_retention,
+            ),
             send_lowat: 1,
             bidi: is_bidi(id),
             local,
@@ -2280,6 +2437,28 @@ mod tests {
     }
 
     #[test]
+    fn collected_stream_ids_compact_full_chunks_after_initial_gap() {
+        let mut collected = CollectedStreamIds::default();
+        let stream_type = 0x3;
+
+        for sequence in 99..1_000_000 {
+            collected.insert((sequence << 2) | stream_type);
+        }
+
+        assert!(collected.storage_units() <= 3);
+        assert!(!collected.contains(stream_type));
+        assert!(!collected.contains((98 << 2) | stream_type));
+        assert!(collected.contains((99 << 2) | stream_type));
+        assert!(collected.contains((999_999 << 2) | stream_type));
+
+        for sequence in 0..99 {
+            collected.insert((sequence << 2) | stream_type);
+        }
+        assert_eq!(collected.storage_units(), 1);
+        assert!(collected.contains((999_999 << 2) | stream_type));
+    }
+
+    #[test]
     fn collected_stream_ids_promote_dense_chunk_into_prefix() {
         let mut collected = CollectedStreamIds::default();
 
@@ -2944,3 +3123,7 @@ mod tests {
 
 mod recv_buf;
 mod send_buf;
+
+pub(crate) use send_buf::StreamSendCharge;
+pub use send_buf::StreamSendRetentionLimits;
+pub use send_buf::StreamSendRetentionStats;

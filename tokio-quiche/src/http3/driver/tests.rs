@@ -2061,6 +2061,15 @@ mod server_side_driver {
         })
     }
 
+    fn wait_for_session_terminal(
+        controller: &WebTransportController, session_id: u64,
+    ) -> tokio::task::JoinHandle<WebTransportSessionTerminalOutcome> {
+        let controller = controller.clone();
+        tokio::spawn(
+            async move { controller.wait_session_terminal(session_id).await },
+        )
+    }
+
     fn retire_send_terminal(
         controller: &WebTransportController, session_id: u64, stream_id: u64,
     ) -> tokio::task::JoinHandle<WebTransportStreamSendTerminalOutcome> {
@@ -7337,6 +7346,211 @@ mod server_side_driver {
             &mut helper,
             0,
             WebTransportSessionCloseReason::Clean,
+        );
+    }
+
+    #[tokio::test]
+    async fn webtransport_session_terminal_wait_is_stream_free_and_latched() {
+        let mut helper = webtransport_helper(webtransport_settings());
+        start_webtransport_driver(&mut helper);
+        let (session_id, to_client, _from_client) =
+            open_pending_webtransport_session(&mut helper);
+        let controller = helper
+            .controller
+            .webtransport_controller()
+            .expect("native WebTransport controller");
+        let bidi_credit = helper.pipe.server.peer_streams_left_bidi();
+        let uni_credit = helper.pipe.server.peer_streams_left_uni();
+
+        let wait = wait_for_session_terminal(&controller, session_id);
+        tokio::task::yield_now().await;
+        helper.work_loop_iter().unwrap();
+        assert!(!wait.is_finished());
+        assert_eq!(
+            helper
+                .driver
+                .webtransport
+                .as_ref()
+                .unwrap()
+                .active_stream_count(),
+            0,
+        );
+        assert_eq!(helper.pipe.server.peer_streams_left_bidi(), bidi_credit);
+        assert_eq!(helper.pipe.server.peer_streams_left_uni(), uni_credit);
+
+        accept_pending_webtransport_session(&mut helper, session_id, &to_client);
+        assert!(!wait.is_finished());
+        helper.peer_client_send_body(session_id, &[], true).unwrap();
+        helper.advance_and_run_loop().unwrap();
+        expect_session_terminated(
+            &mut helper,
+            session_id,
+            WebTransportSessionCloseReason::Clean,
+        );
+        assert_eq!(
+            wait.await.unwrap(),
+            WebTransportSessionTerminalOutcome::Terminated {
+                session_id,
+                reason: WebTransportSessionCloseReason::Clean,
+            }
+        );
+
+        let late = wait_for_session_terminal(&controller, session_id);
+        tokio::task::yield_now().await;
+        helper.work_loop_iter().unwrap();
+        assert_eq!(
+            late.await.unwrap(),
+            WebTransportSessionTerminalOutcome::Terminated {
+                session_id,
+                reason: WebTransportSessionCloseReason::Clean,
+            }
+        );
+        assert_eq!(
+            helper
+                .driver
+                .webtransport
+                .as_ref()
+                .unwrap()
+                .active_stream_count(),
+            0,
+        );
+
+        let queued_before_teardown =
+            wait_for_session_terminal(&controller, session_id);
+        tokio::task::yield_now().await;
+        drop(helper);
+        assert_eq!(
+            queued_before_teardown.await.unwrap(),
+            WebTransportSessionTerminalOutcome::Terminated {
+                session_id,
+                reason: WebTransportSessionCloseReason::Clean,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn webtransport_session_terminal_wait_cancels_and_reuses_capacity() {
+        let mut settings = webtransport_settings();
+        settings.webtransport_max_session_terminal_waiters = 1;
+        settings.webtransport_max_session_terminal_waiters_per_session = 1;
+        let mut helper = webtransport_helper(settings);
+        let (to_client, _from_client) = accept_webtransport_session(&mut helper);
+        let session_id = 0;
+        let controller = helper
+            .controller
+            .webtransport_controller()
+            .expect("native WebTransport controller");
+
+        let first = wait_for_session_terminal(&controller, session_id);
+        tokio::task::yield_now().await;
+        helper.work_loop_iter().unwrap();
+        assert!(!first.is_finished());
+
+        let saturated = wait_for_session_terminal(&controller, session_id);
+        tokio::task::yield_now().await;
+        helper.work_loop_iter().unwrap();
+        assert_eq!(
+            saturated.await.unwrap(),
+            WebTransportSessionTerminalOutcome::ResourceLimit { session_id }
+        );
+
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        tokio::task::yield_now().await;
+        helper.work_loop_iter().unwrap();
+        let stats = webtransport_retention_stats(&mut helper, &controller).await;
+        assert_eq!(stats.session_terminal_waiters, 0);
+        assert_eq!(stats.max_session_terminal_waiters, 1);
+        assert_eq!(stats.max_session_terminal_waiters_per_session, 1);
+        assert_eq!(stats.session_terminal_waiter_saturation_total, 1);
+
+        let replacement = wait_for_session_terminal(&controller, session_id);
+        tokio::task::yield_now().await;
+        helper.work_loop_iter().unwrap();
+        assert!(!replacement.is_finished());
+        helper.peer_client_send_body(session_id, &[], true).unwrap();
+        helper.advance_and_run_loop().unwrap();
+        expect_session_terminated(
+            &mut helper,
+            session_id,
+            WebTransportSessionCloseReason::Clean,
+        );
+        assert_eq!(
+            replacement.await.unwrap(),
+            WebTransportSessionTerminalOutcome::Terminated {
+                session_id,
+                reason: WebTransportSessionCloseReason::Clean,
+            }
+        );
+        drop(to_client);
+    }
+
+    #[tokio::test]
+    async fn webtransport_session_terminal_wait_types_absence_and_teardown() {
+        let mut helper = webtransport_helper(webtransport_settings());
+        let (to_client, _from_client) = accept_webtransport_session(&mut helper);
+        let session_id = 0;
+        let controller = helper
+            .controller
+            .webtransport_controller()
+            .expect("native WebTransport controller");
+
+        let unknown = wait_for_session_terminal(&controller, 4000);
+        tokio::task::yield_now().await;
+        helper.work_loop_iter().unwrap();
+        assert_eq!(
+            unknown.await.unwrap(),
+            WebTransportSessionTerminalOutcome::UnknownSession {
+                session_id: 4000,
+            }
+        );
+
+        helper.peer_client_send_body(session_id, &[], true).unwrap();
+        helper.advance_and_run_loop().unwrap();
+        expect_session_terminated(
+            &mut helper,
+            session_id,
+            WebTransportSessionCloseReason::Clean,
+        );
+        to_client
+            .try_send(OutboundFrame::Body(Bytes::new(), true))
+            .unwrap();
+        helper.advance_and_run_loop().unwrap();
+        while helper.peer_client_poll().is_ok() {}
+        helper.advance_and_run_loop().unwrap();
+        assert!(!helper
+            .driver
+            .webtransport
+            .as_ref()
+            .unwrap()
+            .is_session(session_id));
+
+        let stale = wait_for_session_terminal(&controller, session_id);
+        tokio::task::yield_now().await;
+        helper.work_loop_iter().unwrap();
+        assert_eq!(
+            stale.await.unwrap(),
+            WebTransportSessionTerminalOutcome::StaleSession { session_id }
+        );
+
+        let mut closing = webtransport_helper(webtransport_settings());
+        let (_to_client, _from_client) =
+            accept_webtransport_session(&mut closing);
+        let closing_controller = closing
+            .controller
+            .webtransport_controller()
+            .expect("native WebTransport controller");
+        let connection = wait_for_session_terminal(&closing_controller, 0);
+        tokio::task::yield_now().await;
+        closing.work_loop_iter().unwrap();
+        assert!(!connection.is_finished());
+        drop(closing);
+        assert_eq!(
+            connection.await.unwrap(),
+            WebTransportSessionTerminalOutcome::Terminated {
+                session_id: 0,
+                reason: WebTransportSessionCloseReason::ConnectionClosed,
+            }
         );
     }
 

@@ -26,6 +26,8 @@
 
 use std::net::SocketAddr;
 use std::ops::ControlFlow;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::task::Poll;
 use std::time::Duration;
@@ -46,9 +48,12 @@ use crate::metrics::Metrics;
 use crate::quic::connection::ApplicationOverQuic;
 use crate::quic::connection::HandshakeError;
 use crate::quic::connection::Incoming;
+use crate::quic::connection::IncomingPacketSource;
+use crate::quic::connection::IoWorkerMemoryProfile;
 use crate::quic::connection::QuicConnectionStats;
 use crate::quic::connection::SharedConnectionIdGenerator;
 use crate::quic::router::ConnectionMapCommand;
+use crate::quic::router::ConnectionMapCommandSender;
 use crate::quic::QuicheConnection;
 use crate::settings::QuicTransportEgressStats;
 use crate::QuicResult;
@@ -67,11 +72,7 @@ use tokio::sync::mpsc;
 use tokio::time;
 
 // Number of incoming packets to be buffered in the incoming channel.
-pub(crate) const INCOMING_QUEUE_SIZE: usize = 2048;
-
-// Check if there are any incoming packets while sending data every this number
-// of sent packets
-pub(crate) const CHECK_INCOMING_QUEUE_RATIO: usize = INCOMING_QUEUE_SIZE / 16;
+pub(crate) const DEFAULT_INCOMING_QUEUE_SIZE: usize = 2048;
 
 const RELEASE_TIMER_THRESHOLD: Duration = Duration::from_micros(250);
 
@@ -85,14 +86,15 @@ const GSO_THRESHOLD: usize = 1_000;
 /// buffer, this memory is returned to the per-worker [`SEND_BUF_POOL`] before
 /// the worker sleeps. The free list retains it for reuse (rather than truly
 /// freeing it) but no idle connection owns an egress buffer.
-const SEND_BUFFER_SIZE: usize = crate::buf_factory::BufFactory::MAX_BUF_SIZE;
+pub(crate) const SEND_BUFFER_SIZE: usize =
+    crate::buf_factory::BufFactory::MAX_BUF_SIZE;
 
 /// Size of a temporary egress buffer when pooling is disabled.
 ///
 /// The cold handshake and connection-close paths generate a single datagram at
 /// a time. When pooling is enabled, they borrow a full-size buffer from
 /// [`SEND_BUF_POOL`]; otherwise a one-MTU buffer is enough.
-const TRANSIENT_SEND_BUFFER_SIZE: usize = 1500;
+pub(crate) const TRANSIENT_SEND_BUFFER_SIZE: usize = 1500;
 
 /// Allocates a zero-initialized egress buffer on the heap.
 ///
@@ -105,6 +107,27 @@ fn alloc_send_buffer() -> Box<[u8]> {
     vec![0u8; SEND_BUFFER_SIZE].into_boxed_slice()
 }
 
+#[derive(Default)]
+struct SendBufferPool {
+    free: Vec<PoolAllocation>,
+    bounded_allocations: Arc<AtomicUsize>,
+}
+
+struct PoolAllocation {
+    buf: Option<Box<[u8]>>,
+    bounded_allocations: Option<Arc<AtomicUsize>>,
+}
+
+impl Drop for PoolAllocation {
+    fn drop(&mut self) {
+        if self.buf.is_some() {
+            if let Some(allocated) = &self.bounded_allocations {
+                allocated.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+    }
+}
+
 thread_local! {
     /// Per-runtime-worker free-list of egress scratch buffers.
     ///
@@ -113,8 +136,8 @@ thread_local! {
     /// kernel zero-fill) while no idle connection retains a buffer: the pool
     /// holds at most [`SEND_BUF_POOL_CAP`] buffers per worker thread,
     /// independent of the connection count.
-    static SEND_BUF_POOL: std::cell::RefCell<Vec<Box<[u8]>>> =
-        const { std::cell::RefCell::new(Vec::new()) };
+    static SEND_BUF_POOL: std::cell::RefCell<SendBufferPool> =
+        std::cell::RefCell::new(SendBufferPool::default());
 }
 
 /// Upper bound on egress buffers parked per worker thread. The natural
@@ -127,7 +150,7 @@ thread_local! {
 /// (16 * 64 KiB = 1 MiB) per runtime worker thread. The pool is not shrunk
 /// once grown, so after a burst it stays at its high-water mark for the
 /// process lifetime.
-const SEND_BUF_POOL_CAP: usize = 16;
+pub(crate) const SEND_BUF_POOL_HARD_CAP: usize = 16;
 
 /// Egress scratch buffer borrowed from the per-thread [`SEND_BUF_POOL`] and
 /// returned to it on drop.
@@ -135,23 +158,80 @@ const SEND_BUF_POOL_CAP: usize = 16;
 /// Behaves like the `Box<[u8]>` it replaces via `Deref`/`DerefMut`, so idle
 /// connections still retain no egress buffer, but the backing pages are
 /// recycled instead of re-faulted (and re-zeroed by the kernel) every burst.
-struct PooledSendBuf(Box<[u8]>);
+struct PooledSendBuf {
+    allocation: PoolAllocation,
+    pool_capacity: usize,
+}
 
 impl PooledSendBuf {
-    fn acquire() -> Self {
-        let buf = SEND_BUF_POOL
-            .with(|pool| pool.borrow_mut().pop())
-            .unwrap_or_else(|| {
-                // Pool miss (cold path): allocate a fresh buffer and record it.
-                // Re-using a parked buffer (the hot path) does not touch any
-                // counter.
-                crate::metrics::quic::send_buffer_pool_allocated().inc();
-                alloc_send_buffer()
-            });
+    fn acquire(pool_capacity: usize, hard_bound: bool) -> Self {
+        let pool_capacity = pool_capacity.min(SEND_BUF_POOL_HARD_CAP);
+        let allocation = SEND_BUF_POOL.with(|pool| {
+            let mut pool = pool.borrow_mut();
+            pool.free.truncate(pool_capacity);
+            if let Some(mut allocation) = pool.free.pop() {
+                if hard_bound && allocation.bounded_allocations.is_none() {
+                    if pool
+                        .bounded_allocations
+                        .fetch_update(
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                            |current| {
+                                (current < pool_capacity).then_some(current + 1)
+                            },
+                        )
+                        .is_err()
+                    {
+                        return PoolAllocation {
+                            buf: Some(
+                                vec![0u8; TRANSIENT_SEND_BUFFER_SIZE]
+                                    .into_boxed_slice(),
+                            ),
+                            bounded_allocations: None,
+                        };
+                    }
+                    allocation.bounded_allocations =
+                        Some(Arc::clone(&pool.bounded_allocations));
+                }
+                return allocation;
+            }
+
+            let bounded_allocations =
+                hard_bound.then(|| Arc::clone(&pool.bounded_allocations));
+            if let Some(allocated) = &bounded_allocations {
+                if allocated
+                    .fetch_update(
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                        |current| {
+                            (current < pool_capacity).then_some(current + 1)
+                        },
+                    )
+                    .is_err()
+                {
+                    return PoolAllocation {
+                        buf: Some(
+                            vec![0u8; TRANSIENT_SEND_BUFFER_SIZE]
+                                .into_boxed_slice(),
+                        ),
+                        bounded_allocations: None,
+                    };
+                }
+            }
+
+            crate::metrics::quic::send_buffer_pool_allocated().inc();
+            PoolAllocation {
+                buf: Some(alloc_send_buffer()),
+                bounded_allocations,
+            }
+        });
         // No re-zeroing on reuse: quiche writes only the bytes it emits and
         // the flush path transmits solely `send_buf[..bytes_written]`, so any
         // stale bytes left by a previous burst are never sent.
-        Self(buf)
+        Self {
+            allocation,
+            pool_capacity,
+        }
     }
 }
 
@@ -161,15 +241,25 @@ impl Drop for PooledSendBuf {
         // behind, so it can be returned to the pool. Storing a plain
         // `Box<[u8]>` rather than an `Option` keeps `Deref`/`DerefMut`
         // panic-free.
-        let buf = std::mem::take(&mut self.0);
+        let allocation = PoolAllocation {
+            buf: self.allocation.buf.take(),
+            bounded_allocations: self.allocation.bounded_allocations.take(),
+        };
+        if allocation
+            .buf
+            .as_ref()
+            .is_none_or(|buf| buf.len() != SEND_BUFFER_SIZE)
+        {
+            return;
+        }
         // Returns to *this* thread's pool. With tokio work-stealing a task may
         // migrate across the flush `.await`, so a buffer can be acquired on one
         // worker and returned on another; this is benign, and the per-thread
         // cap keeps the total bounded by `cap * workers`.
         SEND_BUF_POOL.with(|pool| {
             let mut pool = pool.borrow_mut();
-            if pool.len() < SEND_BUF_POOL_CAP {
-                pool.push(buf);
+            if pool.free.len() < self.pool_capacity {
+                pool.free.push(allocation);
             } else {
                 // Pool already at capacity (cold path, only under burst
                 // spikes): drop the buffer instead of parking it, and record
@@ -185,13 +275,19 @@ impl std::ops::Deref for PooledSendBuf {
     type Target = [u8];
 
     fn deref(&self) -> &[u8] {
-        &self.0
+        self.allocation
+            .buf
+            .as_deref()
+            .expect("a live send buffer owns its allocation")
     }
 }
 
 impl std::ops::DerefMut for PooledSendBuf {
     fn deref_mut(&mut self) -> &mut [u8] {
-        &mut self.0
+        self.allocation
+            .buf
+            .as_deref_mut()
+            .expect("a live send buffer owns its allocation")
     }
 }
 
@@ -206,9 +302,11 @@ enum TransientSendBuf {
 }
 
 impl TransientSendBuf {
-    fn acquire(pool_send_buffer: bool) -> Self {
+    fn acquire(
+        pool_send_buffer: bool, pool_capacity: usize, hard_bound: bool,
+    ) -> Self {
         if pool_send_buffer {
-            Self::Pooled(PooledSendBuf::acquire())
+            Self::Pooled(PooledSendBuf::acquire(pool_capacity, hard_bound))
         } else {
             Self::Unpooled(
                 vec![0u8; TRANSIENT_SEND_BUFFER_SIZE].into_boxed_slice(),
@@ -246,6 +344,40 @@ pub struct WriterConfig {
     /// pool for each send burst. When `false`, the worker keeps a persistent
     /// per-connection buffer for its lifetime instead.
     pub pool_send_buffer: bool,
+    /// Maximum buffers parked by the current worker thread.
+    pub send_buffer_pool_capacity: usize,
+    /// Whether the pool cap includes buffers currently leased by workers.
+    pub hard_bound_send_buffer_pool: bool,
+    /// Capacity of this connection's incoming packet lane.
+    pub incoming_packet_queue_capacity: usize,
+    /// Endpoint-wide listener Connection-ID command capacity.
+    pub connection_map_command_capacity: Option<usize>,
+    /// Whether per-connection qlog output is active.
+    pub qlog_enabled: bool,
+    /// Whether TLS key logging is active.
+    pub keylog_enabled: bool,
+}
+
+impl WriterConfig {
+    pub(crate) fn memory_profile(
+        &self, incoming_packet_source: IncomingPacketSource,
+    ) -> IoWorkerMemoryProfile {
+        IoWorkerMemoryProfile {
+            incoming_packet_source,
+            incoming_packet_queue_capacity: self.incoming_packet_queue_capacity,
+            max_incoming_packet_allocation_bytes:
+                datagram_socket::MAX_DATAGRAM_SIZE,
+            pool_send_buffer: self.pool_send_buffer,
+            send_buffer_pool_capacity_per_worker: self
+                .send_buffer_pool_capacity
+                .min(SEND_BUF_POOL_HARD_CAP),
+            hard_bound_send_buffer_pool: self.hard_bound_send_buffer_pool,
+            send_buffer_allocation_bytes: SEND_BUFFER_SIZE,
+            connection_map_command_capacity: self.connection_map_command_capacity,
+            qlog_enabled: self.qlog_enabled,
+            keylog_enabled: self.keylog_enabled,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -272,7 +404,7 @@ pub(crate) struct IoWorkerParams<Tx, M> {
     pub(crate) cfg: WriterConfig,
     pub(crate) audit_log_stats: Arc<QuicAuditStats>,
     pub(crate) write_state: WriteState,
-    pub(crate) conn_map_cmd_tx: mpsc::UnboundedSender<ConnectionMapCommand>,
+    pub(crate) conn_map_cmd_tx: ConnectionMapCommandSender,
     pub(crate) cid_generator: Option<SharedConnectionIdGenerator>,
     #[cfg(feature = "perf-quic-listener-metrics")]
     pub(crate) init_rx_time: Option<SystemTime>,
@@ -289,7 +421,7 @@ pub(crate) struct IoWorker<Tx, M, S> {
     cfg: WriterConfig,
     audit_log_stats: Arc<QuicAuditStats>,
     write_state: WriteState,
-    conn_map_cmd_tx: mpsc::UnboundedSender<ConnectionMapCommand>,
+    conn_map_cmd_tx: ConnectionMapCommandSender,
     cid_generator: Option<SharedConnectionIdGenerator>,
     #[cfg(feature = "perf-quic-listener-metrics")]
     init_rx_time: Option<SystemTime>,
@@ -394,6 +526,8 @@ where
         // burst borrows a transient buffer from the per-worker pool instead.
         let mut persistent_send_buf: Option<Box<[u8]>> =
             (!self.cfg.pool_send_buffer).then(alloc_send_buffer);
+        let check_incoming_queue_ratio =
+            self.cfg.incoming_packet_queue_capacity.div_ceil(16).max(1);
 
         loop {
             let now = Instant::now();
@@ -439,7 +573,7 @@ where
                 self.write_state.has_pending_data &= can_release;
 
                 while self.write_state.has_pending_data &&
-                    packets_sent < CHECK_INCOMING_QUEUE_RATIO
+                    packets_sent < check_incoming_queue_ratio
                 {
                     // Use the persistent per-connection buffer when pooling is
                     // disabled. Otherwise borrow a buffer from the per-worker
@@ -451,8 +585,12 @@ where
                         if let Some(buf) = persistent_send_buf.as_deref_mut() {
                             buf
                         } else {
-                            &mut pooled_send_buf
-                                .get_or_insert_with(PooledSendBuf::acquire)[..]
+                            &mut pooled_send_buf.get_or_insert_with(|| {
+                                PooledSendBuf::acquire(
+                                    self.cfg.send_buffer_pool_capacity,
+                                    self.cfg.hard_bound_send_buffer_pool,
+                                )
+                            })[..]
                         };
 
                     self.gather_data_from_quiche_conn(qconn, send_buf, false)?;
@@ -979,8 +1117,11 @@ where
             // Allocate inside this closure so a pending poll immediately
             // returns its buffer to the pool instead of retaining it across
             // the select! wait.
-            let mut send_buf =
-                TransientSendBuf::acquire(self.cfg.pool_send_buffer);
+            let mut send_buf = TransientSendBuf::acquire(
+                self.cfg.pool_send_buffer,
+                self.cfg.send_buffer_pool_capacity,
+                self.cfg.hard_bound_send_buffer_pool,
+            );
 
             match self.gather_data_from_quiche_conn(
                 qconn,
@@ -1228,7 +1369,11 @@ where
         //
         // This runs once per connection at close and sends a single
         // CONNECTION_CLOSE datagram, so acquire a buffer only for this send.
-        let mut send_buf = TransientSendBuf::acquire(self.cfg.pool_send_buffer);
+        let mut send_buf = TransientSendBuf::acquire(
+            self.cfg.pool_send_buffer,
+            self.cfg.send_buffer_pool_capacity,
+            self.cfg.hard_bound_send_buffer_pool,
+        );
         let _ =
             self.gather_data_from_quiche_conn(qconn, send_buf.as_mut(), false);
         self.flush_buffer_to_socket(send_buf.as_ref()).await;
@@ -1341,15 +1486,15 @@ mod pooled_send_buf_tests {
     fn caps_retained_buffers() {
         std::thread::spawn(|| {
             // Acquire more than the cap at once (all misses, so all fresh
-            // allocations), then drop them. Only `SEND_BUF_POOL_CAP` may be
+            // allocations), then drop them. Only the configured cap may be
             // parked; the remainder are freed.
-            let bufs: Vec<PooledSendBuf> = (0..SEND_BUF_POOL_CAP + 4)
-                .map(|_| PooledSendBuf::acquire())
+            let bufs: Vec<PooledSendBuf> = (0..SEND_BUF_POOL_HARD_CAP + 4)
+                .map(|_| PooledSendBuf::acquire(SEND_BUF_POOL_HARD_CAP, false))
                 .collect();
             drop(bufs);
 
-            let retained = SEND_BUF_POOL.with(|pool| pool.borrow().len());
-            assert_eq!(retained, SEND_BUF_POOL_CAP);
+            let retained = SEND_BUF_POOL.with(|pool| pool.borrow().free.len());
+            assert_eq!(retained, SEND_BUF_POOL_HARD_CAP);
         })
         .join()
         .unwrap();
@@ -1359,12 +1504,12 @@ mod pooled_send_buf_tests {
     fn reuses_a_returned_buffer() {
         std::thread::spawn(|| {
             let first_ptr = {
-                let buf = PooledSendBuf::acquire();
+                let buf = PooledSendBuf::acquire(SEND_BUF_POOL_HARD_CAP, false);
                 assert_eq!(buf.len(), SEND_BUFFER_SIZE);
                 buf.as_ptr()
             }; // returned to the pool here
 
-            let reused = PooledSendBuf::acquire();
+            let reused = PooledSendBuf::acquire(SEND_BUF_POOL_HARD_CAP, false);
             assert_eq!(
                 reused.as_ptr(),
                 first_ptr,
@@ -1380,12 +1525,72 @@ mod pooled_send_buf_tests {
         // Acquire on one thread, drop on another: the buffer lands in the
         // dropping thread's pool (work-stealing migration across `.await` is
         // benign).
-        let buf = std::thread::spawn(PooledSendBuf::acquire).join().unwrap();
+        let buf = std::thread::spawn(|| {
+            PooledSendBuf::acquire(SEND_BUF_POOL_HARD_CAP, false)
+        })
+        .join()
+        .unwrap();
 
         std::thread::spawn(move || {
-            assert_eq!(SEND_BUF_POOL.with(|pool| pool.borrow().len()), 0);
+            assert_eq!(SEND_BUF_POOL.with(|pool| pool.borrow().free.len()), 0);
             drop(buf);
-            assert_eq!(SEND_BUF_POOL.with(|pool| pool.borrow().len()), 1);
+            assert_eq!(SEND_BUF_POOL.with(|pool| pool.borrow().free.len()), 1);
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn hard_bound_includes_leased_buffers() {
+        std::thread::spawn(|| {
+            let bufs: Vec<_> =
+                (0..6).map(|_| PooledSendBuf::acquire(2, true)).collect();
+            assert_eq!(bufs[0].len(), SEND_BUFFER_SIZE);
+            assert_eq!(bufs[1].len(), SEND_BUFFER_SIZE);
+            assert!(bufs[2..]
+                .iter()
+                .all(|buf| buf.len() == TRANSIENT_SEND_BUFFER_SIZE));
+            assert_eq!(
+                SEND_BUF_POOL.with(|pool| {
+                    pool.borrow().bounded_allocations.load(Ordering::Acquire)
+                }),
+                2
+            );
+
+            drop(bufs);
+            SEND_BUF_POOL.with(|pool| {
+                let pool = pool.borrow();
+                assert_eq!(pool.free.len(), 2);
+                assert_eq!(pool.bounded_allocations.load(Ordering::Acquire), 2);
+            });
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn hard_bound_adopts_untracked_pool_allocations() {
+        std::thread::spawn(|| {
+            let general: Vec<_> =
+                (0..2).map(|_| PooledSendBuf::acquire(2, false)).collect();
+            drop(general);
+            assert_eq!(
+                SEND_BUF_POOL.with(|pool| {
+                    pool.borrow().bounded_allocations.load(Ordering::Acquire)
+                }),
+                0
+            );
+
+            let bounded: Vec<_> =
+                (0..3).map(|_| PooledSendBuf::acquire(2, true)).collect();
+            assert!(bounded[..2].iter().all(|buf| buf.len() == SEND_BUFFER_SIZE));
+            assert_eq!(bounded[2].len(), TRANSIENT_SEND_BUFFER_SIZE);
+            assert_eq!(
+                SEND_BUF_POOL.with(|pool| {
+                    pool.borrow().bounded_allocations.load(Ordering::Acquire)
+                }),
+                2
+            );
         })
         .join()
         .unwrap();

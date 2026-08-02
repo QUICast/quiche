@@ -58,6 +58,10 @@ pub(crate) struct Config {
     pub has_ippktinfo: bool,
     pub has_ipv6pktinfo: bool,
     pub pool_send_buffer: bool,
+    pub send_buffer_pool_capacity_per_worker: usize,
+    pub hard_bound_send_buffer_pool: bool,
+    pub incoming_packet_queue_capacity: usize,
+    pub connection_map_command_capacity: Option<usize>,
     pub transport_egress_stats: Option<QuicTransportEgressStats>,
 }
 
@@ -72,6 +76,14 @@ impl Config {
         params: &ConnectionParams, socket_capabilities: SocketCapabilities,
     ) -> QuicResult<Self> {
         let quic_settings = &params.settings;
+        if quic_settings.send_buffer_pool_capacity_per_worker >
+            crate::quic::SEND_BUF_POOL_HARD_CAP
+        {
+            return Err("send buffer pool capacity exceeds hard ceiling".into());
+        }
+        if quic_settings.connection_map_command_capacity == Some(0) {
+            return Err("connection map command capacity must be nonzero".into());
+        }
         let keylog_path = match &quic_settings.keylog_file {
             Some(f) => Some(Cow::Borrowed(f.as_ref())),
             None => std::env::var_os("SSLKEYLOGFILE").map(Cow::from),
@@ -114,6 +126,15 @@ impl Config {
             has_ippktinfo,
             has_ipv6pktinfo,
             pool_send_buffer: quic_settings.pool_send_buffer,
+            send_buffer_pool_capacity_per_worker: quic_settings
+                .send_buffer_pool_capacity_per_worker,
+            hard_bound_send_buffer_pool: quic_settings
+                .hard_bound_send_buffer_pool,
+            incoming_packet_queue_capacity: quic_settings
+                .incoming_packet_queue_capacity
+                .max(1),
+            connection_map_command_capacity: quic_settings
+                .connection_map_command_capacity,
             transport_egress_stats: params.transport_egress_stats.clone(),
         })
     }
@@ -157,6 +178,32 @@ fn make_quiche_config(
         quic_settings.dgram_recv_max_queue_len,
         quic_settings.dgram_send_max_queue_len,
     );
+    config.set_dgram_queue_retention_limits(
+        quiche::DatagramQueueLimits {
+            max_items: quic_settings.dgram_recv_max_queue_len,
+            max_bytes: quic_settings.dgram_recv_max_queue_bytes,
+            max_allocation_bytes: quic_settings
+                .dgram_recv_max_queue_allocation_bytes,
+        },
+        quiche::DatagramQueueLimits {
+            max_items: quic_settings.dgram_send_max_queue_len,
+            max_bytes: quic_settings.dgram_send_max_queue_bytes,
+            max_allocation_bytes: quic_settings
+                .dgram_send_max_queue_allocation_bytes,
+        },
+    );
+    config.set_stream_send_retention_limits(quiche::StreamSendRetentionLimits {
+        max_bytes: quic_settings.stream_send_max_retained_bytes,
+        max_chunks: quic_settings.stream_send_max_retained_chunks,
+    });
+    config.set_max_tracked_sent_packets_per_path(
+        quic_settings.max_tracked_sent_packets_per_path,
+    );
+    config.set_max_tracked_frames_per_packet(
+        quic_settings.max_tracked_frames_per_packet,
+    );
+    config.set_retain_path_events(quic_settings.retain_path_events);
+    config.set_max_source_connection_ids(quic_settings.max_source_connection_ids);
     config.enable_reset_stream_at(quic_settings.enable_reset_stream_at);
     config
         .enable_multicast_server_support(quic_settings.multicast_server_support);

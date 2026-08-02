@@ -46,10 +46,13 @@ use tokio::sync::mpsc;
 use super::connection::InitialQuicConnection;
 use super::connection::QuicConnectionParams;
 use super::io::worker::WriterConfig;
+use super::router::connection_map_command_channel;
 use super::router::ConnectionMapCommand;
+use super::router::ConnectionMapCommandReceiver;
 use crate::metrics::Metrics;
 use crate::quic::HandshakeInfo;
 use crate::quic::Incoming;
+use crate::quic::IncomingPacketSource;
 use crate::quic::QuicheConnection;
 use crate::socket::Socket;
 
@@ -101,7 +104,7 @@ where
         ..
     } = tx_socket;
     let (shutdown_tx, worker_shutdown_rx) = mpsc::channel(1);
-    let (conn_map_cmd_tx, conn_map_rx) = mpsc::unbounded_channel();
+    let (conn_map_cmd_tx, conn_map_rx) = connection_map_command_channel(None);
 
     let scid = quiche_conn.source_id().into_owned();
 
@@ -115,7 +118,17 @@ where
         with_pktinfo: false,
         // Match the default `QuicSettings::pool_send_buffer` (pooling on).
         pool_send_buffer: true,
+        send_buffer_pool_capacity:
+            crate::quic::io::worker::SEND_BUF_POOL_HARD_CAP,
+        hard_bound_send_buffer_pool: false,
+        incoming_packet_queue_capacity:
+            crate::quic::io::worker::DEFAULT_INCOMING_QUEUE_SIZE,
+        connection_map_command_capacity: None,
+        qlog_enabled: false,
+        keylog_enabled: false,
     };
+    let io_worker_memory_profile =
+        writer_cfg.memory_profile(IncomingPacketSource::RawApplication);
 
     let conn_params = QuicConnectionParams {
         writer_cfg,
@@ -128,7 +141,8 @@ where
         transport_egress_stats: None,
         #[cfg(feature = "perf-quic-listener-metrics")]
         init_rx_time: None,
-        handshake_info: HandshakeInfo::new(Instant::now(), None),
+        handshake_info: HandshakeInfo::new(Instant::now(), None)
+            .with_io_worker_memory_profile(io_worker_memory_profile),
         quiche_conn: Box::new(quiche_conn),
         socket,
         local_addr,
@@ -151,7 +165,7 @@ where
 ///
 /// This receiver also fires if the corresponding sender has been dropped
 /// without a `CONNECTION_CLOSE` frame on the connection.
-pub struct ConnCloseReceiver(mpsc::UnboundedReceiver<ConnectionMapCommand>);
+pub struct ConnCloseReceiver(ConnectionMapCommandReceiver);
 
 impl ConnCloseReceiver {
     /// Polls to receive a `connection closed` notification.

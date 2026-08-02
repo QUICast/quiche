@@ -181,6 +181,45 @@ pub enum WebTransportSessionEvent {
     },
 }
 
+/// Level-triggered terminal result for one exact WebTransport session.
+///
+/// Each wait operation resolves once, but observing a result does not consume
+/// the terminal fact. A later wait returns the same result while the session
+/// remains in the native registry. Once the session is collected, later waits
+/// return [`Self::StaleSession`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WebTransportSessionTerminalOutcome {
+    /// The session terminated with its exact existing close reason.
+    Terminated {
+        /// CONNECT stream ID and WebTransport Session ID.
+        session_id: u64,
+        /// Terminal close reason retained by the session registry.
+        reason: WebTransportSessionCloseReason,
+    },
+    /// A pending CONNECT received a final non-successful response.
+    SessionRejected {
+        /// CONNECT stream ID and WebTransport Session ID.
+        session_id: u64,
+        /// Final HTTP response status.
+        status: u16,
+    },
+    /// The Session ID has never identified a native session on this connection.
+    UnknownSession {
+        /// Requested Session ID.
+        session_id: u64,
+    },
+    /// The session existed but its registry entry has been collected.
+    StaleSession {
+        /// Requested Session ID.
+        session_id: u64,
+    },
+    /// The configured connection or per-session waiter bound is full.
+    ResourceLimit {
+        /// Requested Session ID.
+        session_id: u64,
+    },
+}
+
 /// Error returned before a local WebTransport close command is queued.
 #[derive(Debug, Eq, PartialEq)]
 pub enum WebTransportSessionCloseError {
@@ -380,6 +419,9 @@ pub enum WebTransportStreamWriteLeaseLimit {
     Payload,
     /// The owner-declared retained bytes exceeded the per-lease memory bound.
     RetainedBytes,
+    /// The concrete owner would make the transport-owned operation allocation
+    /// exceed its configured inline-size bound.
+    OwnerBytes,
 }
 
 /// An owned payload that can be borrowed for one synchronous stream write.
@@ -788,6 +830,16 @@ pub struct WebTransportRetentionStats {
     pub stream_open_waiter_work_total: u64,
     /// Open requests rejected by configured aggregate or per-session bounds.
     pub stream_open_waiter_saturation_total: u64,
+    /// Pending exact-session terminal registrations.
+    pub session_terminal_waiters: usize,
+    /// Configured aggregate session-terminal waiter bound.
+    pub max_session_terminal_waiters: usize,
+    /// Configured per-session terminal waiter bound.
+    pub max_session_terminal_waiters_per_session: usize,
+    /// Terminal delivery and cancellation-pruning work performed.
+    pub session_terminal_waiter_work_total: u64,
+    /// Registrations rejected by aggregate or per-session bounds.
+    pub session_terminal_waiter_saturation_total: u64,
     /// Pending local opens plus one-shot stream and Datagram registrations.
     pub waiters: usize,
     /// Pending selected-stream send-terminal registrations.
@@ -1382,33 +1434,88 @@ pub enum WebTransportDatagramReadyOutcome {
 #[derive(Clone)]
 pub struct WebTransportController {
     sender: mpsc::Sender<WebTransportCommand>,
-    open_cancellation_pending: Arc<AtomicBool>,
+    cancellation_pending: Arc<AtomicBool>,
     max_stream_write_bytes: usize,
     max_stream_write_lease_retained_bytes: usize,
+    max_stream_write_lease_owner_bytes: usize,
     max_stream_read_bytes: usize,
     max_datagram_send_bytes: usize,
     max_datagram_send_allocation_bytes: usize,
+    max_datagram_prefixed_allocation_bytes: usize,
     write_lease_accounting: Arc<WriteLeaseAccounting>,
+}
+
+pub(crate) struct WebTransportControllerLimits {
+    pub(crate) max_stream_write_bytes: usize,
+    pub(crate) max_stream_write_lease_retained_bytes: usize,
+    pub(crate) max_stream_write_lease_owner_bytes: usize,
+    pub(crate) max_stream_read_bytes: usize,
+    pub(crate) max_datagram_send_allocation_bytes: usize,
+    pub(crate) max_datagram_prefixed_allocation_bytes: usize,
 }
 
 impl WebTransportController {
     pub(crate) fn new(
-        sender: mpsc::Sender<WebTransportCommand>, max_stream_write_bytes: usize,
-        max_stream_write_lease_retained_bytes: usize,
-        max_stream_read_bytes: usize, max_datagram_send_allocation_bytes: usize,
+        sender: mpsc::Sender<WebTransportCommand>,
+        limits: WebTransportControllerLimits,
         write_lease_accounting: Arc<WriteLeaseAccounting>,
-        open_cancellation_pending: Arc<AtomicBool>,
+        cancellation_pending: Arc<AtomicBool>,
     ) -> Self {
         Self {
             sender,
-            open_cancellation_pending,
-            max_stream_write_bytes,
-            max_stream_write_lease_retained_bytes,
-            max_stream_read_bytes,
+            cancellation_pending,
+            max_stream_write_bytes: limits.max_stream_write_bytes,
+            max_stream_write_lease_retained_bytes: limits
+                .max_stream_write_lease_retained_bytes,
+            max_stream_write_lease_owner_bytes: limits
+                .max_stream_write_lease_owner_bytes,
+            max_stream_read_bytes: limits.max_stream_read_bytes,
             max_datagram_send_bytes: datagram_socket::MAX_DATAGRAM_SIZE,
-            max_datagram_send_allocation_bytes,
+            max_datagram_send_allocation_bytes: limits
+                .max_datagram_send_allocation_bytes,
+            max_datagram_prefixed_allocation_bytes: limits
+                .max_datagram_prefixed_allocation_bytes,
             write_lease_accounting,
         }
+    }
+
+    /// Waits for one exact native WebTransport session to become terminal.
+    ///
+    /// This operation consumes no QUIC stream credit and is level-triggered:
+    /// dropping a pending future does not consume the eventual terminal fact,
+    /// and a later registration observes a retained fact immediately. The
+    /// session registry retains that fact only until normal session collection.
+    pub async fn wait_session_terminal(
+        &self, session_id: u64,
+    ) -> WebTransportSessionTerminalOutcome {
+        let connection_closed =
+            || WebTransportSessionTerminalOutcome::Terminated {
+                session_id,
+                reason: WebTransportSessionCloseReason::ConnectionClosed,
+            };
+        let Ok(permit) = self.sender.reserve().await else {
+            return connection_closed();
+        };
+        let (response, recv) = oneshot::channel();
+        permit.send(WebTransportCommand::WaitSessionTerminal {
+            session_id,
+            response,
+        });
+        let mut cancellation = CancellationWake::new(
+            self.sender.clone(),
+            Arc::clone(&self.cancellation_pending),
+        );
+        let outcome = recv.await.unwrap_or_else(|_| connection_closed());
+        cancellation.disarm();
+        outcome
+    }
+
+    fn prefixed_datagram_allocation(
+        &self, datagram: &DgramBuffer,
+    ) -> Option<usize> {
+        datagram.required_capacity_with_headroom(
+            crate::buf_factory::BufFactory::DGRAM_HEADROOM,
+        )
     }
 
     /// Opens a bidirectional stream for an exact active Session ID.
@@ -1455,9 +1562,9 @@ impl WebTransportController {
             direction,
             response,
         });
-        let mut cancellation = OpenCancellationWake::new(
+        let mut cancellation = CancellationWake::new(
             self.sender.clone(),
-            Arc::clone(&self.open_cancellation_pending),
+            Arc::clone(&self.cancellation_pending),
         );
         let outcome =
             recv.await
@@ -1632,6 +1739,15 @@ impl WebTransportController {
                 WebTransportStreamWriteLeaseLimit::Payload,
                 self.max_stream_write_bytes,
                 payload_len,
+            ));
+        }
+        let owner_bytes = std::mem::size_of::<L>();
+        if owner_bytes > self.max_stream_write_lease_owner_bytes {
+            self.write_lease_accounting.record_too_large();
+            return Err((
+                WebTransportStreamWriteLeaseLimit::OwnerBytes,
+                self.max_stream_write_lease_owner_bytes,
+                owner_bytes,
             ));
         }
         let retained_bytes = lease.retained_bytes();
@@ -1871,6 +1987,16 @@ impl WebTransportController {
                 datagram,
             };
         }
+        let prefixed_allocation = self
+            .prefixed_datagram_allocation(&datagram)
+            .unwrap_or(usize::MAX);
+        if prefixed_allocation > self.max_datagram_prefixed_allocation_bytes {
+            return WebTransportDatagramSendOutcome::AllocationTooLarge {
+                max: self.max_datagram_prefixed_allocation_bytes,
+                allocated: prefixed_allocation,
+                datagram,
+            };
+        }
         let Ok(permit) = self.sender.reserve().await else {
             return WebTransportDatagramSendOutcome::Rejected {
                 error: WebTransportDatagramError::ConnectionClosed,
@@ -1901,6 +2027,16 @@ impl WebTransportController {
             return Err(WebTransportDatagramSendOutcome::AllocationTooLarge {
                 max: self.max_datagram_send_allocation_bytes,
                 allocated: datagram.allocated_capacity(),
+                datagram,
+            });
+        }
+        let prefixed_allocation = self
+            .prefixed_datagram_allocation(&datagram)
+            .unwrap_or(usize::MAX);
+        if prefixed_allocation > self.max_datagram_prefixed_allocation_bytes {
+            return Err(WebTransportDatagramSendOutcome::AllocationTooLarge {
+                max: self.max_datagram_prefixed_allocation_bytes,
+                allocated: prefixed_allocation,
                 datagram,
             });
         }
@@ -2034,13 +2170,13 @@ impl WebTransportController {
     }
 }
 
-struct OpenCancellationWake {
+struct CancellationWake {
     sender: mpsc::Sender<WebTransportCommand>,
     pending: Arc<AtomicBool>,
     armed: bool,
 }
 
-impl OpenCancellationWake {
+impl CancellationWake {
     fn new(
         sender: mpsc::Sender<WebTransportCommand>, pending: Arc<AtomicBool>,
     ) -> Self {
@@ -2056,7 +2192,7 @@ impl OpenCancellationWake {
     }
 }
 
-impl Drop for OpenCancellationWake {
+impl Drop for CancellationWake {
     fn drop(&mut self) {
         if !self.armed {
             return;
@@ -2064,7 +2200,7 @@ impl Drop for OpenCancellationWake {
         self.pending.store(true, Ordering::Release);
         let _ = self
             .sender
-            .try_send(WebTransportCommand::PruneCancelledOpens);
+            .try_send(WebTransportCommand::PruneCancelledWaiters);
     }
 }
 
@@ -2245,6 +2381,10 @@ where
 }
 
 pub(crate) enum WebTransportCommand {
+    WaitSessionTerminal {
+        session_id: u64,
+        response: oneshot::Sender<WebTransportSessionTerminalOutcome>,
+    },
     Open {
         session_id: u64,
         direction: WebTransportStreamDirection,
@@ -2273,7 +2413,7 @@ pub(crate) enum WebTransportCommand {
         stream_id: u64,
         response: oneshot::Sender<WebTransportStreamSendTerminalOutcome>,
     },
-    PruneCancelledOpens,
+    PruneCancelledWaiters,
     Reset {
         session_id: u64,
         stream_id: u64,
@@ -2319,6 +2459,17 @@ pub(crate) enum WebTransportCommand {
 impl WebTransportCommand {
     pub(crate) fn reject_connection_closed(self) {
         match self {
+            Self::WaitSessionTerminal {
+                session_id,
+                response,
+            } => {
+                let _ = response.send(
+                    WebTransportSessionTerminalOutcome::Terminated {
+                        session_id,
+                        reason: WebTransportSessionCloseReason::ConnectionClosed,
+                    },
+                );
+            },
             Self::Open { response, .. } => {
                 let _ = response.send(WebTransportOpenStreamOutcome::Rejected(
                     WebTransportSelectionError::ConnectionClosed,
@@ -2360,7 +2511,7 @@ impl WebTransportCommand {
                     },
                 );
             },
-            Self::PruneCancelledOpens => {},
+            Self::PruneCancelledWaiters => {},
             Self::Reset { response, .. } | Self::Stop { response, .. } => {
                 let _ =
                     response.send(WebTransportStreamControlOutcome::Rejected(
@@ -2653,7 +2804,11 @@ impl VarIntDecoder {
 pub(crate) struct RuntimeLimits {
     pub(crate) max_pending_streams: usize,
     pub(crate) max_pending_streams_per_session: usize,
+    pub(crate) max_active_streams: usize,
+    pub(crate) max_active_streams_per_session: usize,
     pub(crate) max_stream_waiters: usize,
+    pub(crate) max_session_terminal_waiters: usize,
+    pub(crate) max_session_terminal_waiters_per_session: usize,
     pub(crate) max_send_terminal_waiters: usize,
     pub(crate) max_send_terminal_waiters_per_session: usize,
     pub(crate) max_datagram_waiters: usize,
@@ -2664,10 +2819,52 @@ pub(crate) struct RuntimeLimits {
     pub(crate) max_pending_datagram_allocation_bytes: usize,
     pub(crate) max_pending_datagram_allocation_bytes_per_session: usize,
     pub(crate) max_pending_datagram_age: Duration,
+    pub(crate) max_datagram_prefixed_allocation_bytes: usize,
     pub(crate) command_capacity: usize,
     pub(crate) max_command_payload_bytes: usize,
     pub(crate) max_write_lease_retained_bytes_per_lease: usize,
     pub(crate) max_session_work_per_callback: usize,
+}
+
+pub(super) fn runtime_metadata_upper_bound(
+    max_pending_streams: usize, max_active_streams: usize,
+    max_stream_waiters: usize, max_send_terminal_waiters: usize,
+    max_session_terminal_waiters: usize,
+) -> Option<usize> {
+    let pending_value_bytes = std::mem::size_of::<AssociatedStream>()
+        .checked_add(std::mem::size_of::<OpeningStream>())?
+        .checked_add(std::mem::size_of::<PendingOpen>())?
+        .checked_add(std::mem::size_of::<u64>() * 4)?;
+    let active_value_bytes = std::mem::size_of::<OwnedStream>()
+        .checked_add(std::mem::size_of::<u64>() * 2)?;
+    let waiter_value_bytes =
+        std::mem::size_of::<oneshot::Sender<WebTransportStreamReadyOutcome>>()
+            .checked_add(std::mem::size_of::<u64>())?;
+    let terminal_value_bytes = std::mem::size_of::<SendTerminalWaiter>()
+        .checked_add(std::mem::size_of::<LatchedSendTerminal>())?
+        .checked_add(std::mem::size_of::<u64>() * 3)?;
+    let session_terminal_value_bytes = std::mem::size_of::<
+        oneshot::Sender<WebTransportSessionTerminalOutcome>,
+    >()
+    .checked_add(std::mem::size_of::<WebTransportSessionTerminalOutcome>())?
+    .checked_add(MAX_CLOSE_MESSAGE_LEN)?
+    .checked_add(std::mem::size_of::<u64>())?;
+    let fixed_session_bytes = std::mem::size_of::<Session>()
+        .checked_add(std::mem::size_of::<SessionWork>())?
+        .checked_add(MAX_CLOSE_MESSAGE_LEN)?;
+
+    max_pending_streams
+        .checked_mul(pending_value_bytes)?
+        .checked_add(max_active_streams.checked_mul(active_value_bytes)?)?
+        .checked_add(max_stream_waiters.checked_mul(waiter_value_bytes)?)?
+        .checked_add(
+            max_send_terminal_waiters.checked_mul(terminal_value_bytes)?,
+        )?
+        .checked_add(
+            max_session_terminal_waiters
+                .checked_mul(session_terminal_value_bytes)?,
+        )?
+        .checked_add(fixed_session_bytes)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2755,6 +2952,29 @@ struct SessionDatagrams {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+enum SessionTerminalFact {
+    Terminated(WebTransportSessionCloseReason),
+    Rejected { status: u16 },
+}
+
+impl SessionTerminalFact {
+    fn outcome(&self, session_id: u64) -> WebTransportSessionTerminalOutcome {
+        match self {
+            Self::Terminated(reason) =>
+                WebTransportSessionTerminalOutcome::Terminated {
+                    session_id,
+                    reason: reason.clone(),
+                },
+            Self::Rejected { status } =>
+                WebTransportSessionTerminalOutcome::SessionRejected {
+                    session_id,
+                    status: *status,
+                },
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum SessionPhase {
     Pending,
     Active,
@@ -2762,7 +2982,7 @@ enum SessionPhase {
         close: CloseCapsule,
         output_queued: bool,
     },
-    Terminal,
+    Terminal(SessionTerminalFact),
 }
 
 #[derive(Debug)]
@@ -2820,9 +3040,14 @@ pub(crate) struct Runtime {
     uni_open_credit_ready: bool,
     pending_open_turn_bidi: bool,
     open_work_pending_turn: bool,
-    open_cancellation_pending: Arc<AtomicBool>,
+    cancellation_pending: Arc<AtomicBool>,
     stream_open_waiter_work_total: u64,
     stream_open_waiter_saturation_total: u64,
+    session_terminal_waiters:
+        BTreeMap<u64, Vec<oneshot::Sender<WebTransportSessionTerminalOutcome>>>,
+    session_terminal_waiter_count: usize,
+    session_terminal_waiter_work_total: u64,
+    session_terminal_waiter_saturation_total: u64,
     readable_waiters:
         BTreeMap<u64, oneshot::Sender<WebTransportStreamReadyOutcome>>,
     writable_waiters:
@@ -2871,7 +3096,7 @@ impl Runtime {
 
     pub(crate) fn new_with_write_lease_accounting(
         limits: RuntimeLimits, write_lease_accounting: Arc<WriteLeaseAccounting>,
-        open_cancellation_pending: Arc<AtomicBool>,
+        cancellation_pending: Arc<AtomicBool>,
     ) -> Self {
         Self {
             limits: RuntimeLimits {
@@ -2883,6 +3108,12 @@ impl Runtime {
                     .max(1),
                 max_send_terminal_waiters_per_session: limits
                     .max_send_terminal_waiters_per_session
+                    .max(1),
+                max_session_terminal_waiters: limits
+                    .max_session_terminal_waiters
+                    .max(1),
+                max_session_terminal_waiters_per_session: limits
+                    .max_session_terminal_waiters_per_session
                     .max(1),
                 ..limits
             },
@@ -2901,9 +3132,13 @@ impl Runtime {
             uni_open_credit_ready: false,
             pending_open_turn_bidi: true,
             open_work_pending_turn: true,
-            open_cancellation_pending,
+            cancellation_pending,
             stream_open_waiter_work_total: 0,
             stream_open_waiter_saturation_total: 0,
+            session_terminal_waiters: BTreeMap::new(),
+            session_terminal_waiter_count: 0,
+            session_terminal_waiter_work_total: 0,
+            session_terminal_waiter_saturation_total: 0,
             readable_waiters: BTreeMap::new(),
             writable_waiters: BTreeMap::new(),
             send_terminal_waiters: BTreeMap::new(),
@@ -2977,7 +3212,7 @@ impl Runtime {
     pub(crate) fn can_start_session(&self) -> bool {
         self.sessions
             .values()
-            .all(|session| matches!(session.phase, SessionPhase::Terminal))
+            .all(|session| matches!(session.phase, SessionPhase::Terminal(_)))
     }
 
     pub(crate) fn make_application_visible(
@@ -3041,7 +3276,8 @@ impl Runtime {
             return Vec::new();
         }
         let application_visible = session.application_visible;
-        session.phase = SessionPhase::Terminal;
+        let terminal = SessionTerminalFact::Rejected { status };
+        session.phase = SessionPhase::Terminal(terminal.clone());
         session.terminal_stream_error = WT_BUFFERED_STREAM_REJECTED;
         self.work.push_back(SessionWork::Terminate {
             session_id,
@@ -3056,6 +3292,7 @@ impl Runtime {
             session_id,
             WebTransportSelectionError::TerminalSession,
         );
+        self.finish_session_terminal_waiters(session_id, &terminal);
         self.finish_send_terminal_session(session_id);
         self.release_datagrams(session_id);
         application_visible
@@ -3182,7 +3419,7 @@ impl Runtime {
         let Some(session) = self.sessions.get_mut(&session_id) else {
             return Vec::new();
         };
-        if session.phase == SessionPhase::Terminal {
+        if matches!(session.phase, SessionPhase::Terminal(_)) {
             return Vec::new();
         }
         let application_visible = session.application_visible;
@@ -3193,7 +3430,8 @@ impl Runtime {
         };
         session.peer_close_received =
             matches!(reason, WebTransportSessionCloseReason::Peer { .. });
-        session.phase = SessionPhase::Terminal;
+        let terminal = SessionTerminalFact::Terminated(reason.clone());
+        session.phase = SessionPhase::Terminal(terminal.clone());
         session.terminal_stream_error = error_code;
         self.deferred_responses.remove(&session_id);
         self.work.push_back(SessionWork::Terminate {
@@ -3209,6 +3447,7 @@ impl Runtime {
             session_id,
             WebTransportSelectionError::TerminalSession,
         );
+        self.finish_session_terminal_waiters(session_id, &terminal);
         self.finish_send_terminal_session(session_id);
         self.release_datagrams(session_id);
         application_visible
@@ -3231,8 +3470,13 @@ impl Runtime {
 
         match self.sessions.get(&stream.session_id).map(|s| &s.phase) {
             Some(SessionPhase::Active) => {
-                self.admit_stream(stream);
-                vec![associated_event(stream)]
+                if self.can_admit_stream(stream.session_id) {
+                    self.admit_stream(stream);
+                    vec![associated_event(stream)]
+                } else {
+                    shutdown_stream(qconn, stream, WT_BUFFERED_STREAM_REJECTED);
+                    Vec::new()
+                }
             },
             Some(SessionPhase::Pending) => {
                 if self.can_buffer(stream.session_id) {
@@ -3242,7 +3486,7 @@ impl Runtime {
                 }
                 Vec::new()
             },
-            Some(SessionPhase::Closing { .. } | SessionPhase::Terminal) => {
+            Some(SessionPhase::Closing { .. } | SessionPhase::Terminal(_)) => {
                 shutdown_stream(qconn, stream, WT_SESSION_GONE);
                 Vec::new()
             },
@@ -3263,7 +3507,36 @@ impl Runtime {
     fn can_buffer(&self, session_id: u64) -> bool {
         self.provisional_stream_count() < self.limits.max_pending_streams &&
             self.provisional_stream_count_for_session(session_id) <
-                self.limits.max_pending_streams_per_session
+                self.limits.max_pending_streams_per_session &&
+            self.active_and_provisional_stream_count() <
+                self.limits.max_active_streams &&
+            self.active_and_provisional_stream_count_for_session(session_id) <
+                self.limits.max_active_streams_per_session
+    }
+
+    fn can_admit_stream(&self, session_id: u64) -> bool {
+        self.stream_sessions.len() < self.limits.max_active_streams &&
+            self.active_stream_count_for_session(session_id) <
+                self.limits.max_active_streams_per_session
+    }
+
+    fn active_and_provisional_stream_count(&self) -> usize {
+        self.stream_sessions
+            .len()
+            .saturating_add(self.provisional_stream_count())
+    }
+
+    fn active_and_provisional_stream_count_for_session(
+        &self, session_id: u64,
+    ) -> usize {
+        self.active_stream_count_for_session(session_id)
+            .saturating_add(self.provisional_stream_count_for_session(session_id))
+    }
+
+    fn active_stream_count_for_session(&self, session_id: u64) -> usize {
+        self.sessions
+            .get(&session_id)
+            .map_or(0, |session| session.streams.len())
     }
 
     fn provisional_stream_count(&self) -> usize {
@@ -3339,7 +3612,7 @@ impl Runtime {
             return Vec::new();
         };
         session.connect_recv_closed = true;
-        if session.phase == SessionPhase::Terminal {
+        if matches!(session.phase, SessionPhase::Terminal(_)) {
             session.peer_close_fin_pending = session.peer_close_received;
             self.work.push_back(SessionWork::Terminate {
                 session_id,
@@ -3363,7 +3636,7 @@ impl Runtime {
             return;
         };
         session.connect_send_closed = true;
-        if session.phase == SessionPhase::Terminal {
+        if matches!(session.phase, SessionPhase::Terminal(_)) {
             self.work.push_back(SessionWork::Terminate {
                 session_id,
                 error_code: session.terminal_stream_error,
@@ -3405,6 +3678,87 @@ impl Runtime {
             .is_some_and(|session| session.phase == SessionPhase::Pending)
     }
 
+    fn wait_session_terminal(
+        &mut self, qconn: &QuicheConnection, session_id: u64,
+        response: oneshot::Sender<WebTransportSessionTerminalOutcome>,
+    ) {
+        if response.is_closed() {
+            return;
+        }
+        let Some(session) = self.sessions.get(&session_id) else {
+            let outcome = if qconn.stream_closed(session_id) {
+                WebTransportSessionTerminalOutcome::StaleSession { session_id }
+            } else {
+                WebTransportSessionTerminalOutcome::UnknownSession { session_id }
+            };
+            let _ = response.send(outcome);
+            return;
+        };
+        if let SessionPhase::Terminal(terminal) = &session.phase {
+            let _ = response.send(terminal.outcome(session_id));
+            self.session_terminal_waiter_work_total =
+                self.session_terminal_waiter_work_total.saturating_add(1);
+            return;
+        }
+
+        let session_waiters = self
+            .session_terminal_waiters
+            .get(&session_id)
+            .map_or(0, Vec::len);
+        if self.session_terminal_waiter_count >=
+            self.limits.max_session_terminal_waiters ||
+            session_waiters >=
+                self.limits.max_session_terminal_waiters_per_session
+        {
+            self.session_terminal_waiter_saturation_total = self
+                .session_terminal_waiter_saturation_total
+                .saturating_add(1);
+            let _ = response.send(
+                WebTransportSessionTerminalOutcome::ResourceLimit { session_id },
+            );
+            return;
+        }
+
+        self.session_terminal_waiters
+            .entry(session_id)
+            .or_default()
+            .push(response);
+        self.session_terminal_waiter_count += 1;
+    }
+
+    fn finish_session_terminal_waiters(
+        &mut self, session_id: u64, terminal: &SessionTerminalFact,
+    ) {
+        let Some(waiters) = self.session_terminal_waiters.remove(&session_id)
+        else {
+            return;
+        };
+        self.session_terminal_waiter_count = self
+            .session_terminal_waiter_count
+            .saturating_sub(waiters.len());
+        self.session_terminal_waiter_work_total = self
+            .session_terminal_waiter_work_total
+            .saturating_add(waiters.len() as u64);
+        for response in waiters {
+            let _ = response.send(terminal.outcome(session_id));
+        }
+    }
+
+    fn prune_cancelled_session_terminal_waiters(&mut self) {
+        let mut removed = 0usize;
+        self.session_terminal_waiters.retain(|_, waiters| {
+            let before = waiters.len();
+            waiters.retain(|response| !response.is_closed());
+            removed = removed.saturating_add(before - waiters.len());
+            !waiters.is_empty()
+        });
+        self.session_terminal_waiter_count =
+            self.session_terminal_waiter_count.saturating_sub(removed);
+        self.session_terminal_waiter_work_total = self
+            .session_terminal_waiter_work_total
+            .saturating_add(removed as u64);
+    }
+
     #[cfg(test)]
     pub(crate) fn is_closing(&self, session_id: u64) -> bool {
         self.sessions.get(&session_id).is_some_and(|session| {
@@ -3421,7 +3775,7 @@ impl Runtime {
                 Some(WebTransportSelectionError::PendingSession),
             Some(SessionPhase::Closing { .. }) =>
                 Some(WebTransportSelectionError::ClosingSession),
-            Some(SessionPhase::Terminal) =>
+            Some(SessionPhase::Terminal(_)) =>
                 Some(WebTransportSelectionError::TerminalSession),
             None if qconn.stream_closed(session_id) =>
                 Some(WebTransportSelectionError::StaleSession),
@@ -3487,10 +3841,15 @@ impl Runtime {
         qconn: &mut QuicheConnection, command: WebTransportCommand,
         queued_command_items: usize,
     ) {
-        if self.open_cancellation_pending.swap(false, Ordering::AcqRel) {
+        if self.cancellation_pending.swap(false, Ordering::AcqRel) {
             self.prune_cancelled_pending_opens();
+            self.prune_cancelled_session_terminal_waiters();
         }
         match command {
+            WebTransportCommand::WaitSessionTerminal {
+                session_id,
+                response,
+            } => self.wait_session_terminal(qconn, session_id, response),
             WebTransportCommand::Open {
                 session_id,
                 direction,
@@ -3525,7 +3884,7 @@ impl Runtime {
             } => self.retire_stream_send_terminal(
                 qconn, session_id, stream_id, response,
             ),
-            WebTransportCommand::PruneCancelledOpens => {},
+            WebTransportCommand::PruneCancelledWaiters => {},
             WebTransportCommand::Reset {
                 session_id,
                 stream_id,
@@ -3589,7 +3948,11 @@ impl Runtime {
         self.prune_cancelled_pending_opens();
         if self.provisional_stream_count() >= self.limits.max_pending_streams ||
             self.provisional_stream_count_for_session(session_id) >=
-                self.limits.max_pending_streams_per_session
+                self.limits.max_pending_streams_per_session ||
+            self.active_and_provisional_stream_count() >=
+                self.limits.max_active_streams ||
+            self.active_and_provisional_stream_count_for_session(session_id) >=
+                self.limits.max_active_streams_per_session
         {
             self.stream_open_waiter_saturation_total =
                 self.stream_open_waiter_saturation_total.saturating_add(1);
@@ -3966,6 +4329,22 @@ impl Runtime {
 
             if let Some(error_code) = opening.reset_after_prefix {
                 shutdown_opening_stream(qconn, &opening.reservation, error_code);
+                self.finish_opening(session_id, stream_id);
+                continue;
+            }
+
+            if !self.can_admit_stream(session_id) {
+                if let Some(response) = opening.response.take() {
+                    let _ =
+                        response.send(WebTransportOpenStreamOutcome::Rejected(
+                            WebTransportSelectionError::ResourceLimit,
+                        ));
+                }
+                shutdown_opening_stream(
+                    qconn,
+                    &opening.reservation,
+                    WT_BUFFERED_STREAM_REJECTED,
+                );
                 self.finish_opening(session_id, stream_id);
                 continue;
             }
@@ -4691,11 +5070,15 @@ impl Runtime {
             return;
         }
 
-        let mut output = Vec::with_capacity(max_bytes).limit(max_bytes);
-        let outcome = match qconn.stream_recv_buf(stream_id, &mut output) {
-            Ok((_, fin)) => WebTransportStreamReadOutcome::Data {
-                data: Bytes::from(output.into_inner()),
-                fin,
+        let mut output = vec![0; max_bytes].into_boxed_slice();
+        let outcome = match qconn.stream_recv(stream_id, &mut output) {
+            Ok((read, fin)) => {
+                let mut output = output.into_vec();
+                output.truncate(read);
+                WebTransportStreamReadOutcome::Data {
+                    data: Bytes::from(output),
+                    fin,
+                }
             },
             Err(quiche::Error::Done) => WebTransportStreamReadOutcome::Blocked,
             Err(quiche::Error::StreamReset(error_code)) =>
@@ -4793,6 +5176,7 @@ impl Runtime {
             qconn,
             session_id / 4,
             datagram,
+            self.limits.max_datagram_prefixed_allocation_bytes,
         ) {
             Ok(()) => WebTransportDatagramSendOutcome::Accepted,
             Err((quiche::Error::Done, datagram)) =>
@@ -5233,8 +5617,16 @@ impl Runtime {
                         .remove_pending(session_id, stream_id)
                         .expect("pending indexes stay synchronized");
                     if self.is_active(session_id) {
-                        self.admit_stream(stream);
-                        events.push(associated_event(stream));
+                        if self.can_admit_stream(session_id) {
+                            self.admit_stream(stream);
+                            events.push(associated_event(stream));
+                        } else {
+                            shutdown_stream(
+                                qconn,
+                                stream,
+                                WT_BUFFERED_STREAM_REJECTED,
+                            );
+                        }
                     } else {
                         shutdown_stream(qconn, stream, WT_SESSION_GONE);
                     }
@@ -5380,7 +5772,7 @@ impl Runtime {
 
     fn remove_terminal_if_closed(&mut self, session_id: u64) {
         let remove = self.sessions.get(&session_id).is_some_and(|session| {
-            session.phase == SessionPhase::Terminal &&
+            matches!(session.phase, SessionPhase::Terminal(_)) &&
                 session.connect_recv_closed &&
                 session.connect_send_closed
         });
@@ -5449,6 +5841,7 @@ impl Runtime {
             .readable_waiters
             .len()
             .saturating_add(self.writable_waiters.len())
+            .saturating_add(self.session_terminal_waiter_count)
             .saturating_add(self.send_terminal_waiters.len())
             .saturating_add(self.pending_open_count())
             .saturating_add(self.datagram_readable_waiters.len())
@@ -5468,6 +5861,7 @@ impl Runtime {
             .saturating_add(self.pending_open_count())
             .saturating_add(self.pending_opens_per_session.len())
             .saturating_add(waiters)
+            .saturating_add(self.session_terminal_waiters.len())
             .saturating_add(self.send_terminal_waiters_per_session.len())
             .saturating_add(self.send_terminal_states.len())
             .saturating_add(self.send_terminal_states_per_session.len())
@@ -5496,6 +5890,17 @@ impl Runtime {
             stream_open_waiter_work_total: self.stream_open_waiter_work_total,
             stream_open_waiter_saturation_total: self
                 .stream_open_waiter_saturation_total,
+            session_terminal_waiters: self.session_terminal_waiter_count,
+            max_session_terminal_waiters: self
+                .limits
+                .max_session_terminal_waiters,
+            max_session_terminal_waiters_per_session: self
+                .limits
+                .max_session_terminal_waiters_per_session,
+            session_terminal_waiter_work_total: self
+                .session_terminal_waiter_work_total,
+            session_terminal_waiter_saturation_total: self
+                .session_terminal_waiter_saturation_total,
             waiters,
             send_terminal_waiters: self.send_terminal_waiters.len(),
             send_terminal_states: self.send_terminal_states.len(),
@@ -5540,13 +5945,39 @@ impl Runtime {
         }
     }
 
+    pub(crate) fn settle_command_on_connection_close(
+        &self, command: WebTransportCommand,
+    ) {
+        let WebTransportCommand::WaitSessionTerminal {
+            session_id,
+            response,
+        } = command
+        else {
+            command.reject_connection_closed();
+            return;
+        };
+        let outcome = self
+            .sessions
+            .get(&session_id)
+            .and_then(|session| match &session.phase {
+                SessionPhase::Terminal(terminal) =>
+                    Some(terminal.outcome(session_id)),
+                _ => None,
+            })
+            .unwrap_or(WebTransportSessionTerminalOutcome::Terminated {
+                session_id,
+                reason: WebTransportSessionCloseReason::ConnectionClosed,
+            });
+        let _ = response.send(outcome);
+    }
+
     pub(crate) fn clear(&mut self) -> Vec<WebTransportSessionEvent> {
         let events = self
             .sessions
             .iter()
             .filter(|(_, session)| {
                 session.application_visible &&
-                    session.phase != SessionPhase::Terminal
+                    !matches!(session.phase, SessionPhase::Terminal(_))
             })
             .map(|(&session_id, _)| WebTransportSessionEvent::Terminated {
                 session_id,
@@ -5580,6 +6011,19 @@ impl Runtime {
                 WebTransportSelectionError::ConnectionClosed,
             ));
         }
+        for (session_id, waiters) in
+            std::mem::take(&mut self.session_terminal_waiters)
+        {
+            for response in waiters {
+                let _ = response.send(
+                    WebTransportSessionTerminalOutcome::Terminated {
+                        session_id,
+                        reason: WebTransportSessionCloseReason::ConnectionClosed,
+                    },
+                );
+            }
+        }
+        self.session_terminal_waiter_count = 0;
         for (stream_id, waiter) in std::mem::take(&mut self.send_terminal_waiters)
         {
             let outcome = self.send_terminal_states.get(&stream_id).map_or(
@@ -5770,6 +6214,7 @@ fn shutdown_owned_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use assert_matches::assert_matches;
 
     type DriverPipe = quiche::test_utils::Pipe<crate::buf_factory::BufFactory>;
 
@@ -5779,7 +6224,11 @@ mod tests {
         RuntimeLimits {
             max_pending_streams: global,
             max_pending_streams_per_session: per_session,
+            max_active_streams: global,
+            max_active_streams_per_session: per_session,
             max_stream_waiters: global,
+            max_session_terminal_waiters: global,
+            max_session_terminal_waiters_per_session: per_session,
             max_send_terminal_waiters: global,
             max_send_terminal_waiters_per_session: per_session,
             max_datagram_waiters: 2,
@@ -5790,6 +6239,7 @@ mod tests {
             max_pending_datagram_allocation_bytes: 1024 * 1024,
             max_pending_datagram_allocation_bytes_per_session: 256 * 1024,
             max_pending_datagram_age: Duration::from_secs(5),
+            max_datagram_prefixed_allocation_bytes: 64 * 1024 + 16,
             command_capacity: 256,
             max_command_payload_bytes: 64 * 1024,
             max_write_lease_retained_bytes_per_lease: 64 * 1024,
@@ -5865,6 +6315,220 @@ mod tests {
             webtransport_error_from_http3(WT_APPLICATION_ERROR_LAST + 1),
             None
         );
+    }
+
+    #[test]
+    fn session_terminal_wait_is_level_triggered_across_live_phases() {
+        let mut pipe = pipe();
+        let mut runtime = Runtime::new(runtime_limits(8, 8, 8));
+        assert_matches!(
+            runtime.observe_request(0, true),
+            RequestObservation::Observed(_)
+        );
+
+        let (response, mut waited) = oneshot::channel();
+        runtime.wait_session_terminal(&pipe.server, 0, response);
+        assert_matches!(
+            waited.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        );
+        assert_eq!(runtime.session_terminal_waiter_count, 1);
+
+        runtime.activate(0);
+        let idle_work = runtime.session_terminal_waiter_work_total;
+        for _ in 0..128 {
+            runtime.process_work(&mut pipe.server);
+        }
+        assert_eq!(runtime.session_terminal_waiter_work_total, idle_work);
+        assert_matches!(
+            waited.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        );
+        assert!(runtime.begin_local_close(
+            0,
+            CloseCapsule::new(17, "closing".to_string()).unwrap(),
+        ));
+        assert_matches!(
+            waited.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        );
+
+        let reason = WebTransportSessionCloseReason::Local {
+            error_code: 17,
+            message: "closing".to_string(),
+        };
+        assert_eq!(runtime.terminate(0, reason.clone()), vec![
+            WebTransportSessionEvent::Terminated {
+                session_id: 0,
+                reason: reason.clone(),
+            }
+        ]);
+        assert_eq!(
+            waited.try_recv().unwrap(),
+            WebTransportSessionTerminalOutcome::Terminated {
+                session_id: 0,
+                reason: reason.clone(),
+            }
+        );
+        assert_eq!(runtime.session_terminal_waiter_count, 0);
+        assert!(runtime
+            .terminate(0, WebTransportSessionCloseReason::ProtocolError)
+            .is_empty());
+
+        let (late_response, mut late) = oneshot::channel();
+        runtime.wait_session_terminal(&pipe.server, 0, late_response);
+        assert_eq!(
+            late.try_recv().unwrap(),
+            WebTransportSessionTerminalOutcome::Terminated {
+                session_id: 0,
+                reason,
+            }
+        );
+        assert!(runtime.pending_bidi_opens.is_empty());
+        assert!(runtime.pending_uni_opens.is_empty());
+        assert!(runtime.opening_streams.is_empty());
+    }
+
+    #[test]
+    fn session_terminal_wait_cancellation_and_bounds_are_exact() {
+        let pipe = pipe();
+        let mut limits = runtime_limits(8, 8, 8);
+        limits.max_session_terminal_waiters = 2;
+        limits.max_session_terminal_waiters_per_session = 2;
+        let mut runtime = Runtime::new(limits);
+        assert_matches!(
+            runtime.observe_request(0, true),
+            RequestObservation::Observed(_)
+        );
+
+        let (first_response, first) = oneshot::channel();
+        runtime.wait_session_terminal(&pipe.server, 0, first_response);
+        let (second_response, mut second) = oneshot::channel();
+        runtime.wait_session_terminal(&pipe.server, 0, second_response);
+        let (full_response, mut full) = oneshot::channel();
+        runtime.wait_session_terminal(&pipe.server, 0, full_response);
+        assert_eq!(
+            full.try_recv().unwrap(),
+            WebTransportSessionTerminalOutcome::ResourceLimit { session_id: 0 }
+        );
+        assert_eq!(runtime.session_terminal_waiter_count, 2);
+
+        drop(first);
+        runtime.prune_cancelled_session_terminal_waiters();
+        assert_eq!(runtime.session_terminal_waiter_count, 1);
+
+        let (replacement_response, mut replacement) = oneshot::channel();
+        runtime.wait_session_terminal(&pipe.server, 0, replacement_response);
+        assert_eq!(runtime.session_terminal_waiter_count, 2);
+        runtime.terminate(0, WebTransportSessionCloseReason::Clean);
+        assert_eq!(
+            second.try_recv().unwrap(),
+            WebTransportSessionTerminalOutcome::Terminated {
+                session_id: 0,
+                reason: WebTransportSessionCloseReason::Clean,
+            }
+        );
+        assert_eq!(
+            replacement.try_recv().unwrap(),
+            WebTransportSessionTerminalOutcome::Terminated {
+                session_id: 0,
+                reason: WebTransportSessionCloseReason::Clean,
+            }
+        );
+        assert_eq!(runtime.session_terminal_waiter_count, 0);
+        assert_eq!(runtime.session_terminal_waiter_saturation_total, 1);
+
+        let mut per_session_limits = runtime_limits(8, 8, 8);
+        per_session_limits.max_session_terminal_waiters = 2;
+        per_session_limits.max_session_terminal_waiters_per_session = 1;
+        let mut per_session = Runtime::new(per_session_limits);
+        per_session.observe_request(0, true);
+        let (admitted_response, admitted) = oneshot::channel();
+        per_session.wait_session_terminal(&pipe.server, 0, admitted_response);
+        let (limited_response, mut limited) = oneshot::channel();
+        per_session.wait_session_terminal(&pipe.server, 0, limited_response);
+        assert_eq!(
+            limited.try_recv().unwrap(),
+            WebTransportSessionTerminalOutcome::ResourceLimit { session_id: 0 }
+        );
+        drop(admitted);
+        per_session.prune_cancelled_session_terminal_waiters();
+        assert_eq!(per_session.session_terminal_waiter_count, 0);
+        assert_eq!(per_session.session_terminal_waiter_saturation_total, 1);
+    }
+
+    #[test]
+    fn session_terminal_wait_reports_rejection_unknown_and_connection_close() {
+        let pipe = pipe();
+        let mut runtime = Runtime::new(runtime_limits(8, 8, 8));
+
+        let (unknown_response, mut unknown) = oneshot::channel();
+        runtime.wait_session_terminal(&pipe.server, 4000, unknown_response);
+        assert_eq!(
+            unknown.try_recv().unwrap(),
+            WebTransportSessionTerminalOutcome::UnknownSession {
+                session_id: 4000,
+            }
+        );
+
+        runtime.observe_request(0, true);
+        let (rejected_response, mut rejected) = oneshot::channel();
+        runtime.wait_session_terminal(&pipe.server, 0, rejected_response);
+        runtime.reject(0, 403);
+        assert_eq!(
+            rejected.try_recv().unwrap(),
+            WebTransportSessionTerminalOutcome::SessionRejected {
+                session_id: 0,
+                status: 403,
+            }
+        );
+
+        runtime.observe_request(4, true);
+        let (closed_response, mut closed) = oneshot::channel();
+        runtime.wait_session_terminal(&pipe.server, 4, closed_response);
+        runtime.clear();
+        assert_eq!(
+            closed.try_recv().unwrap(),
+            WebTransportSessionTerminalOutcome::Terminated {
+                session_id: 4,
+                reason: WebTransportSessionCloseReason::ConnectionClosed,
+            }
+        );
+        assert_eq!(runtime.session_terminal_waiter_count, 0);
+        assert!(runtime.session_terminal_waiters.is_empty());
+
+        // Keep the mutable pipe live to exercise Runtime::clear() with a real
+        // established connection rather than a detached fixture.
+        assert!(!pipe.server.is_closed());
+    }
+
+    #[test]
+    fn session_terminal_waiter_state_is_reclaimed_across_turnover() {
+        let mut pipe = pipe();
+        let mut runtime = Runtime::new(runtime_limits(2, 2, 8));
+
+        for ordinal in 0..4096 {
+            let session_id = ordinal * 4;
+            runtime.observe_request(session_id, true);
+            let (response, mut waited) = oneshot::channel();
+            runtime.wait_session_terminal(&pipe.server, session_id, response);
+            runtime.terminate(session_id, WebTransportSessionCloseReason::Clean);
+            assert_eq!(
+                waited.try_recv().unwrap(),
+                WebTransportSessionTerminalOutcome::Terminated {
+                    session_id,
+                    reason: WebTransportSessionCloseReason::Clean,
+                }
+            );
+            runtime.mark_connect_recv_closed(session_id);
+            runtime.mark_connect_send_closed(session_id);
+            runtime.process_work(&mut pipe.server);
+            assert!(!runtime.sessions.contains_key(&session_id));
+            assert_eq!(runtime.session_terminal_waiter_count, 0);
+            assert!(runtime.session_terminal_waiters.is_empty());
+        }
+
+        assert_eq!(runtime.session_terminal_waiter_saturation_total, 0);
     }
 
     #[test]

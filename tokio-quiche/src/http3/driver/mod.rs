@@ -24,6 +24,7 @@
 // NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 // SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+mod bounded;
 mod client;
 /// Wrapper for running HTTP/3 connections.
 pub mod connection;
@@ -68,6 +69,7 @@ use tokio::sync::mpsc::error::TrySendError;
 use tokio_stream::StreamExt;
 use tokio_util::sync::PollSender;
 
+use self::bounded::PreparedBoundedProfile;
 use self::hooks::DriverHooks;
 use self::hooks::InboundHeaders;
 use self::streams::FlowCtx;
@@ -96,6 +98,30 @@ use crate::quic::QuicheConnection;
 use crate::ApplicationOverQuic;
 use crate::QuicResult;
 
+pub use self::bounded::AppliedBoundedWebTransportProfile;
+pub use self::bounded::BoundedClientWebTransportController;
+pub use self::bounded::BoundedClientWebTransportEvent;
+pub use self::bounded::BoundedConnectAdmissionError;
+pub use self::bounded::BoundedConnectHeaderError;
+pub use self::bounded::BoundedConnectHeaderLimits;
+pub use self::bounded::BoundedConnectHeaders;
+pub use self::bounded::BoundedConnectResponseError;
+pub use self::bounded::BoundedDynamicMemoryComponents;
+pub use self::bounded::BoundedFixedPoolCeilings;
+pub use self::bounded::BoundedMemoryEnvelope;
+pub use self::bounded::BoundedProfileError;
+pub use self::bounded::BoundedSelectedWebTransportController;
+pub use self::bounded::BoundedSelectedWebTransportLimits;
+pub use self::bounded::BoundedSelectedWebTransportSettings;
+pub use self::bounded::BoundedServerConnectResponder;
+pub use self::bounded::BoundedServerWebTransportController;
+pub use self::bounded::BoundedServerWebTransportEvent;
+pub use self::bounded::BoundedWebTransportDatagrams;
+pub use self::bounded::BoundedWebTransportEndpoint;
+pub use self::bounded::BoundedWebTransportIoSettings;
+pub use self::bounded::BoundedWebTransportQuicSettings;
+pub use self::bounded::BoundedWebTransportRevision;
+pub use self::bounded::H3ConnectionMode;
 pub use self::client::ClientEventStream;
 pub use self::client::ClientH3Command;
 pub use self::client::ClientH3Controller;
@@ -125,6 +151,7 @@ pub use self::webtransport::WebTransportSelectionError;
 pub use self::webtransport::WebTransportSessionCloseError;
 pub use self::webtransport::WebTransportSessionCloseReason;
 pub use self::webtransport::WebTransportSessionEvent;
+pub use self::webtransport::WebTransportSessionTerminalOutcome;
 pub use self::webtransport::WebTransportStreamControlOutcome;
 pub use self::webtransport::WebTransportStreamReadOutcome;
 pub use self::webtransport::WebTransportStreamReadyOutcome;
@@ -274,6 +301,30 @@ fn response_status(headers: &[h3::Header]) -> Option<u16> {
     std::str::from_utf8(value).ok()?.parse().ok()
 }
 
+fn validate_bounded_outbound_frame(
+    frame: &OutboundFrame, limits: BoundedConnectHeaderLimits,
+) -> H3ConnectionResult<()> {
+    let allowed = match frame {
+        OutboundFrame::Headers(headers, priority) =>
+            priority.is_none() &&
+                limits.validate(headers).is_ok() &&
+                response_status(headers).is_some_and(|status| status >= 200),
+        OutboundFrame::Body(data, fin) => data.is_empty() && *fin,
+        OutboundFrame::WebTransportClose { .. } => true,
+        OutboundFrame::Datagram(..) |
+        OutboundFrame::Trailers(..) |
+        OutboundFrame::PeerStreamError |
+        OutboundFrame::FlowShutdown { .. } => false,
+    };
+    if allowed {
+        Ok(())
+    } else {
+        Err(H3ConnectionError::BoundedProfile(
+            BoundedProfileError::ForbiddenOperation("legacy OutboundFrame"),
+        ))
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WebTransportRequirements {
     Pending,
@@ -341,6 +392,8 @@ pub enum H3ConnectionError {
     PostAcceptTimeout,
     /// The bounded application event lane was saturated.
     EventQueueOverloaded,
+    /// The live connection did not match its immutable bounded profile.
+    BoundedProfile(BoundedProfileError),
 }
 
 impl From<h3::Error> for H3ConnectionError {
@@ -365,6 +418,7 @@ impl fmt::Display for H3ConnectionError {
             Self::NonexistentStream => &"nonexistent stream",
             Self::PostAcceptTimeout => &"post accept timeout hit",
             Self::EventQueueOverloaded => &"H3 event queue overloaded",
+            Self::BoundedProfile(error) => error,
         };
 
         write!(f, "H3ConnectionError: {s}")
@@ -682,6 +736,8 @@ pub struct H3Driver<H: DriverHooks> {
     raw_streams: BTreeSet<u64>,
     /// Scratch space for receiving raw QUIC stream data.
     raw_stream_recv_buf: Vec<u8>,
+    /// Immutable opt-in bounded profile verified at establishment.
+    bounded_profile: Option<PreparedBoundedProfile>,
     /// Native draft-16 session owner, present only when explicitly enabled.
     webtransport: Option<WebTransportRuntime>,
     /// Bounded native WebTransport selected-I/O command receiver.
@@ -713,7 +769,25 @@ impl<H: DriverHooks> H3Driver<H> {
     /// [`InitialQuicConnection`](crate::InitialQuicConnection)'s `start`
     /// method.
     pub fn new(http3_settings: Http3Settings) -> (Self, H3Controller<H>) {
-        let (dgram_send, dgram_recv) = mpsc::channel(FLOW_CAPACITY);
+        Self::new_inner(http3_settings, None)
+    }
+
+    /// Returns the immutable operating mode selected at construction.
+    pub fn mode(&self) -> H3ConnectionMode {
+        if self.bounded_profile.is_some() {
+            H3ConnectionMode::BoundedSelectedWebTransport
+        } else {
+            H3ConnectionMode::GeneralH3
+        }
+    }
+
+    fn new_inner(
+        http3_settings: Http3Settings,
+        bounded_profile: Option<PreparedBoundedProfile>,
+    ) -> (Self, H3Controller<H>) {
+        let bounded = bounded_profile.is_some();
+        let dgram_capacity = if bounded { 1 } else { FLOW_CAPACITY };
+        let (dgram_send, dgram_recv) = mpsc::channel(dgram_capacity);
         let command_capacity = http3_settings.command_capacity.max(1);
         let event_capacity = http3_settings.event_capacity.max(1);
         let (cmd_sender, cmd_recv) = mpsc::channel(command_capacity);
@@ -736,7 +810,7 @@ impl<H: DriverHooks> H3Driver<H> {
                         http3_settings
                             .webtransport_max_stream_write_lease_retained_bytes,
                     ));
-                let open_cancellation_pending =
+                let cancellation_pending =
                     Arc::new(std::sync::atomic::AtomicBool::new(false));
                 (
                     Some(WebTransportRuntime::new_with_write_lease_accounting(
@@ -745,8 +819,17 @@ impl<H: DriverHooks> H3Driver<H> {
                                 .webtransport_max_pending_streams,
                             max_pending_streams_per_session: http3_settings
                                 .webtransport_max_pending_streams_per_session,
+                            max_active_streams: http3_settings
+                                .webtransport_max_active_streams,
+                            max_active_streams_per_session: http3_settings
+                                .webtransport_max_active_streams_per_session,
                             max_stream_waiters: http3_settings
                                 .webtransport_max_stream_waiters,
+                            max_session_terminal_waiters: http3_settings
+                                .webtransport_max_session_terminal_waiters,
+                            max_session_terminal_waiters_per_session:
+                                http3_settings
+                                    .webtransport_max_session_terminal_waiters_per_session,
                             max_send_terminal_waiters: http3_settings
                                 .webtransport_max_send_terminal_waiters,
                             max_send_terminal_waiters_per_session: http3_settings
@@ -770,6 +853,9 @@ impl<H: DriverHooks> H3Driver<H> {
                                     .webtransport_max_pending_datagram_allocation_bytes_per_session,
                             max_pending_datagram_age: http3_settings
                                 .webtransport_max_pending_datagram_age,
+                            max_datagram_prefixed_allocation_bytes:
+                                http3_settings
+                                    .webtransport_max_datagram_prefixed_allocation_bytes,
                             command_capacity: http3_settings
                                 .webtransport_command_capacity
                                 .max(1),
@@ -791,19 +877,27 @@ impl<H: DriverHooks> H3Driver<H> {
                                 .webtransport_max_session_work_per_callback,
                         },
                         Arc::clone(&write_lease_accounting),
-                        Arc::clone(&open_cancellation_pending),
+                        Arc::clone(&cancellation_pending),
                     )),
                     Some(recv),
                     Some(WebTransportController::new(
                         sender,
-                        http3_settings.webtransport_max_stream_write_bytes,
-                        http3_settings
-                            .webtransport_max_stream_write_lease_retained_bytes,
-                        http3_settings.webtransport_max_stream_read_bytes,
-                        http3_settings
-                            .webtransport_max_datagram_send_allocation_bytes,
+                        webtransport::WebTransportControllerLimits {
+                            max_stream_write_bytes: http3_settings
+                                .webtransport_max_stream_write_bytes,
+                            max_stream_write_lease_retained_bytes: http3_settings
+                                .webtransport_max_stream_write_lease_retained_bytes,
+                            max_stream_write_lease_owner_bytes: http3_settings
+                                .webtransport_max_stream_write_lease_owner_bytes,
+                            max_stream_read_bytes: http3_settings
+                                .webtransport_max_stream_read_bytes,
+                            max_datagram_send_allocation_bytes: http3_settings
+                                .webtransport_max_datagram_send_allocation_bytes,
+                            max_datagram_prefixed_allocation_bytes: http3_settings
+                                .webtransport_max_datagram_prefixed_allocation_bytes,
+                        },
                         write_lease_accounting,
-                        open_cancellation_pending,
+                        cancellation_pending,
                     )),
                 )
             } else {
@@ -828,7 +922,12 @@ impl<H: DriverHooks> H3Driver<H> {
                 max_stream_seen: 0,
                 body_recv_buf: None,
                 raw_streams: BTreeSet::new(),
-                raw_stream_recv_buf: vec![0u8; BufFactory::MAX_BUF_SIZE],
+                raw_stream_recv_buf: if bounded {
+                    Vec::new()
+                } else {
+                    vec![0u8; BufFactory::MAX_BUF_SIZE]
+                },
+                bounded_profile,
                 webtransport,
                 webtransport_cmd_recv,
                 webtransport_command_turn: true,
@@ -857,6 +956,22 @@ impl<H: DriverHooks> H3Driver<H> {
     /// to the paired [H3Controller].
     pub(crate) fn self_cmd_sender(&self) -> &mpsc::Sender<H::Command> {
         &self.cmd_sender
+    }
+
+    pub(crate) fn bounded_connect_header_limits(
+        &self,
+    ) -> Option<BoundedConnectHeaderLimits> {
+        self.bounded_profile
+            .as_ref()
+            .map(|profile| profile.applied.connect_headers)
+    }
+
+    pub(crate) fn stream_channel_capacity(&self) -> usize {
+        if self.bounded_profile.is_some() {
+            1
+        } else {
+            STREAM_CAPACITY
+        }
     }
 
     fn ensure_event_lane_available(&self) -> H3ConnectionResult<()> {
@@ -1452,12 +1567,14 @@ impl<H: DriverHooks> H3Driver<H> {
         }
 
         // capture the peer settings and forward it
+        let bounded = self.bounded_profile.is_some();
         if let Some(settings) = self.conn_mut()?.peer_settings_raw() {
-            let incoming_settings = H3Event::IncomingSettings {
-                settings: settings.to_vec(),
-            };
-
-            self.h3_event_sender.send(incoming_settings.into())?;
+            if !bounded {
+                let incoming_settings = H3Event::IncomingSettings {
+                    settings: settings.to_vec(),
+                };
+                self.h3_event_sender.send(incoming_settings.into())?;
+            }
 
             self.settings_received_and_forwarded = true;
             H::settings_received(self, qconn)?;
@@ -1978,6 +2095,13 @@ impl<H: DriverHooks> H3Driver<H> {
     fn handle_core_command(
         &mut self, qconn: &mut QuicheConnection, cmd: H3Command,
     ) -> H3ConnectionResult<()> {
+        if self.bounded_profile.is_some() &&
+            !matches!(&cmd, H3Command::CloseWebTransportSession { .. })
+        {
+            return Err(H3ConnectionError::BoundedProfile(
+                BoundedProfileError::ForbiddenOperation("generic H3 command"),
+            ));
+        }
         match cmd {
             H3Command::QuicCmd(cmd) => cmd.execute(qconn),
             H3Command::GoAway => {
@@ -2177,7 +2301,11 @@ impl<H: DriverHooks> H3Driver<H> {
         };
         recv.close();
         while let Ok(command) = recv.try_recv() {
-            command.reject_connection_closed();
+            if let Some(runtime) = self.webtransport.as_ref() {
+                runtime.settle_command_on_connection_close(command);
+            } else {
+                command.reject_connection_closed();
+            }
         }
     }
 
@@ -2282,6 +2410,7 @@ impl<H: DriverHooks> H3Driver<H> {
     fn process_writable_stream(
         &mut self, qconn: &mut QuicheConnection, stream_id: u64,
     ) -> H3ConnectionResult<()> {
+        let bounded_connect_headers = self.bounded_connect_header_limits();
         let emit_h3_headers_flushed =
             H::should_emit_h3_headers_flushed(self, stream_id);
         let h3_event_sender = self.h3_event_sender.clone();
@@ -2292,6 +2421,11 @@ impl<H: DriverHooks> H3Driver<H> {
         };
 
         loop {
+            if let (Some(limits), Some(frame)) =
+                (bounded_connect_headers, ctx.queued_frame.as_ref())
+            {
+                validate_bounded_outbound_frame(frame, limits)?;
+            }
             // Process each writable frame, queue the next frame for processing
             // and shut down any errored streams.
             match Self::process_write_frame(
@@ -2503,11 +2637,28 @@ impl<H: DriverHooks> ApplicationOverQuic for H3Driver<H> {
         &mut self, quiche_conn: &mut QuicheConnection,
         handshake_info: &HandshakeInfo,
     ) -> QuicResult<()> {
+        let bounded_applied = if let Some(profile) = self.bounded_profile.as_ref()
+        {
+            match profile.verify_live(quiche_conn, handshake_info) {
+                Ok(applied) => Some(applied),
+                Err(error) => {
+                    profile.record_live(Err(error.clone()));
+                    return Err(H3ConnectionError::BoundedProfile(error).into());
+                },
+            }
+        } else {
+            None
+        };
         let conn = h3::Connection::with_transport(quiche_conn, &self.h3_config)?;
         self.conn = Some(conn);
 
         H::conn_established(self, quiche_conn, handshake_info)?;
         self.ensure_event_lane_available()?;
+        if let (Some(profile), Some(applied)) =
+            (self.bounded_profile.as_ref(), bounded_applied)
+        {
+            profile.record_live(Ok(applied));
+        }
         Ok(())
     }
 
@@ -2626,11 +2777,11 @@ impl<H: DriverHooks> ApplicationOverQuic for H3Driver<H> {
 
         Self::record_quiche_error(quiche_conn, metrics);
 
+        self.close_webtransport_command_lane();
         if let Some(runtime) = self.webtransport.as_mut() {
             let events = runtime.clear();
             let _ = Self::emit_webtransport_events(&self.h3_event_sender, events);
         }
-        self.close_webtransport_command_lane();
 
         if self.h3_event_sender.overloaded() {
             let _ = quiche_conn.close(
@@ -2720,10 +2871,10 @@ impl<H: DriverHooks> ApplicationOverQuic for H3Driver<H> {
 
 impl<H: DriverHooks> Drop for H3Driver<H> {
     fn drop(&mut self) {
+        self.close_webtransport_command_lane();
         if let Some(runtime) = self.webtransport.as_mut() {
             let _ = runtime.clear();
         }
-        self.close_webtransport_command_lane();
         for stream in self.stream_map.values() {
             stream
                 .audit_stats
@@ -2953,8 +3104,9 @@ impl<H: DriverHooks> H3Controller<H> {
         }
         match self.cmd_sender.try_reserve() {
             Ok(permit) => {
-                let mut message = message;
-                message.shrink_to_fit();
+                // `into_boxed_str()` discards caller over-capacity before the
+                // accepted command can retain the message.
+                let message = message.into_boxed_str().into_string();
                 permit.send(
                     H3Command::CloseWebTransportSession {
                         session_id,

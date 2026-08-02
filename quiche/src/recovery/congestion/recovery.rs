@@ -324,14 +324,25 @@ impl RecoveryEpoch {
 
             self.sent_packets.pop_front();
         }
+        if self.sent_packets.is_empty() {
+            self.sent_packets.shrink_to_fit();
+        }
     }
 
     /// Returns the next lost frame, trying ACK-based lost frames first,
     /// then PTO-based lost frames.
     fn next_lost_frame(&mut self) -> Option<frame::Frame> {
-        self.lost_frames_ack
-            .pop()
-            .or_else(|| self.lost_frames_pto.pop())
+        let frame = self.lost_frames_ack.pop().or_else(|| {
+            self.lost_frames_ack.shrink_to_fit();
+            self.lost_frames_pto.pop()
+        });
+        if self.lost_frames_ack.is_empty() {
+            self.lost_frames_ack.shrink_to_fit();
+        }
+        if self.lost_frames_pto.is_empty() {
+            self.lost_frames_pto.shrink_to_fit();
+        }
+        frame
     }
 
     /// Returns true if there are any lost frames (ACK or PTO).
@@ -349,6 +360,8 @@ impl RecoveryEpoch {
     fn clear_lost_frames(&mut self) {
         self.lost_frames_ack.clear();
         self.lost_frames_pto.clear();
+        self.lost_frames_ack.shrink_to_fit();
+        self.lost_frames_pto.shrink_to_fit();
     }
 }
 
@@ -581,7 +594,12 @@ impl RecoveryOps for LegacyRecovery {
     }
 
     fn next_acked_frame(&mut self, epoch: Epoch) -> Option<frame::Frame> {
-        self.epochs[epoch].acked_frames.pop()
+        let frames = &mut self.epochs[epoch].acked_frames;
+        let frame = frames.pop();
+        if frames.is_empty() {
+            frames.shrink_to_fit();
+        }
+        frame
     }
 
     fn next_lost_frame(&mut self, epoch: Epoch) -> Option<frame::Frame> {
@@ -856,8 +874,10 @@ impl RecoveryOps for LegacyRecovery {
         self.bytes_in_flight.saturating_subtract(unacked_bytes, now);
 
         epoch.sent_packets.clear();
+        epoch.sent_packets.shrink_to_fit();
         epoch.clear_lost_frames();
         epoch.acked_frames.clear();
+        epoch.acked_frames.shrink_to_fit();
 
         epoch.time_of_last_ack_eliciting_packet = None;
         epoch.loss_time = None;
@@ -962,7 +982,6 @@ impl RecoveryOps for LegacyRecovery {
         )
     }
 
-    #[cfg(test)]
     fn sent_packets_len(&self, epoch: Epoch) -> usize {
         self.epochs[epoch].sent_packets.len()
     }

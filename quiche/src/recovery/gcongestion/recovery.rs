@@ -347,6 +347,9 @@ impl RecoveryEpoch {
         {
             self.sent_packets.pop_front();
         }
+        if self.sent_packets.is_empty() {
+            self.sent_packets.shrink_to_fit();
+        }
     }
 
     fn least_unacked(&self) -> u64 {
@@ -366,9 +369,17 @@ impl RecoveryEpoch {
     /// Returns the next lost frame, trying ACK-based lost frames first,
     /// then PTO-based lost frames.
     fn next_lost_frame(&mut self) -> Option<frame::Frame> {
-        self.lost_frames_ack
-            .pop_front()
-            .or_else(|| self.lost_frames_pto.pop_front())
+        let frame = self.lost_frames_ack.pop_front().or_else(|| {
+            self.lost_frames_ack.shrink_to_fit();
+            self.lost_frames_pto.pop_front()
+        });
+        if self.lost_frames_ack.is_empty() {
+            self.lost_frames_ack.shrink_to_fit();
+        }
+        if self.lost_frames_pto.is_empty() {
+            self.lost_frames_pto.shrink_to_fit();
+        }
+        frame
     }
 
     /// Returns true if there are any lost frames (ACK or PTO).
@@ -386,6 +397,8 @@ impl RecoveryEpoch {
     fn clear_lost_frames(&mut self) {
         self.lost_frames_ack.clear();
         self.lost_frames_pto.clear();
+        self.lost_frames_ack.shrink_to_fit();
+        self.lost_frames_pto.shrink_to_fit();
     }
 }
 
@@ -701,7 +714,12 @@ impl RecoveryOps for GRecovery {
     }
 
     fn next_acked_frame(&mut self, epoch: packet::Epoch) -> Option<frame::Frame> {
-        self.epochs[epoch].acked_frames.pop_front()
+        let frames = &mut self.epochs[epoch].acked_frames;
+        let frame = frames.pop_front();
+        if frames.is_empty() {
+            frames.shrink_to_fit();
+        }
+        frame
     }
 
     fn next_lost_frame(&mut self, epoch: packet::Epoch) -> Option<frame::Frame> {
@@ -1100,7 +1118,6 @@ impl RecoveryOps for GRecovery {
         self.pacer.on_app_limited(self.bytes_in_flight.get())
     }
 
-    #[cfg(test)]
     fn sent_packets_len(&self, epoch: packet::Epoch) -> usize {
         self.epochs[epoch].sent_packets.len()
     }

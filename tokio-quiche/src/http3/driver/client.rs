@@ -55,7 +55,6 @@ use super::RequestSender;
 use super::StreamCtx;
 use super::WebTransportRequirements;
 use super::WebTransportSessionCloseReason;
-use super::STREAM_CAPACITY;
 use crate::http3::settings::Http3Settings;
 use crate::quic::HandshakeInfo;
 use crate::quic::QuicCommand;
@@ -210,6 +209,13 @@ impl ClientHooks {
         driver: &mut H3Driver<Self>, qconn: &mut QuicheConnection,
         request: NewClientRequest,
     ) -> H3ConnectionResult<()> {
+        if let Some(limits) = driver.bounded_connect_header_limits() {
+            if limits.validate(&request.headers).is_err() ||
+                !webtransport::is_connect(&request.headers)
+            {
+                return Err(H3ConnectionError::H3(h3::Error::MessageError));
+            }
+        }
         let body_finished = request.body_writer.is_none();
         let is_webtransport = driver.webtransport.is_some() &&
             webtransport::is_connect(&request.headers);
@@ -282,7 +288,7 @@ impl ClientHooks {
 
         // log::info!("sent h3 request"; "stream_id" => stream_id);
         let (mut stream_ctx, send, recv) =
-            StreamCtx::new(stream_id, STREAM_CAPACITY);
+            StreamCtx::new(stream_id, driver.stream_channel_capacity());
 
         if body_finished {
             // `send_request()` already sent FIN for bodyless requests, so
@@ -424,6 +430,30 @@ impl DriverHooks for ClientHooks {
         driver: &mut H3Driver<Self>, qconn: &mut QuicheConnection,
         headers: InboundHeaders,
     ) -> H3ConnectionResult<()> {
+        if driver
+            .bounded_connect_header_limits()
+            .is_some_and(|limits| limits.validate(&headers.headers).is_err())
+        {
+            if let Some(runtime) = driver.webtransport.as_mut() {
+                let events = runtime.terminate(
+                    headers.stream_id,
+                    WebTransportSessionCloseReason::ProtocolError,
+                );
+                H3Driver::<Self>::emit_webtransport_events(
+                    &driver.h3_event_sender,
+                    events,
+                )?;
+            }
+            driver.hooks.pending_requests.remove(&headers.stream_id);
+            return driver.shutdown_stream(
+                qconn,
+                headers.stream_id,
+                super::StreamShutdown::Both {
+                    read_error_code: h3::WireErrorCode::MessageError as u64,
+                    write_error_code: h3::WireErrorCode::MessageError as u64,
+                },
+            );
+        }
         let is_webtransport = driver
             .webtransport
             .as_ref()

@@ -30,6 +30,7 @@ pub(crate) mod connector;
 use super::connection::ConnectionMap;
 use super::connection::HandshakeInfo;
 use super::connection::Incoming;
+use super::connection::IncomingPacketSource;
 use super::connection::InitialQuicConnection;
 use super::connection::QuicConnectionParams;
 use super::io::worker::WriterConfig;
@@ -48,8 +49,11 @@ use quiche::MAX_CONN_ID_LEN;
 use std::default::Default;
 use std::future::Future;
 use std::io;
+use std::mem::size_of;
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::task::ready;
 use std::task::Context;
@@ -76,6 +80,20 @@ type ConnStream<Tx, M> = mpsc::Receiver<io::Result<InitialQuicConnection<Tx, M>>
 const PACKET_RX_YIELD_AFTER: usize = 30;
 /// `ConnectionMapCommand` processing batch size to amortize receive operations.
 const CONN_MAP_CMD_BATCH_SIZE: usize = 128;
+
+pub(crate) const fn connection_map_command_slot_upper_bound() -> usize {
+    size_of::<ConnectionMapCommand>() + 2 * MAX_CONN_ID_LEN + usize::BITS as usize
+}
+
+pub(crate) const fn connection_map_command_batch_upper_bound() -> usize {
+    CONN_MAP_CMD_BATCH_SIZE * size_of::<ConnectionMapCommand>()
+}
+
+pub(crate) const fn connection_map_entry_upper_bound() -> usize {
+    MAX_CONN_ID_LEN +
+        size_of::<mpsc::Sender<Incoming>>() +
+        12 * size_of::<usize>()
+}
 
 #[cfg(feature = "perf-quic-listener-metrics")]
 mod listener_stage_timer {
@@ -127,6 +145,138 @@ pub enum ConnectionMapCommand {
     UnmapCid(ConnectionId<'static>),
 }
 
+/// Sender for listener Connection-ID map updates.
+///
+/// Managed bounded endpoints use a finite nonblocking lane. Saturation latches
+/// an endpoint-fatal overload so stale CID mappings cannot accumulate.
+#[derive(Clone)]
+pub struct ConnectionMapCommandSender {
+    inner: ConnectionMapCommandSenderInner,
+}
+
+#[derive(Clone)]
+enum ConnectionMapCommandSenderInner {
+    Unbounded(mpsc::UnboundedSender<ConnectionMapCommand>),
+    Bounded {
+        sender: mpsc::Sender<ConnectionMapCommand>,
+        overloaded: Arc<AtomicBool>,
+    },
+}
+
+/// Failure to submit a listener Connection-ID map update.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConnectionMapCommandSendError;
+
+impl ConnectionMapCommandSender {
+    /// Submits one map update without blocking a connection worker.
+    pub fn send(
+        &self, command: ConnectionMapCommand,
+    ) -> Result<(), ConnectionMapCommandSendError> {
+        match &self.inner {
+            ConnectionMapCommandSenderInner::Unbounded(sender) => sender
+                .send(command)
+                .map_err(|_| ConnectionMapCommandSendError),
+            ConnectionMapCommandSenderInner::Bounded { sender, overloaded } =>
+                match sender.try_send(command) {
+                    Ok(()) => Ok(()),
+                    Err(mpsc::error::TrySendError::Closed(_)) =>
+                        Err(ConnectionMapCommandSendError),
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        overloaded.store(true, Ordering::Release);
+                        Err(ConnectionMapCommandSendError)
+                    },
+                },
+        }
+    }
+}
+
+pub(crate) enum ConnectionMapCommandReceiver {
+    Unbounded(mpsc::UnboundedReceiver<ConnectionMapCommand>),
+    Bounded {
+        receiver: mpsc::Receiver<ConnectionMapCommand>,
+        overloaded: Arc<AtomicBool>,
+    },
+}
+
+impl ConnectionMapCommandReceiver {
+    fn poll_recv_many(
+        &mut self, cx: &mut Context<'_>, buffer: &mut Vec<ConnectionMapCommand>,
+        limit: usize,
+    ) -> Poll<usize> {
+        match self {
+            Self::Unbounded(receiver) =>
+                receiver.poll_recv_many(cx, buffer, limit),
+            Self::Bounded { receiver, .. } =>
+                receiver.poll_recv_many(cx, buffer, limit),
+        }
+    }
+
+    pub(crate) fn poll_recv(
+        &mut self, cx: &mut Context<'_>,
+    ) -> Poll<Option<ConnectionMapCommand>> {
+        match self {
+            Self::Unbounded(receiver) => receiver.poll_recv(cx),
+            Self::Bounded { receiver, .. } => receiver.poll_recv(cx),
+        }
+    }
+
+    fn overloaded(&self) -> bool {
+        match self {
+            Self::Unbounded(_) => false,
+            Self::Bounded { overloaded, .. } =>
+                overloaded.load(Ordering::Acquire),
+        }
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        match self {
+            Self::Unbounded(receiver) => receiver.is_empty(),
+            Self::Bounded { receiver, .. } => receiver.is_empty(),
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        match self {
+            Self::Unbounded(receiver) => receiver.len(),
+            Self::Bounded { receiver, .. } => receiver.len(),
+        }
+    }
+}
+
+pub(crate) fn connection_map_command_channel(
+    capacity: Option<usize>,
+) -> (ConnectionMapCommandSender, ConnectionMapCommandReceiver) {
+    match capacity {
+        Some(capacity) => {
+            let (sender, receiver) = mpsc::channel(capacity);
+            let overloaded = Arc::new(AtomicBool::new(false));
+            (
+                ConnectionMapCommandSender {
+                    inner: ConnectionMapCommandSenderInner::Bounded {
+                        sender,
+                        overloaded: Arc::clone(&overloaded),
+                    },
+                },
+                ConnectionMapCommandReceiver::Bounded {
+                    receiver,
+                    overloaded,
+                },
+            )
+        },
+        None => {
+            let (sender, receiver) = mpsc::unbounded_channel();
+            (
+                ConnectionMapCommandSender {
+                    inner: ConnectionMapCommandSenderInner::Unbounded(sender),
+                },
+                ConnectionMapCommandReceiver::Unbounded(receiver),
+            )
+        },
+    }
+}
+
 /// An `InboundPacketRouter` maintains a map of quic connections and routes
 /// [`Incoming`] packets from the [recv half][rh] of a datagram socket to those
 /// connections or some quic initials handler. There is only 1
@@ -155,8 +305,8 @@ where
     incoming_packet_handler: I,
     shutdown_tx: Option<mpsc::Sender<()>>,
     shutdown_rx: mpsc::Receiver<()>,
-    conn_map_cmd_tx: mpsc::UnboundedSender<ConnectionMapCommand>,
-    conn_map_cmd_rx: mpsc::UnboundedReceiver<ConnectionMapCommand>,
+    conn_map_cmd_tx: ConnectionMapCommandSender,
+    conn_map_cmd_rx: ConnectionMapCommandReceiver,
     /// Reusable buffer to receive a batch of `ConnectionMapCommand`s in
     /// `poll_conn_map_commands`. Always fully drained after use, so its length
     /// should be 0 outside of `poll_conn_map_commands`.
@@ -192,7 +342,9 @@ where
     ) -> (Self, ConnStream<Tx, M>) {
         let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
         let (accept_sink, accept_stream) = mpsc::channel(config.listen_backlog);
-        let (conn_map_cmd_tx, conn_map_cmd_rx) = mpsc::unbounded_channel();
+        let (conn_map_cmd_tx, conn_map_cmd_rx) = connection_map_command_channel(
+            config.connection_map_command_capacity,
+        );
 
         (
             InboundPacketRouter {
@@ -205,7 +357,7 @@ where
                 shutdown_rx,
                 conn_map_cmd_tx,
                 conn_map_cmd_rx,
-                conn_map_cmd_buf: Vec::with_capacity(4),
+                conn_map_cmd_buf: Vec::with_capacity(CONN_MAP_CMD_BATCH_SIZE),
                 accept_sink,
                 #[cfg(target_os = "linux")]
                 udp_drop_count: 0,
@@ -339,11 +491,26 @@ where
                 self.config.has_ipv6pktinfo
             },
             pool_send_buffer: self.config.pool_send_buffer,
+            send_buffer_pool_capacity: self
+                .config
+                .send_buffer_pool_capacity_per_worker,
+            hard_bound_send_buffer_pool: self.config.hard_bound_send_buffer_pool,
+            incoming_packet_queue_capacity: self
+                .config
+                .incoming_packet_queue_capacity,
+            connection_map_command_capacity: self
+                .config
+                .connection_map_command_capacity,
+            qlog_enabled: self.config.qlog_dir.is_some(),
+            keylog_enabled: self.config.keylog_file.is_some(),
         };
 
         let handshake_info = HandshakeInfo::new(
             handshake_start_time,
             self.config.handshake_timeout,
+        )
+        .with_io_worker_memory_profile(
+            writer_cfg.memory_profile(IncomingPacketSource::ManagedSocket),
         );
 
         let conn = InitialQuicConnection::new(QuicConnectionParams {
@@ -709,10 +876,18 @@ where
         Poll::Ready(())
     }
 
-    fn poll_conn_map_commands(&mut self, cx: &mut Context) -> Poll<()> {
+    fn poll_conn_map_commands(
+        &mut self, cx: &mut Context,
+    ) -> Poll<io::Result<()>> {
         let cmd_rx = &mut self.conn_map_cmd_rx;
         let buf = &mut self.conn_map_cmd_buf;
         debug_assert!(buf.is_empty());
+
+        if cmd_rx.overloaded() {
+            return Poll::Ready(Err(io::Error::other(
+                "bounded Connection-ID map command lane saturated",
+            )));
+        }
 
         while ready!(cmd_rx.poll_recv_many(cx, buf, CONN_MAP_CMD_BATCH_SIZE)) > 0
         {
@@ -728,7 +903,7 @@ where
             }
         }
 
-        Poll::Ready(())
+        Poll::Ready(Ok(()))
     }
 }
 
@@ -813,7 +988,9 @@ where
             // our SCID destinations are up-to-date (as of this moment).
             // If this returns pending, we have processed all available commands
             // and are registered for a wakeup on the next command.
-            let _ = self.poll_conn_map_commands(cx);
+            if let Poll::Ready(Err(error)) = self.poll_conn_map_commands(cx) {
+                return Poll::Ready(Err(error));
+            }
 
             // Finally, process up to `PACKET_RX_YIELD_AFTER` packet (batches) at
             // once. If no more packets are available, we wait to be woken again.
@@ -930,6 +1107,38 @@ mod tests {
         let actions = vec![Action::ConnectionClose { error: conn_close }];
 
         let _ = h3i::client::sync_client::connect(h3i_config, actions, None);
+    }
+
+    #[test]
+    fn bounded_connection_map_lane_rejects_cap_plus_one_and_latches_overload() {
+        let (sender, receiver) = connection_map_command_channel(Some(2));
+        let command = |value| {
+            ConnectionMapCommand::UnmapCid(
+                ConnectionId::from_ref(&[value]).into_owned(),
+            )
+        };
+
+        assert!(sender.send(command(1)).is_ok());
+        assert!(sender.send(command(2)).is_ok());
+        assert_eq!(receiver.len(), 2);
+        assert_eq!(sender.send(command(3)), Err(ConnectionMapCommandSendError));
+        assert_eq!(receiver.len(), 2);
+        assert!(receiver.overloaded());
+    }
+
+    #[test]
+    fn general_connection_map_lane_remains_unbounded() {
+        let (sender, receiver) = connection_map_command_channel(None);
+        for value in 0..1024u64 {
+            sender
+                .send(ConnectionMapCommand::UnmapCid(
+                    ConnectionId::from_ref(&value.to_be_bytes()).into_owned(),
+                ))
+                .unwrap();
+        }
+
+        assert_eq!(receiver.len(), 1024);
+        assert!(!receiver.overloaded());
     }
 
     #[tokio::test]

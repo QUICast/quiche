@@ -77,6 +77,11 @@ impl FlowControl {
         self.max_data
     }
 
+    /// Returns the configured maximum receive window.
+    pub fn max_window(&self) -> u64 {
+        self.max_window
+    }
+
     /// Returns the consumed bytes by the receiver.
     pub(crate) fn consumed(&self) -> u64 {
         self.consumed

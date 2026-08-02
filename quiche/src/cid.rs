@@ -34,6 +34,7 @@ use crate::packet::ConnectionId;
 
 use std::collections::HashSet;
 use std::collections::VecDeque;
+use std::mem::size_of;
 
 use smallvec::SmallVec;
 
@@ -251,6 +252,9 @@ pub struct ConnectionIdentifiers {
     /// The maximum number of source Connection IDs our peer allows us.
     source_conn_id_limit: usize,
 
+    /// Local storage cap for source Connection IDs.
+    source_conn_id_limit_cap: usize,
+
     /// Does the host use zero-length source Connection ID.
     zero_length_scid: bool,
 
@@ -265,6 +269,7 @@ impl ConnectionIdentifiers {
     pub fn new(
         mut destination_conn_id_limit: usize, initial_scid: &ConnectionId,
         initial_path_id: usize, reset_token: Option<u128>,
+        source_conn_id_limit_cap: usize,
     ) -> ConnectionIdentifiers {
         // It must be at least 2.
         if destination_conn_id_limit < 2 {
@@ -314,6 +319,7 @@ impl ConnectionIdentifiers {
             retire_dcid_seqs: BoundedConnectionIdSeqSet::new(size),
             next_scid_seq,
             source_conn_id_limit,
+            source_conn_id_limit_cap: source_conn_id_limit_cap.max(2),
             zero_length_scid,
             ..Default::default()
         }
@@ -323,6 +329,7 @@ impl ConnectionIdentifiers {
     pub fn set_source_conn_id_limit(&mut self, v: u64) {
         // Bound conn id limit so our scids queue sizing is valid.
         let v = cmp::min(v, (usize::MAX / 2) as u64) as usize;
+        let v = cmp::min(v, self.source_conn_id_limit_cap);
 
         // It must be at least 2.
         if v >= 2 {
@@ -837,11 +844,54 @@ impl ConnectionIdentifiers {
     pub fn pop_retired_scid(&mut self) -> Option<ConnectionId<'static>> {
         self.retired_scids.pop_front()
     }
+
+    pub fn source_conn_id_limit_cap(&self) -> usize {
+        self.source_conn_id_limit_cap
+    }
+}
+
+pub(crate) fn retention_metadata_upper_bound(
+    destination_limit: usize, source_limit: usize,
+) -> Option<usize> {
+    let source_slots = source_limit.checked_mul(2)?.checked_sub(1)?;
+    let retired_destination_slots = destination_limit
+        .checked_mul(RETIRED_CONN_ID_LIMIT_MULTIPLIER as usize)?;
+    let cid_entry =
+        size_of::<ConnectionIdEntry>().checked_add(crate::MAX_CONN_ID_LEN)?;
+    let cid_slots = destination_limit.checked_add(source_slots)?;
+    let cid_storage = cid_slots.checked_mul(cid_entry)?.checked_mul(2)?;
+    let sequence_slots = source_limit
+        .checked_add(retired_destination_slots)?
+        .checked_mul(size_of::<u64>())?
+        .checked_mul(4)?;
+    let retired_source_storage = source_slots
+        .checked_mul(
+            size_of::<ConnectionId<'static>>()
+                .checked_add(crate::MAX_CONN_ID_LEN)?,
+        )?
+        .checked_mul(2)?;
+
+    size_of::<ConnectionIdentifiers>()
+        .checked_add(cid_storage)?
+        .checked_add(sequence_slots)?
+        .checked_add(retired_source_storage)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_connection_id_limit_is_clamped_to_local_storage_cap() {
+        let (scid, _) = create_cid_and_reset_token(16);
+        let mut ids = ConnectionIdentifiers::new(2, &scid, 0, None, 3);
+
+        ids.set_source_conn_id_limit(u64::MAX);
+
+        assert_eq!(ids.source_conn_id_limit, 3);
+        assert_eq!(ids.source_conn_id_limit_cap(), 3);
+        assert_eq!(ids.scids.capacity, 5);
+    }
     use crate::test_utils::create_cid_and_reset_token;
 
     #[test]
@@ -849,7 +899,7 @@ mod tests {
         let (scid, _) = create_cid_and_reset_token(16);
         let (dcid, _) = create_cid_and_reset_token(16);
 
-        let mut ids = ConnectionIdentifiers::new(2, &scid, 0, None);
+        let mut ids = ConnectionIdentifiers::new(2, &scid, 0, None, usize::MAX);
         ids.set_source_conn_id_limit(3);
         ids.set_initial_dcid(dcid, None, Some(0));
 
@@ -910,7 +960,7 @@ mod tests {
 
         let mut retired_path_ids = SmallVec::new();
 
-        let mut ids = ConnectionIdentifiers::new(2, &scid, 0, None);
+        let mut ids = ConnectionIdentifiers::new(2, &scid, 0, None, usize::MAX);
         ids.set_initial_dcid(dcid, None, Some(0));
 
         assert_eq!(ids.available_dcids(), 0);
@@ -983,7 +1033,7 @@ mod tests {
 
         let mut retired_path_ids = SmallVec::new();
 
-        let mut ids = ConnectionIdentifiers::new(2, &scid, 0, None);
+        let mut ids = ConnectionIdentifiers::new(2, &scid, 0, None, usize::MAX);
         ids.set_initial_dcid(dcid, None, Some(0));
 
         assert_eq!(ids.available_dcids(), 0);
@@ -1023,7 +1073,7 @@ mod tests {
 
         let mut retired_path_ids = SmallVec::new();
 
-        let mut ids = ConnectionIdentifiers::new(5, &scid, 0, None);
+        let mut ids = ConnectionIdentifiers::new(5, &scid, 0, None, usize::MAX);
         ids.set_initial_dcid(dcid, None, Some(0));
 
         assert_eq!(ids.available_dcids(), 0);
@@ -1069,7 +1119,7 @@ mod tests {
 
         let mut retired_path_ids = SmallVec::new();
 
-        let mut ids = ConnectionIdentifiers::new(5, &scid, 0, None);
+        let mut ids = ConnectionIdentifiers::new(5, &scid, 0, None, usize::MAX);
         ids.set_initial_dcid(dcid, None, Some(0));
 
         assert_eq!(ids.available_dcids(), 0);
@@ -1108,7 +1158,7 @@ mod tests {
         let (scid, _) = create_cid_and_reset_token(16);
         let (dcid, _) = create_cid_and_reset_token(16);
 
-        let mut ids = ConnectionIdentifiers::new(3, &scid, 0, None);
+        let mut ids = ConnectionIdentifiers::new(3, &scid, 0, None, usize::MAX);
         ids.set_initial_dcid(dcid, None, Some(0));
         ids.set_source_conn_id_limit(3);
 

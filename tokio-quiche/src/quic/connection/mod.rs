@@ -70,8 +70,7 @@ use super::QuicheConnection;
 use crate::metrics::Metrics;
 use crate::quic::io::worker::IoWorker;
 use crate::quic::io::worker::WriterConfig;
-use crate::quic::io::worker::INCOMING_QUEUE_SIZE;
-use crate::quic::router::ConnectionMapCommand;
+use crate::quic::router::ConnectionMapCommandSender;
 use crate::settings::QuicTransportEgressStats;
 use crate::QuicResult;
 
@@ -82,6 +81,40 @@ pub struct QuicConnectionStats {
     pub stats: quiche::Stats,
     /// Specific statistics about the connection's active path.
     pub path_stats: Option<quiche::PathStats>,
+}
+
+/// Origin of packets admitted to a QUIC connection's worker lane.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IncomingPacketSource {
+    /// Packets are copied by tokio-quiche's managed socket/router path.
+    ManagedSocket,
+    /// Packets are supplied directly by an application through the raw API.
+    RawApplication,
+}
+
+/// Immutable memory-relevant IO worker settings applied to a connection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IoWorkerMemoryProfile {
+    /// Origin of packets admitted to the worker's incoming lane.
+    pub incoming_packet_source: IncomingPacketSource,
+    /// Maximum number of packets retained by the incoming lane.
+    pub incoming_packet_queue_capacity: usize,
+    /// Maximum allocation capacity of one managed incoming packet.
+    pub max_incoming_packet_allocation_bytes: usize,
+    /// Whether egress scratch buffers are borrowed from a worker-local pool.
+    pub pool_send_buffer: bool,
+    /// Maximum full-size buffers retained by one worker-local pool.
+    pub send_buffer_pool_capacity_per_worker: usize,
+    /// Whether that ceiling includes currently leased full-size buffers.
+    pub hard_bound_send_buffer_pool: bool,
+    /// Allocation capacity of one full-size egress scratch buffer.
+    pub send_buffer_allocation_bytes: usize,
+    /// Endpoint-wide listener Connection-ID command capacity.
+    pub connection_map_command_capacity: Option<usize>,
+    /// Whether per-connection qlog output is active.
+    pub qlog_enabled: bool,
+    /// Whether TLS key logging is active.
+    pub keylog_enabled: bool,
 }
 pub(crate) type QuicConnectionStatsShared = Arc<Mutex<QuicConnectionStats>>;
 
@@ -248,7 +281,7 @@ where
     #[inline]
     pub(crate) fn new(params: QuicConnectionParams<Tx, M>) -> Self {
         let (incoming_ev_sender, incoming_ev_receiver) =
-            mpsc::channel(INCOMING_QUEUE_SIZE);
+            mpsc::channel(params.writer_cfg.incoming_packet_queue_capacity);
         let audit_log_stats = Arc::new(QuicAuditStats::new(params.scid.to_vec()));
 
         let stats = Arc::new(Mutex::new(QuicConnectionStats::from_conn(
@@ -470,7 +503,7 @@ where
     pub writer_cfg: WriterConfig,
     pub initial_pkt: Option<Incoming>,
     pub shutdown_tx: mpsc::Sender<()>,
-    pub conn_map_cmd_tx: mpsc::UnboundedSender<ConnectionMapCommand>, /* channel that signals connection map changes */
+    pub conn_map_cmd_tx: ConnectionMapCommandSender, /* channel that signals connection map changes */
     pub scid: ConnectionId<'static>,
     pub cid_generator: Option<SharedConnectionIdGenerator>,
     pub metrics: M,
@@ -616,6 +649,8 @@ pub struct HandshakeInfo {
     timeout: Option<Duration>,
     /// The real duration that the handshake took to complete.
     time_handshake: Option<Duration>,
+    /// Memory-relevant IO worker settings, when constructed by tokio-quiche.
+    io_worker_memory_profile: Option<IoWorkerMemoryProfile>,
 }
 
 impl HandshakeInfo {
@@ -624,7 +659,15 @@ impl HandshakeInfo {
             start_time,
             timeout,
             time_handshake: None,
+            io_worker_memory_profile: None,
         }
+    }
+
+    pub(crate) fn with_io_worker_memory_profile(
+        mut self, profile: IoWorkerMemoryProfile,
+    ) -> Self {
+        self.io_worker_memory_profile = Some(profile);
+        self
     }
 
     /// The time at which the connection was created.
@@ -637,6 +680,11 @@ impl HandshakeInfo {
     #[inline]
     pub fn elapsed(&self) -> Duration {
         self.time_handshake.unwrap_or_default()
+    }
+
+    /// Returns the immutable memory-relevant IO worker settings.
+    pub fn io_worker_memory_profile(&self) -> Option<IoWorkerMemoryProfile> {
+        self.io_worker_memory_profile
     }
 
     pub(crate) fn set_elapsed(&mut self) {

@@ -138,6 +138,12 @@ impl Decoder {
 
     /// Decodes a QPACK header block into a list of headers.
     pub fn decode(&mut self, buf: &[u8], max_size: u64) -> Result<Vec<Header>> {
+        self.decode_with_field_limit(buf, max_size, None)
+    }
+
+    pub(crate) fn decode_with_field_limit(
+        &mut self, buf: &[u8], max_size: u64, max_fields: Option<usize>,
+    ) -> Result<Vec<Header>> {
         let mut b = octets::Octets::with_slice(buf);
 
         let mut out = Vec::new();
@@ -150,6 +156,9 @@ impl Decoder {
         trace!("Header count={req_insert_count} base={base}");
 
         while b.cap() > 0 {
+            if max_fields.is_some_and(|max| out.len() >= max) {
+                return Err(Error::HeaderListTooLarge);
+            }
             let first = b.peek_u8()?;
 
             size_tracker.on_field_start()?;
@@ -490,6 +499,36 @@ mod tests {
         assert_eq!(
             Decoder::new().decode(&encoded_literal, 57),
             Err(Error::HeaderListTooLarge),
+        );
+    }
+
+    #[test]
+    fn field_count_is_checked_before_decoding_the_next_field() {
+        use crate::h3::qpack;
+
+        let headers = vec![
+            Header::new(b":status", b"200"),
+            Header::new(b"server", b"quiche"),
+        ];
+        let mut encoded = [0; 128];
+        let encoded_len = qpack::Encoder::new()
+            .encode(&headers, &mut encoded)
+            .unwrap();
+        assert_eq!(
+            Decoder::new().decode_with_field_limit(
+                &encoded[..encoded_len],
+                u64::MAX,
+                Some(headers.len()),
+            ),
+            Ok(headers)
+        );
+        assert_eq!(
+            Decoder::new().decode_with_field_limit(
+                &encoded[..encoded_len],
+                u64::MAX,
+                Some(1),
+            ),
+            Err(Error::HeaderListTooLarge)
         );
     }
 }

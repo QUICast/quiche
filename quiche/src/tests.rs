@@ -33,6 +33,78 @@ use crate::Header;
 use rstest::rstest;
 
 #[test]
+fn frozen_retention_limits_reject_updates_without_mutation() {
+    let mut config = test_utils::Pipe::default_config("cubic").unwrap();
+    let initial_stream = StreamSendRetentionLimits {
+        max_bytes: 4096,
+        max_chunks: 8,
+    };
+    let initial_recv_dgram = DatagramQueueLimits {
+        max_items: 2,
+        max_bytes: 2048,
+        max_allocation_bytes: 2048,
+    };
+    let initial_send_dgram = DatagramQueueLimits {
+        max_items: 3,
+        max_bytes: 3072,
+        max_allocation_bytes: 3072,
+    };
+    config.set_stream_send_retention_limits(initial_stream);
+    config
+        .set_dgram_queue_retention_limits(initial_recv_dgram, initial_send_dgram);
+    config.set_max_tracked_sent_packets_per_path(32);
+
+    let mut pipe = test_utils::Pipe::with_config(&mut config).unwrap();
+    assert!(!pipe.server.retention_limits_frozen());
+
+    let live_stream = StreamSendRetentionLimits {
+        max_bytes: 8192,
+        max_chunks: 16,
+    };
+    assert_eq!(
+        pipe.server.set_stream_send_retention_limits(live_stream),
+        Ok(())
+    );
+    assert_eq!(
+        pipe.server.set_max_tracked_sent_packets_per_path(64),
+        Ok(())
+    );
+
+    pipe.server.freeze_retention_limits();
+    pipe.server.freeze_retention_limits();
+    assert!(pipe.server.retention_limits_frozen());
+
+    let rejected_stream = StreamSendRetentionLimits {
+        max_bytes: 16_384,
+        max_chunks: 32,
+    };
+    let rejected_dgram = DatagramQueueLimits {
+        max_items: 4,
+        max_bytes: 4096,
+        max_allocation_bytes: 4096,
+    };
+    assert_eq!(
+        pipe.server
+            .set_stream_send_retention_limits(rejected_stream),
+        Err(Error::InvalidState)
+    );
+    assert_eq!(
+        pipe.server
+            .set_dgram_queue_retention_limits(rejected_dgram, rejected_dgram),
+        Err(Error::InvalidState)
+    );
+    assert_eq!(
+        pipe.server.set_max_tracked_sent_packets_per_path(128),
+        Err(Error::InvalidState)
+    );
+
+    assert_eq!(pipe.server.stream_send_retention_limits(), live_stream);
+    assert_eq!(pipe.server.dgram_recv_queue_limits(), initial_recv_dgram);
+    assert_eq!(pipe.server.dgram_send_queue_limits(), initial_send_dgram);
+    assert_eq!(pipe.server.max_tracked_sent_packets_per_path(), 64);
+}
+
+#[test]
 fn transport_params() {
     // Server encodes, client decodes.
     let tp = TransportParams {

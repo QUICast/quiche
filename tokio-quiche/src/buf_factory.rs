@@ -53,10 +53,22 @@ impl quiche::BufFactory for BufFactory {
     type DgramBuf = DgramBuffer;
 
     fn buf_from_slice(buf: &[u8]) -> Bytes {
-        Bytes::copy_from_slice(buf)
+        Bytes::from(buf.to_vec().into_boxed_slice())
+    }
+
+    fn buf_from_slice_capacity(len: usize) -> Option<usize> {
+        Some(len)
     }
 
     fn dgram_buf_from_slice(buf: &[u8]) -> DgramBuffer {
         DgramBuffer::from_slice(buf)
+    }
+
+    fn dgram_buf_from_slice_capacity(len: usize) -> Option<usize> {
+        Some(len)
+    }
+
+    fn dgram_buf_capacity(buf: &DgramBuffer) -> Option<usize> {
+        Some(buf.allocated_capacity())
     }
 }

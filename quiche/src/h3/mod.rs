@@ -362,6 +362,14 @@ use crate::BufSplit;
 /// ../struct.Config.html#method.set_application_protos
 pub const APPLICATION_PROTOCOL: &[&[u8]] = &[b"h3"];
 
+/// Returns conservative retained metadata for one live HTTP/3 stream.
+///
+/// This includes the maximum incremental parser allocation and ordered-map
+/// membership. Allocator size-class rounding remains embedding-specific.
+pub const fn stream_retained_metadata_upper_bound() -> usize {
+    stream::retained_metadata_upper_bound()
+}
+
 // The offset used when converting HTTP/3 urgency to quiche urgency.
 const PRIORITY_URGENCY_OFFSET: u8 = 124;
 
@@ -623,6 +631,7 @@ impl From<octets::BufferTooShortError> for Error {
 /// An HTTP/3 configuration.
 pub struct Config {
     max_field_section_size: Option<u64>,
+    max_field_count: Option<usize>,
     qpack_max_table_capacity: Option<u64>,
     qpack_blocked_streams: Option<u64>,
     connect_protocol_enabled: Option<u64>,
@@ -640,6 +649,7 @@ impl Config {
     pub const fn new() -> Result<Config> {
         Ok(Config {
             max_field_section_size: Some(SETTINGS_MAX_FIELD_SECTION_SIZE_DEFAULT),
+            max_field_count: None,
             qpack_max_table_capacity: None,
             qpack_blocked_streams: None,
             connect_protocol_enabled: None,
@@ -668,6 +678,15 @@ impl Config {
     /// [`Error::ExcessiveLoad`]: enum.Error.html#variant.ExcessiveLoad
     pub fn set_max_field_section_size(&mut self, v: u64) {
         self.max_field_section_size = Some(v);
+    }
+
+    /// Sets a local limit on decoded fields in one HTTP field section.
+    ///
+    /// This is not advertised on the wire. The decoder rejects the first field
+    /// above the limit before allocating its name or value. The default is no
+    /// count limit beyond [`Config::set_max_field_section_size()`].
+    pub fn set_max_field_count(&mut self, value: usize) {
+        self.max_field_count = Some(value);
     }
 
     /// Sets the `SETTINGS_QPACK_MAX_TABLE_CAPACITY` setting.
@@ -1185,6 +1204,7 @@ pub struct Connection {
     peer_goaway_id: Option<u64>,
 
     max_priority_update_size: u64,
+    max_field_count: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1263,6 +1283,7 @@ impl Connection {
             peer_goaway_id: None,
 
             max_priority_update_size: config.max_priority_update_size,
+            max_field_count: config.max_field_count,
         })
     }
 
@@ -3708,10 +3729,11 @@ impl Connection {
                     .max_field_section_size
                     .unwrap_or(u64::MAX);
 
-                let headers = match self
-                    .qpack_decoder
-                    .decode(&header_block[..], max_size)
-                {
+                let headers = match self.qpack_decoder.decode_with_field_limit(
+                    &header_block[..],
+                    max_size,
+                    self.max_field_count,
+                ) {
                     Ok(v) => v,
 
                     Err(e) => {

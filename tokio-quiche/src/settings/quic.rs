@@ -71,6 +71,67 @@ pub struct QuicSettings {
     #[serde(default = "QuicSettings::default_dgram_max_queue_len")]
     pub dgram_send_max_queue_len: usize,
 
+    /// Hard logical-byte limit for retained received DATAGRAM frames.
+    ///
+    /// Defaults to unbounded for compatibility.
+    #[serde(default = "QuicSettings::default_unbounded_retention")]
+    pub dgram_recv_max_queue_bytes: usize,
+
+    /// Hard backing-allocation limit for retained received DATAGRAM frames.
+    ///
+    /// Defaults to unbounded for compatibility.
+    #[serde(default = "QuicSettings::default_unbounded_retention")]
+    pub dgram_recv_max_queue_allocation_bytes: usize,
+
+    /// Hard logical-byte limit for retained outgoing DATAGRAM frames.
+    ///
+    /// Defaults to unbounded for compatibility.
+    #[serde(default = "QuicSettings::default_unbounded_retention")]
+    pub dgram_send_max_queue_bytes: usize,
+
+    /// Hard backing-allocation limit for retained outgoing DATAGRAM frames.
+    ///
+    /// Defaults to unbounded for compatibility.
+    #[serde(default = "QuicSettings::default_unbounded_retention")]
+    pub dgram_send_max_queue_allocation_bytes: usize,
+
+    /// Hard transport-owned stream-send backing limit.
+    ///
+    /// Defaults to unbounded for compatibility.
+    #[serde(default = "QuicSettings::default_unbounded_retention")]
+    pub stream_send_max_retained_bytes: usize,
+
+    /// Hard retained stream-send chunk limit.
+    ///
+    /// Defaults to unbounded for compatibility.
+    #[serde(default = "QuicSettings::default_unbounded_retention")]
+    pub stream_send_max_retained_chunks: usize,
+
+    /// Hard sent-packet recovery-record limit per path.
+    ///
+    /// Defaults to unbounded for compatibility.
+    #[serde(default = "QuicSettings::default_unbounded_retention")]
+    pub max_tracked_sent_packets_per_path: usize,
+
+    /// Hard retransmission-tracked frame limit per sent packet.
+    ///
+    /// Defaults to unbounded for compatibility.
+    #[serde(default = "QuicSettings::default_unbounded_retention")]
+    pub max_tracked_frames_per_packet: usize,
+
+    /// Retains path lifecycle events for application consumption.
+    ///
+    /// Defaults to `true`. The bounded selected-WebTransport profile disables
+    /// this because it does not expose path events.
+    #[serde(default = "QuicSettings::default_retain_path_events")]
+    pub retain_path_events: bool,
+
+    /// Local storage cap for source Connection IDs issued to the peer.
+    ///
+    /// Defaults to unbounded for compatibility.
+    #[serde(default = "QuicSettings::default_unbounded_retention")]
+    pub max_source_connection_ids: usize,
+
     /// Configures whether to advertise multicast server support during the
     /// QUIC handshake.
     ///
@@ -380,6 +441,36 @@ pub struct QuicSettings {
     /// Defaults to `true`.
     #[serde(default = "QuicSettings::default_pool_send_buffer")]
     pub pool_send_buffer: bool,
+
+    /// Maximum full-size egress buffers retained by each Tokio worker thread.
+    ///
+    /// Values above the implementation hard ceiling of 16 are rejected during
+    /// endpoint configuration. Defaults to 16.
+    #[serde(default = "QuicSettings::default_send_buffer_pool_capacity")]
+    pub send_buffer_pool_capacity_per_worker: usize,
+
+    /// Enforces the configured send-buffer pool capacity across both parked
+    /// and currently leased full-size buffers.
+    ///
+    /// When enabled, a worker that has leased every configured full-size
+    /// buffer uses one-MTU scratch storage until a lease returns. This is
+    /// disabled by default so ordinary connections retain their existing GSO
+    /// allocation behavior.
+    pub hard_bound_send_buffer_pool: bool,
+
+    /// Maximum received UDP packets queued for one connection before its I/O
+    /// worker processes them. A value of zero is clamped to one.
+    ///
+    /// Defaults to 2048.
+    #[serde(default = "QuicSettings::default_incoming_packet_queue_capacity")]
+    pub incoming_packet_queue_capacity: usize,
+
+    /// Optional endpoint-wide capacity for listener Connection-ID map updates.
+    ///
+    /// `None` preserves the legacy unbounded lane. A finite capacity is used
+    /// by the bounded selected-WebTransport profile and saturation fail-stops
+    /// the managed endpoint rather than retaining stale mappings.
+    pub connection_map_command_capacity: Option<usize>,
 }
 
 /// Client-side multicast settings used by the tokio-quiche multicast helper.
@@ -422,8 +513,28 @@ impl QuicSettings {
     }
 
     #[inline]
+    fn default_send_buffer_pool_capacity() -> usize {
+        16
+    }
+
+    #[inline]
+    fn default_incoming_packet_queue_capacity() -> usize {
+        2048
+    }
+
+    #[inline]
     fn default_dgram_max_queue_len() -> usize {
         65536
+    }
+
+    #[inline]
+    fn default_unbounded_retention() -> usize {
+        usize::MAX
+    }
+
+    #[inline]
+    fn default_retain_path_events() -> bool {
+        true
     }
 
     #[inline]

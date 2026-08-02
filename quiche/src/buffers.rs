@@ -45,9 +45,38 @@ pub trait BufFactory: Clone + Default + Debug {
     /// same data as the original slice.
     fn buf_from_slice(buf: &[u8]) -> Self::Buf;
 
+    /// Returns the allocation capacity requested by [`Self::buf_from_slice`]
+    /// for an input of `len` bytes.
+    ///
+    /// Implementations that return `Some` must not request a larger backing
+    /// allocation. Allocator size-class rounding is intentionally outside this
+    /// value and belongs in the embedding application's implementation margin.
+    /// Returning `None` prevents copied stream writes when a finite transport
+    /// retention envelope is enabled.
+    fn buf_from_slice_capacity(_len: usize) -> Option<usize> {
+        None
+    }
+
     /// Generate a new datagram buffer from a given slice, the buffer must
     /// contain the same data as the original slice.
     fn dgram_buf_from_slice(buf: &[u8]) -> Self::DgramBuf;
+
+    /// Returns the allocation capacity requested by
+    /// [`Self::dgram_buf_from_slice`] for an input of `len` bytes.
+    ///
+    /// Returning `None` prevents slice-based Datagram sends when a finite
+    /// physical Datagram retention envelope is enabled.
+    fn dgram_buf_from_slice_capacity(_len: usize) -> Option<usize> {
+        None
+    }
+
+    /// Returns the allocation capacity retained by an owned Datagram buffer.
+    ///
+    /// Returning `None` prevents queue admission when a finite physical
+    /// Datagram retention envelope is enabled.
+    fn dgram_buf_capacity(_buf: &Self::DgramBuf) -> Option<usize> {
+        None
+    }
 }
 
 /// A trait that enables zero-copy sends to quiche. When buffers produced
@@ -81,8 +110,20 @@ impl BufFactory for DefaultBufFactory {
         DefaultBuf(Arc::from(buf))
     }
 
+    fn buf_from_slice_capacity(len: usize) -> Option<usize> {
+        Some(len)
+    }
+
     fn dgram_buf_from_slice(buf: &[u8]) -> Vec<u8> {
         buf.into()
+    }
+
+    fn dgram_buf_from_slice_capacity(len: usize) -> Option<usize> {
+        Some(len)
+    }
+
+    fn dgram_buf_capacity(buf: &Vec<u8>) -> Option<usize> {
+        Some(buf.capacity())
     }
 }
 

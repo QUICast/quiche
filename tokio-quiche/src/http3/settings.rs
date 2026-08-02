@@ -48,7 +48,11 @@ const SETTINGS_WT_INITIAL_MAX_STREAMS_BIDI: u64 = 0x2b65;
 
 const DEFAULT_WEBTRANSPORT_MAX_PENDING_STREAMS: usize = 256;
 const DEFAULT_WEBTRANSPORT_MAX_PENDING_STREAMS_PER_SESSION: usize = 64;
+const DEFAULT_WEBTRANSPORT_MAX_ACTIVE_STREAMS: usize = usize::MAX;
+const DEFAULT_WEBTRANSPORT_MAX_ACTIVE_STREAMS_PER_SESSION: usize = usize::MAX;
 const DEFAULT_WEBTRANSPORT_MAX_STREAM_WAITERS: usize = 256;
+const DEFAULT_WEBTRANSPORT_MAX_SESSION_TERMINAL_WAITERS: usize = 256;
+const DEFAULT_WEBTRANSPORT_MAX_SESSION_TERMINAL_WAITERS_PER_SESSION: usize = 64;
 const DEFAULT_WEBTRANSPORT_MAX_SEND_TERMINAL_WAITERS: usize = 256;
 const DEFAULT_WEBTRANSPORT_MAX_SEND_TERMINAL_WAITERS_PER_SESSION: usize = 64;
 const DEFAULT_WEBTRANSPORT_MAX_DATAGRAM_WAITERS: usize = 2;
@@ -57,7 +61,10 @@ const DEFAULT_WEBTRANSPORT_COMMAND_CAPACITY: usize = 256;
 const DEFAULT_WEBTRANSPORT_MAX_STREAM_IO_BYTES: usize = 64 * 1024;
 const DEFAULT_WEBTRANSPORT_MAX_STREAM_WRITE_LEASE_RETAINED_BYTES: usize =
     64 * 1024;
+const DEFAULT_WEBTRANSPORT_MAX_STREAM_WRITE_LEASE_OWNER_BYTES: usize = usize::MAX;
 const DEFAULT_WEBTRANSPORT_MAX_DATAGRAM_SEND_ALLOCATION_BYTES: usize = 64 * 1024;
+const DEFAULT_WEBTRANSPORT_MAX_DATAGRAM_PREFIXED_ALLOCATION_BYTES: usize =
+    64 * 1024 + 16;
 const DEFAULT_WEBTRANSPORT_MAX_PENDING_DATAGRAMS: usize = 256;
 const DEFAULT_WEBTRANSPORT_MAX_PENDING_DATAGRAMS_PER_SESSION: usize = 64;
 const DEFAULT_WEBTRANSPORT_MAX_PENDING_DATAGRAM_BYTES: usize = 1024 * 1024;
@@ -92,6 +99,10 @@ pub struct Http3Settings {
     pub max_requests_per_connection: Option<u64>,
     /// Maximum size of a single HEADERS frame, in bytes.
     pub max_header_list_size: Option<u64>,
+    /// Local maximum decoded field count in one HTTP field section.
+    ///
+    /// This is not advertised on the wire and defaults to no count limit.
+    pub max_header_field_count: Option<usize>,
     /// Maximum value the QPACK encoder is permitted to set for the dynamic
     /// table capcity. See <https://www.rfc-editor.org/rfc/rfc9204.html#name-maximum-dynamic-table-capac>
     pub qpack_max_table_capacity: Option<u64>,
@@ -119,8 +130,18 @@ pub struct Http3Settings {
     /// Per-session aggregate maximum for optimistic inbound, credit-waiting,
     /// and prefix-opening streams.
     pub webtransport_max_pending_streams_per_session: usize,
+    /// Maximum active associated streams retained by one connection.
+    pub webtransport_max_active_streams: usize,
+    /// Maximum active associated streams retained by the active session.
+    pub webtransport_max_active_streams_per_session: usize,
     /// Maximum exact-stream readable and writable wait registrations.
     pub webtransport_max_stream_waiters: usize,
+    /// Maximum pending session-terminal wait registrations per connection.
+    /// A value of zero is clamped to one.
+    pub webtransport_max_session_terminal_waiters: usize,
+    /// Maximum pending session-terminal wait registrations for one session.
+    /// A value of zero is clamped to one.
+    pub webtransport_max_session_terminal_waiters_per_session: usize,
     /// Maximum pending send-terminal waiters and retained terminal facts.
     ///
     /// The bound applies independently to waiters and facts. A value of zero
@@ -156,11 +177,21 @@ pub struct Http3Settings {
     /// also bounded in count by `webtransport_command_capacity` and in bytes by
     /// that capacity multiplied by this value.
     pub webtransport_max_stream_write_lease_retained_bytes: usize,
+    /// Maximum compiler-known inline size of one generic write-lease owner.
+    ///
+    /// This bounds the transport-owned `Arc` allocation used while an admitted
+    /// operation crosses the driver. Heap backing referenced by the owner
+    /// remains in the caller's accounting domain. The default is unbounded for
+    /// compatibility.
+    pub webtransport_max_stream_write_lease_owner_bytes: usize,
     /// Maximum payload bytes returned by one selected-stream read command.
     pub webtransport_max_stream_read_bytes: usize,
     /// Maximum physical `DgramBuffer` allocation accepted by one outgoing
     /// native WebTransport Datagram command.
     pub webtransport_max_datagram_send_allocation_bytes: usize,
+    /// Maximum physical Datagram allocation after adding the H3 Quarter Stream
+    /// ID prefix.
+    pub webtransport_max_datagram_prefixed_allocation_bytes: usize,
     /// Maximum queued incoming native WebTransport Datagrams per connection.
     pub webtransport_max_pending_datagrams: usize,
     /// Maximum queued incoming native WebTransport Datagrams per session.
@@ -201,6 +232,7 @@ impl Default for Http3Settings {
             event_capacity: DEFAULT_H3_EVENT_CAPACITY,
             max_requests_per_connection: None,
             max_header_list_size: None,
+            max_header_field_count: None,
             qpack_max_table_capacity: None,
             qpack_blocked_streams: None,
             post_accept_timeout: None,
@@ -210,8 +242,16 @@ impl Default for Http3Settings {
                 DEFAULT_WEBTRANSPORT_MAX_PENDING_STREAMS,
             webtransport_max_pending_streams_per_session:
                 DEFAULT_WEBTRANSPORT_MAX_PENDING_STREAMS_PER_SESSION,
+            webtransport_max_active_streams:
+                DEFAULT_WEBTRANSPORT_MAX_ACTIVE_STREAMS,
+            webtransport_max_active_streams_per_session:
+                DEFAULT_WEBTRANSPORT_MAX_ACTIVE_STREAMS_PER_SESSION,
             webtransport_max_stream_waiters:
                 DEFAULT_WEBTRANSPORT_MAX_STREAM_WAITERS,
+            webtransport_max_session_terminal_waiters:
+                DEFAULT_WEBTRANSPORT_MAX_SESSION_TERMINAL_WAITERS,
+            webtransport_max_session_terminal_waiters_per_session:
+                DEFAULT_WEBTRANSPORT_MAX_SESSION_TERMINAL_WAITERS_PER_SESSION,
             webtransport_max_send_terminal_waiters:
                 DEFAULT_WEBTRANSPORT_MAX_SEND_TERMINAL_WAITERS,
             webtransport_max_send_terminal_waiters_per_session:
@@ -225,10 +265,14 @@ impl Default for Http3Settings {
                 DEFAULT_WEBTRANSPORT_MAX_STREAM_IO_BYTES,
             webtransport_max_stream_write_lease_retained_bytes:
                 DEFAULT_WEBTRANSPORT_MAX_STREAM_WRITE_LEASE_RETAINED_BYTES,
+            webtransport_max_stream_write_lease_owner_bytes:
+                DEFAULT_WEBTRANSPORT_MAX_STREAM_WRITE_LEASE_OWNER_BYTES,
             webtransport_max_stream_read_bytes:
                 DEFAULT_WEBTRANSPORT_MAX_STREAM_IO_BYTES,
             webtransport_max_datagram_send_allocation_bytes:
                 DEFAULT_WEBTRANSPORT_MAX_DATAGRAM_SEND_ALLOCATION_BYTES,
+            webtransport_max_datagram_prefixed_allocation_bytes:
+                DEFAULT_WEBTRANSPORT_MAX_DATAGRAM_PREFIXED_ALLOCATION_BYTES,
             webtransport_max_pending_datagrams:
                 DEFAULT_WEBTRANSPORT_MAX_PENDING_DATAGRAMS,
             webtransport_max_pending_datagrams_per_session:
@@ -255,6 +299,10 @@ impl From<&Http3Settings> for quiche::h3::Config {
 
         if let Some(v) = value.max_header_list_size {
             config.set_max_field_section_size(v);
+        }
+
+        if let Some(v) = value.max_header_field_count {
+            config.set_max_field_count(v);
         }
 
         if let Some(v) = value.qpack_max_table_capacity {

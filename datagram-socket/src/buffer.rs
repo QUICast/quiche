@@ -122,12 +122,39 @@ impl DgramBuffer {
     /// potentially shifting elements and reallocating. If `headroom` is
     /// less than the existing headroom, this method does nothing.
     pub fn splice_headroom(&mut self, headroom: usize) {
+        let inserted = self.splice_headroom_bounded(headroom, usize::MAX);
+        debug_assert!(inserted);
+    }
+
+    /// Ensures `headroom` bytes before the readable payload without requesting
+    /// backing capacity above `max_capacity`.
+    ///
+    /// Returns `false` without mutation or payload copying when the requested
+    /// capacity does not fit. Allocator size-class rounding is outside the
+    /// requested-capacity accounting contract.
+    pub fn splice_headroom_bounded(
+        &mut self, headroom: usize, max_capacity: usize,
+    ) -> bool {
         if self.start >= headroom {
-            return;
+            return self.data.capacity() <= max_capacity;
         }
-        self.data
-            .splice(0..self.start, std::iter::repeat_n(0u8, headroom));
+
+        let Some(required) = self.len().checked_add(headroom) else {
+            return false;
+        };
+        if required.max(self.data.capacity()) > max_capacity {
+            return false;
+        }
+
+        let mut data = Vec::with_capacity(required);
+        if data.capacity() > max_capacity {
+            return false;
+        }
+        data.resize(headroom, 0);
+        data.extend_from_slice(self.as_slice());
+        self.data = data;
         self.start = headroom;
+        true
     }
 
     /// Resets the buffer to an empty state, dropping all data and headroom.
@@ -167,6 +194,24 @@ impl DgramBuffer {
     /// This includes readable bytes, consumed prefix bytes, and spare capacity.
     pub fn allocated_capacity(&self) -> usize {
         self.data.capacity()
+    }
+
+    /// Returns the retained backing capacity required after ensuring
+    /// `headroom` bytes before the current readable payload.
+    ///
+    /// This does not allocate or mutate the buffer. The returned value is the
+    /// requested `Vec` capacity; allocator size-class overhead remains outside
+    /// the buffer's accounting domain.
+    pub fn required_capacity_with_headroom(
+        &self, headroom: usize,
+    ) -> Option<usize> {
+        if self.start >= headroom {
+            return Some(self.data.capacity());
+        }
+
+        self.len()
+            .checked_add(headroom)
+            .map(|required| required.max(self.data.capacity()))
     }
 
     /// Consumes the buffer and returns the inner `Vec<u8>` and the current

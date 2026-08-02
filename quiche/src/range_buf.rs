@@ -27,9 +27,12 @@
 use std::cmp;
 use std::marker::PhantomData;
 use std::ops::Deref;
+use std::sync::Arc;
 
 use crate::buffers::BufFactory;
 use crate::buffers::DefaultBufFactory;
+use crate::stream::StreamSendCharge;
+use crate::Result;
 
 /// Buffer holding data at a specific offset.
 ///
@@ -72,6 +75,9 @@ where
     /// Whether this contains the final byte in the stream.
     pub(crate) fin: bool,
 
+    /// Retention charge shared by views of one send-buffer chunk.
+    pub(crate) retention: Option<Arc<StreamSendCharge>>,
+
     _bf: PhantomData<F>,
 }
 
@@ -92,8 +98,17 @@ where
             pos: 0,
             off,
             fin,
+            retention: None,
             _bf: Default::default(),
         }
+    }
+
+    pub(crate) fn from_raw_retained(
+        data: F::Buf, off: u64, fin: bool, retention: Arc<StreamSendCharge>,
+    ) -> RangeBuf<F> {
+        let mut buf = Self::from_raw(data, off, fin);
+        buf.retention = Some(retention);
+        buf
     }
 
     /// Returns whether `self` holds the final offset in the stream.
@@ -146,6 +161,7 @@ where
             off: self.off + at as u64,
             _bf: Default::default(),
             fin: self.fin,
+            retention: self.retention.clone(),
         };
 
         self.pos = cmp::min(self.pos, self.start + at);
@@ -153,6 +169,33 @@ where
         self.fin = false;
 
         buf
+    }
+
+    pub(crate) fn try_split_off_retained(
+        &mut self, at: usize,
+    ) -> Result<RangeBuf<F>>
+    where
+        F::Buf: Clone + AsRef<[u8]>,
+    {
+        let sibling = self
+            .retention
+            .as_ref()
+            .map(|charge| charge.try_reserve_sibling())
+            .transpose()?;
+        let mut buf = self.split_off(at);
+        if let Some(sibling) = sibling {
+            buf.retention = Some(sibling);
+        }
+        Ok(buf)
+    }
+
+    pub(crate) fn truncate_total(&mut self, at: usize) -> usize {
+        assert!(at <= self.len);
+        let before = self.len();
+        self.pos = cmp::min(self.pos, self.start + at);
+        self.len = at;
+        self.fin = false;
+        before.saturating_sub(self.len())
     }
 
     /// Truncates the unread portion to at most `len` bytes.

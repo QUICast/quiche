@@ -28,6 +28,7 @@ use std::cmp;
 
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
+use std::mem::size_of;
 
 use std::time::Duration;
 use std::time::Instant;
@@ -612,6 +613,13 @@ impl RecvBuf {
     pub(crate) fn flow_control_for_tests(&self) -> &flowcontrol::FlowControl {
         &self.flow_control
     }
+}
+
+pub(super) const fn retained_fragment_metadata_size() -> usize {
+    // One map key/value, one Arc allocation header, and a conservative ordered
+    // collection node/link allowance. Allocator size-class rounding is kept in
+    // the embedding profile's explicit implementation margin.
+    size_of::<u64>() + size_of::<RangeBuf>() + 12 * size_of::<usize>()
 }
 
 #[cfg(test)]

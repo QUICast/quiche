@@ -596,6 +596,22 @@ pub enum QlogLevel {
     Extra = 2,
 }
 
+/// Current and high-water recovery sent-packet metadata accounting.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SentPacketRetentionStats {
+    /// Packet records currently retained across all paths and epochs.
+    pub retained_packets: usize,
+
+    /// Largest packet-record count observed on any one path.
+    pub high_water_packets_per_path: usize,
+
+    /// Configured hard packet-record limit for each path.
+    pub max_packets_per_path: usize,
+
+    /// Number of currently retained network paths.
+    pub paths: usize,
+}
+
 /// Stores configuration shared between multiple connections.
 pub struct Config {
     local_transport_params: TransportParams,
@@ -626,8 +642,13 @@ pub struct Config {
 
     tx_cap_factor: f64,
 
-    dgram_recv_max_queue_len: usize,
-    dgram_send_max_queue_len: usize,
+    dgram_recv_queue_limits: DatagramQueueLimits,
+    dgram_send_queue_limits: DatagramQueueLimits,
+    stream_send_retention_limits: StreamSendRetentionLimits,
+    max_tracked_sent_packets_per_path: usize,
+    max_tracked_frames_per_packet: usize,
+    retain_path_events: bool,
+    max_source_connection_ids: usize,
     multicast_recv_max_queue_len: usize,
     multicast_send_max_queue_len: usize,
     multicast_send_max_queue_bytes: usize,
@@ -709,8 +730,17 @@ impl Config {
 
             tx_cap_factor: TX_CAP_FACTOR,
 
-            dgram_recv_max_queue_len: DEFAULT_MAX_DGRAM_QUEUE_LEN,
-            dgram_send_max_queue_len: DEFAULT_MAX_DGRAM_QUEUE_LEN,
+            dgram_recv_queue_limits: DatagramQueueLimits::unbounded(
+                DEFAULT_MAX_DGRAM_QUEUE_LEN,
+            ),
+            dgram_send_queue_limits: DatagramQueueLimits::unbounded(
+                DEFAULT_MAX_DGRAM_QUEUE_LEN,
+            ),
+            stream_send_retention_limits: StreamSendRetentionLimits::default(),
+            max_tracked_sent_packets_per_path: usize::MAX,
+            max_tracked_frames_per_packet: usize::MAX,
+            retain_path_events: true,
+            max_source_connection_ids: usize::MAX,
             multicast_recv_max_queue_len: DEFAULT_MAX_MULTICAST_QUEUE_LEN,
             multicast_send_max_queue_len: DEFAULT_MAX_MULTICAST_SEND_QUEUE_LEN,
             multicast_send_max_queue_bytes:
@@ -1236,8 +1266,70 @@ impl Config {
         } else {
             None
         };
-        self.dgram_recv_max_queue_len = recv_queue_len;
-        self.dgram_send_max_queue_len = send_queue_len;
+        self.dgram_recv_queue_limits.max_items = recv_queue_len;
+        self.dgram_send_queue_limits.max_items = send_queue_len;
+    }
+
+    /// Configures hard retained-storage limits for received and sent QUIC
+    /// Datagrams.
+    ///
+    /// Limits are checked before queue admission. A finite allocation-byte
+    /// limit requires the configured [`BufFactory`] to report physical
+    /// Datagram capacities.
+    pub fn set_dgram_queue_retention_limits(
+        &mut self, recv: DatagramQueueLimits, send: DatagramQueueLimits,
+    ) {
+        self.dgram_recv_queue_limits = recv;
+        self.dgram_send_queue_limits = send;
+    }
+
+    /// Configures hard transport-owned stream-send allocation bounds.
+    ///
+    /// Copied stream data reserves its requested backing capacity and one chunk
+    /// before allocation. Externally supplied zero-copy buffers reserve chunk
+    /// metadata but keep their shared payload backing in the caller's memory
+    /// domain. The default is unbounded for compatibility.
+    pub fn set_stream_send_retention_limits(
+        &mut self, limits: StreamSendRetentionLimits,
+    ) {
+        self.stream_send_retention_limits = limits;
+    }
+
+    /// Configures the maximum recovery packet records retained on one network
+    /// path.
+    ///
+    /// The default is unbounded for compatibility. A finite application
+    /// memory profile should configure this before connection construction.
+    pub fn set_max_tracked_sent_packets_per_path(&mut self, limit: usize) {
+        self.max_tracked_sent_packets_per_path = limit;
+    }
+
+    /// Configures the maximum retransmission-tracked frames encoded in one
+    /// packet.
+    ///
+    /// Once the cap is reached, otherwise sendable frames remain queued for a
+    /// later packet. The default is unbounded for compatibility.
+    pub fn set_max_tracked_frames_per_packet(&mut self, limit: usize) {
+        self.max_tracked_frames_per_packet = limit;
+    }
+
+    /// Configures whether path lifecycle events are retained for
+    /// [`Connection::path_event_next()`].
+    ///
+    /// This is enabled by default. Applications that neither expose nor
+    /// consume path events can disable retention before constructing a
+    /// connection.
+    pub fn set_retain_path_events(&mut self, enabled: bool) {
+        self.retain_path_events = enabled;
+    }
+
+    /// Configures a local storage cap for source Connection IDs.
+    ///
+    /// This does not change the advertised transport parameter. It only limits
+    /// how many source IDs this endpoint can issue when the peer advertises a
+    /// larger limit. The default is unbounded for compatibility.
+    pub fn set_max_source_connection_ids(&mut self, limit: usize) {
+        self.max_source_connection_ids = limit.max(2);
     }
 
     /// Configures whether this endpoint advertises support for
@@ -1580,6 +1672,15 @@ where
 
     /// Streams map, indexed by stream ID.
     pub(crate) streams: stream::StreamMap<F>,
+
+    /// Hard recovery metadata bound and observed per-path high-water mark.
+    max_tracked_sent_packets_per_path: usize,
+    max_tracked_frames_per_packet: usize,
+    sent_packets_high_water_per_path: usize,
+
+    /// Prevents live changes to retention limits applied by a bounded
+    /// application profile.
+    retention_limits_frozen: bool,
 
     /// Coalesced peer stream-credit transitions, bounded to one per direction.
     stream_credit_updates: VecDeque<StreamCreditDirection>,
@@ -2123,8 +2224,8 @@ pub fn version_is_supported(version: u32) -> bool {
 /// there is no room to add the frame in the packet. You may retry to add the
 /// frame later.
 macro_rules! push_frame_to_pkt {
-    ($out:expr, $frames:expr, $frame:expr, $left:expr) => {{
-        if $frame.wire_len() <= $left {
+    ($out:expr, $frames:expr, $frame:expr, $left:expr, $max_frames:expr) => {{
+        if $frames.len() < $max_frames && $frame.wire_len() <= $left {
             $left -= $frame.wire_len();
 
             $frame.to_bytes(&mut $out)?;
@@ -2271,6 +2372,7 @@ impl<F: BufFactory> Connection<F> {
             path,
             config.local_transport_params.active_conn_id_limit as usize,
             is_server,
+            config.retain_path_events,
         );
 
         let active_path_id = paths.get_active_path_id()?;
@@ -2280,6 +2382,7 @@ impl<F: BufFactory> Connection<F> {
             scid,
             active_path_id,
             reset_token,
+            config.max_source_connection_ids,
         );
 
         let initial_flow_control_window = max_rx_data;
@@ -2357,11 +2460,17 @@ impl<F: BufFactory> Connection<F> {
 
             stream_retrans_bytes: 0,
 
-            streams: stream::StreamMap::new(
+            streams: stream::StreamMap::new_with_send_retention_limits(
                 config.local_transport_params.initial_max_streams_bidi,
                 config.local_transport_params.initial_max_streams_uni,
                 config.max_stream_window,
+                config.stream_send_retention_limits,
             ),
+            max_tracked_sent_packets_per_path: config
+                .max_tracked_sent_packets_per_path,
+            max_tracked_frames_per_packet: config.max_tracked_frames_per_packet,
+            sent_packets_high_water_per_path: 0,
+            retention_limits_frozen: false,
             stream_credit_updates: VecDeque::with_capacity(2),
 
             odcid: None,
@@ -2423,12 +2532,12 @@ impl<F: BufFactory> Connection<F> {
             #[cfg(feature = "qlog")]
             qlog: Default::default(),
 
-            dgram_recv_queue: dgram::DatagramQueue::new(
-                config.dgram_recv_max_queue_len,
+            dgram_recv_queue: dgram::DatagramQueue::with_queue_limits(
+                config.dgram_recv_queue_limits,
             ),
 
-            dgram_send_queue: dgram::DatagramQueue::new(
-                config.dgram_send_max_queue_len,
+            dgram_send_queue: dgram::DatagramQueue::with_queue_limits(
+                config.dgram_send_queue_limits,
             ),
             multicast_recv_queue: multicast::ControlFrameQueue::new(
                 config.multicast_recv_max_queue_len,
@@ -4701,6 +4810,22 @@ impl<F: BufFactory> Connection<F> {
         #[cfg(debug_assertions)]
         self.streams.debug_check_tx_buffered_consistency();
 
+        let tracked_sent_packets = {
+            let path = self.paths.get(send_pid)?;
+            packet::Epoch::epochs(
+                packet::Epoch::Initial..=packet::Epoch::Application,
+            )
+            .iter()
+            .try_fold(0usize, |total, epoch| {
+                total.checked_add(path.recovery.sent_packets_len(*epoch))
+            })
+            .ok_or(Error::Done)?
+        };
+        if tracked_sent_packets >= self.max_tracked_sent_packets_per_path {
+            return Err(Error::Done);
+        }
+        let max_tracked_frames_per_packet = self.max_tracked_frames_per_packet;
+
         let is_app_limited = self.delivery_rate_check_if_app_limited();
         let n_paths = self.paths.len();
         let path = self.paths.get_mut(send_pid)?;
@@ -4890,7 +5015,13 @@ impl<F: BufFactory> Connection<F> {
                 // ACK-only packets are not congestion controlled so ACKs must
                 // be bundled considering the buffer capacity only, and not the
                 // available cwnd.
-                if push_frame_to_pkt!(b, frames, frame, left) {
+                if push_frame_to_pkt!(
+                    b,
+                    frames,
+                    frame,
+                    left,
+                    max_tracked_frames_per_packet
+                ) {
                     pkt_space.ack_elicited = false;
                 }
             }
@@ -4959,12 +5090,24 @@ impl<F: BufFactory> Connection<F> {
                             len: probe_size - overhead - 1,
                         };
 
-                        if push_frame_to_pkt!(b, frames, frame, left) {
+                        if push_frame_to_pkt!(
+                            b,
+                            frames,
+                            frame,
+                            left,
+                            max_tracked_frames_per_packet
+                        ) {
                             let frame = frame::Frame::Ping {
                                 mtu_probe: Some(probe_size),
                             };
 
-                            if push_frame_to_pkt!(b, frames, frame, left) {
+                            if push_frame_to_pkt!(
+                                b,
+                                frames,
+                                frame,
+                                left,
+                                max_tracked_frames_per_packet
+                            ) {
                                 ack_eliciting = true;
                                 in_flight = true;
                             }
@@ -4984,7 +5127,13 @@ impl<F: BufFactory> Connection<F> {
             while let Some(challenge) = path.pop_received_challenge() {
                 let frame = frame::Frame::PathResponse { data: challenge };
 
-                if push_frame_to_pkt!(b, frames, frame, left) {
+                if push_frame_to_pkt!(
+                    b,
+                    frames,
+                    frame,
+                    left,
+                    max_tracked_frames_per_packet
+                ) {
                     ack_eliciting = true;
                     in_flight = true;
                 } else {
@@ -5001,7 +5150,13 @@ impl<F: BufFactory> Connection<F> {
 
                 let frame = frame::Frame::PathChallenge { data };
 
-                if push_frame_to_pkt!(b, frames, frame, left) {
+                if push_frame_to_pkt!(
+                    b,
+                    frames,
+                    frame,
+                    left,
+                    max_tracked_frames_per_packet
+                ) {
                     // Let's notify the path once we know the packet size.
                     challenge_data = Some(data);
 
@@ -5022,7 +5177,13 @@ impl<F: BufFactory> Connection<F> {
             while let Some(seq_num) = self.ids.next_advertise_new_scid_seq() {
                 let frame = self.ids.get_new_connection_id_frame_for(seq_num)?;
 
-                if push_frame_to_pkt!(b, frames, frame, left) {
+                if push_frame_to_pkt!(
+                    b,
+                    frames,
+                    frame,
+                    left,
+                    max_tracked_frames_per_packet
+                ) {
                     self.ids.mark_advertise_new_scid_seq(seq_num, false);
 
                     ack_eliciting = true;
@@ -5042,7 +5203,13 @@ impl<F: BufFactory> Connection<F> {
             {
                 let frame = frame::Frame::HandshakeDone;
 
-                if push_frame_to_pkt!(b, frames, frame, left) {
+                if push_frame_to_pkt!(
+                    b,
+                    frames,
+                    frame,
+                    left,
+                    max_tracked_frames_per_packet
+                ) {
                     self.handshake_done_sent = true;
 
                     ack_eliciting = true;
@@ -5058,7 +5225,13 @@ impl<F: BufFactory> Connection<F> {
                     max: self.streams.max_streams_bidi_next(),
                 };
 
-                if push_frame_to_pkt!(b, frames, frame, left) {
+                if push_frame_to_pkt!(
+                    b,
+                    frames,
+                    frame,
+                    left,
+                    max_tracked_frames_per_packet
+                ) {
                     self.streams.update_max_streams_bidi();
                     self.should_send_max_streams_bidi = false;
 
@@ -5075,7 +5248,13 @@ impl<F: BufFactory> Connection<F> {
                     max: self.streams.max_streams_uni_next(),
                 };
 
-                if push_frame_to_pkt!(b, frames, frame, left) {
+                if push_frame_to_pkt!(
+                    b,
+                    frames,
+                    frame,
+                    left,
+                    max_tracked_frames_per_packet
+                ) {
                     self.streams.update_max_streams_uni();
                     self.should_send_max_streams_uni = false;
 
@@ -5088,7 +5267,13 @@ impl<F: BufFactory> Connection<F> {
             if let Some(limit) = self.blocked_limit {
                 let frame = frame::Frame::DataBlocked { limit };
 
-                if push_frame_to_pkt!(b, frames, frame, left) {
+                if push_frame_to_pkt!(
+                    b,
+                    frames,
+                    frame,
+                    left,
+                    max_tracked_frames_per_packet
+                ) {
                     self.blocked_limit = None;
                     self.data_blocked_sent_count =
                         self.data_blocked_sent_count.saturating_add(1);
@@ -5107,7 +5292,13 @@ impl<F: BufFactory> Connection<F> {
                 if let Some(limit) = self.streams_blocked_bidi_state.blocked_at {
                     let frame = frame::Frame::StreamsBlockedBidi { limit };
 
-                    if push_frame_to_pkt!(b, frames, frame, left) {
+                    if push_frame_to_pkt!(
+                        b,
+                        frames,
+                        frame,
+                        left,
+                        max_tracked_frames_per_packet
+                    ) {
                         // Record the limit we just notified the peer about so
                         // that redundant frames for the same limit are
                         // suppressed.
@@ -5129,7 +5320,13 @@ impl<F: BufFactory> Connection<F> {
                 if let Some(limit) = self.streams_blocked_uni_state.blocked_at {
                     let frame = frame::Frame::StreamsBlockedUni { limit };
 
-                    if push_frame_to_pkt!(b, frames, frame, left) {
+                    if push_frame_to_pkt!(
+                        b,
+                        frames,
+                        frame,
+                        left,
+                        max_tracked_frames_per_packet
+                    ) {
                         // Record the limit we just notified the peer about so
                         // that redundant frames for the same limit are
                         // suppressed.
@@ -5167,7 +5364,13 @@ impl<F: BufFactory> Connection<F> {
                     max: stream.recv.max_data_next(),
                 };
 
-                if push_frame_to_pkt!(b, frames, frame, left) {
+                if push_frame_to_pkt!(
+                    b,
+                    frames,
+                    frame,
+                    left,
+                    max_tracked_frames_per_packet
+                ) {
                     let recv_win = stream.recv.window();
 
                     stream.recv.update_max_data(now);
@@ -5200,7 +5403,13 @@ impl<F: BufFactory> Connection<F> {
                     max: flow_control.max_data_next(),
                 };
 
-                if push_frame_to_pkt!(b, frames, frame, left) {
+                if push_frame_to_pkt!(
+                    b,
+                    frames,
+                    frame,
+                    left,
+                    max_tracked_frames_per_packet
+                ) {
                     self.should_send_max_data = false;
 
                     // Commits the new max_rx_data limit.
@@ -5223,7 +5432,13 @@ impl<F: BufFactory> Connection<F> {
                     error_code,
                 };
 
-                if push_frame_to_pkt!(b, frames, frame, left) {
+                if push_frame_to_pkt!(
+                    b,
+                    frames,
+                    frame,
+                    left,
+                    max_tracked_frames_per_packet
+                ) {
                     self.streams.remove_stopped(stream_id);
 
                     ack_eliciting = true;
@@ -5260,7 +5475,13 @@ impl<F: BufFactory> Connection<F> {
                     },
                 };
 
-                if push_frame_to_pkt!(b, frames, frame, left) {
+                if push_frame_to_pkt!(
+                    b,
+                    frames,
+                    frame,
+                    left,
+                    max_tracked_frames_per_packet
+                ) {
                     self.streams.remove_reset(stream_id);
 
                     ack_eliciting = true;
@@ -5277,7 +5498,13 @@ impl<F: BufFactory> Connection<F> {
             {
                 let frame = frame::Frame::StreamDataBlocked { stream_id, limit };
 
-                if push_frame_to_pkt!(b, frames, frame, left) {
+                if push_frame_to_pkt!(
+                    b,
+                    frames,
+                    frame,
+                    left,
+                    max_tracked_frames_per_packet
+                ) {
                     self.streams.remove_blocked(stream_id);
                     self.stream_data_blocked_sent_count =
                         self.stream_data_blocked_sent_count.saturating_add(1);
@@ -5302,7 +5529,13 @@ impl<F: BufFactory> Connection<F> {
 
                 let frame = frame::Frame::RetireConnectionId { seq_num };
 
-                if push_frame_to_pkt!(b, frames, frame, left) {
+                if push_frame_to_pkt!(
+                    b,
+                    frames,
+                    frame,
+                    left,
+                    max_tracked_frames_per_packet
+                ) {
                     self.ids.mark_retire_dcid_seq(seq_num, false)?;
 
                     ack_eliciting = true;
@@ -5317,7 +5550,13 @@ impl<F: BufFactory> Connection<F> {
                 let requires_packet_end = frame.requires_packet_end();
                 let frame = frame::Frame::Multicast(frame);
 
-                if push_frame_to_pkt!(b, frames, frame, left) {
+                if push_frame_to_pkt!(
+                    b,
+                    frames,
+                    frame,
+                    left,
+                    max_tracked_frames_per_packet
+                ) {
                     self.multicast_send_queue.pop_front_for_send();
 
                     if ack_eliciting_frame {
@@ -5346,7 +5585,13 @@ impl<F: BufFactory> Connection<F> {
                             reason: conn_err.reason.clone(),
                         };
 
-                        if push_frame_to_pkt!(b, frames, frame, left) {
+                        if push_frame_to_pkt!(
+                            b,
+                            frames,
+                            frame,
+                            left,
+                            max_tracked_frames_per_packet
+                        ) {
                             let pto = path.recovery.pto();
                             self.draining_timer = Some(now + (pto * 3));
 
@@ -5362,7 +5607,13 @@ impl<F: BufFactory> Connection<F> {
                         reason: conn_err.reason.clone(),
                     };
 
-                    if push_frame_to_pkt!(b, frames, frame, left) {
+                    if push_frame_to_pkt!(
+                        b,
+                        frames,
+                        frame,
+                        left,
+                        max_tracked_frames_per_packet
+                    ) {
                         let pto = path.recovery.pto();
                         self.draining_timer = Some(now + (pto * 3));
 
@@ -5431,7 +5682,13 @@ impl<F: BufFactory> Connection<F> {
                     length: len,
                 };
 
-                if push_frame_to_pkt!(b, frames, frame, left) {
+                if push_frame_to_pkt!(
+                    b,
+                    frames,
+                    frame,
+                    left,
+                    max_tracked_frames_per_packet
+                ) {
                     ack_eliciting = true;
                     in_flight = true;
                     has_data = true;
@@ -5514,7 +5771,13 @@ impl<F: BufFactory> Connection<F> {
                                 let frame =
                                     frame::Frame::DatagramHeader { length: len };
 
-                                if push_frame_to_pkt!(b, frames, frame, left) {
+                                if push_frame_to_pkt!(
+                                    b,
+                                    frames,
+                                    frame,
+                                    left,
+                                    max_tracked_frames_per_packet
+                                ) {
                                     ack_eliciting = true;
                                     in_flight = true;
                                     dgram_emitted = true;
@@ -5622,7 +5885,13 @@ impl<F: BufFactory> Connection<F> {
                     fin,
                 };
 
-                if push_frame_to_pkt!(b, frames, frame, left) {
+                if push_frame_to_pkt!(
+                    b,
+                    frames,
+                    frame,
+                    left,
+                    max_tracked_frames_per_packet
+                ) {
                     ack_eliciting = true;
                     in_flight = true;
                     has_data = true;
@@ -5667,7 +5936,13 @@ impl<F: BufFactory> Connection<F> {
         {
             let frame = frame::Frame::Ping { mtu_probe: None };
 
-            if push_frame_to_pkt!(b, frames, frame, left) {
+            if push_frame_to_pkt!(
+                b,
+                frames,
+                frame,
+                left,
+                max_tracked_frames_per_packet
+            ) {
                 ack_eliciting = true;
                 in_flight = true;
             }
@@ -5706,7 +5981,13 @@ impl<F: BufFactory> Connection<F> {
         {
             let frame = frame::Frame::Padding { len: left };
 
-            if push_frame_to_pkt!(b, frames, frame, left) {
+            if push_frame_to_pkt!(
+                b,
+                frames,
+                frame,
+                left,
+                max_tracked_frames_per_packet
+            ) {
                 in_flight = true;
             }
         }
@@ -5720,7 +6001,13 @@ impl<F: BufFactory> Connection<F> {
             };
 
             #[allow(unused_assignments)]
-            if push_frame_to_pkt!(b, frames, frame, left) {
+            if push_frame_to_pkt!(
+                b,
+                frames,
+                frame,
+                left,
+                max_tracked_frames_per_packet
+            ) {
                 in_flight = true;
             }
         }
@@ -5806,6 +6093,11 @@ impl<F: BufFactory> Connection<F> {
         } else {
             has_data
         };
+
+        // Recovery never appends to one packet's frame list after this point.
+        // Release geometric spill capacity so the configured frame count maps
+        // to retained storage rather than a historical allocation high-water.
+        frames.shrink_to_fit();
 
         let sent_pkt = recovery::Sent {
             pkt_num: pn,
@@ -5915,6 +6207,15 @@ impl<F: BufFactory> Connection<F> {
             now,
             &self.trace_id,
         );
+        let retained = packet::Epoch::epochs(
+            packet::Epoch::Initial..=packet::Epoch::Application,
+        )
+        .iter()
+        .fold(0usize, |total, epoch| {
+            total.saturating_add(path.recovery.sent_packets_len(*epoch))
+        });
+        self.sent_packets_high_water_per_path =
+            self.sent_packets_high_water_per_path.max(retained);
 
         Ok(())
     }
@@ -7400,6 +7701,11 @@ impl<F: BufFactory> Connection<F> {
         MIN_CLIENT_INITIAL_LEN
     }
 
+    /// Returns the immutable configured maximum egress UDP payload size.
+    pub fn configured_max_send_udp_payload_size(&self) -> usize {
+        self.recovery_config.max_send_udp_payload_size
+    }
+
     /// Schedule an ack-eliciting packet on the active path.
     ///
     /// QUIC packets might not contain ack-eliciting frames during normal
@@ -7534,6 +7840,132 @@ impl<F: BufFactory> Connection<F> {
         self.streams.tx_buffered()
     }
 
+    /// Returns current and high-water transport-owned stream-send retention.
+    ///
+    /// `retained_bytes` is requested backing capacity for data copied by
+    /// quiche. `retained_chunks` also includes metadata for externally supplied
+    /// zero-copy buffers; their shared payload backing remains
+    /// caller-accounted.
+    #[inline]
+    pub fn stream_send_retention_stats(&self) -> StreamSendRetentionStats {
+        self.streams.send_retention_stats()
+    }
+
+    /// Returns the configured stream-send retained-storage limits.
+    pub fn stream_send_retention_limits(&self) -> StreamSendRetentionLimits {
+        self.streams.send_retention_limits()
+    }
+
+    /// Updates hard transport-owned stream-send retention limits.
+    ///
+    /// This is intended for an application protocol that establishes a
+    /// finite memory profile after the QUIC handshake. Lowering a limit below
+    /// current retained state returns [`Error::Done`] and leaves the prior
+    /// limits unchanged.
+    pub fn set_stream_send_retention_limits(
+        &mut self, limits: StreamSendRetentionLimits,
+    ) -> Result<()> {
+        if self.retention_limits_frozen {
+            return Err(Error::InvalidState);
+        }
+
+        self.streams.set_send_retention_limits(limits)
+    }
+
+    /// Updates the hard recovery packet-record limit for each network path.
+    ///
+    /// Lowering below current retained state returns [`Error::Done`] without
+    /// changing the prior limit.
+    pub fn set_max_tracked_sent_packets_per_path(
+        &mut self, limit: usize,
+    ) -> Result<()> {
+        if self.retention_limits_frozen {
+            return Err(Error::InvalidState);
+        }
+
+        let exceeds = self.paths.iter().any(|(_, path)| {
+            packet::Epoch::epochs(
+                packet::Epoch::Initial..=packet::Epoch::Application,
+            )
+            .iter()
+            .fold(0usize, |total, epoch| {
+                total.saturating_add(path.recovery.sent_packets_len(*epoch))
+            }) > limit
+        });
+        if exceeds {
+            return Err(Error::Done);
+        }
+        self.max_tracked_sent_packets_per_path = limit;
+        Ok(())
+    }
+
+    /// Returns current and high-water recovery packet-record accounting.
+    pub fn sent_packet_retention_stats(&self) -> SentPacketRetentionStats {
+        let retained_packets =
+            self.paths.iter().fold(0usize, |total, (_, path)| {
+                let path_total = packet::Epoch::epochs(
+                    packet::Epoch::Initial..=packet::Epoch::Application,
+                )
+                .iter()
+                .fold(0usize, |path_total, epoch| {
+                    path_total
+                        .saturating_add(path.recovery.sent_packets_len(*epoch))
+                });
+                total.saturating_add(path_total)
+            });
+        SentPacketRetentionStats {
+            retained_packets,
+            high_water_packets_per_path: self.sent_packets_high_water_per_path,
+            max_packets_per_path: self.max_tracked_sent_packets_per_path,
+            paths: self.paths.len(),
+        }
+    }
+
+    /// Returns the configured sent-packet record limit for each path.
+    pub fn max_tracked_sent_packets_per_path(&self) -> usize {
+        self.max_tracked_sent_packets_per_path
+    }
+
+    /// Returns the configured tracked-frame limit for one sent packet.
+    pub fn max_tracked_frames_per_packet(&self) -> usize {
+        self.max_tracked_frames_per_packet
+    }
+
+    /// Freezes the live retained-storage limits on this connection.
+    ///
+    /// After this idempotent operation, attempts to update stream-send,
+    /// Datagram-queue, or sent-packet retention limits return
+    /// [`Error::InvalidState`] without mutation. Construction-time limits that
+    /// have no live setter are already immutable.
+    pub fn freeze_retention_limits(&mut self) {
+        self.retention_limits_frozen = true;
+    }
+
+    /// Returns whether live retained-storage limits have been frozen.
+    pub fn retention_limits_frozen(&self) -> bool {
+        self.retention_limits_frozen
+    }
+
+    /// Returns whether this connection retains application path events.
+    pub fn path_event_retention_enabled(&self) -> bool {
+        self.paths.retains_events()
+    }
+
+    /// Returns the configured local source Connection-ID storage cap.
+    pub fn max_source_connection_ids(&self) -> usize {
+        self.ids.source_conn_id_limit_cap()
+    }
+
+    /// Returns the configured received PATH_CHALLENGE queue limit per path.
+    pub fn path_challenge_recv_max_queue_len(&self) -> usize {
+        self.path_challenge_recv_max_queue_len
+    }
+
+    /// Returns the configured unknown transport-parameter retention limit.
+    pub fn tracked_unknown_transport_parameter_limit(&self) -> Option<usize> {
+        self.peer_transport_params_track_unknown
+    }
+
     /// Returns the number of items in the DATAGRAM receive queue.
     #[inline]
     pub fn dgram_recv_queue_len(&self) -> usize {
@@ -7546,6 +7978,34 @@ impl<F: BufFactory> Connection<F> {
         self.dgram_recv_queue.byte_size()
     }
 
+    /// Returns current and high-water retained-storage accounting for the
+    /// incoming Datagram queue.
+    pub fn dgram_recv_queue_stats(&self) -> DatagramQueueStats {
+        self.dgram_recv_queue.stats()
+    }
+
+    /// Returns the configured incoming Datagram retained-storage limits.
+    pub fn dgram_recv_queue_limits(&self) -> DatagramQueueLimits {
+        self.dgram_recv_queue.limits()
+    }
+
+    /// Updates hard retained-storage limits for QUIC Datagram queues.
+    ///
+    /// Lowering below current retained state returns [`Error::Done`] and
+    /// leaves both queues unchanged.
+    pub fn set_dgram_queue_retention_limits(
+        &mut self, recv: DatagramQueueLimits, send: DatagramQueueLimits,
+    ) -> Result<()> {
+        if self.retention_limits_frozen {
+            return Err(Error::InvalidState);
+        }
+
+        self.dgram_recv_queue.can_set_limits(recv)?;
+        self.dgram_send_queue.can_set_limits(send)?;
+        self.dgram_recv_queue.set_limits(recv)?;
+        self.dgram_send_queue.set_limits(send)
+    }
+
     /// Returns the number of items in the DATAGRAM send queue.
     #[inline]
     pub fn dgram_send_queue_len(&self) -> usize {
@@ -7556,6 +8016,17 @@ impl<F: BufFactory> Connection<F> {
     #[inline]
     pub fn dgram_send_queue_byte_size(&self) -> usize {
         self.dgram_send_queue.byte_size()
+    }
+
+    /// Returns the configured outgoing Datagram retained-storage limits.
+    pub fn dgram_send_queue_limits(&self) -> DatagramQueueLimits {
+        self.dgram_send_queue.limits()
+    }
+
+    /// Returns current and high-water retained-storage accounting for the
+    /// outgoing Datagram queue.
+    pub fn dgram_send_queue_stats(&self) -> DatagramQueueStats {
+        self.dgram_send_queue.stats()
     }
 
     /// Returns whether or not the DATAGRAM send queue is full.
@@ -7603,6 +8074,20 @@ impl<F: BufFactory> Connection<F> {
     /// # Ok::<(), quiche::Error>(())
     /// ```
     pub fn dgram_send(&mut self, buf: &[u8]) -> Result<()> {
+        if self.multicast_default_dgram_channel_id.is_none() {
+            let allocation_bytes =
+                match F::dgram_buf_from_slice_capacity(buf.len()) {
+                    Some(capacity) => capacity,
+                    None if self
+                        .dgram_send_queue
+                        .has_finite_allocation_limit() =>
+                    {
+                        return Err(Error::InvalidState);
+                    },
+                    None => 0,
+                };
+            self.dgram_send_preflight(buf.len(), allocation_bytes)?;
+        }
         self.dgram_send_buf(F::dgram_buf_from_slice(buf))
     }
 
@@ -7646,18 +8131,12 @@ impl<F: BufFactory> Connection<F> {
             return Err((Error::BufferTooShort, buf));
         }
 
-        if self.dgram_send_queue.is_full() {
-            return Err((Error::Done, buf));
-        }
-
         let active_path = match self.paths.get_active_mut() {
             Ok(path) => path,
             Err(err) => return Err((err, buf)),
         };
 
-        self.dgram_send_queue
-            .push(buf)
-            .expect("DATAGRAM queue capacity was preflighted");
+        self.dgram_send_queue.try_push(buf)?;
 
         if self.dgram_send_queue.byte_size() >
             active_path.recovery.cwnd_available()
@@ -7666,6 +8145,20 @@ impl<F: BufFactory> Connection<F> {
         }
 
         Ok(())
+    }
+
+    fn dgram_send_preflight(
+        &self, payload_len: usize, allocation_bytes: usize,
+    ) -> Result<()> {
+        let max_payload_len =
+            self.dgram_max_writable_len().ok_or(Error::InvalidState)?;
+        if payload_len > max_payload_len {
+            return Err(Error::BufferTooShort);
+        }
+
+        self.dgram_send_queue
+            .can_push(payload_len, allocation_bytes)
+            .map(|_| ())
     }
 
     /// Purges queued outgoing DATAGRAMs matching the predicate.
@@ -10116,6 +10609,21 @@ impl<F: BufFactory> Connection<F> {
         Some(&self.peer_transport_params)
     }
 
+    /// Returns the transport parameters advertised by the local endpoint.
+    pub fn local_transport_params(&self) -> &TransportParams {
+        &self.local_transport_params
+    }
+
+    /// Returns the configured maximum connection receive-flow-control window.
+    pub fn max_connection_window(&self) -> u64 {
+        self.flow_control.max_window()
+    }
+
+    /// Returns the configured maximum per-stream receive-flow-control window.
+    pub fn max_stream_window(&self) -> u64 {
+        self.streams.max_stream_window()
+    }
+
     /// Collects and returns statistics about each known path for the
     /// connection.
     pub fn path_stats(&self) -> impl Iterator<Item = PathStats> + '_ {
@@ -11243,12 +11751,11 @@ impl<F: BufFactory> Connection<F> {
                     return Err(Error::InvalidState);
                 }
 
-                // If recv queue is full, discard oldest
-                if self.dgram_recv_queue.is_full() {
-                    self.dgram_recv_queue.pop();
+                match self.dgram_recv_queue.try_push_drop_oldest(data.into()) {
+                    Ok(()) => {},
+                    Err((Error::Done, _)) => return Ok(()),
+                    Err((error, _)) => return Err(error),
                 }
-
-                self.dgram_recv_queue.push(data.into())?;
 
                 self.dgram_recv_count = self.dgram_recv_count.saturating_add(1);
 
@@ -11931,7 +12438,62 @@ pub use crate::recovery::CongestionControlAlgorithm;
 pub use crate::recovery::StartupExit;
 pub use crate::recovery::StartupExitReason;
 
+pub use crate::dgram::DatagramQueueLimits;
+pub use crate::dgram::DatagramQueueStats;
 pub use crate::stream::StreamIter;
+pub use crate::stream::StreamSendRetentionLimits;
+pub use crate::stream::StreamSendRetentionStats;
+
+/// Returns the in-structure metadata size of one retained stream-send chunk.
+///
+/// Backing allocation bytes are accounted separately by
+/// [`StreamSendRetentionLimits::max_bytes`]. Allocator and ordered-map node
+/// overhead remain the embedding application's implementation margin.
+pub const fn stream_send_chunk_metadata_size<F: BufFactory>() -> usize {
+    stream::retained_send_chunk_metadata_size::<F>()
+}
+
+/// Returns conservative retained metadata for one receive-stream fragment.
+///
+/// Payload bytes are accounted separately. This includes the Arc allocation
+/// header and ordered-map membership but excludes allocator size-class
+/// rounding.
+pub const fn stream_receive_fragment_metadata_size() -> usize {
+    stream::retained_receive_fragment_metadata_size()
+}
+
+/// Returns conservative retained metadata for one live core QUIC stream.
+pub const fn live_stream_metadata_size<F: BufFactory>() -> usize {
+    stream::live_stream_metadata_size::<F>()
+}
+
+/// Returns the in-structure metadata size of one retained recovery packet.
+///
+/// Frame spill allocations and collection-node overhead remain the embedding
+/// application's implementation margin.
+pub const fn tracked_sent_packet_metadata_size() -> usize {
+    size_of::<recovery::Sent>()
+}
+
+/// Returns in-structure storage for one retransmission-tracked frame.
+pub const fn tracked_frame_metadata_size() -> usize {
+    size_of::<frame::Frame>()
+}
+
+/// Returns in-structure storage for one retained path.
+pub const fn path_metadata_size() -> usize {
+    size_of::<path::Path>()
+}
+
+/// Returns a conservative requested-capacity bound for Connection-ID state.
+///
+/// The bound includes geometric collection growth and maximum-length owned
+/// Connection IDs. Allocator size-class rounding remains embedding-specific.
+pub fn connection_id_retention_metadata_upper_bound(
+    destination_limit: usize, source_limit: usize,
+) -> Option<usize> {
+    cid::retention_metadata_upper_bound(destination_limit, source_limit)
+}
 
 pub use crate::transport_params::TransportParams;
 pub use crate::transport_params::UnknownTransportParameter;

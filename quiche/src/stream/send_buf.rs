@@ -27,6 +27,9 @@
 use std::cmp;
 
 use std::collections::VecDeque;
+use std::mem::size_of;
+use std::sync::Arc;
+use std::sync::Mutex;
 
 use crate::buffers::BufSplit;
 use crate::range_buf::RangeBuf;
@@ -45,6 +48,209 @@ const SEND_BUFFER_SIZE: usize = 5;
 #[cfg(not(test))]
 const SEND_BUFFER_SIZE: usize = 4096;
 
+/// Hard allocation bounds for retained stream-send data.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StreamSendRetentionLimits {
+    /// Maximum requested backing capacity retained by copied stream chunks.
+    pub max_bytes: usize,
+
+    /// Maximum retained copied or externally-backed stream chunks.
+    pub max_chunks: usize,
+}
+
+impl Default for StreamSendRetentionLimits {
+    fn default() -> Self {
+        Self {
+            max_bytes: usize::MAX,
+            max_chunks: usize::MAX,
+        }
+    }
+}
+
+/// Current and high-water stream-send retention accounting.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct StreamSendRetentionStats {
+    /// Requested backing capacity currently retained by copied chunks.
+    pub retained_bytes: usize,
+
+    /// Copied or externally-backed chunks currently retained.
+    pub retained_chunks: usize,
+
+    /// Largest observed retained copied backing capacity.
+    pub high_water_bytes: usize,
+
+    /// Largest observed retained chunk count.
+    pub high_water_chunks: usize,
+}
+
+#[derive(Debug, Default)]
+struct StreamSendRetentionState {
+    limits: StreamSendRetentionLimits,
+    retained_bytes: usize,
+    retained_chunks: usize,
+    high_water_bytes: usize,
+    high_water_chunks: usize,
+}
+
+/// Connection-scoped retention accounting shared by every send buffer.
+#[derive(Debug, Default)]
+pub(crate) struct StreamSendRetention {
+    state: Mutex<StreamSendRetentionState>,
+}
+
+impl StreamSendRetention {
+    pub(crate) fn new(limits: StreamSendRetentionLimits) -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(StreamSendRetentionState {
+                limits,
+                ..StreamSendRetentionState::default()
+            }),
+        })
+    }
+
+    fn is_bounded(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .limits !=
+            StreamSendRetentionLimits::default()
+    }
+
+    fn try_reserve(
+        self: &Arc<Self>, bytes: usize, chunks: usize,
+    ) -> Result<StreamSendReservation> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let next_bytes =
+            state.retained_bytes.checked_add(bytes).ok_or(Error::Done)?;
+        let next_chunks = state
+            .retained_chunks
+            .checked_add(chunks)
+            .ok_or(Error::Done)?;
+        if next_bytes > state.limits.max_bytes ||
+            next_chunks > state.limits.max_chunks
+        {
+            return Err(Error::Done);
+        }
+
+        state.retained_bytes = next_bytes;
+        state.retained_chunks = next_chunks;
+        state.high_water_bytes = state.high_water_bytes.max(next_bytes);
+        state.high_water_chunks = state.high_water_chunks.max(next_chunks);
+        drop(state);
+
+        Ok(StreamSendReservation {
+            accounting: Arc::clone(self),
+            remaining_bytes: bytes,
+            remaining_chunks: chunks,
+        })
+    }
+
+    fn release(&self, bytes: usize, chunks: usize) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        debug_assert!(state.retained_bytes >= bytes);
+        debug_assert!(state.retained_chunks >= chunks);
+        state.retained_bytes = state.retained_bytes.saturating_sub(bytes);
+        state.retained_chunks = state.retained_chunks.saturating_sub(chunks);
+    }
+
+    pub(crate) fn stats(&self) -> StreamSendRetentionStats {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        StreamSendRetentionStats {
+            retained_bytes: state.retained_bytes,
+            retained_chunks: state.retained_chunks,
+            high_water_bytes: state.high_water_bytes,
+            high_water_chunks: state.high_water_chunks,
+        }
+    }
+
+    pub(crate) fn limits(&self) -> StreamSendRetentionLimits {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .limits
+    }
+
+    pub(crate) fn set_limits(
+        &self, limits: StreamSendRetentionLimits,
+    ) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.retained_bytes > limits.max_bytes ||
+            state.retained_chunks > limits.max_chunks
+        {
+            return Err(Error::Done);
+        }
+        state.limits = limits;
+        Ok(())
+    }
+}
+
+pub(crate) struct StreamSendReservation {
+    accounting: Arc<StreamSendRetention>,
+    remaining_bytes: usize,
+    remaining_chunks: usize,
+}
+
+impl StreamSendReservation {
+    pub(crate) fn charge(
+        &mut self, bytes: usize, chunks: usize,
+    ) -> Arc<StreamSendCharge> {
+        debug_assert!(bytes <= self.remaining_bytes);
+        debug_assert!(chunks <= self.remaining_chunks);
+        self.remaining_bytes = self.remaining_bytes.saturating_sub(bytes);
+        self.remaining_chunks = self.remaining_chunks.saturating_sub(chunks);
+        Arc::new(StreamSendCharge {
+            accounting: Arc::clone(&self.accounting),
+            bytes,
+            chunks,
+        })
+    }
+}
+
+impl Drop for StreamSendReservation {
+    fn drop(&mut self) {
+        self.accounting
+            .release(self.remaining_bytes, self.remaining_chunks);
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct StreamSendCharge {
+    accounting: Arc<StreamSendRetention>,
+    bytes: usize,
+    chunks: usize,
+}
+
+impl Drop for StreamSendCharge {
+    fn drop(&mut self) {
+        self.accounting.release(self.bytes, self.chunks);
+    }
+}
+
+impl StreamSendCharge {
+    pub(crate) fn try_reserve_sibling(&self) -> Result<Arc<StreamSendCharge>> {
+        let mut reservation = self.accounting.try_reserve(0, 1)?;
+        Ok(reservation.charge(0, 1))
+    }
+}
+
+pub(super) const fn retained_chunk_metadata_size<F: BufFactory>() -> usize {
+    size_of::<RangeBuf<F>>() +
+        size_of::<StreamSendCharge>() +
+        4 * size_of::<usize>()
+}
+
 struct SendReserve<'a, F: BufFactory> {
     inner: &'a mut SendBuf<F>,
     reserved: usize,
@@ -52,7 +258,9 @@ struct SendReserve<'a, F: BufFactory> {
 }
 
 impl<F: BufFactory> SendReserve<'_, F> {
-    fn append_buf(&mut self, buf: F::Buf) -> Result<()> {
+    fn append_buf(
+        &mut self, buf: F::Buf, charge: Arc<StreamSendCharge>,
+    ) -> Result<()> {
         let len = buf.as_ref().len();
         let inner = &mut self.inner;
 
@@ -62,7 +270,7 @@ impl<F: BufFactory> SendReserve<'_, F> {
 
         let fin: bool = self.reserved == len && self.fin;
 
-        let buf = RangeBuf::from_raw(buf, inner.off, fin);
+        let buf = RangeBuf::from_raw_retained(buf, inner.off, fin, charge);
 
         // The new data can simply be appended at the end of the send buffer.
         inner.data.push_back(buf);
@@ -175,13 +383,27 @@ where
 
     /// The error code received via STOP_SENDING.
     error: Option<u64>,
+
+    /// Connection-scoped hard retention accounting.
+    retention: Arc<StreamSendRetention>,
 }
 
 impl<F: BufFactory> SendBuf<F> {
     /// Creates a new send buffer.
+    #[cfg(test)]
     pub fn new(max_data: u64) -> SendBuf<F> {
+        Self::new_with_retention(
+            max_data,
+            StreamSendRetention::new(StreamSendRetentionLimits::default()),
+        )
+    }
+
+    pub(crate) fn new_with_retention(
+        max_data: u64, retention: Arc<StreamSendRetention>,
+    ) -> SendBuf<F> {
         SendBuf {
             max_data,
+            retention,
             ..SendBuf::default()
         }
     }
@@ -242,6 +464,18 @@ impl<F: BufFactory> SendBuf<F> {
     /// (this may be lower than the size of the input buffer, in case of partial
     /// writes).
     pub fn write(&mut self, data: &[u8], fin: bool) -> Result<usize> {
+        let writable = self.preflight_write_len(data.len(), fin)?;
+        let chunks = writable.div_ceil(SEND_BUFFER_SIZE);
+        let retained_bytes = data[..writable].chunks(SEND_BUFFER_SIZE).try_fold(
+            0usize,
+            |total, chunk| {
+                let capacity = F::buf_from_slice_capacity(chunk.len())
+                    .or_else(|| (!self.retention.is_bounded()).then_some(0))
+                    .ok_or(Error::InvalidState)?;
+                total.checked_add(capacity).ok_or(Error::Done)
+            },
+        )?;
+        let mut retention = self.retention.try_reserve(retained_bytes, chunks)?;
         let mut reserve = self.reserve_for_write(data.len(), fin)?;
 
         if reserve.reserved == 0 {
@@ -253,7 +487,11 @@ impl<F: BufFactory> SendBuf<F> {
         // Split the remaining input data into consistently-sized buffers to
         // avoid fragmentation.
         for chunk in data[..reserve.reserved].chunks(SEND_BUFFER_SIZE) {
-            reserve.append_buf(F::buf_from_slice(chunk))?;
+            let capacity = F::buf_from_slice_capacity(chunk.len()).unwrap_or(0);
+            reserve.append_buf(
+                F::buf_from_slice(chunk),
+                retention.charge(capacity, 1),
+            )?;
         }
 
         Ok(ret)
@@ -271,6 +509,9 @@ impl<F: BufFactory> SendBuf<F> {
         F::Buf: BufSplit,
     {
         let len = data.as_ref().len();
+        let writable = self.preflight_write_len(cap.min(len), fin)?;
+        let mut retention =
+            self.retention.try_reserve(0, usize::from(writable > 0))?;
         let mut reserve = self.reserve_for_write(cap.min(len), fin)?;
 
         if reserve.reserved == 0 {
@@ -282,7 +523,7 @@ impl<F: BufFactory> SendBuf<F> {
 
         let ret = reserve.reserved;
 
-        reserve.append_buf(data)?;
+        reserve.append_buf(data, retention.charge(0, 1))?;
 
         Ok((ret, remainder))
     }
@@ -326,13 +567,21 @@ impl<F: BufFactory> SendBuf<F> {
             }
         }
 
+        let mut retention =
+            self.retention.try_reserve(0, usize::from(len > 0))?;
+
         if fin {
             self.fin_off = Some(max_off);
             self.fin_acked = false;
         }
 
         if len > 0 {
-            let mut buf = RangeBuf::from_raw(data, offset, fin);
+            let mut buf = RangeBuf::from_raw_retained(
+                data,
+                offset,
+                fin,
+                retention.charge(0, 1),
+            );
 
             if !transmit {
                 buf.consume(len);
@@ -345,6 +594,27 @@ impl<F: BufFactory> SendBuf<F> {
 
         if transmit {
             self.buffered_bytes += len as u64;
+        }
+
+        Ok(len)
+    }
+
+    fn preflight_write_len(&self, mut len: usize, fin: bool) -> Result<usize> {
+        if self.shutdown {
+            return Err(Error::FinalSize);
+        }
+
+        let max_off = self.off.checked_add(len as u64).ok_or(Error::FinalSize)?;
+        len = len.min(self.cap()?);
+
+        if let Some(fin_off) = self.fin_off {
+            if max_off > fin_off || (max_off == fin_off && !fin) {
+                return Err(Error::FinalSize);
+            }
+        }
+
+        if self.ack_off() >= max_off {
+            return Ok(0);
         }
 
         Ok(len)
@@ -528,7 +798,10 @@ impl<F: BufFactory> SendBuf<F> {
             // Split the buffer into 2 if the retransmit range ends before the
             // buffer's final offset.
             let new_buf = if buf.off < max_off && max_off < buf.max_off() {
-                Some(buf.split_off((max_off - buf.off) as usize))
+                // If metadata capacity is exhausted, retransmitting the
+                // containing suffix is conservative and avoids growing state.
+                buf.try_split_off_retained((max_off - buf.off) as usize)
+                    .ok()
             } else {
                 None
             };
@@ -621,9 +894,8 @@ impl<F: BufFactory> SendBuf<F> {
             if end < buf_end {
                 let split_at = usize::try_from(end - buf_start)
                     .expect("range length is already represented as usize");
-                let tail = buf.split_off(split_at);
-                dropped_buffered =
-                    dropped_buffered.saturating_add(tail.len() as u64);
+                dropped_buffered = dropped_buffered
+                    .saturating_add(buf.truncate_total(split_at) as u64);
                 truncate_at = i + 1;
                 break;
             }
@@ -941,7 +1213,42 @@ impl<F: BufFactory> SendBuf<F> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::*;
+
+    #[derive(Clone, Debug, Default)]
+    struct CountingBufFactory;
+
+    thread_local! {
+        static COPIED_ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    impl BufFactory for CountingBufFactory {
+        type Buf = Arc<[u8]>;
+        type DgramBuf = Vec<u8>;
+
+        fn buf_from_slice(buf: &[u8]) -> Self::Buf {
+            COPIED_ALLOCATIONS.set(COPIED_ALLOCATIONS.get() + 1);
+            Arc::from(buf)
+        }
+
+        fn buf_from_slice_capacity(len: usize) -> Option<usize> {
+            Some(len)
+        }
+
+        fn dgram_buf_from_slice(buf: &[u8]) -> Self::DgramBuf {
+            buf.to_vec()
+        }
+
+        fn dgram_buf_from_slice_capacity(len: usize) -> Option<usize> {
+            Some(len)
+        }
+
+        fn dgram_buf_capacity(buf: &Self::DgramBuf) -> Option<usize> {
+            Some(buf.capacity())
+        }
+    }
 
     #[test]
     fn empty_write() {
@@ -1384,5 +1691,62 @@ mod tests {
         assert!(send.is_complete());
         assert_eq!(send.shutdown_at(9, 5, 4), Err(Error::Done));
         assert_eq!(send.shutdown(9, 5), Err(Error::Done));
+    }
+
+    #[test]
+    fn retention_cap_rejects_before_copy_and_releases_on_ack() {
+        COPIED_ALLOCATIONS.set(0);
+        let retention = StreamSendRetention::new(StreamSendRetentionLimits {
+            max_bytes: 5,
+            max_chunks: 1,
+        });
+        let mut send = SendBuf::<CountingBufFactory>::new_with_retention(
+            u64::MAX,
+            Arc::clone(&retention),
+        );
+
+        assert_eq!(send.write(b"123456", false), Err(Error::Done));
+        assert_eq!(COPIED_ALLOCATIONS.get(), 0);
+        assert_eq!(retention.stats(), StreamSendRetentionStats::default());
+
+        assert_eq!(send.write(b"12345", false), Ok(5));
+        assert_eq!(COPIED_ALLOCATIONS.get(), 1);
+        assert_eq!(retention.stats().retained_bytes, 5);
+        assert_eq!(retention.stats().retained_chunks, 1);
+
+        let mut out = [0; 5];
+        assert_eq!(send.emit(&mut out), Ok((5, false)));
+        assert_eq!(send.retransmit(0, 5), 5);
+        assert_eq!(retention.stats().retained_bytes, 5);
+        assert_eq!(retention.stats().retained_chunks, 1);
+        assert_eq!(send.ack_and_drop(0, 5), 5);
+        assert_eq!(retention.stats().retained_bytes, 0);
+        assert_eq!(retention.stats().retained_chunks, 0);
+    }
+
+    #[test]
+    fn retention_cap_releases_on_stop_and_accepts_followup_stream() {
+        let retention = StreamSendRetention::new(StreamSendRetentionLimits {
+            max_bytes: 5,
+            max_chunks: 1,
+        });
+        let mut stopped = SendBuf::<CountingBufFactory>::new_with_retention(
+            u64::MAX,
+            Arc::clone(&retention),
+        );
+        assert_eq!(stopped.write(b"12345", false), Ok(5));
+        stopped.stop(42, 5, None).unwrap();
+        assert_eq!(retention.stats().retained_bytes, 0);
+        assert_eq!(retention.stats().retained_chunks, 0);
+
+        let mut followup = SendBuf::<CountingBufFactory>::new_with_retention(
+            u64::MAX,
+            Arc::clone(&retention),
+        );
+        assert_eq!(followup.write(b"abcde", true), Ok(5));
+        assert_eq!(retention.stats().retained_bytes, 5);
+        drop(followup);
+        assert_eq!(retention.stats().retained_bytes, 0);
+        assert_eq!(retention.stats().retained_chunks, 0);
     }
 }

@@ -630,6 +630,9 @@ pub struct PathMap {
     /// Path-specific events to be notified to the application.
     events: VecDeque<PathEvent>,
 
+    /// Whether path-specific application events are retained.
+    retain_events: bool,
+
     /// Whether this manager serves a connection as a server.
     is_server: bool,
 }
@@ -639,6 +642,7 @@ impl PathMap {
     /// capacity limit.
     pub fn new(
         mut initial_path: Path, max_concurrent_paths: usize, is_server: bool,
+        retain_events: bool,
     ) -> Self {
         let mut paths = Slab::with_capacity(1); // most connections only have one path
         let mut addrs_to_paths = BTreeMap::new();
@@ -657,6 +661,7 @@ impl PathMap {
             max_concurrent_paths,
             addrs_to_paths,
             events: VecDeque::new(),
+            retain_events,
             is_server,
         }
     }
@@ -803,7 +808,14 @@ impl PathMap {
 
     /// Notifies a path event to the application served by the connection.
     pub fn notify_event(&mut self, ev: PathEvent) {
-        self.events.push_back(ev);
+        if self.retain_events {
+            self.events.push_back(ev);
+        }
+    }
+
+    /// Returns whether application path events are retained.
+    pub fn retains_events(&self) -> bool {
+        self.retain_events
     }
 
     /// Gets the first path event to be notified to the application.
@@ -813,6 +825,10 @@ impl PathMap {
 
     /// Notifies all failed validations to the application.
     pub fn notify_failed_validations(&mut self) {
+        if !self.retain_events {
+            return;
+        }
+
         let validation_failed = self
             .paths
             .iter_mut()
@@ -1075,6 +1091,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn disabled_event_retention_never_queues_path_events() {
+        let client_addr = "127.0.0.1:1234".parse().unwrap();
+        let server_addr = "127.0.0.1:4321".parse().unwrap();
+        let config = Config::new(crate::PROTOCOL_VERSION).unwrap();
+        let recovery_config = RecoveryConfig::from_config(&config);
+        let path = Path::new(
+            client_addr,
+            server_addr,
+            &recovery_config,
+            config.path_challenge_recv_max_queue_len,
+            true,
+            None,
+        );
+        let mut paths = PathMap::new(path, 2, false, false);
+
+        paths.notify_event(PathEvent::Validated(client_addr, server_addr));
+        paths.notify_failed_validations();
+
+        assert!(!paths.retains_events());
+        assert_eq!(paths.pop_event(), None);
+    }
+
+    #[test]
     fn path_validation_limited_mtu() {
         let client_addr = "127.0.0.1:1234".parse().unwrap();
         let client_addr_2 = "127.0.0.1:5678".parse().unwrap();
@@ -1091,7 +1130,7 @@ mod tests {
             true,
             None,
         );
-        let mut path_mgr = PathMap::new(path, 2, false);
+        let mut path_mgr = PathMap::new(path, 2, false, true);
 
         let probed_path = Path::new(
             client_addr_2,
@@ -1178,7 +1217,7 @@ mod tests {
             true,
             None,
         );
-        let mut client_path_mgr = PathMap::new(path, 2, false);
+        let mut client_path_mgr = PathMap::new(path, 2, false, true);
         let mut server_path = Path::new(
             server_addr,
             client_addr,
@@ -1262,7 +1301,7 @@ mod tests {
             true,
             None,
         );
-        let mut client_path_mgr = PathMap::new(path, 2, false);
+        let mut client_path_mgr = PathMap::new(path, 2, false, true);
         let mut server_path = Path::new(
             server_addr,
             client_addr,

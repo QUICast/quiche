@@ -24,6 +24,7 @@
 // NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 // SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+use std::mem::size_of;
 use std::mem::MaybeUninit;
 
 use crate::buffers::BufFactory;
@@ -201,6 +202,15 @@ pub struct Stream {
     /// Max PRIORITY_UPDATE frame payload size; see
     /// <https://datatracker.ietf.org/doc/html/rfc9218#section-7.2>
     max_priority_update_size: u64,
+}
+
+pub(super) const fn retained_metadata_upper_bound() -> usize {
+    // One stream-map entry, the largest incremental parser allocation, and a
+    // conservative ordered-map node/link allowance.
+    size_of::<u64>() +
+        size_of::<Stream>() +
+        MAX_STATE_BUF_ALLOC_SIZE +
+        usize::BITS as usize
 }
 
 impl Stream {

@@ -88,12 +88,16 @@ pub(crate) fn send_h3_dgram(
 /// The unprefixed payload buffer is returned on every pre-admission error.
 pub(crate) fn send_h3_dgram_unicast(
     conn: &mut QuicheConnection, quarter_stream_id: u64, dgram: DgramBuffer,
+    max_prefixed_allocation: usize,
 ) -> Result<(), (quiche::Error, DgramBuffer)> {
     if quarter_stream_id > octets::MAX_VAR_INT {
         return Err((quiche::Error::InvalidFrame, dgram));
     }
-    let prefixed = h3_dgram_add_quarter_stream_id(quarter_stream_id, dgram)
-        .expect("validated Quarter Stream ID must encode");
+    let prefixed = h3_dgram_add_quarter_stream_id_bounded(
+        quarter_stream_id,
+        dgram,
+        max_prefixed_allocation,
+    )?;
     match conn.dgram_send_buf_unicast(prefixed) {
         Ok(()) => Ok(()),
         Err((err, prefixed)) => {
@@ -130,11 +134,26 @@ pub(crate) fn send_h3_dgram_on_multicast_channel(
 
 /// Prepends the HTTP/3 DATAGRAM flow ID to `dgram`.
 fn h3_dgram_add_quarter_stream_id(
-    quarter_stream_id: u64, mut dgram: DgramBuffer,
+    quarter_stream_id: u64, dgram: DgramBuffer,
 ) -> quiche::Result<DgramBuffer> {
+    h3_dgram_add_quarter_stream_id_bounded(quarter_stream_id, dgram, usize::MAX)
+        .map_err(|(error, _)| error)
+}
+
+fn h3_dgram_add_quarter_stream_id_bounded(
+    quarter_stream_id: u64, mut dgram: DgramBuffer,
+    max_prefixed_allocation: usize,
+) -> Result<DgramBuffer, (quiche::Error, DgramBuffer)> {
+    if dgram.allocated_capacity() > max_prefixed_allocation {
+        return Err((quiche::Error::Done, dgram));
+    }
+
     let mut prefix_buf = [0u8; 8];
     let mut enc = octets::OctetsMut::with_slice(&mut prefix_buf);
-    let prefix = enc.put_varint(quarter_stream_id)?;
+    let prefix = match enc.put_varint(quarter_stream_id) {
+        Ok(prefix) => prefix,
+        Err(error) => return Err((error.into(), dgram)),
+    };
 
     if dgram.try_add_prefix(prefix).is_err() {
         // There wasn't enough room. Let's add more headroom and add the
@@ -144,7 +163,12 @@ fn h3_dgram_add_quarter_stream_id(
             // Note, since this is const, it asserts at compile time.
             assert!(BufFactory::DGRAM_HEADROOM >= /* max varint len */ 8);
         }
-        dgram.splice_headroom(BufFactory::DGRAM_HEADROOM);
+        if !dgram.splice_headroom_bounded(
+            BufFactory::DGRAM_HEADROOM,
+            max_prefixed_allocation,
+        ) {
+            return Err((quiche::Error::Done, dgram));
+        }
         dgram.try_add_prefix(prefix).unwrap();
     }
     Ok(dgram)

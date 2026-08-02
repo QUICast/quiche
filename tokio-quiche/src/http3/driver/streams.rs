@@ -25,6 +25,7 @@
 // SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 use std::future::Future;
+use std::mem::size_of;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::Context;
@@ -168,6 +169,17 @@ impl StreamCtx {
     pub(crate) fn both_directions_done(&self) -> bool {
         self.fin_or_reset_recv && self.fin_or_reset_sent
     }
+}
+
+pub(crate) const fn retained_stream_metadata_upper_bound() -> usize {
+    // One stream-map value, one outstanding readiness future, two bounded
+    // channel slots, and conservative channel/map linkage. Payload backing is
+    // accounted separately by the bounded driver's handoff-byte component.
+    size_of::<StreamCtx>() +
+        size_of::<WaitForStream>() +
+        size_of::<InboundFrame>() +
+        size_of::<OutboundFrame>() +
+        24 * size_of::<usize>()
 }
 
 pub(crate) struct FlowCtx {
