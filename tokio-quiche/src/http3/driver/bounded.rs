@@ -29,6 +29,7 @@ use std::mem;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::OnceLock;
 
 use tokio::sync::mpsc;
@@ -48,6 +49,8 @@ use super::H3Controller;
 use super::H3Driver;
 use super::H3Event;
 use super::H3EventQueueStats;
+use super::InboundFrameStream;
+use super::IncomingH3Headers;
 use super::NewClientRequest;
 use super::OutboundFrame;
 use super::OutboundFrameSender;
@@ -66,6 +69,7 @@ use super::WebTransportStreamWriteLease;
 use super::WebTransportStreamWriteLeaseOperation;
 use super::WebTransportStreamWriteLeaseOutcome;
 use crate::http3::settings::Http3Settings;
+use crate::http3::H3AuditStats;
 use crate::quic::HandshakeInfo;
 use crate::quic::Incoming;
 use crate::quic::IncomingPacketSource;
@@ -443,6 +447,9 @@ pub struct BoundedSelectedWebTransportLimits {
     pub max_session_terminal_waiters_per_session: usize,
     /// Aggregate and per-session terminal waiter/fact cap.
     pub max_send_terminal_waiters: usize,
+    /// Retained bounded-client CONNECT owners. The one-session profile
+    /// requires exactly one slot.
+    pub max_client_connect_owners: usize,
     /// Selected runtime work cap per driver callback.
     pub max_session_work_per_callback: usize,
     /// Maximum payload exposed by one selected write attempt.
@@ -477,6 +484,7 @@ impl Default for BoundedSelectedWebTransportLimits {
             max_session_terminal_waiters: 64,
             max_session_terminal_waiters_per_session: 64,
             max_send_terminal_waiters: 64,
+            max_client_connect_owners: 1,
             max_session_work_per_callback: 64,
             max_stream_write_bytes: 64 * 1024,
             max_stream_write_lease_retained_bytes: 64 * 1024,
@@ -590,6 +598,7 @@ impl BoundedSelectedWebTransportSettings {
                 mem::size_of::<ServerH3Event>(),
         };
         let components = self.memory_components(
+            endpoint,
             field_section_size,
             endpoint_command_size,
             endpoint_event_size,
@@ -656,6 +665,15 @@ impl BoundedSelectedWebTransportSettings {
             http3: self.http3_settings(field_section_size)?,
             applied,
             status: Arc::new(OnceLock::new()),
+            client_connect_ownership: matches!(
+                endpoint,
+                BoundedWebTransportEndpoint::Client
+            )
+            .then(|| {
+                Arc::new(BoundedClientConnectOwnership::new(
+                    self.selected.max_client_connect_owners,
+                ))
+            }),
         })
     }
 
@@ -768,6 +786,10 @@ impl BoundedSelectedWebTransportSettings {
             (
                 "send terminal waiters",
                 self.selected.max_send_terminal_waiters,
+            ),
+            (
+                "bounded client CONNECT owners",
+                self.selected.max_client_connect_owners,
             ),
             ("callback work", self.selected.max_session_work_per_callback),
             ("stream write bytes", self.selected.max_stream_write_bytes),
@@ -911,6 +933,11 @@ impl BoundedSelectedWebTransportSettings {
                 "per-session terminal waiter cap exceeds connection cap",
             ));
         }
+        if self.selected.max_client_connect_owners != 1 {
+            return Err(BoundedProfileError::InvalidSetting(
+                "the one-session profile requires one client CONNECT owner",
+            ));
+        }
         if self.quic.retain_path_events {
             return Err(BoundedProfileError::InvalidSetting(
                 "bounded mode cannot retain path events",
@@ -920,8 +947,8 @@ impl BoundedSelectedWebTransportSettings {
     }
 
     fn memory_components(
-        self, field_section_size: usize, endpoint_command_size: usize,
-        endpoint_event_size: usize,
+        self, endpoint: BoundedWebTransportEndpoint, field_section_size: usize,
+        endpoint_command_size: usize, endpoint_event_size: usize,
     ) -> Result<BoundedDynamicMemoryComponents, BoundedProfileError> {
         let checked_mul = |a: usize, b: usize, name| {
             a.checked_mul(b)
@@ -1009,6 +1036,16 @@ impl BoundedSelectedWebTransportSettings {
             .ok_or(BoundedProfileError::ArithmeticOverflow(
                 "CONNECT header storage",
             ))?;
+        let bounded_client_connect_owner_metadata =
+            if matches!(endpoint, BoundedWebTransportEndpoint::Client) {
+                checked_mul(
+                    self.selected.max_client_connect_owners,
+                    bounded_client_connect_owner_metadata_upper_bound(),
+                    "bounded client CONNECT owner metadata",
+                )?
+            } else {
+                0
+            };
         let selected_command_lane = checked_mul(
             self.selected.selected_command_capacity,
             mem::size_of::<WebTransportCommand>(),
@@ -1142,6 +1179,7 @@ impl BoundedSelectedWebTransportSettings {
             h3_body_scratch,
             incoming_packet_lane,
             connect_header_storage,
+            bounded_client_connect_owner_metadata,
             selected_command_lane,
             h3_command_lane,
             h3_command_payloads,
@@ -1177,6 +1215,7 @@ impl BoundedSelectedWebTransportSettings {
             h3_body_scratch,
             incoming_packet_lane,
             connect_header_storage,
+            bounded_client_connect_owner_metadata,
             selected_command_lane,
             h3_command_lane,
             h3_command_payloads,
@@ -1222,6 +1261,8 @@ pub struct BoundedDynamicMemoryComponents {
     pub incoming_packet_lane: usize,
     /// Peak encoded, decoded, and right-sized CONNECT field storage.
     pub connect_header_storage: usize,
+    /// Private bounded-client CONNECT channel and audit ownership.
+    pub bounded_client_connect_owner_metadata: usize,
     /// Selected WebTransport command-lane metadata.
     pub selected_command_lane: usize,
     /// Private endpoint H3 command-lane metadata.
@@ -1403,10 +1444,178 @@ impl std::error::Error for BoundedProfileError {}
 pub(crate) type AppliedProfileStatus =
     Arc<OnceLock<Result<AppliedBoundedWebTransportProfile, BoundedProfileError>>>;
 
+struct BoundedClientConnectOwner {
+    session_id: u64,
+    _send: OutboundFrameSender,
+    _recv: InboundFrameStream,
+    _audit: Arc<H3AuditStats>,
+}
+
+#[derive(Default)]
+struct BoundedClientConnectOwnershipState {
+    owner: Option<BoundedClientConnectOwner>,
+    terminal_session_id: Option<u64>,
+    closed: bool,
+    installed_total: u64,
+    terminal_release_total: u64,
+    teardown_release_total: u64,
+    late_install_total: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BoundedClientConnectOwnerInstall {
+    Installed,
+    NotRetained,
+    AlreadyTerminal,
+    Closed,
+    Occupied,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct BoundedClientConnectOwnershipStats {
+    current: usize,
+    max: usize,
+    installed_total: u64,
+    terminal_release_total: u64,
+    teardown_release_total: u64,
+    late_install_total: u64,
+}
+
+pub(crate) struct BoundedClientConnectOwnership {
+    max: usize,
+    state: Mutex<BoundedClientConnectOwnershipState>,
+}
+
+impl BoundedClientConnectOwnership {
+    fn new(max: usize) -> Self {
+        Self {
+            max,
+            state: Mutex::new(BoundedClientConnectOwnershipState::default()),
+        }
+    }
+
+    fn install(
+        &self, incoming: IncomingH3Headers, retain: bool,
+    ) -> (
+        BoundedClientConnectOwnerInstall,
+        Vec<quiche::h3::Header>,
+        bool,
+    ) {
+        let IncomingH3Headers {
+            stream_id,
+            headers,
+            send,
+            recv,
+            read_fin,
+            h3_audit_stats,
+        } = incoming;
+        let owner = BoundedClientConnectOwner {
+            session_id: stream_id,
+            _send: send,
+            _recv: recv,
+            _audit: h3_audit_stats,
+        };
+        if !retain {
+            return (
+                BoundedClientConnectOwnerInstall::NotRetained,
+                headers,
+                read_fin,
+            );
+        }
+        let result = {
+            let mut state = self.lock_state();
+            if state.closed {
+                state.late_install_total =
+                    state.late_install_total.saturating_add(1);
+                BoundedClientConnectOwnerInstall::Closed
+            } else if state.terminal_session_id == Some(stream_id) {
+                state.late_install_total =
+                    state.late_install_total.saturating_add(1);
+                BoundedClientConnectOwnerInstall::AlreadyTerminal
+            } else if state.owner.is_some() || self.max == 0 {
+                BoundedClientConnectOwnerInstall::Occupied
+            } else {
+                state.owner = Some(owner);
+                state.installed_total = state.installed_total.saturating_add(1);
+                BoundedClientConnectOwnerInstall::Installed
+            }
+        };
+        (result, headers, read_fin)
+    }
+
+    pub(crate) fn observe_event(&self, event: &WebTransportSessionEvent) {
+        let session_id = match event {
+            WebTransportSessionEvent::Rejected { session_id, .. } |
+            WebTransportSessionEvent::Terminated { session_id, .. } =>
+                *session_id,
+            _ => return,
+        };
+        let released = {
+            let mut state = self.lock_state();
+            state.terminal_session_id.get_or_insert(session_id);
+            if state
+                .owner
+                .as_ref()
+                .is_some_and(|owner| owner.session_id == session_id)
+            {
+                state.terminal_release_total =
+                    state.terminal_release_total.saturating_add(1);
+                state.owner.take()
+            } else {
+                None
+            }
+        };
+        drop(released);
+    }
+
+    pub(crate) fn clear(&self) {
+        let released = {
+            let mut state = self.lock_state();
+            state.closed = true;
+            let released = state.owner.take();
+            if released.is_some() {
+                state.teardown_release_total =
+                    state.teardown_release_total.saturating_add(1);
+            }
+            released
+        };
+        drop(released);
+    }
+
+    fn stats(&self) -> BoundedClientConnectOwnershipStats {
+        let state = self.lock_state();
+        BoundedClientConnectOwnershipStats {
+            current: usize::from(state.owner.is_some()),
+            max: self.max,
+            installed_total: state.installed_total,
+            terminal_release_total: state.terminal_release_total,
+            teardown_release_total: state.teardown_release_total,
+            late_install_total: state.late_install_total,
+        }
+    }
+
+    fn lock_state(
+        &self,
+    ) -> std::sync::MutexGuard<'_, BoundedClientConnectOwnershipState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+const fn bounded_client_connect_owner_metadata_upper_bound() -> usize {
+    mem::size_of::<BoundedClientConnectOwnership>() +
+        mem::size_of::<BoundedClientConnectOwnershipState>() +
+        mem::size_of::<BoundedClientConnectOwner>() +
+        4 * mem::size_of::<usize>()
+}
+
 pub(crate) struct PreparedBoundedProfile {
     pub(crate) http3: Http3Settings,
     pub(crate) applied: AppliedBoundedWebTransportProfile,
     pub(crate) status: AppliedProfileStatus,
+    pub(crate) client_connect_ownership:
+        Option<Arc<BoundedClientConnectOwnership>>,
 }
 
 /// Selected draft-16 stream I/O without Bytes or Datagram escape paths.
@@ -1425,13 +1634,18 @@ pub(crate) struct PreparedBoundedProfile {
 pub struct BoundedSelectedWebTransportController {
     inner: WebTransportController,
     read_permits: Arc<Semaphore>,
+    client_connect_ownership: Option<Arc<BoundedClientConnectOwnership>>,
 }
 
 impl BoundedSelectedWebTransportController {
-    fn new(inner: WebTransportController, max_concurrent_reads: usize) -> Self {
+    fn new(
+        inner: WebTransportController, max_concurrent_reads: usize,
+        client_connect_ownership: Option<Arc<BoundedClientConnectOwnership>>,
+    ) -> Self {
         Self {
             inner,
             read_permits: Arc::new(Semaphore::new(max_concurrent_reads)),
+            client_connect_ownership,
         }
     }
 
@@ -1551,7 +1765,23 @@ impl BoundedSelectedWebTransportController {
     pub async fn retention_stats(
         &self,
     ) -> Result<WebTransportRetentionStats, WebTransportDatagramError> {
-        self.inner.retention_stats().await
+        let mut stats = self.inner.retention_stats().await?;
+        if let Some(ownership) = &self.client_connect_ownership {
+            let owner = ownership.stats();
+            stats.bounded_client_connect_owners = owner.current;
+            stats.max_bounded_client_connect_owners = owner.max;
+            stats.bounded_client_connect_owner_installed_total =
+                owner.installed_total;
+            stats.bounded_client_connect_owner_terminal_release_total =
+                owner.terminal_release_total;
+            stats.bounded_client_connect_owner_teardown_release_total =
+                owner.teardown_release_total;
+            stats.bounded_client_connect_owner_late_install_total =
+                owner.late_install_total;
+            stats.metadata_index_entries =
+                stats.metadata_index_entries.saturating_add(owner.current);
+        }
+        Ok(stats)
     }
 }
 
@@ -1573,6 +1803,7 @@ pub struct BoundedClientWebTransportController {
     connect_headers: BoundedConnectHeaderLimits,
     status: AppliedProfileStatus,
     connect_requested: AtomicBool,
+    connect_ownership: Arc<BoundedClientConnectOwnership>,
 }
 
 /// Nonblocking bounded CONNECT admission failure with ownership preserved.
@@ -1714,7 +1945,10 @@ impl BoundedClientWebTransportController {
     /// Receives the next bounded client event.
     pub async fn recv_event(&mut self) -> Option<BoundedClientWebTransportEvent> {
         loop {
-            let event = self.inner.event_receiver_mut().recv().await?;
+            let Some(event) = self.inner.event_receiver_mut().recv().await else {
+                self.connect_ownership.clear();
+                return None;
+            };
             match event {
                 ClientH3Event::NewOutboundRequest {
                     stream_id,
@@ -1731,37 +1965,66 @@ impl BoundedClientWebTransportController {
                         },
                     ),
                 ClientH3Event::Core(H3Event::IncomingHeaders(incoming)) => {
-                    let headers = BoundedConnectHeaders::copy_from(
+                    let session_id = incoming.stream_id;
+                    let Ok(headers) = BoundedConnectHeaders::copy_from(
                         &incoming.headers,
                         self.connect_headers,
-                    )
-                    .expect("bounded response headers were checked in-driver");
+                    ) else {
+                        self.connect_ownership.clear();
+                        return Some(
+                            BoundedClientWebTransportEvent::ProfileViolation,
+                        );
+                    };
+                    let Some(status) = super::response_status(headers.as_slice())
+                    else {
+                        self.connect_ownership.clear();
+                        return Some(
+                            BoundedClientWebTransportEvent::ProfileViolation,
+                        );
+                    };
+                    let retain = (200..300).contains(&status);
+                    let (install, _raw_headers, read_fin) =
+                        self.connect_ownership.install(incoming, retain);
+                    if install == BoundedClientConnectOwnerInstall::Occupied {
+                        self.connect_ownership.clear();
+                        return Some(
+                            BoundedClientWebTransportEvent::ProfileViolation,
+                        );
+                    }
                     return Some(
                         BoundedClientWebTransportEvent::ConnectResponse {
-                            session_id: incoming.stream_id,
+                            session_id,
                             headers,
-                            fin: incoming.read_fin,
+                            fin: read_fin,
                         },
                     );
                 },
                 ClientH3Event::Core(H3Event::WebTransportSession(event)) =>
                     return Some(BoundedClientWebTransportEvent::Session(event)),
-                ClientH3Event::Core(H3Event::ConnectionError(error)) =>
-                    return Some(BoundedClientWebTransportEvent::ConnectionError(
-                        error,
-                    )),
-                ClientH3Event::Core(H3Event::ConnectionShutdown(reason)) =>
+                ClientH3Event::Core(H3Event::ConnectionError(error)) => {
+                    self.connect_ownership.clear();
+                    return Some(
+                        BoundedClientWebTransportEvent::ConnectionError(error),
+                    );
+                },
+                ClientH3Event::Core(H3Event::ConnectionShutdown(reason)) => {
+                    self.connect_ownership.clear();
                     return Some(
                         BoundedClientWebTransportEvent::ConnectionShutdown(
                             reason,
                         ),
-                    ),
+                    );
+                },
                 ClientH3Event::Core(
                     H3Event::NewFlow { .. } |
                     H3Event::RawStreamData { .. } |
                     H3Event::WebTransportStreamData { .. },
-                ) =>
-                    return Some(BoundedClientWebTransportEvent::ProfileViolation),
+                ) => {
+                    self.connect_ownership.clear();
+                    return Some(
+                        BoundedClientWebTransportEvent::ProfileViolation,
+                    );
+                },
                 ClientH3Event::Core(_) => {},
             }
         }
@@ -1778,6 +2041,12 @@ impl BoundedClientWebTransportController {
     ) -> Result<(), WebTransportSessionCloseError> {
         self.inner
             .close_webtransport_session(session_id, error_code, message)
+    }
+}
+
+impl Drop for BoundedClientWebTransportController {
+    fn drop(&mut self) {
+        self.connect_ownership.clear();
     }
 }
 
@@ -1998,6 +2267,12 @@ impl H3Driver<ClientHooks> {
     {
         let prepared = settings.prepare(BoundedWebTransportEndpoint::Client)?;
         let status = Arc::clone(&prepared.status);
+        let connect_ownership = Arc::clone(
+            prepared
+                .client_connect_ownership
+                .as_ref()
+                .expect("a bounded client profile owns its CONNECT handles"),
+        );
         let http3 = prepared.http3.clone();
         let (driver, inner) = Self::new_inner(http3, Some(prepared));
         let selected = inner
@@ -2008,10 +2283,12 @@ impl H3Driver<ClientHooks> {
             selected: BoundedSelectedWebTransportController::new(
                 selected,
                 settings.selected.max_concurrent_stream_reads,
+                Some(Arc::clone(&connect_ownership)),
             ),
             connect_headers: settings.connect_headers,
             status,
             connect_requested: AtomicBool::new(false),
+            connect_ownership,
         }))
     }
 }
@@ -2034,6 +2311,7 @@ impl H3Driver<ServerHooks> {
             selected: BoundedSelectedWebTransportController::new(
                 selected,
                 settings.selected.max_concurrent_stream_reads,
+                None,
             ),
             connect_headers: settings.connect_headers,
             status,
@@ -2212,6 +2490,8 @@ mod tests {
     use std::time::Instant;
 
     use super::*;
+    use crate::http3::driver::WebTransportSessionCloseReason;
+    use crate::http3::driver::WebTransportStreamDirection;
     use crate::ApplicationOverQuic as _;
     use assert_matches::assert_matches;
 
@@ -2297,6 +2577,223 @@ mod tests {
         driver.process_writes(&mut pipe.client).unwrap();
     }
 
+    struct BoundedClientHarness {
+        pipe: quiche::test_utils::Pipe<crate::buf_factory::BufFactory>,
+        peer: quiche::h3::Connection,
+        driver: H3Driver<ClientHooks>,
+        controller: BoundedClientWebTransportController,
+        session_id: u64,
+    }
+
+    impl BoundedClientHarness {
+        async fn pending() -> Self {
+            let settings = BoundedSelectedWebTransportSettings::default();
+            let mut config = bounded_core_config(settings);
+            let mut pipe = quiche::test_utils::Pipe::<
+                crate::buf_factory::BufFactory,
+            >::with_config_and_buf(&mut config)
+            .unwrap();
+            pipe.handshake().unwrap();
+
+            let peer_settings = settings
+                .prepare(BoundedWebTransportEndpoint::Server)
+                .unwrap()
+                .http3;
+            let mut peer = quiche::h3::Connection::with_transport(
+                &mut pipe.server,
+                &quiche::h3::Config::from(&peer_settings),
+            )
+            .unwrap();
+            let (mut driver, controller) =
+                H3Driver::<ClientHooks>::new_bounded_selected_webtransport(
+                    settings,
+                )
+                .unwrap();
+            let handshake = HandshakeInfo::new(Instant::now(), None)
+                .with_io_worker_memory_profile(settings.io.expected_profile());
+            driver
+                .on_conn_established(&mut pipe.client, &handshake)
+                .unwrap();
+
+            pipe.advance().unwrap();
+            drive_client(&mut driver, &mut pipe);
+            pipe.advance().unwrap();
+            while peer.poll(&mut pipe.server).is_ok() {}
+
+            let headers = BoundedConnectHeaders::copy_from(
+                &connect_headers(),
+                settings.connect_headers,
+            )
+            .unwrap();
+            controller.try_connect(7, headers).unwrap();
+            driver.wait_for_data(&mut pipe.client).await.unwrap();
+            drive_client(&mut driver, &mut pipe);
+            pipe.advance().unwrap();
+            let session_id = assert_matches!(
+                peer.poll(&mut pipe.server),
+                Ok((stream_id, quiche::h3::Event::Headers { .. })) => stream_id
+            );
+
+            Self {
+                pipe,
+                peer,
+                driver,
+                controller,
+                session_id,
+            }
+        }
+
+        async fn consume_request_events(&mut self) {
+            assert_matches!(
+                self.controller.recv_event().await,
+                Some(BoundedClientWebTransportEvent::Session(
+                    WebTransportSessionEvent::Pending { session_id }
+                )) if session_id == self.session_id
+            );
+            assert_matches!(
+                self.controller.recv_event().await,
+                Some(BoundedClientWebTransportEvent::ConnectOpened {
+                    request_id: 7,
+                    session_id,
+                }) if session_id == self.session_id
+            );
+        }
+
+        fn send_response(&mut self, status: u16, fin: bool) {
+            let status = status.to_string();
+            self.peer
+                .send_response(
+                    &mut self.pipe.server,
+                    self.session_id,
+                    &[quiche::h3::Header::new(b":status", status.as_bytes())],
+                    fin,
+                )
+                .unwrap();
+            self.pipe.advance().unwrap();
+            self.drive();
+        }
+
+        async fn consume_success_response(&mut self, fin: bool) {
+            assert_matches!(
+                self.controller.recv_event().await,
+                Some(BoundedClientWebTransportEvent::Session(
+                    WebTransportSessionEvent::Accepted { session_id }
+                )) if session_id == self.session_id
+            );
+            assert_matches!(
+                self.controller.recv_event().await,
+                Some(BoundedClientWebTransportEvent::ConnectResponse {
+                    session_id,
+                    fin: actual_fin,
+                    ..
+                }) if session_id == self.session_id && actual_fin == fin
+            );
+        }
+
+        async fn active() -> Self {
+            let mut harness = Self::pending().await;
+            harness.consume_request_events().await;
+            harness.send_response(200, false);
+            harness.consume_success_response(false).await;
+            harness
+        }
+
+        fn drive(&mut self) {
+            drive_client(&mut self.driver, &mut self.pipe);
+        }
+
+        async fn open_stream(
+            &mut self, direction: WebTransportStreamDirection,
+        ) -> u64 {
+            let selected = self.controller.selected();
+            let session_id = self.session_id;
+            let open = tokio::spawn(async move {
+                match direction {
+                    WebTransportStreamDirection::Bidi =>
+                        selected.open_bidirectional_stream(session_id).await,
+                    WebTransportStreamDirection::Uni =>
+                        selected.open_unidirectional_stream(session_id).await,
+                }
+            });
+            tokio::task::yield_now().await;
+            self.drive();
+            assert_matches!(
+                open.await.unwrap(),
+                WebTransportOpenStreamOutcome::Opened { stream_id } => stream_id
+            )
+        }
+
+        async fn retention_stats(&mut self) -> WebTransportRetentionStats {
+            let selected = self.controller.selected();
+            let stats =
+                tokio::spawn(async move { selected.retention_stats().await });
+            tokio::task::yield_now().await;
+            self.drive();
+            stats.await.unwrap().unwrap()
+        }
+
+        async fn write_stream(
+            &mut self, stream_id: u64, payload: &'static [u8], fin: bool,
+        ) {
+            let write = self
+                .controller
+                .selected()
+                .try_write_stream_lease(
+                    self.session_id,
+                    stream_id,
+                    TestLease {
+                        bytes: Arc::from(payload),
+                    },
+                    fin,
+                )
+                .unwrap();
+            self.drive();
+            assert_matches!(
+                write.outcome().await,
+                WebTransportStreamWriteLeaseOutcome::Accepted {
+                    accepted,
+                    complete: true,
+                    fin_accepted,
+                    ..
+                } if accepted == payload.len() && fin_accepted == fin
+            );
+        }
+
+        async fn read_stream(
+            &mut self, stream_id: u64, max_bytes: usize,
+        ) -> WebTransportStreamReadOutcome {
+            let selected = self.controller.selected();
+            let session_id = self.session_id;
+            let read = tokio::spawn(async move {
+                selected.read_stream(session_id, stream_id, max_bytes).await
+            });
+            tokio::task::yield_now().await;
+            self.drive();
+            read.await.unwrap()
+        }
+    }
+
+    fn encoded_associated_stream(
+        direction: WebTransportStreamDirection, session_id: u64, payload: &[u8],
+    ) -> Vec<u8> {
+        let stream_type = match direction {
+            WebTransportStreamDirection::Bidi => 0x41,
+            WebTransportStreamDirection::Uni => 0x54,
+        };
+        let mut encoded = Vec::new();
+        for value in [stream_type, session_id] {
+            let mut varint = [0; 8];
+            let written = {
+                let mut out = octets::OctetsMut::with_slice(&mut varint);
+                out.put_varint(value).unwrap();
+                out.off()
+            };
+            encoded.extend_from_slice(&varint[..written]);
+        }
+        encoded.extend_from_slice(payload);
+        encoded
+    }
+
     #[derive(Debug)]
     struct TestLease {
         bytes: Arc<[u8]>,
@@ -2345,6 +2842,9 @@ mod tests {
         let prepared = settings
             .prepare(BoundedWebTransportEndpoint::Server)
             .unwrap();
+        let client = settings
+            .prepare(BoundedWebTransportEndpoint::Client)
+            .unwrap();
         assert_eq!(
             prepared.applied.mode,
             H3ConnectionMode::BoundedSelectedWebTransport
@@ -2378,6 +2878,21 @@ mod tests {
             prepared.applied.dynamic_components.total <=
                 settings.dynamic_retained_memory_ceiling
         );
+        assert_eq!(client.applied.selected.max_client_connect_owners, 1);
+        assert!(
+            client
+                .applied
+                .dynamic_components
+                .bounded_client_connect_owner_metadata >
+                0
+        );
+        assert_eq!(
+            prepared
+                .applied
+                .dynamic_components
+                .bounded_client_connect_owner_metadata,
+            0
+        );
         assert_eq!(
             prepared.applied.fixed_pools.shared_egress_bytes_per_worker,
             settings.io.send_buffer_pool_capacity_per_worker *
@@ -2394,6 +2909,15 @@ mod tests {
                 .selected_state_metadata >
                 prepared.applied.dynamic_components.selected_state_metadata
         );
+
+        let mut extra_connect_owner = settings;
+        extra_connect_owner.selected.max_client_connect_owners = 2;
+        assert!(matches!(
+            extra_connect_owner.prepare(BoundedWebTransportEndpoint::Client),
+            Err(BoundedProfileError::InvalidSetting(
+                "the one-session profile requires one client CONNECT owner"
+            ))
+        ));
     }
 
     #[test]
@@ -3147,95 +3671,494 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bounded_client_connect_uses_checked_headers_and_live_profile() {
-        let settings = BoundedSelectedWebTransportSettings::default();
-        let mut config = bounded_core_config(settings);
-        let mut pipe = quiche::test_utils::Pipe::<
-            crate::buf_factory::BufFactory,
-        >::with_config_and_buf(&mut config)
-        .unwrap();
-        pipe.handshake().unwrap();
+    async fn bounded_client_connect_owner_keeps_selected_streams_live() {
+        let mut harness = BoundedClientHarness::active().await;
+        let session_id = harness.session_id;
 
-        let peer_settings = settings
-            .prepare(BoundedWebTransportEndpoint::Server)
-            .unwrap()
-            .http3;
-        let mut peer = quiche::h3::Connection::with_transport(
-            &mut pipe.server,
-            &quiche::h3::Config::from(&peer_settings),
+        let stats = harness.retention_stats().await;
+        assert_eq!(stats.bounded_client_connect_owners, 1);
+        assert_eq!(stats.max_bounded_client_connect_owners, 1);
+        assert_eq!(stats.bounded_client_connect_owner_installed_total, 1);
+        assert_eq!(stats.bounded_client_connect_owner_terminal_release_total, 0);
+
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(10),
+            harness.driver.wait_for_data(&mut harness.pipe.client),
         )
-        .unwrap();
-        let (mut driver, mut controller) =
-            H3Driver::<ClientHooks>::new_bounded_selected_webtransport(settings)
-                .unwrap();
-        let handshake = HandshakeInfo::new(Instant::now(), None)
-            .with_io_worker_memory_profile(settings.io.expected_profile());
-        driver
-            .on_conn_established(&mut pipe.client, &handshake)
+        .await
+        .is_err());
+        harness.drive();
+        harness.pipe.advance().unwrap();
+        assert!(!matches!(
+            harness.peer.poll(&mut harness.pipe.server),
+            Ok((actual, quiche::h3::Event::Reset(0x10c)))
+                if actual == session_id
+        ));
+        assert!(harness.pipe.server.stream_capacity(session_id).is_ok());
+
+        let bidi = harness.open_stream(WebTransportStreamDirection::Bidi).await;
+        harness.write_stream(bidi, b"bidi payload", true).await;
+        harness.pipe.advance().unwrap();
+        let mut received = [0; 128];
+        let (len, fin) = harness
+            .pipe
+            .server
+            .stream_recv(bidi, &mut received)
             .unwrap();
-
-        pipe.advance().unwrap();
-        drive_client(&mut driver, &mut pipe);
-        pipe.advance().unwrap();
-        while peer.poll(&mut pipe.server).is_ok() {}
-
-        let headers = BoundedConnectHeaders::copy_from(
-            &connect_headers(),
-            settings.connect_headers,
-        )
-        .unwrap();
-        controller.try_connect(7, headers).unwrap();
-        driver.wait_for_data(&mut pipe.client).await.unwrap();
-        drive_client(&mut driver, &mut pipe);
-        pipe.advance().unwrap();
-        let session_id = assert_matches!(
-            peer.poll(&mut pipe.server),
-            Ok((stream_id, quiche::h3::Event::Headers { .. })) => stream_id
-        );
-        peer.send_response(
-            &mut pipe.server,
-            session_id,
-            &[quiche::h3::Header::new(b":status", b"200")],
-            false,
-        )
-        .unwrap();
-        pipe.advance().unwrap();
-        for _ in 0..2 {
-            drive_client(&mut driver, &mut pipe);
-        }
-
-        assert_matches!(
-            controller.recv_event().await,
-            Some(BoundedClientWebTransportEvent::Session(
-                WebTransportSessionEvent::Pending { session_id: actual }
-            )) if actual == session_id
-        );
-        assert_matches!(
-            controller.recv_event().await,
-            Some(BoundedClientWebTransportEvent::ConnectOpened {
-                request_id: 7,
-                session_id: actual,
-            }) if actual == session_id
-        );
-        assert_matches!(
-            controller.recv_event().await,
-            Some(BoundedClientWebTransportEvent::Session(
-                WebTransportSessionEvent::Accepted { session_id: actual }
-            )) if actual == session_id
-        );
-        assert_matches!(
-            controller.recv_event().await,
-            Some(BoundedClientWebTransportEvent::ConnectResponse {
-                session_id: actual,
-                fin: false,
-                ..
-            }) if actual == session_id
-        );
         assert_eq!(
-            controller.applied_profile().unwrap().unwrap().endpoint,
+            &received[..len],
+            encoded_associated_stream(
+                WebTransportStreamDirection::Bidi,
+                session_id,
+                b"bidi payload",
+            )
+        );
+        assert!(fin);
+
+        harness
+            .pipe
+            .server
+            .stream_send(bidi, b"bidi reply", true)
+            .unwrap();
+        harness.pipe.advance().unwrap();
+        harness.drive();
+        assert_matches!(
+            harness.read_stream(bidi, 128).await,
+            WebTransportStreamReadOutcome::Data { data, fin: true }
+                if data.as_ref() == b"bidi reply"
+        );
+
+        let uni = harness.open_stream(WebTransportStreamDirection::Uni).await;
+        harness.write_stream(uni, b"uni payload", true).await;
+        harness.pipe.advance().unwrap();
+        let (len, fin) =
+            harness.pipe.server.stream_recv(uni, &mut received).unwrap();
+        assert_eq!(
+            &received[..len],
+            encoded_associated_stream(
+                WebTransportStreamDirection::Uni,
+                session_id,
+                b"uni payload",
+            )
+        );
+        assert!(fin);
+
+        assert_eq!(
+            harness
+                .controller
+                .applied_profile()
+                .unwrap()
+                .unwrap()
+                .endpoint,
             BoundedWebTransportEndpoint::Client
         );
-        assert_eq!(pipe.client.dgram_send_queue_len(), 0);
-        assert_eq!(pipe.client.dgram_recv_queue_len(), 0);
+        assert_eq!(harness.pipe.client.dgram_send_queue_len(), 0);
+        assert_eq!(harness.pipe.client.dgram_recv_queue_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn bounded_client_close_capsules_preserve_first_terminal_reason() {
+        let mut local = BoundedClientHarness::active().await;
+        let session_id = local.session_id;
+        local
+            .controller
+            .close_session(session_id, 17, "local close".to_string())
+            .unwrap();
+        local
+            .driver
+            .wait_for_data(&mut local.pipe.client)
+            .await
+            .unwrap();
+        local.drive();
+        assert_matches!(
+            local.controller.recv_event().await,
+            Some(BoundedClientWebTransportEvent::Session(
+                WebTransportSessionEvent::Terminated {
+                    session_id: actual,
+                    reason: WebTransportSessionCloseReason::Local {
+                        error_code: 17,
+                        message,
+                    },
+                }
+            )) if actual == session_id && message == "local close"
+        );
+        assert_eq!(local.controller.connect_ownership.stats().current, 0);
+        assert_eq!(
+            local
+                .controller
+                .connect_ownership
+                .stats()
+                .terminal_release_total,
+            1
+        );
+
+        local.pipe.advance().unwrap();
+        assert_matches!(
+            local.peer.poll(&mut local.pipe.server),
+            Ok((actual, quiche::h3::Event::Data)) if actual == session_id
+        );
+        let mut close = [0; 128];
+        let len = local
+            .peer
+            .recv_body(&mut local.pipe.server, session_id, &mut close)
+            .unwrap();
+        assert_eq!(
+            &close[..len],
+            webtransport::CloseCapsule::new(17, "local close".to_string())
+                .unwrap()
+                .encode()
+        );
+        assert_matches!(
+            local.peer.poll(&mut local.pipe.server),
+            Ok((actual, quiche::h3::Event::Finished)) if actual == session_id
+        );
+
+        let mut peer = BoundedClientHarness::active().await;
+        let session_id = peer.session_id;
+        let capsule =
+            webtransport::CloseCapsule::new(23, "peer close".to_string())
+                .unwrap()
+                .encode();
+        peer.peer
+            .send_body(&mut peer.pipe.server, session_id, &capsule, true)
+            .unwrap();
+        peer.pipe.advance().unwrap();
+        peer.drive();
+        assert_matches!(
+            peer.controller.recv_event().await,
+            Some(BoundedClientWebTransportEvent::Session(
+                WebTransportSessionEvent::Terminated {
+                    session_id: actual,
+                    reason: WebTransportSessionCloseReason::Peer {
+                        error_code: 23,
+                        message,
+                    },
+                }
+            )) if actual == session_id && message == "peer close"
+        );
+        let stats = peer.controller.connect_ownership.stats();
+        assert_eq!(stats.current, 0);
+        assert_eq!(stats.terminal_release_total, 1);
+        peer.drive();
+        peer.pipe.advance().unwrap();
+        assert!(!matches!(
+            peer.peer.poll(&mut peer.pipe.server),
+            Ok((actual, quiche::h3::Event::Reset(0x10c)))
+                if actual == session_id
+        ));
+    }
+
+    #[tokio::test]
+    async fn bounded_client_connect_reset_is_exact_before_and_after_response() {
+        let mut before = BoundedClientHarness::pending().await;
+        before.consume_request_events().await;
+        before
+            .pipe
+            .server
+            .stream_shutdown(before.session_id, quiche::Shutdown::Write, 0x51)
+            .unwrap();
+        before.pipe.advance().unwrap();
+        before.drive();
+        assert_matches!(
+            before.controller.recv_event().await,
+            Some(BoundedClientWebTransportEvent::Session(
+                WebTransportSessionEvent::Terminated {
+                    session_id,
+                    reason: WebTransportSessionCloseReason::ConnectReset {
+                        error_code: 0x51,
+                    },
+                }
+            )) if session_id == before.session_id
+        );
+        assert_eq!(before.controller.connect_ownership.stats().current, 0);
+
+        let mut after = BoundedClientHarness::active().await;
+        after
+            .pipe
+            .server
+            .stream_shutdown(after.session_id, quiche::Shutdown::Write, 0x52)
+            .unwrap();
+        after.pipe.advance().unwrap();
+        after.drive();
+        assert_matches!(
+            after.controller.recv_event().await,
+            Some(BoundedClientWebTransportEvent::Session(
+                WebTransportSessionEvent::Terminated {
+                    session_id,
+                    reason: WebTransportSessionCloseReason::ConnectReset {
+                        error_code: 0x52,
+                    },
+                }
+            )) if session_id == after.session_id
+        );
+        let stats = after.controller.connect_ownership.stats();
+        assert_eq!(stats.current, 0);
+        assert_eq!(stats.terminal_release_total, 1);
+        after.drive();
+        after.pipe.advance().unwrap();
+        assert!(!matches!(
+            after.peer.poll(&mut after.pipe.server),
+            Ok((actual, quiche::h3::Event::Reset(0x10c)))
+                if actual == after.session_id
+        ));
+    }
+
+    #[tokio::test]
+    async fn bounded_client_event_cancellation_and_terminal_order_are_safe() {
+        let mut cancelled = BoundedClientHarness::pending().await;
+        cancelled.consume_request_events().await;
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(10),
+            cancelled.controller.recv_event(),
+        )
+        .await
+        .is_err());
+        cancelled.send_response(200, false);
+        cancelled.consume_success_response(false).await;
+        assert_eq!(cancelled.controller.connect_ownership.stats().current, 1);
+
+        let mut queued = BoundedClientHarness::pending().await;
+        queued.consume_request_events().await;
+        let capsule = webtransport::CloseCapsule::new(31, "queued".to_string())
+            .unwrap()
+            .encode();
+        queued
+            .peer
+            .send_response(
+                &mut queued.pipe.server,
+                queued.session_id,
+                &[quiche::h3::Header::new(b":status", b"200")],
+                false,
+            )
+            .unwrap();
+        queued
+            .peer
+            .send_body(&mut queued.pipe.server, queued.session_id, &capsule, true)
+            .unwrap();
+        queued.pipe.advance().unwrap();
+        queued.drive();
+        queued.consume_success_response(false).await;
+        assert_matches!(
+            queued.controller.recv_event().await,
+            Some(BoundedClientWebTransportEvent::Session(
+                WebTransportSessionEvent::Terminated {
+                    session_id,
+                    reason: WebTransportSessionCloseReason::Peer {
+                        error_code: 31,
+                        message,
+                    },
+                }
+            )) if session_id == queued.session_id && message == "queued"
+        );
+        let stats = queued.controller.connect_ownership.stats();
+        assert_eq!(stats.current, 0);
+        assert_eq!(stats.installed_total, 0);
+        assert_eq!(stats.late_install_total, 1);
+    }
+
+    #[tokio::test]
+    async fn bounded_client_fin_and_invalid_responses_fail_closed() {
+        let mut finished = BoundedClientHarness::pending().await;
+        finished.consume_request_events().await;
+        finished.send_response(200, true);
+        finished.consume_success_response(true).await;
+        assert_matches!(
+            finished.controller.recv_event().await,
+            Some(BoundedClientWebTransportEvent::Session(
+                WebTransportSessionEvent::Terminated {
+                    session_id,
+                    reason: WebTransportSessionCloseReason::Clean,
+                }
+            )) if session_id == finished.session_id
+        );
+        let stats = finished.controller.connect_ownership.stats();
+        assert_eq!(stats.current, 0);
+        assert_eq!(stats.installed_total, 0);
+        assert_eq!(stats.late_install_total, 1);
+
+        for headers in [
+            vec![quiche::h3::Header::new(b"x-test", b"missing status")],
+            vec![
+                quiche::h3::Header::new(b":status", b"200"),
+                quiche::h3::Header::new(b"x-test", &vec![
+                    b'x';
+                    BoundedConnectHeaderLimits::default().max_value_bytes +
+                        1
+                ]),
+            ],
+        ] {
+            let settings = BoundedSelectedWebTransportSettings::default();
+            let (driver, mut controller) =
+                H3Driver::<ClientHooks>::new_bounded_selected_webtransport(
+                    settings,
+                )
+                .unwrap();
+            let (ctx, send, recv) = super::super::StreamCtx::new(0, 1);
+            driver
+                .h3_event_sender
+                .send(ClientH3Event::Core(H3Event::IncomingHeaders(
+                    IncomingH3Headers {
+                        stream_id: 0,
+                        headers,
+                        send,
+                        recv,
+                        read_fin: false,
+                        h3_audit_stats: Arc::clone(&ctx.audit_stats),
+                    },
+                )))
+                .unwrap();
+            assert_matches!(
+                controller.recv_event().await,
+                Some(BoundedClientWebTransportEvent::ProfileViolation)
+            );
+            assert_eq!(controller.connect_ownership.stats().current, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_client_connection_close_orders_with_response_delivery() {
+        let mut before = BoundedClientHarness::pending().await;
+        before.consume_request_events().await;
+        crate::ApplicationOverQuic::on_conn_close(
+            &mut before.driver,
+            &mut before.pipe.client,
+            &crate::metrics::DefaultMetrics,
+            &Ok(()),
+        );
+        assert_matches!(
+            before.controller.recv_event().await,
+            Some(BoundedClientWebTransportEvent::Session(
+                WebTransportSessionEvent::Terminated {
+                    session_id,
+                    reason: WebTransportSessionCloseReason::ConnectionClosed,
+                }
+            )) if session_id == before.session_id
+        );
+        assert_eq!(before.controller.connect_ownership.stats().current, 0);
+
+        let mut queued = BoundedClientHarness::pending().await;
+        queued.consume_request_events().await;
+        queued.send_response(200, false);
+        crate::ApplicationOverQuic::on_conn_close(
+            &mut queued.driver,
+            &mut queued.pipe.client,
+            &crate::metrics::DefaultMetrics,
+            &Ok(()),
+        );
+        queued.consume_success_response(false).await;
+        assert_matches!(
+            queued.controller.recv_event().await,
+            Some(BoundedClientWebTransportEvent::Session(
+                WebTransportSessionEvent::Terminated {
+                    session_id,
+                    reason: WebTransportSessionCloseReason::ConnectionClosed,
+                }
+            )) if session_id == queued.session_id
+        );
+        let stats = queued.controller.connect_ownership.stats();
+        assert_eq!(stats.current, 0);
+        assert_eq!(stats.installed_total, 0);
+        assert_eq!(stats.late_install_total, 1);
+
+        let mut after = BoundedClientHarness::active().await;
+        crate::ApplicationOverQuic::on_conn_close(
+            &mut after.driver,
+            &mut after.pipe.client,
+            &crate::metrics::DefaultMetrics,
+            &Ok(()),
+        );
+        assert_matches!(
+            after.controller.recv_event().await,
+            Some(BoundedClientWebTransportEvent::Session(
+                WebTransportSessionEvent::Terminated {
+                    session_id,
+                    reason: WebTransportSessionCloseReason::ConnectionClosed,
+                }
+            )) if session_id == after.session_id
+        );
+        let stats = after.controller.connect_ownership.stats();
+        assert_eq!(stats.current, 0);
+        assert_eq!(stats.installed_total, 1);
+        assert_eq!(stats.terminal_release_total, 1);
+    }
+
+    #[tokio::test]
+    async fn bounded_client_rejection_and_controller_drop_release_exactly_once() {
+        let mut rejected = BoundedClientHarness::pending().await;
+        rejected.consume_request_events().await;
+        rejected.send_response(404, true);
+        assert_matches!(
+            rejected.controller.recv_event().await,
+            Some(BoundedClientWebTransportEvent::Session(
+                WebTransportSessionEvent::Rejected {
+                    session_id,
+                    status: 404,
+                }
+            )) if session_id == rejected.session_id
+        );
+        assert_matches!(
+            rejected.controller.recv_event().await,
+            Some(BoundedClientWebTransportEvent::ConnectResponse {
+                session_id,
+                fin: true,
+                ..
+            }) if session_id == rejected.session_id
+        );
+        rejected.drive();
+        let stats = rejected.retention_stats().await;
+        assert_eq!(stats.bounded_client_connect_owners, 0);
+        assert_eq!(stats.bounded_client_connect_owner_installed_total, 0);
+        assert_eq!(stats.bounded_client_connect_owner_terminal_release_total, 0);
+
+        let active = BoundedClientHarness::active().await;
+        let ownership = Arc::clone(&active.controller.connect_ownership);
+        assert_eq!(ownership.stats().current, 1);
+        let BoundedClientHarness {
+            controller, driver, ..
+        } = active;
+        drop(controller);
+        let stats = ownership.stats();
+        assert_eq!(stats.current, 0);
+        assert_eq!(stats.teardown_release_total, 1);
+        drop(driver);
+        assert_eq!(ownership.stats().teardown_release_total, 1);
+    }
+
+    #[test]
+    fn bounded_client_owner_turnover_is_constant_and_general_h3_is_unchanged() {
+        let mut peak = 0;
+        for session_id in 0_u64..4096 {
+            let ownership = BoundedClientConnectOwnership::new(1);
+            let (ctx, send, recv) = super::super::StreamCtx::new(session_id, 1);
+            let incoming = IncomingH3Headers {
+                stream_id: session_id,
+                headers: vec![quiche::h3::Header::new(b":status", b"200")],
+                send,
+                recv,
+                read_fin: false,
+                h3_audit_stats: Arc::clone(&ctx.audit_stats),
+            };
+            let (result, ..) = ownership.install(incoming, true);
+            assert_eq!(result, BoundedClientConnectOwnerInstall::Installed);
+            peak = peak.max(ownership.stats().current);
+            ownership.observe_event(&WebTransportSessionEvent::Terminated {
+                session_id,
+                reason: WebTransportSessionCloseReason::Clean,
+            });
+            let stats = ownership.stats();
+            assert_eq!(stats.current, 0);
+            assert_eq!(stats.installed_total, 1);
+            assert_eq!(stats.terminal_release_total, 1);
+        }
+        assert_eq!(peak, 1);
+
+        let (driver, _controller) =
+            H3Driver::<ClientHooks>::new(Http3Settings::default());
+        assert_eq!(driver.mode(), H3ConnectionMode::GeneralH3);
+        assert!(driver.bounded_profile.is_none());
+        assert!(driver
+            .h3_event_sender
+            .bounded_client_connect_ownership
+            .is_none());
     }
 }

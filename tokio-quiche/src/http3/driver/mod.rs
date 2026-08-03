@@ -69,6 +69,7 @@ use tokio::sync::mpsc::error::TrySendError;
 use tokio_stream::StreamExt;
 use tokio_util::sync::PollSender;
 
+use self::bounded::BoundedClientConnectOwnership;
 use self::bounded::PreparedBoundedProfile;
 use self::hooks::DriverHooks;
 use self::hooks::InboundHeaders;
@@ -477,6 +478,7 @@ impl H3EventLaneState {
 struct H3EventSender<E> {
     sender: mpsc::Sender<E>,
     state: Arc<H3EventLaneState>,
+    bounded_client_connect_ownership: Option<Arc<BoundedClientConnectOwnership>>,
 }
 
 impl<E> Clone for H3EventSender<E> {
@@ -484,6 +486,10 @@ impl<E> Clone for H3EventSender<E> {
         Self {
             sender: self.sender.clone(),
             state: Arc::clone(&self.state),
+            bounded_client_connect_ownership: self
+                .bounded_client_connect_ownership
+                .as_ref()
+                .map(Arc::clone),
         }
     }
 }
@@ -515,6 +521,12 @@ impl<E> H3EventSender<E> {
 
     fn overloaded(&self) -> bool {
         self.state.overloaded.load(Ordering::Acquire)
+    }
+
+    fn observe_webtransport_event(&self, event: &WebTransportSessionEvent) {
+        if let Some(ownership) = &self.bounded_client_connect_ownership {
+            ownership.observe_event(event);
+        }
     }
 }
 
@@ -793,9 +805,14 @@ impl<H: DriverHooks> H3Driver<H> {
         let (cmd_sender, cmd_recv) = mpsc::channel(command_capacity);
         let (event_sender, h3_event_recv) = mpsc::channel(event_capacity);
         let h3_event_state = Arc::new(H3EventLaneState::new(event_capacity));
+        let bounded_client_connect_ownership = bounded_profile
+            .as_ref()
+            .and_then(|profile| profile.client_connect_ownership.as_ref())
+            .map(Arc::clone);
         let h3_event_sender = H3EventSender {
             sender: event_sender,
             state: Arc::clone(&h3_event_state),
+            bounded_client_connect_ownership,
         };
         let multicast_datagram_channel_id =
             http3_settings.multicast_datagram_channel_id.clone();
@@ -1814,6 +1831,7 @@ impl<H: DriverHooks> H3Driver<H> {
         sender: &H3EventSender<H::Event>, events: Vec<WebTransportSessionEvent>,
     ) -> H3ConnectionResult<()> {
         for event in events {
+            sender.observe_webtransport_event(&event);
             sender.send(H3Event::WebTransportSession(event).into())?;
         }
         Ok(())
@@ -2576,6 +2594,21 @@ impl<H: DriverHooks> H3Driver<H> {
             match recv.try_recv() {
                 Ok(frame) => ctx.queued_frame = Some(frame),
                 Err(TryRecvError::Disconnected) => {
+                    let bounded_terminal_connect =
+                        self.bounded_profile.as_ref().is_some_and(|profile| {
+                            profile.client_connect_ownership.is_some()
+                        }) && self.webtransport.as_ref().is_some_and(|runtime| {
+                            runtime.is_terminal(stream_id)
+                        });
+                    if bounded_terminal_connect {
+                        if !ctx.fin_or_reset_sent {
+                            ctx.queued_frame =
+                                Some(OutboundFrame::Body(Bytes::new(), true));
+                            continue;
+                        }
+                        ctx.recv = None;
+                        break;
+                    }
                     if !ctx.fin_or_reset_sent &&
                         ctx.associated_dgram_flow_id.is_none()
                     // The channel might be closed if the stream was used to
@@ -2874,6 +2907,13 @@ impl<H: DriverHooks> Drop for H3Driver<H> {
         self.close_webtransport_command_lane();
         if let Some(runtime) = self.webtransport.as_mut() {
             let _ = runtime.clear();
+        }
+        if let Some(ownership) = self
+            .bounded_profile
+            .as_ref()
+            .and_then(|profile| profile.client_connect_ownership.as_ref())
+        {
+            ownership.clear();
         }
         for stream in self.stream_map.values() {
             stream

@@ -858,6 +858,20 @@ pub struct WebTransportRetentionStats {
     pub send_terminal_waiter_saturation_total: u64,
     /// Terminal facts rejected by the retained-state bound.
     pub send_terminal_state_saturation_total: u64,
+    /// Bounded-client CONNECT stream owners currently retained outside the
+    /// generic H3 event value.
+    pub bounded_client_connect_owners: usize,
+    /// Configured bounded-client CONNECT owner limit.
+    pub max_bounded_client_connect_owners: usize,
+    /// Bounded-client CONNECT owners installed after a successful response.
+    pub bounded_client_connect_owner_installed_total: u64,
+    /// CONNECT owners released after the authoritative session terminal fact.
+    pub bounded_client_connect_owner_terminal_release_total: u64,
+    /// CONNECT owners released by deterministic controller/driver teardown.
+    pub bounded_client_connect_owner_teardown_release_total: u64,
+    /// Successful responses delivered only after termination or teardown had
+    /// already closed the owner slot.
+    pub bounded_client_connect_owner_late_install_total: u64,
     /// Aggregate retained runtime index entries, including duplicate indexes.
     pub metadata_index_entries: usize,
     /// Incoming native/provisional Datagram items retained by the runtime.
@@ -3678,6 +3692,12 @@ impl Runtime {
             .is_some_and(|session| session.phase == SessionPhase::Pending)
     }
 
+    pub(crate) fn is_terminal(&self, session_id: u64) -> bool {
+        self.sessions.get(&session_id).is_some_and(|session| {
+            matches!(session.phase, SessionPhase::Terminal(_))
+        })
+    }
+
     fn wait_session_terminal(
         &mut self, qconn: &QuicheConnection, session_id: u64,
         response: oneshot::Sender<WebTransportSessionTerminalOutcome>,
@@ -5916,6 +5936,12 @@ impl Runtime {
                 .send_terminal_waiter_saturation_total,
             send_terminal_state_saturation_total: self
                 .send_terminal_state_saturation_total,
+            bounded_client_connect_owners: 0,
+            max_bounded_client_connect_owners: 0,
+            bounded_client_connect_owner_installed_total: 0,
+            bounded_client_connect_owner_terminal_release_total: 0,
+            bounded_client_connect_owner_teardown_release_total: 0,
+            bounded_client_connect_owner_late_install_total: 0,
             metadata_index_entries,
             pending_datagrams: self.pending_datagram_count,
             pending_datagram_payload_bytes: self.pending_datagram_bytes,
