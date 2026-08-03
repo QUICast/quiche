@@ -156,6 +156,9 @@ pub use self::webtransport::WebTransportSessionTerminalOutcome;
 pub use self::webtransport::WebTransportStreamControlOutcome;
 pub use self::webtransport::WebTransportStreamReadOutcome;
 pub use self::webtransport::WebTransportStreamReadyOutcome;
+pub use self::webtransport::WebTransportStreamReceiveTerminal;
+pub use self::webtransport::WebTransportStreamReceiveTerminalRead;
+pub use self::webtransport::WebTransportStreamReceiveTerminalRetirementOutcome;
 pub use self::webtransport::WebTransportStreamSendTerminalOutcome;
 pub use self::webtransport::WebTransportStreamWriteLease;
 pub use self::webtransport::WebTransportStreamWriteLeaseLimit;
@@ -851,6 +854,21 @@ impl<H: DriverHooks> H3Driver<H> {
                                 .webtransport_max_send_terminal_waiters,
                             max_send_terminal_waiters_per_session: http3_settings
                                 .webtransport_max_send_terminal_waiters_per_session,
+                            max_receive_terminal_states: http3_settings
+                                .webtransport_max_receive_terminal_states,
+                            max_receive_terminal_states_per_session:
+                                http3_settings
+                                    .webtransport_max_receive_terminal_states_per_session,
+                            max_receive_terminal_waiters: http3_settings
+                                .webtransport_max_receive_terminal_waiters,
+                            max_receive_terminal_waiters_per_session:
+                                http3_settings
+                                    .webtransport_max_receive_terminal_waiters_per_session,
+                            max_receive_terminal_bytes: http3_settings
+                                .webtransport_max_receive_terminal_bytes,
+                            max_receive_terminal_bytes_per_session:
+                                http3_settings
+                                    .webtransport_max_receive_terminal_bytes_per_session,
                             max_datagram_waiters: http3_settings
                                 .webtransport_max_datagram_waiters,
                             max_pending_datagrams: http3_settings

@@ -607,19 +607,121 @@ where
     }
 }
 
+/// Terminal receive fact retained for one selected associated stream.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WebTransportStreamReceiveTerminal {
+    /// The peer's final offset was reached without a reset.
+    Fin,
+    /// RESET_STREAM became visible after any reliable prefix was released.
+    Reset {
+        /// HTTP/3 wire error carried by RESET_STREAM or RESET_STREAM_AT.
+        wire_error_code: u64,
+        /// Decoded 32-bit WebTransport application error, when valid.
+        application_error_code: Option<u32>,
+    },
+}
+
+#[derive(Debug)]
+struct ReceiveTerminalReadShared {
+    session_id: u64,
+    stream_id: u64,
+    data: Bytes,
+    terminal: WebTransportStreamReceiveTerminal,
+    allocation_bytes: usize,
+    leased: AtomicBool,
+}
+
+/// Non-cloneable ownership of one selected stream's terminal receive result.
+///
+/// The runtime retains the same backing allocation until
+/// [`WebTransportController::retire_stream_receive_terminal()`] succeeds.
+/// Dropping this lease without retirement makes the exact result available to
+/// a later read without copying it. While one lease is outstanding, another
+/// read of the same terminal result is rejected with
+/// [`WebTransportSelectionError::ResourceLimit`].
+pub struct WebTransportStreamReceiveTerminalRead {
+    shared: Arc<ReceiveTerminalReadShared>,
+}
+
+impl WebTransportStreamReceiveTerminalRead {
+    fn try_acquire(shared: &Arc<ReceiveTerminalReadShared>) -> Option<Self> {
+        shared
+            .leased
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()?;
+        Some(Self {
+            shared: Arc::clone(shared),
+        })
+    }
+
+    /// Returns the CONNECT stream ID identifying the owning session.
+    pub fn session_id(&self) -> u64 {
+        self.shared.session_id
+    }
+
+    /// Returns the exact physical QUIC stream ID.
+    pub fn stream_id(&self) -> u64 {
+        self.shared.stream_id
+    }
+
+    /// Returns payload bytes delivered with the terminal fact.
+    pub fn data(&self) -> &[u8] {
+        &self.shared.data
+    }
+
+    /// Returns the exact graceful-FIN or reset fact.
+    pub fn terminal(&self) -> WebTransportStreamReceiveTerminal {
+        self.shared.terminal
+    }
+}
+
+impl fmt::Debug for WebTransportStreamReceiveTerminalRead {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WebTransportStreamReceiveTerminalRead")
+            .field("session_id", &self.session_id())
+            .field("stream_id", &self.stream_id())
+            .field("data", &self.shared.data)
+            .field("terminal", &self.terminal())
+            .finish()
+    }
+}
+
+impl PartialEq for WebTransportStreamReceiveTerminalRead {
+    fn eq(&self, other: &Self) -> bool {
+        self.session_id() == other.session_id() &&
+            self.stream_id() == other.stream_id() &&
+            self.shared.data == other.shared.data &&
+            self.terminal() == other.terminal()
+    }
+}
+
+impl Eq for WebTransportStreamReceiveTerminalRead {}
+
+impl Drop for WebTransportStreamReceiveTerminalRead {
+    fn drop(&mut self) {
+        self.shared.leased.store(false, Ordering::Release);
+    }
+}
+
 /// Outcome of one bounded selected-stream read.
 #[derive(Debug, Eq, PartialEq)]
 pub enum WebTransportStreamReadOutcome {
-    /// Payload bytes were read, optionally including the final offset.
+    /// Non-terminal payload bytes were read.
     Data {
         /// Payload bytes after the WebTransport stream prefix.
         data: Bytes,
-        /// Whether the peer's FIN was reached.
+        /// This remains false; terminal payload is returned through
+        /// [`Self::Terminal`] so cancellation cannot lose FIN ownership.
         fin: bool,
     },
+    /// Payload and the exact receive-terminal fact are retained in one lease.
+    Terminal(WebTransportStreamReceiveTerminalRead),
     /// No payload or terminal signal is currently readable.
     Blocked,
-    /// RESET_STREAM became visible after any reliable prefix was released.
+    /// Compatibility-only unleased RESET result.
+    ///
+    /// Selected reads now return RESET through [`Self::Terminal`] so the exact
+    /// fact remains owned across cancellation and explicit retirement.
     Reset {
         /// HTTP/3 wire error carried by RESET_STREAM or RESET_STREAM_AT.
         wire_error_code: u64,
@@ -632,6 +734,49 @@ pub enum WebTransportStreamReadOutcome {
         max: usize,
     },
     /// Session or stream selection failed.
+    Rejected(WebTransportSelectionError),
+}
+
+/// Settlement of selected receive-terminal observation ownership.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WebTransportStreamReceiveTerminalRetirementOutcome {
+    /// The exact terminal fact was retired without changing the QUIC stream.
+    Retired {
+        /// CONNECT stream ID identifying the WebTransport session.
+        session_id: u64,
+        /// Exact physical QUIC stream ID.
+        stream_id: u64,
+    },
+    /// No FIN or RESET has been delivered yet, so retirement was not applied.
+    NotObserved {
+        /// CONNECT stream ID identifying the WebTransport session.
+        session_id: u64,
+        /// Exact physical QUIC stream ID.
+        stream_id: u64,
+    },
+    /// The terminal-read lease must be dropped before retirement can reclaim
+    /// its retained backing allocation.
+    OutstandingRead {
+        /// CONNECT stream ID identifying the WebTransport session.
+        session_id: u64,
+        /// Exact physical QUIC stream ID.
+        stream_id: u64,
+    },
+    /// The owning session terminated before retirement was processed.
+    SessionTerminated {
+        /// CONNECT stream ID identifying the WebTransport session.
+        session_id: u64,
+        /// Exact physical QUIC stream ID.
+        stream_id: u64,
+    },
+    /// The enclosing connection terminated before retirement was processed.
+    ConnectionTerminated {
+        /// CONNECT stream ID identifying the WebTransport session.
+        session_id: u64,
+        /// Exact physical QUIC stream ID.
+        stream_id: u64,
+    },
+    /// Session or associated-stream validation failed.
     Rejected(WebTransportSelectionError),
 }
 
@@ -858,6 +1003,42 @@ pub struct WebTransportRetentionStats {
     pub send_terminal_waiter_saturation_total: u64,
     /// Terminal facts rejected by the retained-state bound.
     pub send_terminal_state_saturation_total: u64,
+    /// Receive-capable streams retaining terminal-observation ownership.
+    pub receive_terminal_observations: usize,
+    /// Latched FIN or RESET results awaiting explicit retirement.
+    pub receive_terminal_states: usize,
+    /// Pending readable waits for receive-capable streams.
+    pub receive_terminal_waiters: usize,
+    /// Terminal-read leases currently held outside the runtime.
+    pub receive_terminal_leases: usize,
+    /// Physical payload backing retained with terminal reads.
+    pub receive_terminal_bytes: usize,
+    /// Configured aggregate receive-terminal observation/fact bound.
+    pub max_receive_terminal_states: usize,
+    /// Configured per-session receive-terminal observation/fact bound.
+    pub max_receive_terminal_states_per_session: usize,
+    /// Configured aggregate receive-terminal waiter bound.
+    pub max_receive_terminal_waiters: usize,
+    /// Configured per-session receive-terminal waiter bound.
+    pub max_receive_terminal_waiters_per_session: usize,
+    /// Configured aggregate terminal-read backing-byte bound.
+    pub max_receive_terminal_bytes: usize,
+    /// Configured per-session terminal-read backing-byte bound.
+    pub max_receive_terminal_bytes_per_session: usize,
+    /// Peak receive-terminal observation ownership.
+    pub receive_terminal_observations_high_water: usize,
+    /// Peak retained receive-terminal facts.
+    pub receive_terminal_states_high_water: usize,
+    /// Peak retained terminal-read backing bytes.
+    pub receive_terminal_bytes_high_water: usize,
+    /// Peak pending receive-terminal/readable waiters.
+    pub receive_terminal_waiters_high_water: usize,
+    /// Streams rejected because terminal-observation capacity was full.
+    pub receive_terminal_state_saturation_total: u64,
+    /// Reads rejected before mutation because terminal-byte capacity was full.
+    pub receive_terminal_byte_saturation_total: u64,
+    /// Readable waits rejected by aggregate, per-session, or duplicate bounds.
+    pub receive_terminal_waiter_saturation_total: u64,
     /// Bounded-client CONNECT stream owners currently retained outside the
     /// generic H3 event value.
     pub bounded_client_connect_owners: usize,
@@ -1910,6 +2091,38 @@ impl WebTransportController {
         )
     }
 
+    /// Retires a delivered FIN or RESET for one selected receive direction.
+    ///
+    /// Until this succeeds, the exact terminal fact and any payload delivered
+    /// with it remain level-triggered and prevent selected-stream collection.
+    /// Calling this before a terminal read returns
+    /// [`WebTransportStreamReceiveTerminalRetirementOutcome::NotObserved`]
+    /// without changing the stream or its future receive ownership. The
+    /// terminal-read lease must be dropped first; an outstanding lease returns
+    /// [`WebTransportStreamReceiveTerminalRetirementOutcome::OutstandingRead`]
+    /// so its backing bytes cannot escape the configured retention accounting.
+    pub async fn retire_stream_receive_terminal(
+        &self, session_id: u64, stream_id: u64,
+    ) -> WebTransportStreamReceiveTerminalRetirementOutcome {
+        let Ok(permit) = self.sender.reserve().await else {
+            return WebTransportStreamReceiveTerminalRetirementOutcome::Rejected(
+                WebTransportSelectionError::ConnectionClosed,
+            );
+        };
+        let (response, recv) = oneshot::channel();
+        permit.send(WebTransportCommand::RetireReceiveTerminal {
+            session_id,
+            stream_id,
+            response,
+        });
+        recv.await.unwrap_or(
+            WebTransportStreamReceiveTerminalRetirementOutcome::ConnectionTerminated {
+                session_id,
+                stream_id,
+            },
+        )
+    }
+
     async fn wait_stream(
         &self, session_id: u64, stream_id: u64, write: bool,
     ) -> WebTransportStreamReadyOutcome {
@@ -1925,10 +2138,17 @@ impl WebTransportController {
             write,
             response,
         });
-        recv.await
-            .unwrap_or(WebTransportStreamReadyOutcome::Rejected(
-                WebTransportSelectionError::ConnectionClosed,
-            ))
+        let mut cancellation = CancellationWake::new(
+            self.sender.clone(),
+            Arc::clone(&self.cancellation_pending),
+        );
+        let outcome =
+            recv.await
+                .unwrap_or(WebTransportStreamReadyOutcome::Rejected(
+                    WebTransportSelectionError::ConnectionClosed,
+                ));
+        cancellation.disarm();
+        outcome
     }
 
     /// Sends RESET_STREAM_AT using the draft-16 application-error mapping.
@@ -2427,6 +2647,12 @@ pub(crate) enum WebTransportCommand {
         stream_id: u64,
         response: oneshot::Sender<WebTransportStreamSendTerminalOutcome>,
     },
+    RetireReceiveTerminal {
+        session_id: u64,
+        stream_id: u64,
+        response:
+            oneshot::Sender<WebTransportStreamReceiveTerminalRetirementOutcome>,
+    },
     PruneCancelledWaiters,
     Reset {
         session_id: u64,
@@ -2520,6 +2746,18 @@ impl WebTransportCommand {
             } => {
                 let _ = response.send(
                     WebTransportStreamSendTerminalOutcome::ConnectionTerminated {
+                        session_id,
+                        stream_id,
+                    },
+                );
+            },
+            Self::RetireReceiveTerminal {
+                session_id,
+                stream_id,
+                response,
+            } => {
+                let _ = response.send(
+                    WebTransportStreamReceiveTerminalRetirementOutcome::ConnectionTerminated {
                         session_id,
                         stream_id,
                     },
@@ -2825,6 +3063,12 @@ pub(crate) struct RuntimeLimits {
     pub(crate) max_session_terminal_waiters_per_session: usize,
     pub(crate) max_send_terminal_waiters: usize,
     pub(crate) max_send_terminal_waiters_per_session: usize,
+    pub(crate) max_receive_terminal_states: usize,
+    pub(crate) max_receive_terminal_states_per_session: usize,
+    pub(crate) max_receive_terminal_waiters: usize,
+    pub(crate) max_receive_terminal_waiters_per_session: usize,
+    pub(crate) max_receive_terminal_bytes: usize,
+    pub(crate) max_receive_terminal_bytes_per_session: usize,
     pub(crate) max_datagram_waiters: usize,
     pub(crate) max_pending_datagrams: usize,
     pub(crate) max_pending_datagrams_per_session: usize,
@@ -2843,6 +3087,7 @@ pub(crate) struct RuntimeLimits {
 pub(super) fn runtime_metadata_upper_bound(
     max_pending_streams: usize, max_active_streams: usize,
     max_stream_waiters: usize, max_send_terminal_waiters: usize,
+    max_receive_terminal_states: usize, max_receive_terminal_waiters: usize,
     max_session_terminal_waiters: usize,
 ) -> Option<usize> {
     let pending_value_bytes = std::mem::size_of::<AssociatedStream>()
@@ -2851,12 +3096,16 @@ pub(super) fn runtime_metadata_upper_bound(
         .checked_add(std::mem::size_of::<u64>() * 4)?;
     let active_value_bytes = std::mem::size_of::<OwnedStream>()
         .checked_add(std::mem::size_of::<u64>() * 2)?;
-    let waiter_value_bytes =
-        std::mem::size_of::<oneshot::Sender<WebTransportStreamReadyOutcome>>()
-            .checked_add(std::mem::size_of::<u64>())?;
+    let waiter_value_bytes = std::mem::size_of::<StreamReadyWaiter>()
+        .checked_add(std::mem::size_of::<u64>() * 2)?;
     let terminal_value_bytes = std::mem::size_of::<SendTerminalWaiter>()
         .checked_add(std::mem::size_of::<LatchedSendTerminal>())?
         .checked_add(std::mem::size_of::<u64>() * 3)?;
+    let receive_terminal_value_bytes =
+        std::mem::size_of::<Arc<ReceiveTerminalReadShared>>()
+            .checked_add(std::mem::size_of::<ReceiveTerminalReadShared>())?
+            .checked_add(std::mem::size_of::<usize>() * 2)?
+            .checked_add(std::mem::size_of::<u64>() * 3)?;
     let session_terminal_value_bytes = std::mem::size_of::<
         oneshot::Sender<WebTransportSessionTerminalOutcome>,
     >()
@@ -2875,6 +3124,13 @@ pub(super) fn runtime_metadata_upper_bound(
             max_send_terminal_waiters.checked_mul(terminal_value_bytes)?,
         )?
         .checked_add(
+            max_receive_terminal_states
+                .checked_mul(receive_terminal_value_bytes)?,
+        )?
+        .checked_add(
+            max_receive_terminal_waiters.checked_mul(waiter_value_bytes)?,
+        )?
+        .checked_add(
             max_session_terminal_waiters
                 .checked_mul(session_terminal_value_bytes)?,
         )?
@@ -2888,12 +3144,58 @@ struct OwnedStream {
     local_prefix_len: u64,
     locally_initiated: bool,
     send_terminal_observation: SendTerminalObservation,
+    receive_terminal_observation: ReceiveTerminalObservation,
+}
+
+impl OwnedStream {
+    fn new(
+        session_id: u64, direction: WebTransportStreamDirection,
+        local_prefix_len: u64, locally_initiated: bool,
+    ) -> Self {
+        let send_terminal_observation = if direction ==
+            WebTransportStreamDirection::Bidi ||
+            locally_initiated
+        {
+            SendTerminalObservation::Active
+        } else {
+            SendTerminalObservation::NotApplicable
+        };
+        let receive_terminal_observation = if direction ==
+            WebTransportStreamDirection::Bidi ||
+            !locally_initiated
+        {
+            ReceiveTerminalObservation::Active
+        } else {
+            ReceiveTerminalObservation::NotApplicable
+        };
+        Self {
+            session_id,
+            direction,
+            local_prefix_len,
+            locally_initiated,
+            send_terminal_observation,
+            receive_terminal_observation,
+        }
+    }
+
+    fn has_receive_direction(self) -> bool {
+        self.receive_terminal_observation !=
+            ReceiveTerminalObservation::NotApplicable
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SendTerminalObservation {
+    NotApplicable,
     Active,
     Overloaded,
+    Retired,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReceiveTerminalObservation {
+    NotApplicable,
+    Active,
     Retired,
 }
 
@@ -2933,6 +3235,12 @@ struct LatchedSendTerminal {
 struct SendTerminalWaiter {
     session_id: u64,
     response: oneshot::Sender<WebTransportStreamSendTerminalOutcome>,
+}
+
+#[derive(Debug)]
+struct StreamReadyWaiter {
+    session_id: u64,
+    response: oneshot::Sender<WebTransportStreamReadyOutcome>,
 }
 
 #[derive(Debug)]
@@ -3062,10 +3370,9 @@ pub(crate) struct Runtime {
     session_terminal_waiter_count: usize,
     session_terminal_waiter_work_total: u64,
     session_terminal_waiter_saturation_total: u64,
-    readable_waiters:
-        BTreeMap<u64, oneshot::Sender<WebTransportStreamReadyOutcome>>,
-    writable_waiters:
-        BTreeMap<u64, oneshot::Sender<WebTransportStreamReadyOutcome>>,
+    readable_waiters: BTreeMap<u64, StreamReadyWaiter>,
+    readable_waiters_per_session: BTreeMap<u64, usize>,
+    writable_waiters: BTreeMap<u64, StreamReadyWaiter>,
     send_terminal_waiters: BTreeMap<u64, SendTerminalWaiter>,
     send_terminal_waiters_per_session: BTreeMap<u64, usize>,
     send_terminal_states: BTreeMap<u64, LatchedSendTerminal>,
@@ -3074,6 +3381,19 @@ pub(crate) struct Runtime {
     send_terminal_waiter_work_total: u64,
     send_terminal_waiter_saturation_total: u64,
     send_terminal_state_saturation_total: u64,
+    receive_terminal_observations: usize,
+    receive_terminal_observations_per_session: BTreeMap<u64, usize>,
+    receive_terminal_states: BTreeMap<u64, Arc<ReceiveTerminalReadShared>>,
+    receive_terminal_states_per_session: BTreeMap<u64, usize>,
+    receive_terminal_bytes: usize,
+    receive_terminal_bytes_per_session: BTreeMap<u64, usize>,
+    receive_terminal_observations_high_water: usize,
+    receive_terminal_states_high_water: usize,
+    receive_terminal_bytes_high_water: usize,
+    receive_terminal_waiters_high_water: usize,
+    receive_terminal_state_saturation_total: u64,
+    receive_terminal_byte_saturation_total: u64,
+    receive_terminal_waiter_saturation_total: u64,
     datagram_readable_waiters:
         BTreeMap<u64, oneshot::Sender<WebTransportDatagramReadyOutcome>>,
     datagram_send_waiters:
@@ -3123,6 +3443,18 @@ impl Runtime {
                 max_send_terminal_waiters_per_session: limits
                     .max_send_terminal_waiters_per_session
                     .max(1),
+                max_receive_terminal_states: limits
+                    .max_receive_terminal_states
+                    .max(1),
+                max_receive_terminal_states_per_session: limits
+                    .max_receive_terminal_states_per_session
+                    .max(1),
+                max_receive_terminal_waiters: limits
+                    .max_receive_terminal_waiters
+                    .max(1),
+                max_receive_terminal_waiters_per_session: limits
+                    .max_receive_terminal_waiters_per_session
+                    .max(1),
                 max_session_terminal_waiters: limits
                     .max_session_terminal_waiters
                     .max(1),
@@ -3154,6 +3486,7 @@ impl Runtime {
             session_terminal_waiter_work_total: 0,
             session_terminal_waiter_saturation_total: 0,
             readable_waiters: BTreeMap::new(),
+            readable_waiters_per_session: BTreeMap::new(),
             writable_waiters: BTreeMap::new(),
             send_terminal_waiters: BTreeMap::new(),
             send_terminal_waiters_per_session: BTreeMap::new(),
@@ -3163,6 +3496,19 @@ impl Runtime {
             send_terminal_waiter_work_total: 0,
             send_terminal_waiter_saturation_total: 0,
             send_terminal_state_saturation_total: 0,
+            receive_terminal_observations: 0,
+            receive_terminal_observations_per_session: BTreeMap::new(),
+            receive_terminal_states: BTreeMap::new(),
+            receive_terminal_states_per_session: BTreeMap::new(),
+            receive_terminal_bytes: 0,
+            receive_terminal_bytes_per_session: BTreeMap::new(),
+            receive_terminal_observations_high_water: 0,
+            receive_terminal_states_high_water: 0,
+            receive_terminal_bytes_high_water: 0,
+            receive_terminal_waiters_high_water: 0,
+            receive_terminal_state_saturation_total: 0,
+            receive_terminal_byte_saturation_total: 0,
+            receive_terminal_waiter_saturation_total: 0,
             datagram_readable_waiters: BTreeMap::new(),
             datagram_send_waiters: BTreeMap::new(),
             datagrams: BTreeMap::new(),
@@ -3308,6 +3654,7 @@ impl Runtime {
         );
         self.finish_session_terminal_waiters(session_id, &terminal);
         self.finish_send_terminal_session(session_id);
+        self.finish_receive_terminal_session(session_id);
         self.release_datagrams(session_id);
         application_visible
             .then_some(WebTransportSessionEvent::Rejected { session_id, status })
@@ -3463,6 +3810,7 @@ impl Runtime {
         );
         self.finish_session_terminal_waiters(session_id, &terminal);
         self.finish_send_terminal_session(session_id);
+        self.finish_receive_terminal_session(session_id);
         self.release_datagrams(session_id);
         application_visible
             .then_some(WebTransportSessionEvent::Terminated {
@@ -3484,7 +3832,7 @@ impl Runtime {
 
         match self.sessions.get(&stream.session_id).map(|s| &s.phase) {
             Some(SessionPhase::Active) => {
-                if self.can_admit_stream(stream.session_id) {
+                if self.can_admit_associated_stream(stream) {
                     self.admit_stream(stream);
                     vec![associated_event(stream)]
                 } else {
@@ -3528,10 +3876,38 @@ impl Runtime {
                 self.limits.max_active_streams_per_session
     }
 
-    fn can_admit_stream(&self, session_id: u64) -> bool {
-        self.stream_sessions.len() < self.limits.max_active_streams &&
-            self.active_stream_count_for_session(session_id) <
+    fn can_admit_associated_stream(&mut self, stream: AssociatedStream) -> bool {
+        self.can_admit_owned_stream(OwnedStream::new(
+            stream.session_id,
+            stream.direction,
+            0,
+            false,
+        ))
+    }
+
+    fn can_admit_owned_stream(&mut self, stream: OwnedStream) -> bool {
+        if self.stream_sessions.len() >= self.limits.max_active_streams ||
+            self.active_stream_count_for_session(stream.session_id) >=
                 self.limits.max_active_streams_per_session
+        {
+            return false;
+        }
+        if !stream.has_receive_direction() {
+            return true;
+        }
+        let available = self.receive_terminal_observations <
+            self.limits.max_receive_terminal_states &&
+            self.receive_terminal_observations_per_session
+                .get(&stream.session_id)
+                .copied()
+                .unwrap_or(0) <
+                self.limits.max_receive_terminal_states_per_session;
+        if !available {
+            self.receive_terminal_state_saturation_total = self
+                .receive_terminal_state_saturation_total
+                .saturating_add(1);
+        }
+        available
     }
 
     fn active_and_provisional_stream_count(&self) -> usize {
@@ -3586,16 +3962,28 @@ impl Runtime {
     }
 
     fn admit_stream(&mut self, stream: AssociatedStream) {
-        self.stream_sessions.insert(stream.stream_id, OwnedStream {
-            session_id: stream.session_id,
-            direction: stream.direction,
-            local_prefix_len: 0,
-            locally_initiated: false,
-            send_terminal_observation: SendTerminalObservation::Active,
-        });
+        let owned =
+            OwnedStream::new(stream.session_id, stream.direction, 0, false);
+        self.insert_owned_stream(stream.stream_id, owned);
         if let Some(session) = self.sessions.get_mut(&stream.session_id) {
             session.streams.insert(stream.stream_id);
         }
+    }
+
+    fn insert_owned_stream(&mut self, stream_id: u64, stream: OwnedStream) {
+        if stream.has_receive_direction() {
+            self.receive_terminal_observations =
+                self.receive_terminal_observations.saturating_add(1);
+            let count = self
+                .receive_terminal_observations_per_session
+                .entry(stream.session_id)
+                .or_default();
+            *count = count.saturating_add(1);
+            self.receive_terminal_observations_high_water = self
+                .receive_terminal_observations_high_water
+                .max(self.receive_terminal_observations);
+        }
+        self.stream_sessions.insert(stream_id, stream);
     }
 
     fn reject_orphaned_pending(&mut self, session_id: u64) {
@@ -3853,6 +4241,12 @@ impl Runtime {
         if !direction_allowed {
             return Err(WebTransportSelectionError::WrongDirection);
         }
+        if !write &&
+            stream.receive_terminal_observation ==
+                ReceiveTerminalObservation::Retired
+        {
+            return Err(WebTransportSelectionError::StaleStream);
+        }
         Ok(stream)
     }
 
@@ -3864,6 +4258,8 @@ impl Runtime {
         if self.cancellation_pending.swap(false, Ordering::AcqRel) {
             self.prune_cancelled_pending_opens();
             self.prune_cancelled_session_terminal_waiters();
+            self.prune_cancelled_stream_waiters();
+            self.prune_cancelled_send_terminal_waiters();
         }
         match command {
             WebTransportCommand::WaitSessionTerminal {
@@ -3904,7 +4300,19 @@ impl Runtime {
             } => self.retire_stream_send_terminal(
                 qconn, session_id, stream_id, response,
             ),
-            WebTransportCommand::PruneCancelledWaiters => {},
+            WebTransportCommand::RetireReceiveTerminal {
+                session_id,
+                stream_id,
+                response,
+            } => self.retire_stream_receive_terminal(
+                qconn, session_id, stream_id, response,
+            ),
+            WebTransportCommand::PruneCancelledWaiters => {
+                self.prune_cancelled_pending_opens();
+                self.prune_cancelled_session_terminal_waiters();
+                self.prune_cancelled_stream_waiters();
+                self.prune_cancelled_send_terminal_waiters();
+            },
             WebTransportCommand::Reset {
                 session_id,
                 stream_id,
@@ -4353,7 +4761,18 @@ impl Runtime {
                 continue;
             }
 
-            if !self.can_admit_stream(session_id) {
+            let owned = OwnedStream::new(
+                session_id,
+                match opening.reservation.direction() {
+                    quiche::h3::WebTransportStreamDirection::Bidirectional =>
+                        WebTransportStreamDirection::Bidi,
+                    quiche::h3::WebTransportStreamDirection::Unidirectional =>
+                        WebTransportStreamDirection::Uni,
+                },
+                opening.reservation.prefix_len() as u64,
+                true,
+            );
+            if !self.can_admit_owned_stream(owned) {
                 if let Some(response) = opening.response.take() {
                     let _ =
                         response.send(WebTransportOpenStreamOutcome::Rejected(
@@ -4369,19 +4788,7 @@ impl Runtime {
                 continue;
             }
 
-            let owned = OwnedStream {
-                session_id,
-                direction: match opening.reservation.direction() {
-                    quiche::h3::WebTransportStreamDirection::Bidirectional =>
-                        WebTransportStreamDirection::Bidi,
-                    quiche::h3::WebTransportStreamDirection::Unidirectional =>
-                        WebTransportStreamDirection::Uni,
-                },
-                local_prefix_len: opening.reservation.prefix_len() as u64,
-                locally_initiated: true,
-                send_terminal_observation: SendTerminalObservation::Active,
-            };
-            self.stream_sessions.insert(stream_id, owned);
+            self.insert_owned_stream(stream_id, owned);
             if let Some(session) = self.sessions.get_mut(&session_id) {
                 session.streams.insert(stream_id);
             }
@@ -4391,10 +4798,7 @@ impl Runtime {
                     .is_ok()
             });
             if !delivered {
-                self.stream_sessions.remove(&stream_id);
-                if let Some(session) = self.sessions.get_mut(&session_id) {
-                    session.streams.remove(&stream_id);
-                }
+                self.remove_owned_stream(stream_id);
                 shutdown_owned_stream(qconn, stream_id, owned, WT_SESSION_GONE);
             }
             self.finish_opening(session_id, stream_id);
@@ -4442,6 +4846,19 @@ impl Runtime {
             return;
         }
 
+        let cancelled_duplicate = if write {
+            self.writable_waiters
+                .get(&stream_id)
+                .is_some_and(|waiter| waiter.response.is_closed())
+        } else {
+            self.readable_waiters
+                .get(&stream_id)
+                .is_some_and(|waiter| waiter.response.is_closed())
+        };
+        if cancelled_duplicate {
+            self.remove_stream_waiter(stream_id, write);
+        }
+
         let waiter_count = self
             .readable_waiters
             .len()
@@ -4451,7 +4868,26 @@ impl Runtime {
         } else {
             self.readable_waiters.contains_key(&stream_id)
         };
-        if waiter_count >= self.limits.max_stream_waiters || duplicate {
+        let receive_waiters = self.readable_waiters.len();
+        let session_receive_waiters = self
+            .readable_waiters_per_session
+            .get(&session_id)
+            .copied()
+            .unwrap_or(0);
+        let receive_full = !write &&
+            (receive_waiters >= self.limits.max_receive_terminal_waiters ||
+                session_receive_waiters >=
+                    self.limits
+                        .max_receive_terminal_waiters_per_session);
+        if waiter_count >= self.limits.max_stream_waiters ||
+            receive_full ||
+            duplicate
+        {
+            if !write {
+                self.receive_terminal_waiter_saturation_total = self
+                    .receive_terminal_waiter_saturation_total
+                    .saturating_add(1);
+            }
             let _ = response.send(WebTransportStreamReadyOutcome::Rejected(
                 WebTransportSelectionError::ResourceLimit,
             ));
@@ -4462,7 +4898,20 @@ impl Runtime {
         } else {
             &mut self.readable_waiters
         };
-        waiters.insert(stream_id, response);
+        waiters.insert(stream_id, StreamReadyWaiter {
+            session_id,
+            response,
+        });
+        if !write {
+            let count = self
+                .readable_waiters_per_session
+                .entry(session_id)
+                .or_default();
+            *count = count.saturating_add(1);
+            self.receive_terminal_waiters_high_water = self
+                .receive_terminal_waiters_high_water
+                .max(self.readable_waiters.len());
+        }
     }
 
     fn stream_ready_outcome(
@@ -4476,12 +4925,15 @@ impl Runtime {
         }
 
         if !write {
+            if self.receive_terminal_states.contains_key(&stream_id) {
+                return Some(WebTransportStreamReadyOutcome::Ready);
+            }
             if qconn.stream_readable(stream_id) {
                 return Some(WebTransportStreamReadyOutcome::Ready);
             }
             return (qconn.stream_finished(stream_id) ||
                 qconn.stream_closed(stream_id))
-            .then_some(WebTransportStreamReadyOutcome::Closed);
+            .then_some(WebTransportStreamReadyOutcome::Ready);
         }
 
         match qconn.stream_send_status(stream_id) {
@@ -4537,6 +4989,14 @@ impl Runtime {
             },
         };
         match stream.send_terminal_observation {
+            SendTerminalObservation::NotApplicable => {
+                let _ = response.send(
+                    WebTransportStreamSendTerminalOutcome::Rejected(
+                        WebTransportSelectionError::WrongDirection,
+                    ),
+                );
+                return;
+            },
             SendTerminalObservation::Retired => {
                 let _ = response.send(
                     WebTransportStreamSendTerminalOutcome::Retired {
@@ -4874,6 +5334,19 @@ impl Runtime {
         self.send_terminal_overloaded_sessions.remove(&session_id);
     }
 
+    fn finish_receive_terminal_session(&mut self, session_id: u64) {
+        let terminal_ids: Vec<_> = self
+            .receive_terminal_states
+            .iter()
+            .filter_map(|(&stream_id, terminal)| {
+                (terminal.session_id == session_id).then_some(stream_id)
+            })
+            .collect();
+        for stream_id in terminal_ids {
+            self.remove_receive_terminal_state(stream_id);
+        }
+    }
+
     fn wake_stream_waiter(
         &mut self, qconn: &QuicheConnection, stream_id: u64, write: bool,
     ) {
@@ -4885,13 +5358,48 @@ impl Runtime {
         else {
             return;
         };
-        let response = if write {
-            self.writable_waiters.remove(&stream_id)
+        if let Some(waiter) = self.remove_stream_waiter(stream_id, write) {
+            let _ = waiter.response.send(outcome);
+        }
+    }
+
+    fn remove_stream_waiter(
+        &mut self, stream_id: u64, write: bool,
+    ) -> Option<StreamReadyWaiter> {
+        let waiter = if write {
+            self.writable_waiters.remove(&stream_id)?
         } else {
-            self.readable_waiters.remove(&stream_id)
+            self.readable_waiters.remove(&stream_id)?
         };
-        if let Some(response) = response {
-            let _ = response.send(outcome);
+        if !write {
+            decrement_session_count(
+                &mut self.readable_waiters_per_session,
+                waiter.session_id,
+            );
+        }
+        Some(waiter)
+    }
+
+    fn prune_cancelled_stream_waiters(&mut self) {
+        let readable: Vec<_> = self
+            .readable_waiters
+            .iter()
+            .filter_map(|(&stream_id, waiter)| {
+                waiter.response.is_closed().then_some(stream_id)
+            })
+            .collect();
+        for stream_id in readable {
+            self.remove_stream_waiter(stream_id, false);
+        }
+        let writable: Vec<_> = self
+            .writable_waiters
+            .iter()
+            .filter_map(|(&stream_id, waiter)| {
+                waiter.response.is_closed().then_some(stream_id)
+            })
+            .collect();
+        for stream_id in writable {
+            self.remove_stream_waiter(stream_id, true);
         }
     }
 
@@ -4899,20 +5407,20 @@ impl Runtime {
         &mut self, stream_id: u64, error: WebTransportSelectionError,
     ) {
         let outcome = WebTransportStreamReadyOutcome::Rejected(error);
-        if let Some(response) = self.readable_waiters.remove(&stream_id) {
-            let _ = response.send(outcome);
+        if let Some(waiter) = self.remove_stream_waiter(stream_id, false) {
+            let _ = waiter.response.send(outcome);
         }
-        if let Some(response) = self.writable_waiters.remove(&stream_id) {
-            let _ = response.send(outcome);
+        if let Some(waiter) = self.remove_stream_waiter(stream_id, true) {
+            let _ = waiter.response.send(outcome);
         }
     }
 
     fn close_stream_waiters(&mut self, stream_id: u64) {
-        if let Some(response) = self.readable_waiters.remove(&stream_id) {
-            let _ = response.send(WebTransportStreamReadyOutcome::Closed);
+        if let Some(waiter) = self.remove_stream_waiter(stream_id, false) {
+            let _ = waiter.response.send(WebTransportStreamReadyOutcome::Closed);
         }
-        if let Some(response) = self.writable_waiters.remove(&stream_id) {
-            let _ = response.send(WebTransportStreamReadyOutcome::Closed);
+        if let Some(waiter) = self.remove_stream_waiter(stream_id, true) {
+            let _ = waiter.response.send(WebTransportStreamReadyOutcome::Closed);
         }
     }
 
@@ -5076,7 +5584,7 @@ impl Runtime {
     }
 
     fn read_stream(
-        &self, qconn: &mut QuicheConnection, session_id: u64, stream_id: u64,
+        &mut self, qconn: &mut QuicheConnection, session_id: u64, stream_id: u64,
         max_bytes: usize,
         response: oneshot::Sender<WebTransportStreamReadOutcome>,
     ) {
@@ -5090,29 +5598,310 @@ impl Runtime {
             return;
         }
 
-        let mut output = vec![0; max_bytes].into_boxed_slice();
+        if let Some(shared) = self.receive_terminal_states.get(&stream_id) {
+            let outcome =
+                WebTransportStreamReceiveTerminalRead::try_acquire(shared)
+                    .map_or_else(
+                        || {
+                            WebTransportStreamReadOutcome::Rejected(
+                                WebTransportSelectionError::ResourceLimit,
+                            )
+                        },
+                        WebTransportStreamReadOutcome::Terminal,
+                    );
+            let _ = response.send(outcome);
+            return;
+        }
+
+        let allocation_bytes =
+            qconn.stream_readable_len(stream_id).min(max_bytes);
+        let session_bytes = self
+            .receive_terminal_bytes_per_session
+            .get(&session_id)
+            .copied()
+            .unwrap_or(0);
+        let bytes_fit = self
+            .receive_terminal_bytes
+            .checked_add(allocation_bytes)
+            .is_some_and(|bytes| bytes <= self.limits.max_receive_terminal_bytes) &&
+            session_bytes
+                .checked_add(allocation_bytes)
+                .is_some_and(|bytes| {
+                    bytes <= self.limits.max_receive_terminal_bytes_per_session
+                });
+        if !bytes_fit {
+            self.receive_terminal_byte_saturation_total = self
+                .receive_terminal_byte_saturation_total
+                .saturating_add(1);
+            let _ = response.send(WebTransportStreamReadOutcome::Rejected(
+                WebTransportSelectionError::ResourceLimit,
+            ));
+            return;
+        }
+
+        let mut output = vec![0; allocation_bytes].into_boxed_slice();
         let outcome = match qconn.stream_recv(stream_id, &mut output) {
             Ok((read, fin)) => {
                 let mut output = output.into_vec();
                 output.truncate(read);
-                WebTransportStreamReadOutcome::Data {
-                    data: Bytes::from(output),
-                    fin,
+                let data = Bytes::from(output);
+                if fin {
+                    self.latch_receive_terminal(
+                        session_id,
+                        stream_id,
+                        data,
+                        allocation_bytes,
+                        WebTransportStreamReceiveTerminal::Fin,
+                    )
+                } else {
+                    WebTransportStreamReadOutcome::Data { data, fin: false }
                 }
             },
             Err(quiche::Error::Done) => WebTransportStreamReadOutcome::Blocked,
-            Err(quiche::Error::StreamReset(error_code)) =>
-                WebTransportStreamReadOutcome::Reset {
-                    wire_error_code: error_code,
-                    application_error_code: webtransport_error_from_http3(
-                        error_code,
-                    ),
-                },
+            Err(quiche::Error::StreamReset(error_code)) => self
+                .latch_receive_terminal(
+                    session_id,
+                    stream_id,
+                    Bytes::new(),
+                    0,
+                    WebTransportStreamReceiveTerminal::Reset {
+                        wire_error_code: error_code,
+                        application_error_code: webtransport_error_from_http3(
+                            error_code,
+                        ),
+                    },
+                ),
             Err(_) => WebTransportStreamReadOutcome::Rejected(
                 WebTransportSelectionError::StaleStream,
             ),
         };
         let _ = response.send(outcome);
+    }
+
+    fn latch_receive_terminal(
+        &mut self, session_id: u64, stream_id: u64, data: Bytes,
+        allocation_bytes: usize, terminal: WebTransportStreamReceiveTerminal,
+    ) -> WebTransportStreamReadOutcome {
+        if let Some(shared) = self.receive_terminal_states.get(&stream_id) {
+            return WebTransportStreamReceiveTerminalRead::try_acquire(shared)
+                .map_or_else(
+                    || {
+                        WebTransportStreamReadOutcome::Rejected(
+                            WebTransportSelectionError::ResourceLimit,
+                        )
+                    },
+                    WebTransportStreamReadOutcome::Terminal,
+                );
+        }
+
+        let session_states = self
+            .receive_terminal_states_per_session
+            .get(&session_id)
+            .copied()
+            .unwrap_or(0);
+        debug_assert!(
+            self.receive_terminal_states.len() <
+                self.limits.max_receive_terminal_states &&
+                session_states <
+                    self.limits.max_receive_terminal_states_per_session,
+            "receive-terminal admission must reserve fact capacity"
+        );
+        let shared = Arc::new(ReceiveTerminalReadShared {
+            session_id,
+            stream_id,
+            data,
+            terminal,
+            allocation_bytes,
+            leased: AtomicBool::new(false),
+        });
+        self.receive_terminal_states
+            .insert(stream_id, Arc::clone(&shared));
+        let count = self
+            .receive_terminal_states_per_session
+            .entry(session_id)
+            .or_default();
+        *count = count.saturating_add(1);
+        self.receive_terminal_bytes =
+            self.receive_terminal_bytes.saturating_add(allocation_bytes);
+        let bytes = self
+            .receive_terminal_bytes_per_session
+            .entry(session_id)
+            .or_default();
+        *bytes = bytes.saturating_add(allocation_bytes);
+        self.receive_terminal_states_high_water = self
+            .receive_terminal_states_high_water
+            .max(self.receive_terminal_states.len());
+        self.receive_terminal_bytes_high_water = self
+            .receive_terminal_bytes_high_water
+            .max(self.receive_terminal_bytes);
+
+        WebTransportStreamReadOutcome::Terminal(
+            WebTransportStreamReceiveTerminalRead::try_acquire(&shared)
+                .expect("a newly retained terminal result is unleased"),
+        )
+    }
+
+    fn retire_stream_receive_terminal(
+        &mut self, qconn: &QuicheConnection, session_id: u64, stream_id: u64,
+        response: oneshot::Sender<
+            WebTransportStreamReceiveTerminalRetirementOutcome,
+        >,
+    ) {
+        if let Some(error) = self.selection_error(session_id, qconn) {
+            let outcome = match error {
+                WebTransportSelectionError::TerminalSession =>
+                    WebTransportStreamReceiveTerminalRetirementOutcome::SessionTerminated {
+                        session_id,
+                        stream_id,
+                    },
+                WebTransportSelectionError::ConnectionClosed =>
+                    WebTransportStreamReceiveTerminalRetirementOutcome::ConnectionTerminated {
+                        session_id,
+                        stream_id,
+                    },
+                _ =>
+                    WebTransportStreamReceiveTerminalRetirementOutcome::Rejected(
+                        error,
+                    ),
+            };
+            let _ = response.send(outcome);
+            return;
+        }
+
+        let retained_owner = self
+            .receive_terminal_states
+            .get(&stream_id)
+            .map(|terminal| terminal.session_id);
+        let selected = self.stream_sessions.get(&stream_id).copied();
+        let owner = selected.map(|stream| stream.session_id).or(retained_owner);
+        let Some(owner_session_id) = owner else {
+            let error = if qconn.stream_closed(stream_id) {
+                WebTransportSelectionError::StaleStream
+            } else {
+                WebTransportSelectionError::UnknownStream
+            };
+            let _ = response.send(
+                WebTransportStreamReceiveTerminalRetirementOutcome::Rejected(
+                    error,
+                ),
+            );
+            return;
+        };
+        if owner_session_id != session_id {
+            let _ = response.send(
+                WebTransportStreamReceiveTerminalRetirementOutcome::Rejected(
+                    WebTransportSelectionError::ForeignStream {
+                        owner_session_id,
+                    },
+                ),
+            );
+            return;
+        }
+        let Some(stream) = selected else {
+            let _ = response.send(
+                WebTransportStreamReceiveTerminalRetirementOutcome::Rejected(
+                    WebTransportSelectionError::StaleStream,
+                ),
+            );
+            return;
+        };
+        if !stream.has_receive_direction() {
+            let _ = response.send(
+                WebTransportStreamReceiveTerminalRetirementOutcome::Rejected(
+                    WebTransportSelectionError::WrongDirection,
+                ),
+            );
+            return;
+        }
+        if stream.receive_terminal_observation ==
+            ReceiveTerminalObservation::Retired
+        {
+            let _ = response.send(
+                WebTransportStreamReceiveTerminalRetirementOutcome::Retired {
+                    session_id,
+                    stream_id,
+                },
+            );
+            return;
+        }
+        if !self.receive_terminal_states.contains_key(&stream_id) {
+            let _ = response.send(
+                WebTransportStreamReceiveTerminalRetirementOutcome::NotObserved {
+                    session_id,
+                    stream_id,
+                },
+            );
+            return;
+        }
+        if self
+            .receive_terminal_states
+            .get(&stream_id)
+            .is_some_and(|terminal| terminal.leased.load(Ordering::Acquire))
+        {
+            let _ = response.send(
+                WebTransportStreamReceiveTerminalRetirementOutcome::OutstandingRead {
+                    session_id,
+                    stream_id,
+                },
+            );
+            return;
+        }
+
+        self.remove_receive_terminal_state(stream_id);
+        self.retire_receive_terminal_observation(stream_id, stream);
+        if let Some(waiter) = self.remove_stream_waiter(stream_id, false) {
+            let _ = waiter.response.send(WebTransportStreamReadyOutcome::Closed);
+        }
+        let _ = response.send(
+            WebTransportStreamReceiveTerminalRetirementOutcome::Retired {
+                session_id,
+                stream_id,
+            },
+        );
+    }
+
+    fn retire_receive_terminal_observation(
+        &mut self, stream_id: u64, stream: OwnedStream,
+    ) {
+        if stream.receive_terminal_observation !=
+            ReceiveTerminalObservation::Active
+        {
+            return;
+        }
+        self.receive_terminal_observations =
+            self.receive_terminal_observations.saturating_sub(1);
+        decrement_session_count(
+            &mut self.receive_terminal_observations_per_session,
+            stream.session_id,
+        );
+        if let Some(stream) = self.stream_sessions.get_mut(&stream_id) {
+            stream.receive_terminal_observation =
+                ReceiveTerminalObservation::Retired;
+        }
+    }
+
+    fn remove_receive_terminal_state(
+        &mut self, stream_id: u64,
+    ) -> Option<Arc<ReceiveTerminalReadShared>> {
+        let terminal = self.receive_terminal_states.remove(&stream_id)?;
+        decrement_session_count(
+            &mut self.receive_terminal_states_per_session,
+            terminal.session_id,
+        );
+        self.receive_terminal_bytes = self
+            .receive_terminal_bytes
+            .saturating_sub(terminal.allocation_bytes);
+        if let Some(bytes) = self
+            .receive_terminal_bytes_per_session
+            .get_mut(&terminal.session_id)
+        {
+            *bytes = bytes.saturating_sub(terminal.allocation_bytes);
+            if *bytes == 0 {
+                self.receive_terminal_bytes_per_session
+                    .remove(&terminal.session_id);
+            }
+        }
+        Some(terminal)
     }
 
     fn control_stream(
@@ -5637,7 +6426,7 @@ impl Runtime {
                         .remove_pending(session_id, stream_id)
                         .expect("pending indexes stay synchronized");
                     if self.is_active(session_id) {
-                        if self.can_admit_stream(session_id) {
+                        if self.can_admit_associated_stream(stream) {
                             self.admit_stream(stream);
                             events.push(associated_event(stream));
                         } else {
@@ -5694,11 +6483,7 @@ impl Runtime {
                         shutdown_owned_stream(
                             qconn, stream_id, stream, error_code,
                         );
-                        self.stream_sessions.remove(&stream_id);
-                        if let Some(session) = self.sessions.get_mut(&session_id)
-                        {
-                            session.streams.remove(&stream_id);
-                        }
+                        self.remove_owned_stream(stream_id);
                         if self
                             .sessions
                             .get(&session_id)
@@ -5760,21 +6545,53 @@ impl Runtime {
             if self.stream_sessions.contains_key(&stream_id) {
                 self.observe_send_terminal(qconn, stream_id);
             }
-            if let Some(stream) = self.stream_sessions.remove(&stream_id) {
-                if stream.send_terminal_observation ==
-                    SendTerminalObservation::Overloaded
-                {
-                    decrement_session_count(
-                        &mut self.send_terminal_overloaded_sessions,
-                        stream.session_id,
-                    );
-                }
-                self.close_stream_waiters(stream_id);
-                if let Some(session) = self.sessions.get_mut(&stream.session_id) {
-                    session.streams.remove(&stream_id);
-                }
+            if self.stream_sessions.get(&stream_id).copied().is_some_and(
+                |stream| {
+                    matches!(
+                        stream.send_terminal_observation,
+                        SendTerminalObservation::NotApplicable |
+                            SendTerminalObservation::Retired
+                    ) && matches!(
+                        stream.receive_terminal_observation,
+                        ReceiveTerminalObservation::NotApplicable |
+                            ReceiveTerminalObservation::Retired
+                    ) && !self.receive_terminal_states.contains_key(&stream_id) &&
+                        !self.readable_waiters.contains_key(&stream_id) &&
+                        !self.writable_waiters.contains_key(&stream_id) &&
+                        !self.send_terminal_waiters.contains_key(&stream_id) &&
+                        !self.send_terminal_states.contains_key(&stream_id)
+                },
+            ) {
+                self.remove_owned_stream(stream_id);
             }
         }
+    }
+
+    fn remove_owned_stream(&mut self, stream_id: u64) -> Option<OwnedStream> {
+        let stream = self.stream_sessions.remove(&stream_id)?;
+        if stream.send_terminal_observation == SendTerminalObservation::Overloaded
+        {
+            decrement_session_count(
+                &mut self.send_terminal_overloaded_sessions,
+                stream.session_id,
+            );
+        }
+        if stream.receive_terminal_observation ==
+            ReceiveTerminalObservation::Active
+        {
+            self.receive_terminal_observations =
+                self.receive_terminal_observations.saturating_sub(1);
+            decrement_session_count(
+                &mut self.receive_terminal_observations_per_session,
+                stream.session_id,
+            );
+        }
+        self.remove_receive_terminal_state(stream_id);
+        self.close_stream_waiters(stream_id);
+        if let Some(session) = self.sessions.get_mut(&stream.session_id) {
+            session.streams.remove(&stream_id);
+        }
+        Some(stream)
     }
 
     fn remove_pending(
@@ -5886,6 +6703,11 @@ impl Runtime {
             .saturating_add(self.send_terminal_states.len())
             .saturating_add(self.send_terminal_states_per_session.len())
             .saturating_add(self.send_terminal_overloaded_sessions.len())
+            .saturating_add(self.readable_waiters_per_session.len())
+            .saturating_add(self.receive_terminal_observations_per_session.len())
+            .saturating_add(self.receive_terminal_states.len())
+            .saturating_add(self.receive_terminal_states_per_session.len())
+            .saturating_add(self.receive_terminal_bytes_per_session.len())
             .saturating_add(self.datagrams.len())
             .saturating_add(self.pending_datagram_count)
             .saturating_add(self.provisional_deadlines.len())
@@ -5936,6 +6758,43 @@ impl Runtime {
                 .send_terminal_waiter_saturation_total,
             send_terminal_state_saturation_total: self
                 .send_terminal_state_saturation_total,
+            receive_terminal_observations: self.receive_terminal_observations,
+            receive_terminal_states: self.receive_terminal_states.len(),
+            receive_terminal_waiters: self.readable_waiters.len(),
+            receive_terminal_leases: self
+                .receive_terminal_states
+                .values()
+                .filter(|terminal| terminal.leased.load(Ordering::Acquire))
+                .count(),
+            receive_terminal_bytes: self.receive_terminal_bytes,
+            max_receive_terminal_states: self.limits.max_receive_terminal_states,
+            max_receive_terminal_states_per_session: self
+                .limits
+                .max_receive_terminal_states_per_session,
+            max_receive_terminal_waiters: self
+                .limits
+                .max_receive_terminal_waiters,
+            max_receive_terminal_waiters_per_session: self
+                .limits
+                .max_receive_terminal_waiters_per_session,
+            max_receive_terminal_bytes: self.limits.max_receive_terminal_bytes,
+            max_receive_terminal_bytes_per_session: self
+                .limits
+                .max_receive_terminal_bytes_per_session,
+            receive_terminal_observations_high_water: self
+                .receive_terminal_observations_high_water,
+            receive_terminal_states_high_water: self
+                .receive_terminal_states_high_water,
+            receive_terminal_bytes_high_water: self
+                .receive_terminal_bytes_high_water,
+            receive_terminal_waiters_high_water: self
+                .receive_terminal_waiters_high_water,
+            receive_terminal_state_saturation_total: self
+                .receive_terminal_state_saturation_total,
+            receive_terminal_byte_saturation_total: self
+                .receive_terminal_byte_saturation_total,
+            receive_terminal_waiter_saturation_total: self
+                .receive_terminal_waiter_saturation_total,
             bounded_client_connect_owners: 0,
             max_bounded_client_connect_owners: 0,
             bounded_client_connect_owner_installed_total: 0,
@@ -6027,15 +6886,21 @@ impl Runtime {
                         WebTransportSelectionError::ConnectionClosed,
                     ));
         }
-        for (_, response) in std::mem::take(&mut self.readable_waiters) {
-            let _ = response.send(WebTransportStreamReadyOutcome::Rejected(
-                WebTransportSelectionError::ConnectionClosed,
-            ));
+        for (_, waiter) in std::mem::take(&mut self.readable_waiters) {
+            let _ =
+                waiter
+                    .response
+                    .send(WebTransportStreamReadyOutcome::Rejected(
+                        WebTransportSelectionError::ConnectionClosed,
+                    ));
         }
-        for (_, response) in std::mem::take(&mut self.writable_waiters) {
-            let _ = response.send(WebTransportStreamReadyOutcome::Rejected(
-                WebTransportSelectionError::ConnectionClosed,
-            ));
+        for (_, waiter) in std::mem::take(&mut self.writable_waiters) {
+            let _ =
+                waiter
+                    .response
+                    .send(WebTransportStreamReadyOutcome::Rejected(
+                        WebTransportSelectionError::ConnectionClosed,
+                    ));
         }
         for (session_id, waiters) in
             std::mem::take(&mut self.session_terminal_waiters)
@@ -6075,10 +6940,17 @@ impl Runtime {
         self.pending_streams.clear();
         self.pending_by_session.clear();
         self.stream_sessions.clear();
+        self.readable_waiters_per_session.clear();
         self.send_terminal_waiters_per_session.clear();
         self.send_terminal_states.clear();
         self.send_terminal_states_per_session.clear();
         self.send_terminal_overloaded_sessions.clear();
+        self.receive_terminal_observations = 0;
+        self.receive_terminal_observations_per_session.clear();
+        self.receive_terminal_states.clear();
+        self.receive_terminal_states_per_session.clear();
+        self.receive_terminal_bytes = 0;
+        self.receive_terminal_bytes_per_session.clear();
         self.opening_streams.clear();
         self.opening_order.clear();
         self.opening_by_session.clear();
@@ -6257,6 +7129,13 @@ mod tests {
             max_session_terminal_waiters_per_session: per_session,
             max_send_terminal_waiters: global,
             max_send_terminal_waiters_per_session: per_session,
+            max_receive_terminal_states: global,
+            max_receive_terminal_states_per_session: per_session,
+            max_receive_terminal_waiters: global,
+            max_receive_terminal_waiters_per_session: per_session,
+            max_receive_terminal_bytes: global.saturating_mul(64 * 1024),
+            max_receive_terminal_bytes_per_session: per_session
+                .saturating_mul(64 * 1024),
             max_datagram_waiters: 2,
             max_pending_datagrams: 256,
             max_pending_datagrams_per_session: 64,
@@ -6300,6 +7179,48 @@ mod tests {
         CloseCapsule::new(code, message.to_string())
             .unwrap()
             .encode()
+    }
+
+    fn activate_session(runtime: &mut Runtime, session_id: u64) {
+        let mut session = Session::pending(false);
+        session.phase = SessionPhase::Active;
+        runtime.sessions.insert(session_id, session);
+    }
+
+    fn own_stream(
+        runtime: &mut Runtime, session_id: u64, stream_id: u64,
+        direction: WebTransportStreamDirection, locally_initiated: bool,
+    ) {
+        let stream =
+            OwnedStream::new(session_id, direction, 0, locally_initiated);
+        assert!(runtime.can_admit_owned_stream(stream));
+        runtime.insert_owned_stream(stream_id, stream);
+        runtime
+            .sessions
+            .get_mut(&session_id)
+            .unwrap()
+            .streams
+            .insert(stream_id);
+    }
+
+    fn read_stream(
+        runtime: &mut Runtime, qconn: &mut QuicheConnection, session_id: u64,
+        stream_id: u64, max_bytes: usize,
+    ) -> WebTransportStreamReadOutcome {
+        let (response, mut outcome) = oneshot::channel();
+        runtime.read_stream(qconn, session_id, stream_id, max_bytes, response);
+        outcome.try_recv().unwrap()
+    }
+
+    fn retire_receive_terminal(
+        runtime: &mut Runtime, qconn: &QuicheConnection, session_id: u64,
+        stream_id: u64,
+    ) -> WebTransportStreamReceiveTerminalRetirementOutcome {
+        let (response, mut outcome) = oneshot::channel();
+        runtime.retire_stream_receive_terminal(
+            qconn, session_id, stream_id, response,
+        );
+        outcome.try_recv().unwrap()
     }
 
     #[test]
@@ -6566,13 +7487,10 @@ mod tests {
             session.phase = SessionPhase::Active;
             runtime.sessions.insert(session_id, session);
         }
-        runtime.stream_sessions.insert(8, OwnedStream {
-            session_id: 0,
-            direction: WebTransportStreamDirection::Bidi,
-            local_prefix_len: 3,
-            locally_initiated: true,
-            send_terminal_observation: SendTerminalObservation::Active,
-        });
+        runtime.stream_sessions.insert(
+            8,
+            OwnedStream::new(0, WebTransportStreamDirection::Uni, 3, true),
+        );
 
         let (response, mut outcome) = oneshot::channel();
         runtime.wait_stream_send_terminal(&pipe.server, 4, 8, response);
@@ -6597,13 +7515,10 @@ mod tests {
 
         for ordinal in 0..4_096 {
             let stream_id = ordinal * 4 + 1;
-            runtime.stream_sessions.insert(stream_id, OwnedStream {
-                session_id: 0,
-                direction: WebTransportStreamDirection::Bidi,
-                local_prefix_len: 3,
-                locally_initiated: true,
-                send_terminal_observation: SendTerminalObservation::Active,
-            });
+            runtime.stream_sessions.insert(
+                stream_id,
+                OwnedStream::new(0, WebTransportStreamDirection::Uni, 3, true),
+            );
             runtime
                 .sessions
                 .get_mut(&0)
@@ -6655,6 +7570,597 @@ mod tests {
 
         assert_eq!(runtime.send_terminal_state_saturation_total, 0);
         assert_eq!(runtime.send_terminal_waiter_saturation_total, 0);
+    }
+
+    #[test]
+    fn receive_terminal_separate_fin_survives_closed_stream_collection() {
+        let mut pipe = pipe();
+        let mut runtime = Runtime::new(runtime_limits(8, 8, 8));
+        activate_session(&mut runtime, 0);
+        own_stream(&mut runtime, 0, 2, WebTransportStreamDirection::Uni, false);
+
+        pipe.client.stream_send(2, b"last payload", false).unwrap();
+        pipe.advance().unwrap();
+        let (payload_response, mut payload) = oneshot::channel();
+        runtime.read_stream(&mut pipe.server, 0, 2, 64, payload_response);
+        assert_eq!(
+            payload.try_recv().unwrap(),
+            WebTransportStreamReadOutcome::Data {
+                data: Bytes::from_static(b"last payload"),
+                fin: false,
+            }
+        );
+        assert_eq!(
+            retire_receive_terminal(&mut runtime, &pipe.server, 0, 2),
+            WebTransportStreamReceiveTerminalRetirementOutcome::NotObserved {
+                session_id: 0,
+                stream_id: 2,
+            }
+        );
+
+        pipe.client.stream_send(2, b"", true).unwrap();
+        pipe.advance().unwrap();
+        let (ready_response, mut ready) = oneshot::channel();
+        runtime.wait_stream(&pipe.server, 0, 2, false, ready_response);
+        assert_eq!(
+            ready.try_recv().unwrap(),
+            WebTransportStreamReadyOutcome::Ready
+        );
+
+        runtime.process_work(&mut pipe.server);
+        let (terminal_response, mut terminal) = oneshot::channel();
+        runtime.read_stream(&mut pipe.server, 0, 2, 64, terminal_response);
+        let terminal = assert_matches!(
+            terminal.try_recv().unwrap(),
+            WebTransportStreamReadOutcome::Terminal(terminal) => terminal
+        );
+        assert!(terminal.data().is_empty());
+        assert_eq!(terminal.terminal(), WebTransportStreamReceiveTerminal::Fin);
+        drop(terminal);
+
+        let (retire_response, mut retired) = oneshot::channel();
+        runtime.retire_stream_receive_terminal(
+            &pipe.server,
+            0,
+            2,
+            retire_response,
+        );
+        assert_eq!(
+            retired.try_recv().unwrap(),
+            WebTransportStreamReceiveTerminalRetirementOutcome::Retired {
+                session_id: 0,
+                stream_id: 2,
+            }
+        );
+        runtime.process_work(&mut pipe.server);
+        assert!(!runtime.stream_sessions.contains_key(&2));
+    }
+
+    #[test]
+    fn receive_terminal_fin_shapes_replay_without_copy_until_retired() {
+        let mut pipe = pipe();
+        let mut runtime = Runtime::new(runtime_limits(8, 8, 8));
+        activate_session(&mut runtime, 0);
+        own_stream(&mut runtime, 0, 2, WebTransportStreamDirection::Uni, false);
+
+        pipe.client.stream_send(2, b"final", true).unwrap();
+        pipe.advance().unwrap();
+        let terminal = assert_matches!(
+            read_stream(&mut runtime, &mut pipe.server, 0, 2, 64),
+            WebTransportStreamReadOutcome::Terminal(terminal) => terminal
+        );
+        assert_eq!(terminal.session_id(), 0);
+        assert_eq!(terminal.stream_id(), 2);
+        assert_eq!(terminal.data(), b"final");
+        assert_eq!(terminal.terminal(), WebTransportStreamReceiveTerminal::Fin);
+        let retained_ptr = terminal.data().as_ptr();
+        assert_eq!(runtime.receive_terminal_states.len(), 1);
+        assert_eq!(runtime.receive_terminal_bytes, 5);
+        assert_eq!(runtime.receive_terminal_observations, 1);
+        assert_eq!(
+            retire_receive_terminal(&mut runtime, &pipe.server, 0, 2),
+            WebTransportStreamReceiveTerminalRetirementOutcome::OutstandingRead {
+                session_id: 0,
+                stream_id: 2,
+            }
+        );
+        assert_eq!(runtime.receive_terminal_states.len(), 1);
+        assert_eq!(runtime.receive_terminal_bytes, 5);
+        drop(terminal);
+
+        let replayed = assert_matches!(
+            read_stream(&mut runtime, &mut pipe.server, 0, 2, 64),
+            WebTransportStreamReadOutcome::Terminal(terminal) => terminal
+        );
+        assert_eq!(replayed.data().as_ptr(), retained_ptr);
+        assert_eq!(replayed.data(), b"final");
+        assert_eq!(replayed.terminal(), WebTransportStreamReceiveTerminal::Fin);
+        drop(replayed);
+
+        assert_eq!(
+            retire_receive_terminal(&mut runtime, &pipe.server, 0, 2),
+            WebTransportStreamReceiveTerminalRetirementOutcome::Retired {
+                session_id: 0,
+                stream_id: 2,
+            }
+        );
+        assert_eq!(runtime.receive_terminal_states.len(), 0);
+        assert_eq!(runtime.receive_terminal_bytes, 0);
+        assert_eq!(runtime.receive_terminal_observations, 0);
+        assert_eq!(
+            retire_receive_terminal(&mut runtime, &pipe.server, 0, 2),
+            WebTransportStreamReceiveTerminalRetirementOutcome::Retired {
+                session_id: 0,
+                stream_id: 2,
+            }
+        );
+        runtime.process_work(&mut pipe.server);
+        assert_eq!(
+            read_stream(&mut runtime, &mut pipe.server, 0, 2, 64),
+            WebTransportStreamReadOutcome::Rejected(
+                WebTransportSelectionError::StaleStream,
+            )
+        );
+
+        own_stream(&mut runtime, 0, 6, WebTransportStreamDirection::Uni, false);
+        pipe.client.stream_send(6, b"", true).unwrap();
+        pipe.advance().unwrap();
+        let empty = assert_matches!(
+            read_stream(&mut runtime, &mut pipe.server, 0, 6, 64),
+            WebTransportStreamReadOutcome::Terminal(terminal) => terminal
+        );
+        assert!(empty.data().is_empty());
+        assert_eq!(empty.terminal(), WebTransportStreamReceiveTerminal::Fin);
+        assert_eq!(runtime.receive_terminal_bytes, 0);
+        drop(empty);
+        assert_eq!(
+            retire_receive_terminal(&mut runtime, &pipe.server, 0, 6),
+            WebTransportStreamReceiveTerminalRetirementOutcome::Retired {
+                session_id: 0,
+                stream_id: 6,
+            }
+        );
+    }
+
+    #[test]
+    fn receive_terminal_reset_survives_wait_and_read_cancellation() {
+        let mut pipe = pipe();
+        let mut runtime = Runtime::new(runtime_limits(8, 8, 8));
+        activate_session(&mut runtime, 0);
+        pipe.client.stream_send(0, b"x", false).unwrap();
+        pipe.advance().unwrap();
+        let mut opened = [0; 1];
+        assert_eq!(pipe.server.stream_recv(0, &mut opened), Ok((1, false)));
+        own_stream(&mut runtime, 0, 0, WebTransportStreamDirection::Bidi, false);
+
+        let (cancelled_wait, cancelled) = oneshot::channel();
+        runtime.wait_stream(&pipe.server, 0, 0, false, cancelled_wait);
+        assert_eq!(runtime.readable_waiters.len(), 1);
+        drop(cancelled);
+        runtime.prune_cancelled_stream_waiters();
+        assert!(runtime.readable_waiters.is_empty());
+        assert!(runtime.readable_waiters_per_session.is_empty());
+
+        let (wait_response, mut waited) = oneshot::channel();
+        runtime.wait_stream(&pipe.server, 0, 0, false, wait_response);
+        let wire_error_code = webtransport_error_to_http3(73);
+        pipe.client
+            .stream_shutdown(0, quiche::Shutdown::Write, wire_error_code)
+            .unwrap();
+        pipe.advance().unwrap();
+        assert!(runtime.process_owned_readable(&pipe.server, 0));
+        assert_eq!(
+            waited.try_recv().unwrap(),
+            WebTransportStreamReadyOutcome::Ready
+        );
+
+        let (late_wait_response, mut late_wait) = oneshot::channel();
+        runtime.wait_stream(&pipe.server, 0, 0, false, late_wait_response);
+        assert_eq!(
+            late_wait.try_recv().unwrap(),
+            WebTransportStreamReadyOutcome::Ready
+        );
+
+        let (cancelled_read, cancelled) = oneshot::channel();
+        drop(cancelled);
+        runtime.read_stream(&mut pipe.server, 0, 0, 64, cancelled_read);
+        assert!(runtime.receive_terminal_states.is_empty());
+
+        let (raced_response, raced) = oneshot::channel();
+        runtime.read_stream(&mut pipe.server, 0, 0, 64, raced_response);
+        assert_eq!(runtime.receive_terminal_states.len(), 1);
+        assert!(runtime
+            .receive_terminal_states
+            .get(&0)
+            .unwrap()
+            .leased
+            .load(Ordering::Acquire));
+        drop(raced);
+        assert!(!runtime
+            .receive_terminal_states
+            .get(&0)
+            .unwrap()
+            .leased
+            .load(Ordering::Acquire));
+
+        let terminal = assert_matches!(
+            read_stream(&mut runtime, &mut pipe.server, 0, 0, 64),
+            WebTransportStreamReadOutcome::Terminal(terminal) => terminal
+        );
+        assert!(terminal.data().is_empty());
+        assert_eq!(
+            terminal.terminal(),
+            WebTransportStreamReceiveTerminal::Reset {
+                wire_error_code,
+                application_error_code: Some(73),
+            }
+        );
+        drop(terminal);
+        assert_eq!(
+            retire_receive_terminal(&mut runtime, &pipe.server, 0, 0),
+            WebTransportStreamReceiveTerminalRetirementOutcome::Retired {
+                session_id: 0,
+                stream_id: 0,
+            }
+        );
+
+        own_stream(&mut runtime, 0, 4, WebTransportStreamDirection::Bidi, false);
+        pipe.client.stream_send(4, b"prefix", false).unwrap();
+        pipe.advance().unwrap();
+        assert_eq!(
+            read_stream(&mut runtime, &mut pipe.server, 0, 4, 64),
+            WebTransportStreamReadOutcome::Data {
+                data: Bytes::from_static(b"prefix"),
+                fin: false,
+            }
+        );
+        let second_wire_error = WT_APPLICATION_ERROR_FIRST - 1;
+        pipe.client
+            .stream_shutdown(4, quiche::Shutdown::Write, second_wire_error)
+            .unwrap();
+        pipe.advance().unwrap();
+        let terminal = assert_matches!(
+            read_stream(&mut runtime, &mut pipe.server, 0, 4, 64),
+            WebTransportStreamReadOutcome::Terminal(terminal) => terminal
+        );
+        assert_eq!(
+            terminal.terminal(),
+            WebTransportStreamReceiveTerminal::Reset {
+                wire_error_code: second_wire_error,
+                application_error_code: None,
+            }
+        );
+        drop(terminal);
+        assert_eq!(
+            retire_receive_terminal(&mut runtime, &pipe.server, 0, 4),
+            WebTransportStreamReceiveTerminalRetirementOutcome::Retired {
+                session_id: 0,
+                stream_id: 4,
+            }
+        );
+    }
+
+    #[test]
+    fn receive_terminal_bounds_reject_before_mutation_and_reclaim_capacity() {
+        let mut pipe = pipe();
+        let mut limits = runtime_limits(3, 3, 8);
+        limits.max_receive_terminal_states = 2;
+        limits.max_receive_terminal_states_per_session = 2;
+        limits.max_receive_terminal_waiters = 1;
+        limits.max_receive_terminal_waiters_per_session = 1;
+        limits.max_receive_terminal_bytes = 4;
+        limits.max_receive_terminal_bytes_per_session = 4;
+        let mut runtime = Runtime::new(limits);
+        activate_session(&mut runtime, 0);
+        for stream_id in [2, 6] {
+            own_stream(
+                &mut runtime,
+                0,
+                stream_id,
+                WebTransportStreamDirection::Uni,
+                false,
+            );
+        }
+        assert!(!runtime.can_admit_owned_stream(OwnedStream::new(
+            0,
+            WebTransportStreamDirection::Uni,
+            0,
+            false,
+        )));
+        assert_eq!(runtime.receive_terminal_state_saturation_total, 1);
+
+        pipe.client.stream_send(2, b"12345", true).unwrap();
+        pipe.advance().unwrap();
+        assert_eq!(pipe.server.stream_readable_len(2), 5);
+        assert_eq!(
+            read_stream(&mut runtime, &mut pipe.server, 0, 2, 64),
+            WebTransportStreamReadOutcome::Rejected(
+                WebTransportSelectionError::ResourceLimit,
+            )
+        );
+        assert_eq!(pipe.server.stream_readable_len(2), 5);
+        assert_eq!(runtime.receive_terminal_states.len(), 0);
+        assert_eq!(runtime.receive_terminal_bytes, 0);
+        assert_eq!(runtime.receive_terminal_byte_saturation_total, 1);
+
+        assert_eq!(
+            read_stream(&mut runtime, &mut pipe.server, 0, 2, 4),
+            WebTransportStreamReadOutcome::Data {
+                data: Bytes::from_static(b"1234"),
+                fin: false,
+            }
+        );
+        let terminal = assert_matches!(
+            read_stream(&mut runtime, &mut pipe.server, 0, 2, 4),
+            WebTransportStreamReadOutcome::Terminal(terminal) => terminal
+        );
+        assert_eq!(terminal.data(), b"5");
+        assert_eq!(runtime.receive_terminal_bytes, 1);
+        assert_eq!(runtime.receive_terminal_states.len(), 1);
+        drop(terminal);
+        assert_eq!(
+            retire_receive_terminal(&mut runtime, &pipe.server, 0, 2),
+            WebTransportStreamReceiveTerminalRetirementOutcome::Retired {
+                session_id: 0,
+                stream_id: 2,
+            }
+        );
+        assert!(runtime.can_admit_owned_stream(OwnedStream::new(
+            0,
+            WebTransportStreamDirection::Uni,
+            0,
+            false,
+        )));
+
+        pipe.client.stream_send(6, b"x", false).unwrap();
+        pipe.advance().unwrap();
+        let mut opened = [0; 1];
+        assert_eq!(pipe.server.stream_recv(6, &mut opened), Ok((1, false)));
+        let (first_response, first) = oneshot::channel();
+        runtime.wait_stream(&pipe.server, 0, 6, false, first_response);
+        let (full_response, mut full) = oneshot::channel();
+        runtime.wait_stream(&pipe.server, 0, 6, false, full_response);
+        assert_eq!(
+            full.try_recv().unwrap(),
+            WebTransportStreamReadyOutcome::Rejected(
+                WebTransportSelectionError::ResourceLimit,
+            )
+        );
+        assert_eq!(runtime.receive_terminal_waiter_saturation_total, 1);
+        drop(first);
+        runtime.prune_cancelled_stream_waiters();
+        assert!(runtime.readable_waiters.is_empty());
+        assert!(runtime.readable_waiters_per_session.is_empty());
+
+        let (replacement_response, mut replacement) = oneshot::channel();
+        runtime.wait_stream(&pipe.server, 0, 6, false, replacement_response);
+        pipe.client.stream_send(6, b"", true).unwrap();
+        pipe.advance().unwrap();
+        assert!(runtime.process_owned_readable(&pipe.server, 6));
+        assert_eq!(
+            replacement.try_recv().unwrap(),
+            WebTransportStreamReadyOutcome::Ready
+        );
+        assert!(runtime.readable_waiters.is_empty());
+        assert!(runtime.readable_waiters_per_session.is_empty());
+    }
+
+    #[test]
+    fn receive_terminal_directional_half_closes_are_independent() {
+        let mut pipe = pipe();
+        let mut runtime = Runtime::new(runtime_limits(8, 8, 8));
+        activate_session(&mut runtime, 4);
+        own_stream(&mut runtime, 4, 0, WebTransportStreamDirection::Bidi, false);
+        own_stream(&mut runtime, 4, 2, WebTransportStreamDirection::Uni, false);
+        own_stream(&mut runtime, 4, 3, WebTransportStreamDirection::Uni, true);
+
+        assert_eq!(
+            read_stream(&mut runtime, &mut pipe.server, 4, 3, 16),
+            WebTransportStreamReadOutcome::Rejected(
+                WebTransportSelectionError::WrongDirection,
+            )
+        );
+        assert_eq!(
+            retire_receive_terminal(&mut runtime, &pipe.server, 4, 3),
+            WebTransportStreamReceiveTerminalRetirementOutcome::Rejected(
+                WebTransportSelectionError::WrongDirection,
+            )
+        );
+        let (send_response, mut send) = oneshot::channel();
+        runtime.wait_stream_send_terminal(&pipe.server, 4, 2, send_response);
+        assert_eq!(
+            send.try_recv().unwrap(),
+            WebTransportStreamSendTerminalOutcome::Rejected(
+                WebTransportSelectionError::WrongDirection,
+            )
+        );
+
+        pipe.client.stream_send(0, b"request", true).unwrap();
+        pipe.advance().unwrap();
+        let (write_response, mut write_waiter) = oneshot::channel();
+        runtime.writable_waiters.insert(0, StreamReadyWaiter {
+            session_id: 4,
+            response: write_response,
+        });
+        let terminal = assert_matches!(
+            read_stream(&mut runtime, &mut pipe.server, 4, 0, 64),
+            WebTransportStreamReadOutcome::Terminal(terminal) => terminal
+        );
+        assert_eq!(terminal.data(), b"request");
+        drop(terminal);
+        assert_eq!(
+            retire_receive_terminal(&mut runtime, &pipe.server, 4, 0),
+            WebTransportStreamReceiveTerminalRetirementOutcome::Retired {
+                session_id: 4,
+                stream_id: 0,
+            }
+        );
+        assert_matches!(
+            write_waiter.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        );
+        assert!(runtime.writable_waiters.contains_key(&0));
+        runtime.process_work(&mut pipe.server);
+        assert!(runtime.stream_sessions.contains_key(&0));
+
+        pipe.server.stream_send(0, b"", true).unwrap();
+        assert!(runtime.process_owned_writable(&mut pipe.server, 0));
+        assert_eq!(
+            write_waiter.try_recv().unwrap(),
+            WebTransportStreamReadyOutcome::Closed
+        );
+        let (send_response, mut send) = oneshot::channel();
+        runtime.wait_stream_send_terminal(&pipe.server, 4, 0, send_response);
+        assert_eq!(
+            send.try_recv().unwrap(),
+            WebTransportStreamSendTerminalOutcome::Closed { stream_id: 0 }
+        );
+        let (retire_response, mut retired) = oneshot::channel();
+        runtime.retire_stream_send_terminal(&pipe.server, 4, 0, retire_response);
+        assert_eq!(
+            retired.try_recv().unwrap(),
+            WebTransportStreamSendTerminalOutcome::Retired {
+                session_id: 4,
+                stream_id: 0,
+            }
+        );
+        runtime.process_work(&mut pipe.server);
+        assert!(!runtime.stream_sessions.contains_key(&0));
+    }
+
+    #[test]
+    fn receive_terminal_teardown_preserves_first_session_reason() {
+        let mut pipe = pipe();
+        let mut runtime = Runtime::new(runtime_limits(8, 8, 8));
+        activate_session(&mut runtime, 0);
+        own_stream(&mut runtime, 0, 2, WebTransportStreamDirection::Uni, false);
+        pipe.client.stream_send(2, b"terminal", true).unwrap();
+        pipe.advance().unwrap();
+        let terminal = assert_matches!(
+            read_stream(&mut runtime, &mut pipe.server, 0, 2, 64),
+            WebTransportStreamReadOutcome::Terminal(terminal) => terminal
+        );
+        let reason = WebTransportSessionCloseReason::Peer {
+            error_code: 27,
+            message: "first".to_string(),
+        };
+        assert_eq!(runtime.terminate(0, reason.clone()), Vec::new());
+        assert!(runtime
+            .terminate(0, WebTransportSessionCloseReason::ProtocolError)
+            .is_empty());
+        assert!(runtime.receive_terminal_states.is_empty());
+        assert_eq!(runtime.receive_terminal_bytes, 0);
+        assert_eq!(terminal.data(), b"terminal");
+        assert_eq!(terminal.terminal(), WebTransportStreamReceiveTerminal::Fin);
+
+        let (wait_response, mut waited) = oneshot::channel();
+        runtime.wait_session_terminal(&pipe.server, 0, wait_response);
+        assert_eq!(
+            waited.try_recv().unwrap(),
+            WebTransportSessionTerminalOutcome::Terminated {
+                session_id: 0,
+                reason: reason.clone(),
+            }
+        );
+        assert_eq!(
+            retire_receive_terminal(&mut runtime, &pipe.server, 0, 2),
+            WebTransportStreamReceiveTerminalRetirementOutcome::SessionTerminated {
+                session_id: 0,
+                stream_id: 2,
+            }
+        );
+        drop(terminal);
+        runtime.process_work(&mut pipe.server);
+        assert_eq!(runtime.receive_terminal_observations, 0);
+
+        let mut closed_runtime = Runtime::new(runtime_limits(8, 8, 8));
+        activate_session(&mut closed_runtime, 4);
+        closed_runtime
+            .sessions
+            .get_mut(&4)
+            .unwrap()
+            .application_visible = true;
+        own_stream(
+            &mut closed_runtime,
+            4,
+            6,
+            WebTransportStreamDirection::Uni,
+            false,
+        );
+        let terminal = assert_matches!(
+            closed_runtime.latch_receive_terminal(
+                4,
+                6,
+                Bytes::from_static(b"closed"),
+                6,
+                WebTransportStreamReceiveTerminal::Fin,
+            ),
+            WebTransportStreamReadOutcome::Terminal(terminal) => terminal
+        );
+        let events = closed_runtime.clear();
+        assert_eq!(events, vec![WebTransportSessionEvent::Terminated {
+            session_id: 4,
+            reason: WebTransportSessionCloseReason::ConnectionClosed,
+        }]);
+        assert!(closed_runtime.receive_terminal_states.is_empty());
+        assert_eq!(closed_runtime.receive_terminal_observations, 0);
+        assert_eq!(closed_runtime.receive_terminal_bytes, 0);
+        assert_eq!(terminal.data(), b"closed");
+    }
+
+    #[test]
+    fn receive_terminal_turnover_reclaims_all_bounded_state() {
+        let pipe = pipe();
+        let mut limits = runtime_limits(1, 1, 8);
+        limits.max_receive_terminal_bytes = 7;
+        limits.max_receive_terminal_bytes_per_session = 7;
+        let mut runtime = Runtime::new(limits);
+        activate_session(&mut runtime, 0);
+
+        for ordinal in 0..4_096 {
+            let stream_id = ordinal * 4 + 2;
+            own_stream(
+                &mut runtime,
+                0,
+                stream_id,
+                WebTransportStreamDirection::Uni,
+                false,
+            );
+            let terminal = assert_matches!(
+                runtime.latch_receive_terminal(
+                    0,
+                    stream_id,
+                    Bytes::from_static(b"turnover"),
+                    7,
+                    WebTransportStreamReceiveTerminal::Fin,
+                ),
+                WebTransportStreamReadOutcome::Terminal(terminal) => terminal
+            );
+            drop(terminal);
+            assert_eq!(
+                retire_receive_terminal(&mut runtime, &pipe.server, 0, stream_id,),
+                WebTransportStreamReceiveTerminalRetirementOutcome::Retired {
+                    session_id: 0,
+                    stream_id,
+                }
+            );
+            runtime.remove_owned_stream(stream_id);
+            assert_eq!(runtime.receive_terminal_observations, 0);
+            assert!(runtime.receive_terminal_observations_per_session.is_empty());
+            assert!(runtime.receive_terminal_states.is_empty());
+            assert!(runtime.receive_terminal_states_per_session.is_empty());
+            assert_eq!(runtime.receive_terminal_bytes, 0);
+            assert!(runtime.receive_terminal_bytes_per_session.is_empty());
+            assert!(runtime.readable_waiters.is_empty());
+            assert!(runtime.readable_waiters_per_session.is_empty());
+        }
+
+        assert_eq!(runtime.receive_terminal_observations_high_water, 1);
+        assert_eq!(runtime.receive_terminal_states_high_water, 1);
+        assert_eq!(runtime.receive_terminal_bytes_high_water, 7);
+        assert_eq!(runtime.receive_terminal_state_saturation_total, 0);
+        assert_eq!(runtime.receive_terminal_byte_saturation_total, 0);
+        assert_eq!(runtime.receive_terminal_waiter_saturation_total, 0);
     }
 
     #[test]

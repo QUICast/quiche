@@ -48,6 +48,7 @@ pub mod migration;
 pub mod qlog_compression;
 pub mod stream_limit;
 pub mod timeouts;
+pub mod webtransport;
 pub mod zero_rtt;
 
 #[tokio::test]

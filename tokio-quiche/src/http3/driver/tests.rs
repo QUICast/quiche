@@ -2081,6 +2081,18 @@ mod server_side_driver {
         })
     }
 
+    fn retire_receive_terminal(
+        controller: &WebTransportController, session_id: u64, stream_id: u64,
+    ) -> tokio::task::JoinHandle<WebTransportStreamReceiveTerminalRetirementOutcome>
+    {
+        let controller = controller.clone();
+        tokio::spawn(async move {
+            controller
+                .retire_stream_receive_terminal(session_id, stream_id)
+                .await
+        })
+    }
+
     async fn webtransport_retention_stats(
         helper: &mut DriverTestHelper<ServerHooks>,
         controller: &WebTransportController,
@@ -3041,6 +3053,26 @@ mod server_side_driver {
             )
         );
 
+        readable.abort();
+        let _ = readable.await;
+        tokio::task::yield_now().await;
+        helper.work_loop_iter().unwrap();
+        assert_eq!(
+            webtransport_retention_stats(&mut helper, &controller)
+                .await
+                .receive_terminal_waiters,
+            0
+        );
+        let read_controller = controller.clone();
+        let readable = tokio::spawn(async move {
+            read_controller
+                .wait_stream_readable(session_id, stream_id)
+                .await
+        });
+        tokio::task::yield_now().await;
+        helper.work_loop_iter().unwrap();
+        assert!(!readable.is_finished());
+
         helper.pipe.advance().unwrap();
         assert_matches!(
             helper.peer_client_poll(),
@@ -3076,10 +3108,23 @@ mod server_side_driver {
         });
         tokio::task::yield_now().await;
         helper.work_loop_iter().unwrap();
-        assert_eq!(read.await.unwrap(), WebTransportStreamReadOutcome::Data {
-            data: Bytes::from_static(b"ready"),
-            fin: true,
-        });
+        let terminal = assert_matches!(
+            read.await.unwrap(),
+            WebTransportStreamReadOutcome::Terminal(terminal) => terminal
+        );
+        assert_eq!(terminal.data(), b"ready");
+        assert_eq!(terminal.terminal(), WebTransportStreamReceiveTerminal::Fin);
+        drop(terminal);
+        let retired = retire_receive_terminal(&controller, session_id, stream_id);
+        tokio::task::yield_now().await;
+        helper.work_loop_iter().unwrap();
+        assert_eq!(
+            retired.await.unwrap(),
+            WebTransportStreamReceiveTerminalRetirementOutcome::Retired {
+                session_id,
+                stream_id,
+            }
+        );
 
         let writable_stream =
             open_server_webtransport_bidi(&mut helper, &controller, session_id)
@@ -3141,11 +3186,28 @@ mod server_side_driver {
         });
         tokio::task::yield_now().await;
         helper.work_loop_iter().unwrap();
-        assert_eq!(
+        let reset_terminal = assert_matches!(
             reset_read.await.unwrap(),
-            WebTransportStreamReadOutcome::Reset {
+            WebTransportStreamReadOutcome::Terminal(terminal) => terminal
+        );
+        assert!(reset_terminal.data().is_empty());
+        assert_eq!(
+            reset_terminal.terminal(),
+            WebTransportStreamReceiveTerminal::Reset {
                 wire_error_code: reset_wire,
                 application_error_code: Some(29),
+            }
+        );
+        drop(reset_terminal);
+        let retired =
+            retire_receive_terminal(&controller, session_id, reset_stream);
+        tokio::task::yield_now().await;
+        helper.work_loop_iter().unwrap();
+        assert_eq!(
+            retired.await.unwrap(),
+            WebTransportStreamReceiveTerminalRetirementOutcome::Retired {
+                session_id,
+                stream_id: reset_stream,
             }
         );
 
@@ -3745,6 +3807,30 @@ mod server_side_driver {
             }
         }
         assert!(helper.pipe.server.stream_closed(peer_uni));
+        let read_controller = controller.clone();
+        let terminal = tokio::spawn(async move {
+            read_controller.read_stream(session_id, peer_uni, 16).await
+        });
+        tokio::task::yield_now().await;
+        helper.work_loop_iter().unwrap();
+        let terminal = assert_matches!(
+            terminal.await.unwrap(),
+            WebTransportStreamReadOutcome::Terminal(terminal) => terminal
+        );
+        assert!(terminal.data().is_empty());
+        assert_eq!(terminal.terminal(), WebTransportStreamReceiveTerminal::Fin);
+        drop(terminal);
+        let retired = retire_receive_terminal(&controller, session_id, peer_uni);
+        tokio::task::yield_now().await;
+        helper.work_loop_iter().unwrap();
+        assert_eq!(
+            retired.await.unwrap(),
+            WebTransportStreamReceiveTerminalRetirementOutcome::Retired {
+                session_id,
+                stream_id: peer_uni,
+            }
+        );
+        helper.work_loop_iter().unwrap();
         let stale = wait_for_send_terminal(&controller, session_id, peer_uni);
         tokio::task::yield_now().await;
         helper.work_loop_iter().unwrap();
@@ -5234,10 +5320,27 @@ mod server_side_driver {
         });
         tokio::task::yield_now().await;
         helper.work_loop_iter().unwrap();
-        assert_eq!(read.await.unwrap(), WebTransportStreamReadOutcome::Data {
-            data: Bytes::from_static(b"fin payload"),
-            fin: true,
-        });
+        let fin_terminal = assert_matches!(
+            read.await.unwrap(),
+            WebTransportStreamReadOutcome::Terminal(terminal) => terminal
+        );
+        assert_eq!(fin_terminal.data(), b"fin payload");
+        assert_eq!(
+            fin_terminal.terminal(),
+            WebTransportStreamReceiveTerminal::Fin
+        );
+        drop(fin_terminal);
+        let retire =
+            retire_receive_terminal(&controller, session_id, fin_stream_id);
+        tokio::task::yield_now().await;
+        helper.work_loop_iter().unwrap();
+        assert_eq!(
+            retire.await.unwrap(),
+            WebTransportStreamReceiveTerminalRetirementOutcome::Retired {
+                session_id,
+                stream_id: fin_stream_id,
+            }
+        );
 
         let reset_stream_id = 8;
         let reset_bytes = webtransport_stream_data(
@@ -5290,11 +5393,28 @@ mod server_side_driver {
         });
         tokio::task::yield_now().await;
         helper.work_loop_iter().unwrap();
-        assert_eq!(
+        let reset_terminal = assert_matches!(
             second.await.unwrap(),
-            WebTransportStreamReadOutcome::Reset {
+            WebTransportStreamReadOutcome::Terminal(terminal) => terminal
+        );
+        assert!(reset_terminal.data().is_empty());
+        assert_eq!(
+            reset_terminal.terminal(),
+            WebTransportStreamReceiveTerminal::Reset {
                 wire_error_code: wire_error,
                 application_error_code: Some(77),
+            }
+        );
+        drop(reset_terminal);
+        let retire =
+            retire_receive_terminal(&controller, session_id, reset_stream_id);
+        tokio::task::yield_now().await;
+        helper.work_loop_iter().unwrap();
+        assert_eq!(
+            retire.await.unwrap(),
+            WebTransportStreamReceiveTerminalRetirementOutcome::Retired {
+                session_id,
+                stream_id: reset_stream_id,
             }
         );
     }
@@ -6062,6 +6182,28 @@ mod server_side_driver {
             }
         }
         assert!(helper.pipe.server.stream_closed(uni_stream));
+        let terminal =
+            wait_for_send_terminal(&controller, first_session, uni_stream);
+        tokio::task::yield_now().await;
+        helper.work_loop_iter().unwrap();
+        assert_eq!(
+            terminal.await.unwrap(),
+            WebTransportStreamSendTerminalOutcome::Closed {
+                stream_id: uni_stream,
+            }
+        );
+        let retired =
+            retire_send_terminal(&controller, first_session, uni_stream);
+        tokio::task::yield_now().await;
+        helper.work_loop_iter().unwrap();
+        assert_eq!(
+            retired.await.unwrap(),
+            WebTransportStreamSendTerminalOutcome::Retired {
+                session_id: first_session,
+                stream_id: uni_stream,
+            }
+        );
+        helper.work_loop_iter().unwrap();
         let stale_stream_controller = controller.clone();
         let stale_stream = tokio::spawn(async move {
             stale_stream_controller

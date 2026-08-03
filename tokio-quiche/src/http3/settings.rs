@@ -55,6 +55,13 @@ const DEFAULT_WEBTRANSPORT_MAX_SESSION_TERMINAL_WAITERS: usize = 256;
 const DEFAULT_WEBTRANSPORT_MAX_SESSION_TERMINAL_WAITERS_PER_SESSION: usize = 64;
 const DEFAULT_WEBTRANSPORT_MAX_SEND_TERMINAL_WAITERS: usize = 256;
 const DEFAULT_WEBTRANSPORT_MAX_SEND_TERMINAL_WAITERS_PER_SESSION: usize = 64;
+const DEFAULT_WEBTRANSPORT_MAX_RECEIVE_TERMINAL_STATES: usize = 256;
+const DEFAULT_WEBTRANSPORT_MAX_RECEIVE_TERMINAL_STATES_PER_SESSION: usize = 64;
+const DEFAULT_WEBTRANSPORT_MAX_RECEIVE_TERMINAL_WAITERS: usize = 256;
+const DEFAULT_WEBTRANSPORT_MAX_RECEIVE_TERMINAL_WAITERS_PER_SESSION: usize = 64;
+const DEFAULT_WEBTRANSPORT_MAX_RECEIVE_TERMINAL_BYTES: usize = 16 * 1024 * 1024;
+const DEFAULT_WEBTRANSPORT_MAX_RECEIVE_TERMINAL_BYTES_PER_SESSION: usize =
+    4 * 1024 * 1024;
 const DEFAULT_WEBTRANSPORT_MAX_DATAGRAM_WAITERS: usize = 2;
 const DEFAULT_WEBTRANSPORT_MAX_SESSION_WORK_PER_CALLBACK: usize = 64;
 const DEFAULT_WEBTRANSPORT_COMMAND_CAPACITY: usize = 256;
@@ -152,6 +159,18 @@ pub struct Http3Settings {
     /// The bound applies independently to waiters and facts. A value of zero
     /// is clamped to one.
     pub webtransport_max_send_terminal_waiters_per_session: usize,
+    /// Maximum receive-terminal observation slots and retained FIN/RESET facts.
+    pub webtransport_max_receive_terminal_states: usize,
+    /// Per-session receive-terminal observation and retained-fact bound.
+    pub webtransport_max_receive_terminal_states_per_session: usize,
+    /// Maximum pending readable waiters for receive-capable selected streams.
+    pub webtransport_max_receive_terminal_waiters: usize,
+    /// Per-session pending readable-waiter bound.
+    pub webtransport_max_receive_terminal_waiters_per_session: usize,
+    /// Maximum physical backing bytes retained with terminal stream reads.
+    pub webtransport_max_receive_terminal_bytes: usize,
+    /// Per-session terminal-read backing-byte bound.
+    pub webtransport_max_receive_terminal_bytes_per_session: usize,
     /// Maximum exact-session Datagram-readable and send-capacity waiters.
     pub webtransport_max_datagram_waiters: usize,
     /// Work bound used independently by the native WebTransport runtime's
@@ -256,6 +275,18 @@ impl Default for Http3Settings {
                 DEFAULT_WEBTRANSPORT_MAX_SEND_TERMINAL_WAITERS,
             webtransport_max_send_terminal_waiters_per_session:
                 DEFAULT_WEBTRANSPORT_MAX_SEND_TERMINAL_WAITERS_PER_SESSION,
+            webtransport_max_receive_terminal_states:
+                DEFAULT_WEBTRANSPORT_MAX_RECEIVE_TERMINAL_STATES,
+            webtransport_max_receive_terminal_states_per_session:
+                DEFAULT_WEBTRANSPORT_MAX_RECEIVE_TERMINAL_STATES_PER_SESSION,
+            webtransport_max_receive_terminal_waiters:
+                DEFAULT_WEBTRANSPORT_MAX_RECEIVE_TERMINAL_WAITERS,
+            webtransport_max_receive_terminal_waiters_per_session:
+                DEFAULT_WEBTRANSPORT_MAX_RECEIVE_TERMINAL_WAITERS_PER_SESSION,
+            webtransport_max_receive_terminal_bytes:
+                DEFAULT_WEBTRANSPORT_MAX_RECEIVE_TERMINAL_BYTES,
+            webtransport_max_receive_terminal_bytes_per_session:
+                DEFAULT_WEBTRANSPORT_MAX_RECEIVE_TERMINAL_BYTES_PER_SESSION,
             webtransport_max_datagram_waiters:
                 DEFAULT_WEBTRANSPORT_MAX_DATAGRAM_WAITERS,
             webtransport_max_session_work_per_callback:

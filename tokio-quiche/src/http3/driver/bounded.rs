@@ -64,6 +64,7 @@ use super::WebTransportSessionTerminalOutcome;
 use super::WebTransportStreamControlOutcome;
 use super::WebTransportStreamReadOutcome;
 use super::WebTransportStreamReadyOutcome;
+use super::WebTransportStreamReceiveTerminalRetirementOutcome;
 use super::WebTransportStreamSendTerminalOutcome;
 use super::WebTransportStreamWriteLease;
 use super::WebTransportStreamWriteLeaseOperation;
@@ -447,6 +448,12 @@ pub struct BoundedSelectedWebTransportLimits {
     pub max_session_terminal_waiters_per_session: usize,
     /// Aggregate and per-session terminal waiter/fact cap.
     pub max_send_terminal_waiters: usize,
+    /// Aggregate and per-session receive-terminal observation/fact cap.
+    pub max_receive_terminal_states: usize,
+    /// Aggregate and per-session readable waiter cap.
+    pub max_receive_terminal_waiters: usize,
+    /// Aggregate and per-session terminal-read backing-byte cap.
+    pub max_receive_terminal_bytes: usize,
     /// Retained bounded-client CONNECT owners. The one-session profile
     /// requires exactly one slot.
     pub max_client_connect_owners: usize,
@@ -484,6 +491,9 @@ impl Default for BoundedSelectedWebTransportLimits {
             max_session_terminal_waiters: 64,
             max_session_terminal_waiters_per_session: 64,
             max_send_terminal_waiters: 64,
+            max_receive_terminal_states: 64,
+            max_receive_terminal_waiters: 64,
+            max_receive_terminal_bytes: 4 * 1024 * 1024,
             max_client_connect_owners: 1,
             max_session_work_per_callback: 64,
             max_stream_write_bytes: 64 * 1024,
@@ -718,6 +728,24 @@ impl BoundedSelectedWebTransportSettings {
             webtransport_max_send_terminal_waiters_per_session: self
                 .selected
                 .max_send_terminal_waiters,
+            webtransport_max_receive_terminal_states: self
+                .selected
+                .max_receive_terminal_states,
+            webtransport_max_receive_terminal_states_per_session: self
+                .selected
+                .max_receive_terminal_states,
+            webtransport_max_receive_terminal_waiters: self
+                .selected
+                .max_receive_terminal_waiters,
+            webtransport_max_receive_terminal_waiters_per_session: self
+                .selected
+                .max_receive_terminal_waiters,
+            webtransport_max_receive_terminal_bytes: self
+                .selected
+                .max_receive_terminal_bytes,
+            webtransport_max_receive_terminal_bytes_per_session: self
+                .selected
+                .max_receive_terminal_bytes,
             webtransport_max_datagram_waiters: 0,
             webtransport_max_session_work_per_callback: self
                 .selected
@@ -786,6 +814,18 @@ impl BoundedSelectedWebTransportSettings {
             (
                 "send terminal waiters",
                 self.selected.max_send_terminal_waiters,
+            ),
+            (
+                "receive terminal states",
+                self.selected.max_receive_terminal_states,
+            ),
+            (
+                "receive terminal waiters",
+                self.selected.max_receive_terminal_waiters,
+            ),
+            (
+                "receive terminal bytes",
+                self.selected.max_receive_terminal_bytes,
             ),
             (
                 "bounded client CONNECT owners",
@@ -938,6 +978,27 @@ impl BoundedSelectedWebTransportSettings {
                 "the one-session profile requires one client CONNECT owner",
             ));
         }
+        if self.selected.max_receive_terminal_states <
+            self.selected.max_active_streams
+        {
+            return Err(BoundedProfileError::InvalidSetting(
+                "receive terminal state cap is below the active stream cap",
+            ));
+        }
+        if self.selected.max_receive_terminal_waiters >
+            self.selected.max_stream_waiters
+        {
+            return Err(BoundedProfileError::InvalidSetting(
+                "receive terminal waiter cap exceeds the stream waiter cap",
+            ));
+        }
+        if self.selected.max_receive_terminal_bytes <
+            self.selected.max_stream_read_bytes
+        {
+            return Err(BoundedProfileError::InvalidSetting(
+                "receive terminal byte cap is below one maximum read",
+            ));
+        }
         if self.quic.retain_path_events {
             return Err(BoundedProfileError::InvalidSetting(
                 "bounded mode cannot retain path events",
@@ -1071,6 +1132,8 @@ impl BoundedSelectedWebTransportSettings {
             self.selected.max_active_streams,
             self.selected.max_stream_waiters,
             self.selected.max_send_terminal_waiters,
+            self.selected.max_receive_terminal_states,
+            self.selected.max_receive_terminal_waiters,
             self.selected.max_session_terminal_waiters,
         )
         .and_then(|value| value.checked_mul(2))
@@ -1082,6 +1145,8 @@ impl BoundedSelectedWebTransportSettings {
             self.selected.max_stream_read_bytes,
             "selected read results",
         )?;
+        let selected_receive_terminal_chunks =
+            self.selected.max_receive_terminal_bytes;
         let selected_write_lease_owners = checked_mul(
             self.selected.selected_command_capacity,
             self.selected.max_stream_write_lease_owner_bytes,
@@ -1186,6 +1251,7 @@ impl BoundedSelectedWebTransportSettings {
             h3_event_lane,
             selected_state_metadata,
             selected_read_results,
+            selected_receive_terminal_chunks,
             selected_write_lease_owners,
             recovery_metadata,
             recovery_frame_metadata,
@@ -1222,6 +1288,7 @@ impl BoundedSelectedWebTransportSettings {
             h3_event_lane,
             selected_state_metadata,
             selected_read_results,
+            selected_receive_terminal_chunks,
             selected_write_lease_owners,
             recovery_metadata,
             recovery_frame_metadata,
@@ -1275,6 +1342,8 @@ pub struct BoundedDynamicMemoryComponents {
     pub selected_state_metadata: usize,
     /// Exact-capacity selected read results awaiting caller ownership.
     pub selected_read_results: usize,
+    /// Terminal-read backing retained until explicit receive retirement.
+    pub selected_receive_terminal_chunks: usize,
     /// Maximum transport-owned inline storage for admitted lease owners.
     pub selected_write_lease_owners: usize,
     /// Per-path sent-packet recovery metadata.
@@ -1740,6 +1809,15 @@ impl BoundedSelectedWebTransportController {
     ) -> WebTransportStreamSendTerminalOutcome {
         self.inner
             .retire_stream_send_terminal(session_id, stream_id)
+            .await
+    }
+
+    /// Retires one delivered selected receive-direction FIN or RESET.
+    pub async fn retire_stream_receive_terminal(
+        &self, session_id: u64, stream_id: u64,
+    ) -> WebTransportStreamReceiveTerminalRetirementOutcome {
+        self.inner
+            .retire_stream_receive_terminal(session_id, stream_id)
             .await
     }
 
@@ -2492,6 +2570,7 @@ mod tests {
     use super::*;
     use crate::http3::driver::WebTransportSessionCloseReason;
     use crate::http3::driver::WebTransportStreamDirection;
+    use crate::http3::driver::WebTransportStreamReceiveTerminal;
     use crate::ApplicationOverQuic as _;
     use assert_matches::assert_matches;
 
@@ -2771,6 +2850,21 @@ mod tests {
             self.drive();
             read.await.unwrap()
         }
+
+        async fn retire_receive_terminal(
+            &mut self, stream_id: u64,
+        ) -> WebTransportStreamReceiveTerminalRetirementOutcome {
+            let selected = self.controller.selected();
+            let session_id = self.session_id;
+            let retire = tokio::spawn(async move {
+                selected
+                    .retire_stream_receive_terminal(session_id, stream_id)
+                    .await
+            });
+            tokio::task::yield_now().await;
+            self.drive();
+            retire.await.unwrap()
+        }
     }
 
     fn encoded_associated_stream(
@@ -2916,6 +3010,92 @@ mod tests {
             extra_connect_owner.prepare(BoundedWebTransportEndpoint::Client),
             Err(BoundedProfileError::InvalidSetting(
                 "the one-session profile requires one client CONNECT owner"
+            ))
+        ));
+    }
+
+    #[test]
+    fn receive_terminal_profile_is_applied_and_checked() {
+        let settings = BoundedSelectedWebTransportSettings::default();
+        let prepared = settings
+            .prepare(BoundedWebTransportEndpoint::Server)
+            .unwrap();
+        assert_eq!(
+            prepared.http3.webtransport_max_receive_terminal_states,
+            settings.selected.max_receive_terminal_states
+        );
+        assert_eq!(
+            prepared
+                .http3
+                .webtransport_max_receive_terminal_states_per_session,
+            settings.selected.max_receive_terminal_states
+        );
+        assert_eq!(
+            prepared.http3.webtransport_max_receive_terminal_waiters,
+            settings.selected.max_receive_terminal_waiters
+        );
+        assert_eq!(
+            prepared
+                .http3
+                .webtransport_max_receive_terminal_waiters_per_session,
+            settings.selected.max_receive_terminal_waiters
+        );
+        assert_eq!(
+            prepared.http3.webtransport_max_receive_terminal_bytes,
+            settings.selected.max_receive_terminal_bytes
+        );
+        assert_eq!(
+            prepared
+                .http3
+                .webtransport_max_receive_terminal_bytes_per_session,
+            settings.selected.max_receive_terminal_bytes
+        );
+        assert_eq!(prepared.applied.selected, settings.selected);
+        assert_eq!(
+            prepared
+                .applied
+                .dynamic_components
+                .selected_receive_terminal_chunks,
+            settings.selected.max_receive_terminal_bytes
+        );
+
+        let mut one_more_byte = settings;
+        one_more_byte.selected.max_receive_terminal_bytes += 1;
+        let one_more_byte = one_more_byte
+            .prepare(BoundedWebTransportEndpoint::Server)
+            .unwrap();
+        assert_eq!(
+            one_more_byte.applied.dynamic_components.total,
+            prepared.applied.dynamic_components.total + 1
+        );
+
+        let mut too_few_states = settings;
+        too_few_states.selected.max_receive_terminal_states =
+            too_few_states.selected.max_active_streams - 1;
+        assert!(matches!(
+            too_few_states.prepare(BoundedWebTransportEndpoint::Server),
+            Err(BoundedProfileError::InvalidSetting(
+                "receive terminal state cap is below the active stream cap"
+            ))
+        ));
+
+        let mut too_many_waiters = settings;
+        too_many_waiters.selected.max_receive_terminal_waiters =
+            too_many_waiters.selected.max_stream_waiters + 1;
+        assert!(matches!(
+            too_many_waiters.prepare(BoundedWebTransportEndpoint::Server),
+            Err(BoundedProfileError::InvalidSetting(
+                "receive terminal waiter cap exceeds the stream waiter cap"
+            ))
+        ));
+
+        let mut too_few_bytes = settings;
+        too_few_bytes.selected.max_receive_terminal_bytes =
+            too_few_bytes.selected.max_stream_read_bytes - 1;
+        assert!(matches!(
+            too_few_bytes.prepare(BoundedWebTransportEndpoint::Server),
+            Err(BoundedProfileError::InvalidSetting(
+                "receive terminal byte cap is below one maximum read"
             ))
         ));
     }
@@ -3722,10 +3902,19 @@ mod tests {
             .unwrap();
         harness.pipe.advance().unwrap();
         harness.drive();
-        assert_matches!(
+        let terminal = assert_matches!(
             harness.read_stream(bidi, 128).await,
-            WebTransportStreamReadOutcome::Data { data, fin: true }
-                if data.as_ref() == b"bidi reply"
+            WebTransportStreamReadOutcome::Terminal(terminal) => terminal
+        );
+        assert_eq!(terminal.data(), b"bidi reply");
+        assert_eq!(terminal.terminal(), WebTransportStreamReceiveTerminal::Fin);
+        drop(terminal);
+        assert_eq!(
+            harness.retire_receive_terminal(bidi).await,
+            WebTransportStreamReceiveTerminalRetirementOutcome::Retired {
+                session_id,
+                stream_id: bidi,
+            }
         );
 
         let uni = harness.open_stream(WebTransportStreamDirection::Uni).await;
