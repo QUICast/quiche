@@ -77,7 +77,13 @@ pub const fn webtransport_error_from_http3(error_code: u64) -> Option<u32> {
     Some((shifted - shifted / 0x1f) as u32)
 }
 
-pub(crate) fn is_connect(headers: &[quiche::h3::Header]) -> bool {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ConnectProtocol {
+    Draft16,
+    LegacyBrowser,
+}
+
+fn connect_protocol(headers: &[quiche::h3::Header]) -> Option<ConnectProtocol> {
     let mut method = None;
     let mut protocol = None;
     let mut scheme = None;
@@ -95,11 +101,44 @@ pub(crate) fn is_connect(headers: &[quiche::h3::Header]) -> bool {
         }
     }
 
-    method == Some(b"CONNECT".as_slice()) &&
-        protocol == Some(b"webtransport-h3".as_slice()) &&
-        scheme == Some(b"https".as_slice()) &&
-        authority.is_some_and(|value| !value.is_empty()) &&
-        path.is_some_and(|value| !value.is_empty())
+    if method != Some(b"CONNECT".as_slice()) ||
+        scheme != Some(b"https".as_slice()) ||
+        authority.is_none_or(|value| value.is_empty()) ||
+        path.is_none_or(|value| value.is_empty())
+    {
+        return None;
+    }
+
+    match protocol {
+        Some(b"webtransport-h3") => Some(ConnectProtocol::Draft16),
+        Some(b"webtransport") => Some(ConnectProtocol::LegacyBrowser),
+        _ => None,
+    }
+}
+
+pub(crate) fn is_connect(headers: &[quiche::h3::Header]) -> bool {
+    connect_protocol(headers) == Some(ConnectProtocol::Draft16)
+}
+
+pub(crate) fn is_legacy_connect(headers: &[quiche::h3::Header]) -> bool {
+    connect_protocol(headers) == Some(ConnectProtocol::LegacyBrowser)
+}
+
+pub(crate) fn is_connect_for_profile(
+    headers: &[quiche::h3::Header],
+    profile: quiche::h3::WebTransportHandshakeProfile,
+) -> bool {
+    matches!(
+        (connect_protocol(headers), profile),
+        (
+            Some(ConnectProtocol::Draft16),
+            quiche::h3::WebTransportHandshakeProfile::Draft16
+        ) | (
+            Some(ConnectProtocol::LegacyBrowser),
+            quiche::h3::WebTransportHandshakeProfile::Draft07 |
+                quiche::h3::WebTransportHandshakeProfile::Draft02
+        )
+    )
 }
 
 /// Why a WebTransport session reached its terminal state.

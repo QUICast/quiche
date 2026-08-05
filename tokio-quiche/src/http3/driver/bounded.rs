@@ -105,11 +105,30 @@ pub enum BoundedWebTransportRevision {
     Draft16,
 }
 
+/// HTTP/3 SETTINGS profile advertised by a bounded WebTransport driver.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum BoundedWebTransportHandshakeProfile {
+    /// Advertise only the current `SETTINGS_WT_ENABLED` handshake.
+    #[default]
+    Draft16Only,
+    /// Advertise draft-16 plus the draft-02/draft-07 browser handshake.
+    BrowserInteroperable,
+}
+
+impl BoundedWebTransportHandshakeProfile {
+    fn accepts_connect_candidate(self, headers: &[quiche::h3::Header]) -> bool {
+        webtransport::is_connect(headers) ||
+            (self == Self::BrowserInteroperable &&
+                webtransport::is_legacy_connect(headers))
+    }
+}
+
 /// Datagram capability applied by the bounded profile.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BoundedWebTransportDatagrams {
-    /// Negotiation remains available for draft-16, but selected Datagram APIs
-    /// and transport Datagram queues retain no storage.
+    /// H3 Datagram negotiation remains available to every handshake profile,
+    /// but selected Datagram APIs and transport Datagram queues retain no
+    /// storage.
     Disabled,
 }
 
@@ -227,7 +246,7 @@ pub enum BoundedConnectHeaderError {
     },
     /// Aggregate length arithmetic overflowed.
     AggregateOverflow,
-    /// The fields do not form a draft-16 WebTransport CONNECT request.
+    /// The fields do not form a configured WebTransport CONNECT request.
     NotWebTransportConnect,
     /// A server response omitted a valid `:status` field.
     NotHttpResponse,
@@ -512,6 +531,8 @@ impl Default for BoundedSelectedWebTransportLimits {
 /// Construction settings for one bounded selected-WebTransport H3 driver.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BoundedSelectedWebTransportSettings {
+    /// HTTP/3 SETTINGS handshake advertised to the peer.
+    pub handshake_profile: BoundedWebTransportHandshakeProfile,
     /// CONNECT request and response field bounds.
     pub connect_headers: BoundedConnectHeaderLimits,
     /// Selected-I/O and lane bounds.
@@ -529,6 +550,7 @@ pub struct BoundedSelectedWebTransportSettings {
 impl Default for BoundedSelectedWebTransportSettings {
     fn default() -> Self {
         Self {
+            handshake_profile: BoundedWebTransportHandshakeProfile::Draft16Only,
             connect_headers: BoundedConnectHeaderLimits::default(),
             selected: BoundedSelectedWebTransportLimits::default(),
             quic: BoundedWebTransportQuicSettings::default(),
@@ -652,6 +674,8 @@ impl BoundedSelectedWebTransportSettings {
             mode: H3ConnectionMode::BoundedSelectedWebTransport,
             endpoint,
             revision: BoundedWebTransportRevision::Draft16,
+            handshake_profile: self.handshake_profile,
+            negotiated_handshake_profile: None,
             webtransport_enabled: true,
             max_sessions: 1,
             quic: self.quic,
@@ -1429,6 +1453,11 @@ pub struct AppliedBoundedWebTransportProfile {
     pub endpoint: BoundedWebTransportEndpoint,
     /// Applied WebTransport revision.
     pub revision: BoundedWebTransportRevision,
+    /// Construction-time HTTP/3 handshake profile.
+    pub handshake_profile: BoundedWebTransportHandshakeProfile,
+    /// Exact peer profile selected after processing live SETTINGS.
+    negotiated_handshake_profile:
+        Option<quiche::h3::WebTransportHandshakeProfile>,
     /// Whether native WebTransport classification is enabled.
     pub webtransport_enabled: bool,
     /// Pending plus active session limit.
@@ -1463,6 +1492,18 @@ pub struct AppliedBoundedWebTransportProfile {
     pub dynamic_components: BoundedDynamicMemoryComponents,
     /// Configured dynamic retained-memory ceiling.
     pub dynamic_retained_memory_ceiling: usize,
+}
+
+impl AppliedBoundedWebTransportProfile {
+    /// Returns the exact WebTransport handshake selected from peer SETTINGS.
+    ///
+    /// A successfully published applied profile always returns `Some`. The
+    /// internal pre-negotiation profile is not exposed by controllers.
+    pub fn negotiated_handshake_profile(
+        self,
+    ) -> Option<quiche::h3::WebTransportHandshakeProfile> {
+        self.negotiated_handshake_profile
+    }
 }
 
 /// Checked construction or live-profile mismatch error.
@@ -1500,6 +1541,9 @@ pub enum BoundedProfileError {
     /// A general H3 capability reached a bounded driver through an internal
     /// sender that is intentionally absent from its public controller.
     ForbiddenOperation(&'static str),
+    /// Peer SETTINGS or transport parameters did not negotiate a supported
+    /// bounded WebTransport handshake.
+    PeerHandshakeRequirementsNotMet,
 }
 
 impl fmt::Display for BoundedProfileError {
@@ -1685,6 +1729,35 @@ pub(crate) struct PreparedBoundedProfile {
     pub(crate) status: AppliedProfileStatus,
     pub(crate) client_connect_ownership:
         Option<Arc<BoundedClientConnectOwnership>>,
+}
+
+impl PreparedBoundedProfile {
+    pub(crate) fn configure_h3(&self, config: &mut quiche::h3::Config) {
+        if self.applied.handshake_profile ==
+            BoundedWebTransportHandshakeProfile::Draft16Only
+        {
+            return;
+        }
+
+        config.enable_webtransport_browser_compatibility(true);
+        config
+            .set_additional_settings(vec![
+                (quiche::h3::SETTINGS_WT_ENABLED, 1),
+                (quiche::h3::SETTINGS_ENABLE_WEBTRANSPORT_DRAFT02, 1),
+                (quiche::h3::SETTINGS_WEBTRANSPORT_MAX_SESSIONS_DRAFT07, 1),
+                (quiche::h3::SETTINGS_H3_DATAGRAM_DRAFT04, 1),
+            ])
+            .expect("bounded WebTransport settings are unique and valid");
+    }
+
+    pub(crate) fn negotiated_applied(
+        &self, profile: quiche::h3::WebTransportHandshakeProfile,
+    ) -> AppliedBoundedWebTransportProfile {
+        AppliedBoundedWebTransportProfile {
+            negotiated_handshake_profile: Some(profile),
+            ..self.applied
+        }
+    }
 }
 
 /// Selected draft-16 stream I/O without Bytes or Datagram escape paths.
@@ -1879,6 +1952,7 @@ pub struct BoundedClientWebTransportController {
     inner: H3Controller<ClientHooks>,
     selected: BoundedSelectedWebTransportController,
     connect_headers: BoundedConnectHeaderLimits,
+    handshake_profile: BoundedWebTransportHandshakeProfile,
     status: AppliedProfileStatus,
     connect_requested: AtomicBool,
     connect_ownership: Arc<BoundedClientConnectOwnership>,
@@ -1887,7 +1961,7 @@ pub struct BoundedClientWebTransportController {
 /// Nonblocking bounded CONNECT admission failure with ownership preserved.
 #[derive(Debug)]
 pub enum BoundedConnectAdmissionError {
-    /// The fields were bounded but do not form a draft-16 CONNECT.
+    /// The fields were bounded but do not form a configured CONNECT.
     Invalid {
         /// Validation failure.
         error: BoundedConnectHeaderError,
@@ -1964,7 +2038,8 @@ impl BoundedClientWebTransportController {
         self.selected.clone()
     }
 
-    /// Returns the immutable live-applied profile after establishment.
+    /// Returns the immutable live-applied profile after establishment and
+    /// peer SETTINGS negotiation.
     pub fn applied_profile(
         &self,
     ) -> Result<Option<AppliedBoundedWebTransportProfile>, BoundedProfileError>
@@ -1977,7 +2052,7 @@ impl BoundedClientWebTransportController {
         self.connect_headers
     }
 
-    /// Attempts to admit the single bounded draft-16 CONNECT request.
+    /// Attempts to admit the single bounded WebTransport CONNECT request.
     ///
     /// The command lane is reserved before fields are converted into the
     /// driver's request representation. Every rejection returns field
@@ -1988,7 +2063,10 @@ impl BoundedClientWebTransportController {
         if let Err(error) = self.connect_headers.validate(headers.as_slice()) {
             return Err(BoundedConnectAdmissionError::Invalid { error, headers });
         }
-        if !webtransport::is_connect(headers.as_slice()) {
+        if !self
+            .handshake_profile
+            .accepts_connect_candidate(headers.as_slice())
+        {
             return Err(BoundedConnectAdmissionError::Invalid {
                 error: BoundedConnectHeaderError::NotWebTransportConnect,
                 headers,
@@ -2258,7 +2336,8 @@ impl BoundedServerWebTransportController {
         self.selected.clone()
     }
 
-    /// Returns the immutable live-applied profile after establishment.
+    /// Returns the immutable live-applied profile after establishment and
+    /// peer SETTINGS negotiation.
     pub fn applied_profile(
         &self,
     ) -> Result<Option<AppliedBoundedWebTransportProfile>, BoundedProfileError>
@@ -2338,7 +2417,8 @@ impl BoundedServerWebTransportController {
 }
 
 impl H3Driver<ClientHooks> {
-    /// Constructs the opt-in bounded draft-16 client profile.
+    /// Constructs the opt-in bounded draft-16 profile with the configured
+    /// HTTP/3 handshake.
     pub fn new_bounded_selected_webtransport(
         settings: BoundedSelectedWebTransportSettings,
     ) -> Result<(Self, BoundedClientWebTransportController), BoundedProfileError>
@@ -2364,6 +2444,7 @@ impl H3Driver<ClientHooks> {
                 Some(Arc::clone(&connect_ownership)),
             ),
             connect_headers: settings.connect_headers,
+            handshake_profile: settings.handshake_profile,
             status,
             connect_requested: AtomicBool::new(false),
             connect_ownership,
@@ -2372,7 +2453,8 @@ impl H3Driver<ClientHooks> {
 }
 
 impl H3Driver<ServerHooks> {
-    /// Constructs the opt-in bounded draft-16 server profile.
+    /// Constructs the opt-in bounded draft-16 profile with the configured
+    /// HTTP/3 handshake.
     pub fn new_bounded_selected_webtransport(
         settings: BoundedSelectedWebTransportSettings,
     ) -> Result<(Self, BoundedServerWebTransportController), BoundedProfileError>
@@ -2567,6 +2649,8 @@ mod tests {
     use std::sync::Arc;
     use std::time::Instant;
 
+    use super::super::webtransport_connect_requirements;
+    use super::super::WebTransportRequirements;
     use super::*;
     use crate::http3::driver::WebTransportSessionCloseReason;
     use crate::http3::driver::WebTransportStreamDirection;
@@ -2581,6 +2665,17 @@ mod tests {
             quiche::h3::Header::new(b":scheme", b"https"),
             quiche::h3::Header::new(b":authority", b"example.test"),
             quiche::h3::Header::new(b":path", b"/moq"),
+        ]
+    }
+
+    fn legacy_connect_headers() -> Vec<quiche::h3::Header> {
+        vec![
+            quiche::h3::Header::new(b":method", b"CONNECT"),
+            quiche::h3::Header::new(b":protocol", b"webtransport"),
+            quiche::h3::Header::new(b":scheme", b"https"),
+            quiche::h3::Header::new(b":authority", b"example.test"),
+            quiche::h3::Header::new(b":path", b"/moq"),
+            quiche::h3::Header::new(b"sec-webtransport-http3-draft02", b"1"),
         ]
     }
 
@@ -2943,6 +3038,11 @@ mod tests {
             prepared.applied.mode,
             H3ConnectionMode::BoundedSelectedWebTransport
         );
+        assert_eq!(
+            prepared.applied.handshake_profile,
+            BoundedWebTransportHandshakeProfile::Draft16Only
+        );
+        assert_eq!(prepared.applied.negotiated_handshake_profile(), None);
         assert_eq!(
             prepared.applied.datagrams,
             BoundedWebTransportDatagrams::Disabled
@@ -3617,6 +3717,16 @@ mod tests {
         .unwrap();
         pipe.handshake().unwrap();
 
+        let peer_settings = settings
+            .prepare(BoundedWebTransportEndpoint::Client)
+            .unwrap()
+            .http3;
+        let _peer = quiche::h3::Connection::with_transport(
+            &mut pipe.client,
+            &quiche::h3::Config::from(&peer_settings),
+        )
+        .unwrap();
+
         let (mut driver, controller) =
             H3Driver::<ServerHooks>::new_bounded_selected_webtransport(settings)
                 .unwrap();
@@ -3625,8 +3735,19 @@ mod tests {
         driver
             .on_conn_established(&mut pipe.server, &handshake)
             .unwrap();
+        assert_eq!(controller.applied_profile().unwrap(), None);
+        pipe.advance().unwrap();
+        driver.process_reads(&mut pipe.server).unwrap();
         let applied = controller.applied_profile().unwrap().unwrap();
         assert_eq!(applied.endpoint, BoundedWebTransportEndpoint::Server);
+        assert_eq!(
+            applied.handshake_profile,
+            BoundedWebTransportHandshakeProfile::Draft16Only
+        );
+        assert_eq!(
+            applied.negotiated_handshake_profile(),
+            Some(quiche::h3::WebTransportHandshakeProfile::Draft16)
+        );
         assert_eq!(
             applied.selected.max_session_terminal_waiters,
             settings.selected.max_session_terminal_waiters,
@@ -3717,6 +3838,243 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chromium_handshake_admits_connect_and_associated_streams() {
+        let settings = BoundedSelectedWebTransportSettings {
+            handshake_profile:
+                BoundedWebTransportHandshakeProfile::BrowserInteroperable,
+            ..BoundedSelectedWebTransportSettings::default()
+        };
+        let mut config = bounded_core_config(settings);
+        let mut pipe = quiche::test_utils::Pipe::<
+            crate::buf_factory::BufFactory,
+        >::with_config_and_buf(&mut config)
+        .unwrap();
+        pipe.handshake().unwrap();
+
+        let mut peer_config = quiche::h3::Config::new().unwrap();
+        peer_config.enable_extended_connect(true);
+        peer_config.enable_webtransport_stream_classification(true);
+        peer_config.enable_webtransport_browser_compatibility(true);
+        peer_config
+            .set_additional_settings(vec![
+                (quiche::h3::SETTINGS_ENABLE_WEBTRANSPORT_DRAFT02, 1),
+                (quiche::h3::SETTINGS_WEBTRANSPORT_MAX_SESSIONS_DRAFT07, 1),
+                (quiche::h3::SETTINGS_H3_DATAGRAM_DRAFT04, 1),
+            ])
+            .unwrap();
+        let mut peer = quiche::h3::Connection::with_transport(
+            &mut pipe.client,
+            &peer_config,
+        )
+        .unwrap();
+        let (mut driver, mut controller) =
+            H3Driver::<ServerHooks>::new_bounded_selected_webtransport(settings)
+                .unwrap();
+        let handshake = HandshakeInfo::new(Instant::now(), None)
+            .with_io_worker_memory_profile(settings.io.expected_profile());
+        driver
+            .on_conn_established(&mut pipe.server, &handshake)
+            .unwrap();
+
+        assert_eq!(controller.applied_profile().unwrap(), None);
+        assert_eq!(
+            webtransport_connect_requirements(
+                driver.conn.as_ref().unwrap(),
+                &pipe.server,
+                &legacy_connect_headers(),
+            ),
+            WebTransportRequirements::Pending
+        );
+
+        pipe.advance().unwrap();
+        drive_server(&mut driver, &mut pipe);
+        pipe.advance().unwrap();
+        while peer.poll(&mut pipe.client).is_ok() {}
+
+        let advertised = peer.peer_settings_raw().unwrap();
+        for setting in [
+            quiche::h3::SETTINGS_WT_ENABLED,
+            quiche::h3::SETTINGS_ENABLE_WEBTRANSPORT_DRAFT02,
+            quiche::h3::SETTINGS_WEBTRANSPORT_MAX_SESSIONS_DRAFT07,
+            quiche::h3::SETTINGS_H3_DATAGRAM_DRAFT04,
+            quiche::h3::frame::SETTINGS_ENABLE_CONNECT_PROTOCOL,
+            quiche::h3::frame::SETTINGS_H3_DATAGRAM,
+        ] {
+            assert!(
+                advertised.contains(&(setting, 1)),
+                "missing browser-compatible setting {setting:#x}"
+            );
+        }
+        assert_eq!(
+            webtransport_connect_requirements(
+                driver.conn.as_ref().unwrap(),
+                &pipe.server,
+                &legacy_connect_headers(),
+            ),
+            WebTransportRequirements::Met(
+                quiche::h3::WebTransportHandshakeProfile::Draft07
+            )
+        );
+        let applied = controller.applied_profile().unwrap().unwrap();
+        assert_eq!(
+            applied.negotiated_handshake_profile(),
+            Some(quiche::h3::WebTransportHandshakeProfile::Draft07)
+        );
+        assert_eq!(applied.datagrams, BoundedWebTransportDatagrams::Disabled);
+        assert_eq!(applied.datagram_send_items, 0);
+        assert_eq!(applied.datagram_recv_items, 0);
+
+        let session_id = peer
+            .send_request(&mut pipe.client, &legacy_connect_headers(), false)
+            .unwrap();
+        pipe.advance().unwrap();
+        drive_server(&mut driver, &mut pipe);
+
+        assert_matches!(
+            controller.recv_event().await,
+            Some(BoundedServerWebTransportEvent::Session(
+                WebTransportSessionEvent::Pending { session_id: actual }
+            )) if actual == session_id
+        );
+        let mut responder = assert_matches!(
+            controller.recv_event().await,
+            Some(BoundedServerWebTransportEvent::ConnectRequested {
+                session_id: actual,
+                headers,
+                responder,
+                ..
+            }) if actual == session_id &&
+                webtransport::is_legacy_connect(headers.as_slice()) => responder
+        );
+        responder
+            .try_send_response(
+                BoundedConnectHeaders::copy_from(
+                    &[quiche::h3::Header::new(b":status", b"200")],
+                    settings.connect_headers,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        drive_server(&mut driver, &mut pipe);
+        pipe.advance().unwrap();
+        assert_matches!(
+            controller.recv_event().await,
+            Some(BoundedServerWebTransportEvent::Session(
+                WebTransportSessionEvent::Accepted { session_id: actual }
+            )) if actual == session_id
+        );
+        assert_matches!(
+            peer.poll(&mut pipe.client),
+            Ok((actual, quiche::h3::Event::Headers { .. }))
+                if actual == session_id
+        );
+
+        let reservation = peer
+            .reserve_webtransport_stream(
+                &mut pipe.client,
+                session_id,
+                quiche::h3::WebTransportStreamDirection::Unidirectional,
+            )
+            .unwrap();
+        let stream_id = reservation.stream_id();
+        pipe.client
+            .stream_send(stream_id, reservation.prefix(), false)
+            .unwrap();
+        peer.commit_webtransport_stream(&mut pipe.client, &reservation)
+            .unwrap();
+        pipe.client
+            .stream_send(stream_id, b"browser payload", true)
+            .unwrap();
+        pipe.advance().unwrap();
+        drive_server(&mut driver, &mut pipe);
+        assert_matches!(
+            controller.recv_event().await,
+            Some(BoundedServerWebTransportEvent::Session(
+                WebTransportSessionEvent::AssociatedStream {
+                    session_id: actual_session,
+                    stream_id: actual_stream,
+                    direction: WebTransportStreamDirection::Uni,
+                    ..
+                }
+            )) if actual_session == session_id && actual_stream == stream_id
+        );
+        assert_eq!(pipe.server.dgram_send_queue_len(), 0);
+        assert_eq!(pipe.server.dgram_recv_queue_len(), 0);
+    }
+
+    #[test]
+    fn draft02_only_negotiates_and_protocol_mixtures_fail_closed() {
+        let settings = BoundedSelectedWebTransportSettings {
+            handshake_profile:
+                BoundedWebTransportHandshakeProfile::BrowserInteroperable,
+            ..BoundedSelectedWebTransportSettings::default()
+        };
+        let mut config = bounded_core_config(settings);
+        let mut pipe = quiche::test_utils::Pipe::<
+            crate::buf_factory::BufFactory,
+        >::with_config_and_buf(&mut config)
+        .unwrap();
+        pipe.handshake().unwrap();
+
+        let mut peer_config = quiche::h3::Config::new().unwrap();
+        peer_config.enable_extended_connect(true);
+        peer_config.enable_webtransport_browser_compatibility(true);
+        peer_config
+            .set_additional_settings(vec![
+                (quiche::h3::SETTINGS_ENABLE_WEBTRANSPORT_DRAFT02, 1),
+                (quiche::h3::SETTINGS_H3_DATAGRAM_DRAFT04, 1),
+            ])
+            .unwrap();
+        let mut peer = quiche::h3::Connection::with_transport(
+            &mut pipe.client,
+            &peer_config,
+        )
+        .unwrap();
+        let (mut driver, mut controller) =
+            H3Driver::<ServerHooks>::new_bounded_selected_webtransport(settings)
+                .unwrap();
+        let handshake = HandshakeInfo::new(Instant::now(), None)
+            .with_io_worker_memory_profile(settings.io.expected_profile());
+        driver
+            .on_conn_established(&mut pipe.server, &handshake)
+            .unwrap();
+        pipe.advance().unwrap();
+        drive_server(&mut driver, &mut pipe);
+
+        assert_eq!(
+            controller
+                .applied_profile()
+                .unwrap()
+                .unwrap()
+                .negotiated_handshake_profile(),
+            Some(quiche::h3::WebTransportHandshakeProfile::Draft02)
+        );
+        assert!(!webtransport::is_connect_for_profile(
+            &connect_headers(),
+            quiche::h3::WebTransportHandshakeProfile::Draft02,
+        ));
+        assert!(!webtransport::is_connect_for_profile(
+            &legacy_connect_headers(),
+            quiche::h3::WebTransportHandshakeProfile::Draft16,
+        ));
+
+        let stream_id = peer
+            .send_request(&mut pipe.client, &connect_headers(), false)
+            .unwrap();
+        pipe.advance().unwrap();
+        drive_server(&mut driver, &mut pipe);
+        assert_matches!(
+            controller.inner.event_receiver_mut().try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        );
+        pipe.advance().unwrap();
+        assert!(matches!(
+            peer.poll(&mut pipe.client),
+            Ok((actual, quiche::h3::Event::Reset(_))) if actual == stream_id
+        ));
+    }
+
+    #[tokio::test]
     async fn bounded_server_connect_and_selected_lease_stay_restricted() {
         let settings = BoundedSelectedWebTransportSettings::default();
         let mut config = bounded_core_config(settings);
@@ -3748,6 +4106,14 @@ mod tests {
         drive_server(&mut driver, &mut pipe);
         pipe.advance().unwrap();
         while peer.poll(&mut pipe.client).is_ok() {}
+        assert_eq!(
+            controller
+                .applied_profile()
+                .unwrap()
+                .unwrap()
+                .negotiated_handshake_profile(),
+            Some(quiche::h3::WebTransportHandshakeProfile::Draft16)
+        );
 
         let session_id = peer
             .send_request(&mut pipe.client, &connect_headers(), false)

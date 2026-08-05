@@ -39,7 +39,7 @@ use tokio::sync::oneshot;
 use super::datagram;
 use super::response_status;
 use super::webtransport;
-use super::webtransport_requirements;
+use super::webtransport_connect_requirements;
 use super::DriverHooks;
 use super::H3Command;
 use super::H3ConnectionError;
@@ -211,19 +211,19 @@ impl ClientHooks {
     ) -> H3ConnectionResult<()> {
         if let Some(limits) = driver.bounded_connect_header_limits() {
             if limits.validate(&request.headers).is_err() ||
-                !webtransport::is_connect(&request.headers)
+                !driver.is_webtransport_connect_candidate(&request.headers)
             {
                 return Err(H3ConnectionError::H3(h3::Error::MessageError));
             }
         }
         let body_finished = request.body_writer.is_none();
         let is_webtransport = driver.webtransport.is_some() &&
-            webtransport::is_connect(&request.headers);
+            driver.is_webtransport_connect_candidate(&request.headers);
         if is_webtransport {
             let queued_candidate =
                 !driver.hooks.queued_webtransport_requests.is_empty() ||
                     driver.hooks.queued_requests.iter().any(|queued| {
-                        webtransport::is_connect(&queued.headers)
+                        driver.is_webtransport_connect_candidate(&queued.headers)
                     });
             if queued_candidate {
                 driver.h3_event_sender.send(
@@ -245,12 +245,13 @@ impl ClientHooks {
                 )?;
                 return Ok(());
             }
-            match webtransport_requirements(
+            match webtransport_connect_requirements(
                 driver
                     .conn
                     .as_ref()
                     .ok_or_else(H3Driver::<Self>::connection_not_present)?,
                 qconn,
+                &request.headers,
             ) {
                 WebTransportRequirements::Pending => {
                     driver.hooks.queued_webtransport_requests.push_back(request);
@@ -264,7 +265,7 @@ impl ClientHooks {
                     )?;
                     return Ok(());
                 },
-                WebTransportRequirements::Met => {},
+                WebTransportRequirements::Met(_) => {},
             }
         }
 
@@ -512,18 +513,19 @@ impl DriverHooks for ClientHooks {
     fn settings_received(
         driver: &mut H3Driver<Self>, qconn: &mut QuicheConnection,
     ) -> H3ConnectionResult<()> {
-        let requirements = webtransport_requirements(
-            driver
-                .conn
-                .as_ref()
-                .ok_or_else(H3Driver::<Self>::connection_not_present)?,
-            qconn,
-        );
         let mut requests =
             std::mem::take(&mut driver.hooks.queued_webtransport_requests);
         while let Some(request) = requests.pop_front() {
+            let requirements = webtransport_connect_requirements(
+                driver
+                    .conn
+                    .as_ref()
+                    .ok_or_else(H3Driver::<Self>::connection_not_present)?,
+                qconn,
+                &request.headers,
+            );
             match requirements {
-                WebTransportRequirements::Met => {
+                WebTransportRequirements::Met(_) => {
                     let Some(sender) = &driver.hooks.self_cmd_sender else {
                         continue;
                     };

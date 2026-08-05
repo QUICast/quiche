@@ -270,6 +270,9 @@
 //! signal and unidirectional `0x54` stream type. Classification starts only
 //! after the peer's SETTINGS frame selects this draft with the same setting at
 //! a value of `1`.
+//! [`Config::enable_webtransport_browser_compatibility()`] additionally permits
+//! explicit draft-02 or draft-07 SETTINGS negotiation while retaining the same
+//! associated-stream classifier. It is disabled by default.
 //!
 //! A candidate that arrives before peer SETTINGS retains its already-decoded
 //! signal or stream type, but does not consume a Session ID or detach the QUIC
@@ -394,6 +397,28 @@ pub const SETTINGS_MAX_FIELD_SECTION_SIZE_DEFAULT: u64 = 32_768;
 
 /// WebTransport support setting from draft-ietf-webtrans-http3-16.
 pub const SETTINGS_WT_ENABLED: u64 = 0x2c7c_f000;
+
+/// WebTransport support setting from draft-ietf-webtrans-http3-02.
+pub const SETTINGS_ENABLE_WEBTRANSPORT_DRAFT02: u64 = 0x2b60_3742;
+
+/// WebTransport session-limit setting from draft-ietf-webtrans-http3-07.
+pub const SETTINGS_WEBTRANSPORT_MAX_SESSIONS_DRAFT07: u64 = 0xc671_706a;
+
+/// HTTP/3 Datagram support setting from draft-ietf-masque-h3-datagram-04.
+pub const SETTINGS_H3_DATAGRAM_DRAFT04: u64 = 0xff_d277;
+
+/// WebTransport handshake profile selected from the peer's HTTP/3 SETTINGS.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WebTransportHandshakeProfile {
+    /// `draft-ietf-webtrans-http3-16` using [`SETTINGS_WT_ENABLED`].
+    Draft16,
+    /// `draft-ietf-webtrans-http3-07` using
+    /// [`SETTINGS_WEBTRANSPORT_MAX_SESSIONS_DRAFT07`].
+    Draft07,
+    /// `draft-ietf-webtrans-http3-02` using
+    /// [`SETTINGS_ENABLE_WEBTRANSPORT_DRAFT02`].
+    Draft02,
+}
 
 /// Bidirectional WebTransport stream signal from draft-16.
 pub const WEBTRANSPORT_BIDI_STREAM_SIGNAL: u64 = 0x41;
@@ -640,6 +665,7 @@ pub struct Config {
     additional_settings: Option<Vec<(u64, u64)>>,
 
     webtransport_stream_classification: bool,
+    webtransport_browser_compatibility: bool,
 
     max_priority_update_size: u64,
 }
@@ -655,6 +681,7 @@ impl Config {
             connect_protocol_enabled: None,
             additional_settings: None,
             webtransport_stream_classification: false,
+            webtransport_browser_compatibility: false,
             max_priority_update_size:
                 PRIORITY_UPDATE_FRAME_PAYLOAD_MAX_SIZE_DEFAULT,
         })
@@ -748,9 +775,17 @@ impl Config {
         let dedup_settings: HashSet<u64> =
             additional_settings.iter().map(|(key, _)| *key).collect();
 
-        let invalid_webtransport_value = additional_settings
-            .iter()
-            .any(|(key, value)| *key == SETTINGS_WT_ENABLED && *value > 1);
+        let invalid_webtransport_value =
+            additional_settings.iter().any(|(key, value)| {
+                (*key == SETTINGS_WT_ENABLED ||
+                    (self.webtransport_browser_compatibility &&
+                        matches!(
+                            *key,
+                            SETTINGS_ENABLE_WEBTRANSPORT_DRAFT02 |
+                                SETTINGS_H3_DATAGRAM_DRAFT04
+                        ))) &&
+                    *value > 1
+            });
 
         if dedup_settings.len() != additional_settings.len() ||
             invalid_webtransport_value ||
@@ -762,19 +797,29 @@ impl Config {
         Ok(())
     }
 
-    /// Enables native draft-16 WebTransport stream-prefix classification.
+    /// Enables native WebTransport stream-prefix classification.
     ///
     /// The default is `false`. This only activates classification when this
-    /// configuration also advertises a [`SETTINGS_WT_ENABLED`] value of `1`
-    /// and the peer later sends the same draft-specific setting with value `1`.
-    /// Advertising the setting alone does not transfer stream ownership
-    /// out of HTTP/3.
+    /// configuration also advertises at least one supported WebTransport
+    /// setting and the peer later sends a compatible setting. The draft-16,
+    /// draft-07, and draft-02 setting identifiers are recognized. Advertising
+    /// a setting alone does not transfer stream ownership out of HTTP/3.
     ///
     /// Applications must consume every [`Event::WebTransportStream`] and take
     /// ownership of the corresponding QUIC stream. Session admission remains
     /// the application's responsibility.
     pub fn enable_webtransport_stream_classification(&mut self, enabled: bool) {
         self.webtransport_stream_classification = enabled;
+    }
+
+    /// Enables draft-02 and draft-07 browser handshake compatibility.
+    ///
+    /// The default is `false`, preserving draft-16-only behavior. Enabling
+    /// this recognizes the legacy WebTransport and HTTP/3 Datagram settings
+    /// when native stream classification is also enabled. Callers remain
+    /// responsible for advertising the corresponding additional settings.
+    pub fn enable_webtransport_browser_compatibility(&mut self, enabled: bool) {
+        self.webtransport_browser_compatibility = enabled;
     }
 
     /// Sets the maximum size for the payload of PRIORITY_UPDATE frames.
@@ -1175,8 +1220,9 @@ pub struct Connection {
     local_settings: ConnectionSettings,
     peer_settings: ConnectionSettings,
 
-    local_webtransport_support: bool,
+    local_webtransport_support: WebTransportLocalSupport,
     peer_webtransport_support: WebTransportPeerSupport,
+    peer_webtransport_profile: Option<WebTransportHandshakeProfile>,
     webtransport_stream_classification: bool,
     pending_webtransport_streams: BTreeSet<u64>,
     pending_invalid_webtransport_signal: bool,
@@ -1214,18 +1260,88 @@ enum WebTransportPeerSupport {
     Enabled,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct WebTransportLocalSupport {
+    browser_compatible: bool,
+    draft16: bool,
+    draft07: bool,
+    draft02: bool,
+    h3_datagram_draft04: bool,
+}
+
+impl WebTransportLocalSupport {
+    fn from_settings(
+        settings: Option<&[(u64, u64)]>, browser_compatible: bool,
+    ) -> Self {
+        let mut support = Self {
+            browser_compatible,
+            ..Self::default()
+        };
+        let Some(settings) = settings else {
+            return support;
+        };
+
+        for (identifier, value) in settings {
+            match *identifier {
+                SETTINGS_WT_ENABLED => support.draft16 = *value == 1,
+
+                SETTINGS_WEBTRANSPORT_MAX_SESSIONS_DRAFT07
+                    if browser_compatible =>
+                    support.draft07 = *value > 0,
+
+                SETTINGS_ENABLE_WEBTRANSPORT_DRAFT02 if browser_compatible =>
+                    support.draft02 = *value == 1,
+
+                SETTINGS_H3_DATAGRAM_DRAFT04 if browser_compatible =>
+                    support.h3_datagram_draft04 = *value == 1,
+
+                _ => (),
+            }
+        }
+
+        support
+    }
+
+    fn enabled(self) -> bool {
+        self.draft16 || self.draft07 || self.draft02
+    }
+
+    fn negotiate(
+        self, peer_settings: Option<&[(u64, u64)]>,
+    ) -> Option<WebTransportHandshakeProfile> {
+        let peer = Self::from_settings(peer_settings, self.browser_compatible);
+
+        if self.draft16 && peer.draft16 {
+            Some(WebTransportHandshakeProfile::Draft16)
+        } else if self.draft07 && peer.draft07 {
+            Some(WebTransportHandshakeProfile::Draft07)
+        } else if self.draft02 && peer.draft02 {
+            Some(WebTransportHandshakeProfile::Draft02)
+        } else {
+            None
+        }
+    }
+}
+
 impl Connection {
+    fn effective_peer_webtransport_support(&self) -> WebTransportPeerSupport {
+        match self.peer_webtransport_support {
+            WebTransportPeerSupport::Pending => WebTransportPeerSupport::Pending,
+            _ if self.peer_webtransport_profile.is_some() =>
+                WebTransportPeerSupport::Enabled,
+            _ => WebTransportPeerSupport::Disabled,
+        }
+    }
+
     fn new(
         config: &Config, is_server: bool, enable_dgram: bool,
     ) -> Result<Connection> {
         let initial_uni_stream_id = if is_server { 0x3 } else { 0x2 };
         let h3_datagram = if enable_dgram { Some(1) } else { None };
-        let local_webtransport_support =
-            config.additional_settings.as_ref().is_some_and(|settings| {
-                settings.iter().any(|(identifier, value)| {
-                    *identifier == SETTINGS_WT_ENABLED && *value == 1
-                })
-            });
+        let local_webtransport_support = WebTransportLocalSupport::from_settings(
+            config.additional_settings.as_deref(),
+            config.webtransport_browser_compatibility,
+        );
 
         Ok(Connection {
             is_server,
@@ -1259,6 +1375,7 @@ impl Connection {
 
             local_webtransport_support,
             peer_webtransport_support: WebTransportPeerSupport::Pending,
+            peer_webtransport_profile: None,
             webtransport_stream_classification: config
                 .webtransport_stream_classification,
             pending_webtransport_streams: BTreeSet::new(),
@@ -2017,6 +2134,52 @@ impl Connection {
             conn.dgram_max_writable_len().is_some()
     }
 
+    /// Returns the WebTransport handshake profile negotiated with the peer.
+    ///
+    /// This returns `None` until peer SETTINGS have been processed or when no
+    /// locally advertised profile intersects with the peer's profile.
+    pub fn webtransport_handshake_profile_by_peer(
+        &self,
+    ) -> Option<WebTransportHandshakeProfile> {
+        self.peer_webtransport_profile
+    }
+
+    /// Returns whether HTTP/3 Datagram negotiation satisfies WebTransport.
+    ///
+    /// Draft-16 requires the current HTTP/3 Datagram setting. The bounded
+    /// browser-interoperability profile also permits draft-02 and draft-07
+    /// peers to use the draft-04 setting when it was advertised locally.
+    pub fn webtransport_dgram_enabled_by_peer<F: BufFactory>(
+        &self, conn: &super::Connection<F>,
+    ) -> bool {
+        let transport_enabled = conn.dgram_max_writable_len().is_some();
+        if !transport_enabled {
+            return false;
+        }
+
+        match self.peer_webtransport_profile {
+            Some(WebTransportHandshakeProfile::Draft16) =>
+                self.peer_settings.h3_datagram == Some(1),
+
+            Some(
+                WebTransportHandshakeProfile::Draft07 |
+                WebTransportHandshakeProfile::Draft02,
+            ) =>
+                self.peer_settings.h3_datagram == Some(1) ||
+                    (self.local_webtransport_support.h3_datagram_draft04 &&
+                        self.peer_settings.raw.as_ref().is_some_and(
+                            |settings| {
+                                settings.iter().any(|(identifier, value)| {
+                                    *identifier == SETTINGS_H3_DATAGRAM_DRAFT04 &&
+                                        *value == 1
+                                })
+                            },
+                        )),
+
+            None => false,
+        }
+    }
+
     /// Returns whether the peer enabled extended CONNECT support.
     ///
     /// Support is signalled by the peer's SETTINGS, so this method always
@@ -2028,8 +2191,7 @@ impl Connection {
         self.peer_settings.connect_protocol_enabled == Some(1)
     }
 
-    /// Reserves the next local stream ID and encodes its draft-16
-    /// WebTransport prefix.
+    /// Reserves the next local stream ID and encodes its WebTransport prefix.
     ///
     /// Bidirectional client reservations share the request-stream allocator;
     /// unidirectional reservations share the HTTP/3 extension-stream
@@ -2037,9 +2199,9 @@ impl Connection {
     /// space. The selected ID is consumed only after the transport reserves
     /// its mandatory reliable prefix.
     ///
-    /// Both endpoints must have advertised [`SETTINGS_WT_ENABLED`] with value
-    /// `1`, and `session_id` must identify a client-initiated
-    /// bidirectional stream.
+    /// Both endpoints must have negotiated a supported WebTransport handshake
+    /// profile, and `session_id` must identify a client-initiated bidirectional
+    /// stream.
     pub fn reserve_webtransport_stream<F: BufFactory>(
         &mut self, conn: &mut super::Connection<F>, session_id: u64,
         direction: WebTransportStreamDirection,
@@ -2047,8 +2209,8 @@ impl Connection {
         if conn.is_server != self.is_server {
             return Err(Error::InternalError);
         }
-        if !self.local_webtransport_support ||
-            self.peer_webtransport_support != WebTransportPeerSupport::Enabled
+        if !self.local_webtransport_support.enabled() ||
+            self.peer_webtransport_profile.is_none()
         {
             return Err(Error::SettingsError);
         }
@@ -2535,7 +2697,9 @@ impl Connection {
     fn poll_pending_webtransport_stream<F: BufFactory>(
         &mut self, conn: &mut super::Connection<F>,
     ) -> Result<Option<(u64, Event)>> {
-        if self.peer_webtransport_support == WebTransportPeerSupport::Pending {
+        let peer_webtransport_support =
+            self.effective_peer_webtransport_support();
+        if peer_webtransport_support == WebTransportPeerSupport::Pending {
             return Ok(None);
         }
 
@@ -2548,7 +2712,7 @@ impl Connection {
                 continue;
             };
 
-            let transition = match self.peer_webtransport_support {
+            let transition = match peer_webtransport_support {
                 WebTransportPeerSupport::Enabled =>
                     stream.resolve_webtransport_candidate(),
 
@@ -3042,8 +3206,9 @@ impl Connection {
     ) -> Result<(u64, Event)> {
         let webtransport_classification_enabled = self
             .webtransport_stream_classification &&
-            self.local_webtransport_support;
-        let peer_webtransport_support = self.peer_webtransport_support;
+            self.local_webtransport_support.enabled();
+        let peer_webtransport_support =
+            self.effective_peer_webtransport_support();
         let remote_initiated =
             !crate::stream::is_local(stream_id, self.is_server);
 
@@ -3660,13 +3825,21 @@ impl Connection {
                     return Err(Error::SettingsError);
                 }
 
-                let peer_webtransport_support =
-                    if peer_webtransport_value == Some(1) {
-                        WebTransportPeerSupport::Enabled
-                    } else {
-                        WebTransportPeerSupport::Disabled
-                    };
+                let peer_webtransport_profile =
+                    self.local_webtransport_support.negotiate(raw.as_deref());
+                let peer_advertised_webtransport =
+                    WebTransportLocalSupport::from_settings(
+                        raw.as_deref(),
+                        self.local_webtransport_support.browser_compatible,
+                    )
+                    .enabled();
+                let peer_webtransport_support = if peer_advertised_webtransport {
+                    WebTransportPeerSupport::Enabled
+                } else {
+                    WebTransportPeerSupport::Disabled
+                };
                 self.peer_webtransport_support = peer_webtransport_support;
+                self.peer_webtransport_profile = peer_webtransport_profile;
 
                 self.peer_settings = ConnectionSettings {
                     max_field_section_size,
@@ -3694,7 +3867,7 @@ impl Connection {
                 let invalid_signal =
                     std::mem::take(&mut self.pending_invalid_webtransport_signal);
                 if invalid_signal &&
-                    peer_webtransport_support ==
+                    self.effective_peer_webtransport_support() ==
                         WebTransportPeerSupport::Enabled
                 {
                     conn.close(
@@ -4444,6 +4617,111 @@ mod tests {
         session.pipe.handshake().unwrap();
 
         session
+    }
+
+    fn assert_legacy_webtransport_profile(
+        settings: Vec<(u64, u64)>, expected: WebTransportHandshakeProfile,
+    ) {
+        let (mut transport_config, mut h3_config) =
+            Session::default_configs().unwrap();
+        transport_config.set_initial_max_data(1_000_000);
+        transport_config.set_initial_max_streams_bidi(64);
+        transport_config.set_initial_max_streams_uni(64);
+        transport_config.enable_dgram(true, 10, 10);
+        transport_config.enable_reset_stream_at(true);
+        h3_config.enable_webtransport_browser_compatibility(true);
+        h3_config.set_additional_settings(settings).unwrap();
+        h3_config.enable_webtransport_stream_classification(true);
+
+        let mut session =
+            Session::with_configs(&mut transport_config, &h3_config).unwrap();
+        session.handshake().unwrap();
+
+        assert_eq!(
+            session.server.webtransport_handshake_profile_by_peer(),
+            Some(expected)
+        );
+        assert_eq!(
+            session.client.webtransport_handshake_profile_by_peer(),
+            Some(expected)
+        );
+        assert!(session
+            .server
+            .webtransport_dgram_enabled_by_peer(&session.pipe.server));
+
+        let stream_id = take_client_uni_stream(&mut session);
+        let payload = b"legacy-associated-stream";
+        let mut bytes = webtransport_prefix(WEBTRANSPORT_UNI_STREAM_TYPE, 0);
+        let prefix_len = bytes.len();
+        bytes.extend_from_slice(payload);
+        session
+            .pipe
+            .client
+            .stream_send(stream_id, &bytes, true)
+            .unwrap();
+        session.advance().unwrap();
+
+        assert_eq!(
+            session.poll_server(),
+            Ok((stream_id, Event::WebTransportStream {
+                session_id: 0,
+                direction: WebTransportStreamDirection::Unidirectional,
+                prefix_len,
+            }))
+        );
+        let mut received = vec![0; payload.len()];
+        assert_eq!(
+            session.pipe.server.stream_recv(stream_id, &mut received),
+            Ok((payload.len(), true))
+        );
+        assert_eq!(received, payload);
+    }
+
+    #[test]
+    fn webtransport_legacy_handshakes_enable_associated_streams() {
+        assert_legacy_webtransport_profile(
+            vec![
+                (SETTINGS_ENABLE_WEBTRANSPORT_DRAFT02, 1),
+                (SETTINGS_H3_DATAGRAM_DRAFT04, 1),
+            ],
+            WebTransportHandshakeProfile::Draft02,
+        );
+        assert_legacy_webtransport_profile(
+            vec![
+                (SETTINGS_WEBTRANSPORT_MAX_SESSIONS_DRAFT07, 1),
+                (SETTINGS_H3_DATAGRAM_DRAFT04, 1),
+            ],
+            WebTransportHandshakeProfile::Draft07,
+        );
+    }
+
+    #[test]
+    fn webtransport_legacy_settings_require_explicit_compatibility() {
+        let (mut transport_config, mut h3_config) =
+            Session::default_configs().unwrap();
+        transport_config.enable_dgram(true, 10, 10);
+        transport_config.enable_reset_stream_at(true);
+        h3_config
+            .set_additional_settings(vec![
+                (SETTINGS_ENABLE_WEBTRANSPORT_DRAFT02, 1),
+                (SETTINGS_WEBTRANSPORT_MAX_SESSIONS_DRAFT07, 1),
+                (SETTINGS_H3_DATAGRAM_DRAFT04, 1),
+            ])
+            .unwrap();
+        h3_config.enable_webtransport_stream_classification(true);
+
+        let mut session =
+            Session::with_configs(&mut transport_config, &h3_config).unwrap();
+        session.handshake().unwrap();
+
+        assert_eq!(
+            session.server.webtransport_handshake_profile_by_peer(),
+            None
+        );
+        assert_eq!(
+            session.client.webtransport_handshake_profile_by_peer(),
+            None
+        );
     }
 
     fn send_client_settings(session: &mut Session) {
@@ -7956,18 +8234,25 @@ mod tests {
     #[test]
     fn webtransport_local_setting_requires_zero_or_one_without_mutation() {
         let mut config = Config::new().unwrap();
+        config.enable_webtransport_browser_compatibility(true);
         config
             .set_additional_settings(vec![(42, 43), (SETTINGS_WT_ENABLED, 0)])
             .unwrap();
 
-        assert_eq!(
-            config.set_additional_settings(vec![(SETTINGS_WT_ENABLED, 2)]),
-            Err(Error::SettingsError)
-        );
-        assert_eq!(
-            config.additional_settings.as_deref(),
-            Some(&[(42, 43), (SETTINGS_WT_ENABLED, 0)][..])
-        );
+        for setting in [
+            SETTINGS_WT_ENABLED,
+            SETTINGS_ENABLE_WEBTRANSPORT_DRAFT02,
+            SETTINGS_H3_DATAGRAM_DRAFT04,
+        ] {
+            assert_eq!(
+                config.set_additional_settings(vec![(setting, 2)]),
+                Err(Error::SettingsError)
+            );
+            assert_eq!(
+                config.additional_settings.as_deref(),
+                Some(&[(42, 43), (SETTINGS_WT_ENABLED, 0)][..])
+            );
+        }
 
         config
             .set_additional_settings(vec![(SETTINGS_WT_ENABLED, 1)])

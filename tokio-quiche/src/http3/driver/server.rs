@@ -32,7 +32,7 @@ use tokio::sync::mpsc;
 
 use super::datagram;
 use super::webtransport;
-use super::webtransport_requirements;
+use super::webtransport_connect_requirements;
 use super::DriverHooks;
 use super::H3Command;
 use super::H3ConnectionError;
@@ -212,8 +212,8 @@ impl ServerHooks {
             return Ok(());
         }
 
-        let is_webtransport =
-            driver.webtransport.is_some() && webtransport::is_connect(&headers);
+        let is_webtransport = driver.webtransport.is_some() &&
+            driver.is_webtransport_connect_candidate(&headers);
         if let Some(limits) = driver.bounded_connect_header_limits() {
             if limits.validate(&headers).is_err() || !is_webtransport {
                 let error = quiche::h3::WireErrorCode::MessageError as u64;
@@ -231,12 +231,13 @@ impl ServerHooks {
             }
         }
         if is_webtransport {
-            let requirements = webtransport_requirements(
+            let requirements = webtransport_connect_requirements(
                 driver
                     .conn
                     .as_ref()
                     .ok_or_else(H3Driver::<Self>::connection_not_present)?,
                 qconn,
+                &headers,
             );
             match requirements {
                 WebTransportRequirements::Pending => {
@@ -290,7 +291,7 @@ impl ServerHooks {
                     );
                     return Ok(());
                 },
-                WebTransportRequirements::Met => {},
+                WebTransportRequirements::Met(_) => {},
             }
         }
         if let Some(runtime) = driver.webtransport.as_mut() {
@@ -418,12 +419,13 @@ impl DriverHooks for ServerHooks {
             return Ok(());
         };
         let session_id = request.stream_id;
-        let requirements = webtransport_requirements(
+        let requirements = webtransport_connect_requirements(
             driver
                 .conn
                 .as_ref()
                 .ok_or_else(H3Driver::<Self>::connection_not_present)?,
             qconn,
+            &request.headers,
         );
         match requirements {
             WebTransportRequirements::Pending => {
@@ -447,7 +449,7 @@ impl DriverHooks for ServerHooks {
                     error,
                 );
             },
-            WebTransportRequirements::Met => {
+            WebTransportRequirements::Met(_) => {
                 let runtime = driver
                     .webtransport
                     .as_mut()

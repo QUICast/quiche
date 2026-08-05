@@ -119,6 +119,7 @@ pub use self::bounded::BoundedServerWebTransportController;
 pub use self::bounded::BoundedServerWebTransportEvent;
 pub use self::bounded::BoundedWebTransportDatagrams;
 pub use self::bounded::BoundedWebTransportEndpoint;
+pub use self::bounded::BoundedWebTransportHandshakeProfile;
 pub use self::bounded::BoundedWebTransportIoSettings;
 pub use self::bounded::BoundedWebTransportQuicSettings;
 pub use self::bounded::BoundedWebTransportRevision;
@@ -332,33 +333,46 @@ fn validate_bounded_outbound_frame(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WebTransportRequirements {
     Pending,
-    Met,
+    Met(h3::WebTransportHandshakeProfile),
     Failed,
 }
 
 fn webtransport_requirements(
     conn: &h3::Connection, qconn: &QuicheConnection,
 ) -> WebTransportRequirements {
-    let Some(settings) = conn.peer_settings_raw() else {
+    if conn.peer_settings_raw().is_none() {
         return WebTransportRequirements::Pending;
-    };
+    }
 
-    let peer_wt = settings
-        .iter()
-        .any(|(id, value)| *id == h3::SETTINGS_WT_ENABLED && *value == 1);
+    let Some(profile) = conn.webtransport_handshake_profile_by_peer() else {
+        return WebTransportRequirements::Failed;
+    };
     let endpoint_settings_met = if qconn.is_server() {
-        peer_wt
+        true
     } else {
-        peer_wt && conn.extended_connect_enabled_by_peer()
+        conn.extended_connect_enabled_by_peer()
     };
     let transport_met = qconn.dgram_enabled() &&
-        conn.dgram_enabled_by_peer(qconn) &&
+        conn.webtransport_dgram_enabled_by_peer(qconn) &&
         qconn.reset_stream_at_enabled();
 
     if endpoint_settings_met && transport_met {
-        WebTransportRequirements::Met
+        WebTransportRequirements::Met(profile)
     } else {
         WebTransportRequirements::Failed
+    }
+}
+
+fn webtransport_connect_requirements(
+    conn: &h3::Connection, qconn: &QuicheConnection, headers: &[h3::Header],
+) -> WebTransportRequirements {
+    match webtransport_requirements(conn, qconn) {
+        WebTransportRequirements::Met(profile)
+            if webtransport::is_connect_for_profile(headers, profile) =>
+            WebTransportRequirements::Met(profile),
+
+        WebTransportRequirements::Met(_) => WebTransportRequirements::Failed,
+        other => other,
     }
 }
 
@@ -801,6 +815,10 @@ impl<H: DriverHooks> H3Driver<H> {
         bounded_profile: Option<PreparedBoundedProfile>,
     ) -> (Self, H3Controller<H>) {
         let bounded = bounded_profile.is_some();
+        let mut h3_config = (&http3_settings).into();
+        if let Some(profile) = bounded_profile.as_ref() {
+            profile.configure_h3(&mut h3_config);
+        }
         let dgram_capacity = if bounded { 1 } else { FLOW_CAPACITY };
         let (dgram_send, dgram_recv) = mpsc::channel(dgram_capacity);
         let command_capacity = http3_settings.command_capacity.max(1);
@@ -941,7 +959,7 @@ impl<H: DriverHooks> H3Driver<H> {
 
         (
             H3Driver {
-                h3_config: (&http3_settings).into(),
+                h3_config,
                 multicast_datagram_channel_id,
                 conn: None,
                 hooks: H::new(&http3_settings),
@@ -999,6 +1017,20 @@ impl<H: DriverHooks> H3Driver<H> {
         self.bounded_profile
             .as_ref()
             .map(|profile| profile.applied.connect_headers)
+    }
+
+    pub(crate) fn is_webtransport_connect_candidate(
+        &self, headers: &[h3::Header],
+    ) -> bool {
+        if webtransport::is_connect(headers) {
+            return true;
+        }
+
+        self.bounded_profile.as_ref().is_some_and(|profile| {
+            profile.applied.handshake_profile ==
+                BoundedWebTransportHandshakeProfile::BrowserInteroperable &&
+                webtransport::is_legacy_connect(headers)
+        })
     }
 
     pub(crate) fn stream_channel_capacity(&self) -> usize {
@@ -1601,19 +1633,38 @@ impl<H: DriverHooks> H3Driver<H> {
             return Ok(());
         }
 
-        // capture the peer settings and forward it
-        let bounded = self.bounded_profile.is_some();
-        if let Some(settings) = self.conn_mut()?.peer_settings_raw() {
-            if !bounded {
-                let incoming_settings = H3Event::IncomingSettings {
-                    settings: settings.to_vec(),
-                };
-                self.h3_event_sender.send(incoming_settings.into())?;
-            }
+        let Some(settings) =
+            self.conn_mut()?.peer_settings_raw().map(<[_]>::to_vec)
+        else {
+            return Ok(());
+        };
 
-            self.settings_received_and_forwarded = true;
-            H::settings_received(self, qconn)?;
+        if self.bounded_profile.is_none() {
+            let incoming_settings = H3Event::IncomingSettings { settings };
+            self.h3_event_sender.send(incoming_settings.into())?;
         }
+
+        if let Some(profile) = self.bounded_profile.as_ref() {
+            let negotiated = match webtransport_requirements(
+                self.conn
+                    .as_ref()
+                    .ok_or_else(Self::connection_not_present)?,
+                qconn,
+            ) {
+                WebTransportRequirements::Met(negotiated) => negotiated,
+                WebTransportRequirements::Pending => return Ok(()),
+                WebTransportRequirements::Failed => {
+                    let error =
+                        BoundedProfileError::PeerHandshakeRequirementsNotMet;
+                    profile.record_live(Err(error.clone()));
+                    return Err(H3ConnectionError::BoundedProfile(error));
+                },
+            };
+            profile.record_live(Ok(profile.negotiated_applied(negotiated)));
+        }
+
+        self.settings_received_and_forwarded = true;
+        H::settings_received(self, qconn)?;
         Ok(())
     }
 
@@ -1670,7 +1721,7 @@ impl<H: DriverHooks> H3Driver<H> {
                                 h3::Error::MessageError,
                             ));
                         },
-                        WebTransportRequirements::Met => {},
+                        WebTransportRequirements::Met(_) => {},
                     }
                 }
 
@@ -2688,28 +2739,20 @@ impl<H: DriverHooks> ApplicationOverQuic for H3Driver<H> {
         &mut self, quiche_conn: &mut QuicheConnection,
         handshake_info: &HandshakeInfo,
     ) -> QuicResult<()> {
-        let bounded_applied = if let Some(profile) = self.bounded_profile.as_ref()
-        {
+        if let Some(profile) = self.bounded_profile.as_ref() {
             match profile.verify_live(quiche_conn, handshake_info) {
-                Ok(applied) => Some(applied),
+                Ok(_) => {},
                 Err(error) => {
                     profile.record_live(Err(error.clone()));
                     return Err(H3ConnectionError::BoundedProfile(error).into());
                 },
             }
-        } else {
-            None
-        };
+        }
         let conn = h3::Connection::with_transport(quiche_conn, &self.h3_config)?;
         self.conn = Some(conn);
 
         H::conn_established(self, quiche_conn, handshake_info)?;
         self.ensure_event_lane_available()?;
-        if let (Some(profile), Some(applied)) =
-            (self.bounded_profile.as_ref(), bounded_applied)
-        {
-            profile.record_live(Ok(applied));
-        }
         Ok(())
     }
 
