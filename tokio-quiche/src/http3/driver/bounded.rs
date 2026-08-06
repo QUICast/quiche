@@ -676,6 +676,7 @@ impl BoundedSelectedWebTransportSettings {
             revision: BoundedWebTransportRevision::Draft16,
             handshake_profile: self.handshake_profile,
             negotiated_handshake_profile: None,
+            negotiated_stream_reset_mode: None,
             webtransport_enabled: true,
             max_sessions: 1,
             quic: self.quic,
@@ -1458,6 +1459,8 @@ pub struct AppliedBoundedWebTransportProfile {
     /// Exact peer profile selected after processing live SETTINGS.
     negotiated_handshake_profile:
         Option<quiche::h3::WebTransportHandshakeProfile>,
+    /// Exact stream-reset capability selected after the transport handshake.
+    negotiated_stream_reset_mode: Option<quiche::h3::WebTransportStreamResetMode>,
     /// Whether native WebTransport classification is enabled.
     pub webtransport_enabled: bool,
     /// Pending plus active session limit.
@@ -1503,6 +1506,21 @@ impl AppliedBoundedWebTransportProfile {
         self,
     ) -> Option<quiche::h3::WebTransportHandshakeProfile> {
         self.negotiated_handshake_profile
+    }
+
+    /// Returns the exact selected WebTransport stream-reset behavior.
+    ///
+    /// A successfully published applied profile always returns `Some`. The
+    /// browser-interoperable profile can return [`StandardReset`] when its peer
+    /// did not negotiate `RESET_STREAM_AT`; draft-16-only operation always
+    /// returns [`ReliablePrefixReset`].
+    ///
+    /// [`ReliablePrefixReset`]: quiche::h3::WebTransportStreamResetMode::ReliablePrefixReset
+    /// [`StandardReset`]: quiche::h3::WebTransportStreamResetMode::StandardReset
+    pub fn negotiated_stream_reset_mode(
+        self,
+    ) -> Option<quiche::h3::WebTransportStreamResetMode> {
+        self.negotiated_stream_reset_mode
     }
 }
 
@@ -1752,9 +1770,11 @@ impl PreparedBoundedProfile {
 
     pub(crate) fn negotiated_applied(
         &self, profile: quiche::h3::WebTransportHandshakeProfile,
+        reset_mode: quiche::h3::WebTransportStreamResetMode,
     ) -> AppliedBoundedWebTransportProfile {
         AppliedBoundedWebTransportProfile {
             negotiated_handshake_profile: Some(profile),
+            negotiated_stream_reset_mode: Some(reset_mode),
             ..self.applied
         }
     }
@@ -1894,7 +1914,7 @@ impl BoundedSelectedWebTransportController {
             .await
     }
 
-    /// Sends RESET_STREAM_AT using draft-16 error-code transformation.
+    /// Resets the stream using the applied reset mode and error transformation.
     pub async fn reset_stream(
         &self, session_id: u64, stream_id: u64, error_code: u32,
     ) -> WebTransportStreamControlOutcome {
@@ -2650,6 +2670,7 @@ mod tests {
     use std::time::Instant;
 
     use super::super::webtransport_connect_requirements;
+    use super::super::WebTransportNegotiatedCapabilities;
     use super::super::WebTransportRequirements;
     use super::*;
     use crate::http3::driver::WebTransportSessionCloseReason;
@@ -2749,6 +2770,76 @@ mod tests {
     ) {
         driver.process_reads(&mut pipe.client).unwrap();
         driver.process_writes(&mut pipe.client).unwrap();
+    }
+
+    async fn open_server_selected_stream(
+        selected: &BoundedSelectedWebTransportController,
+        driver: &mut H3Driver<ServerHooks>,
+        pipe: &mut quiche::test_utils::Pipe<crate::buf_factory::BufFactory>,
+        session_id: u64, direction: WebTransportStreamDirection,
+    ) -> u64 {
+        let controller = selected.clone();
+        let open = tokio::spawn(async move {
+            match direction {
+                WebTransportStreamDirection::Bidi =>
+                    controller.open_bidirectional_stream(session_id).await,
+                WebTransportStreamDirection::Uni =>
+                    controller.open_unidirectional_stream(session_id).await,
+            }
+        });
+        tokio::task::yield_now().await;
+        drive_server(driver, pipe);
+        assert_matches!(
+            open.await.unwrap(),
+            WebTransportOpenStreamOutcome::Opened { stream_id } => stream_id
+        )
+    }
+
+    async fn reset_server_selected_stream(
+        selected: &BoundedSelectedWebTransportController,
+        driver: &mut H3Driver<ServerHooks>,
+        pipe: &mut quiche::test_utils::Pipe<crate::buf_factory::BufFactory>,
+        session_id: u64, stream_id: u64, error_code: u32,
+    ) -> WebTransportStreamControlOutcome {
+        let controller = selected.clone();
+        let reset = tokio::spawn(async move {
+            controller
+                .reset_stream(session_id, stream_id, error_code)
+                .await
+        });
+        tokio::task::yield_now().await;
+        drive_server(driver, pipe);
+        reset.await.unwrap()
+    }
+
+    async fn retire_server_send_terminal(
+        selected: &BoundedSelectedWebTransportController,
+        driver: &mut H3Driver<ServerHooks>,
+        pipe: &mut quiche::test_utils::Pipe<crate::buf_factory::BufFactory>,
+        session_id: u64, stream_id: u64,
+    ) -> WebTransportStreamSendTerminalOutcome {
+        let controller = selected.clone();
+        let retire = tokio::spawn(async move {
+            controller
+                .retire_stream_send_terminal(session_id, stream_id)
+                .await
+        });
+        tokio::task::yield_now().await;
+        drive_server(driver, pipe);
+        retire.await.unwrap()
+    }
+
+    async fn server_retention_stats(
+        selected: &BoundedSelectedWebTransportController,
+        driver: &mut H3Driver<ServerHooks>,
+        pipe: &mut quiche::test_utils::Pipe<crate::buf_factory::BufFactory>,
+    ) -> WebTransportRetentionStats {
+        let controller = selected.clone();
+        let stats =
+            tokio::spawn(async move { controller.retention_stats().await });
+        tokio::task::yield_now().await;
+        drive_server(driver, pipe);
+        stats.await.unwrap().unwrap()
     }
 
     struct BoundedClientHarness {
@@ -3749,6 +3840,10 @@ mod tests {
             Some(quiche::h3::WebTransportHandshakeProfile::Draft16)
         );
         assert_eq!(
+            applied.negotiated_stream_reset_mode(),
+            Some(quiche::h3::WebTransportStreamResetMode::ReliablePrefixReset)
+        );
+        assert_eq!(
             applied.selected.max_session_terminal_waiters,
             settings.selected.max_session_terminal_waiters,
         );
@@ -3844,12 +3939,18 @@ mod tests {
                 BoundedWebTransportHandshakeProfile::BrowserInteroperable,
             ..BoundedSelectedWebTransportSettings::default()
         };
-        let mut config = bounded_core_config(settings);
+        let mut client_config = bounded_core_config(settings);
+        client_config.enable_reset_stream_at(false);
+        let mut server_config = bounded_core_config(settings);
         let mut pipe = quiche::test_utils::Pipe::<
             crate::buf_factory::BufFactory,
-        >::with_config_and_buf(&mut config)
+        >::with_client_and_server_config_and_buf(
+            &mut client_config,
+            &mut server_config,
+        )
         .unwrap();
         pipe.handshake().unwrap();
+        assert!(!pipe.server.reset_stream_at_enabled());
 
         let mut peer_config = quiche::h3::Config::new().unwrap();
         peer_config.enable_extended_connect(true);
@@ -3882,6 +3983,7 @@ mod tests {
                 driver.conn.as_ref().unwrap(),
                 &pipe.server,
                 &legacy_connect_headers(),
+                true,
             ),
             WebTransportRequirements::Pending
         );
@@ -3910,15 +4012,23 @@ mod tests {
                 driver.conn.as_ref().unwrap(),
                 &pipe.server,
                 &legacy_connect_headers(),
+                true,
             ),
-            WebTransportRequirements::Met(
-                quiche::h3::WebTransportHandshakeProfile::Draft07
-            )
+            WebTransportRequirements::Met(WebTransportNegotiatedCapabilities {
+                handshake_profile:
+                    quiche::h3::WebTransportHandshakeProfile::Draft07,
+                reset_mode:
+                    quiche::h3::WebTransportStreamResetMode::StandardReset,
+            })
         );
         let applied = controller.applied_profile().unwrap().unwrap();
         assert_eq!(
             applied.negotiated_handshake_profile(),
             Some(quiche::h3::WebTransportHandshakeProfile::Draft07)
+        );
+        assert_eq!(
+            applied.negotiated_stream_reset_mode(),
+            Some(quiche::h3::WebTransportStreamResetMode::StandardReset)
         );
         assert_eq!(applied.datagrams, BoundedWebTransportDatagrams::Disabled);
         assert_eq!(applied.datagram_send_items, 0);
@@ -3998,8 +4108,506 @@ mod tests {
                 }
             )) if actual_session == session_id && actual_stream == stream_id
         );
+
+        let selected = controller.selected();
+        let reset_before_payload = open_server_selected_stream(
+            &selected,
+            &mut driver,
+            &mut pipe,
+            session_id,
+            WebTransportStreamDirection::Uni,
+        )
+        .await;
+        assert_eq!(
+            reset_server_selected_stream(
+                &selected,
+                &mut driver,
+                &mut pipe,
+                session_id,
+                reset_before_payload,
+                17,
+            )
+            .await,
+            WebTransportStreamControlOutcome::Applied
+        );
+        pipe.advance().unwrap();
+        let reset_wire =
+            super::super::webtransport::webtransport_error_to_http3(17);
+        assert_eq!(
+            pipe.client.stream_recv(reset_before_payload, &mut [0; 1]),
+            Err(quiche::Error::StreamReset(reset_wire))
+        );
+        assert_eq!(
+            retire_server_send_terminal(
+                &selected,
+                &mut driver,
+                &mut pipe,
+                session_id,
+                reset_before_payload,
+            )
+            .await,
+            WebTransportStreamSendTerminalOutcome::Retired {
+                session_id,
+                stream_id: reset_before_payload,
+            }
+        );
+
+        let partial = open_server_selected_stream(
+            &selected,
+            &mut driver,
+            &mut pipe,
+            session_id,
+            WebTransportStreamDirection::Uni,
+        )
+        .await;
+        let write = selected
+            .try_write_stream_lease(
+                session_id,
+                partial,
+                TestLease {
+                    bytes: Arc::from(b"partial".as_slice()),
+                },
+                false,
+            )
+            .unwrap();
+        drive_server(&mut driver, &mut pipe);
+        assert_matches!(
+            write.outcome().await,
+            WebTransportStreamWriteLeaseOutcome::Accepted {
+                accepted: 7,
+                complete: true,
+                fin_accepted: false,
+                ..
+            }
+        );
+        pipe.advance().unwrap();
+        assert_matches!(
+            peer.poll(&mut pipe.client),
+            Ok((actual, quiche::h3::Event::WebTransportStream { .. }))
+                if actual == partial
+        );
+        let mut partial_payload = [0; 7];
+        assert_eq!(
+            pipe.client.stream_recv(partial, &mut partial_payload),
+            Ok((7, false))
+        );
+        assert_eq!(&partial_payload, b"partial");
+        assert_eq!(
+            reset_server_selected_stream(
+                &selected,
+                &mut driver,
+                &mut pipe,
+                session_id,
+                partial,
+                29,
+            )
+            .await,
+            WebTransportStreamControlOutcome::Applied
+        );
+        pipe.advance().unwrap();
+        let partial_reset_wire =
+            super::super::webtransport::webtransport_error_to_http3(29);
+        assert_eq!(
+            pipe.client.stream_recv(partial, &mut [0; 1]),
+            Err(quiche::Error::StreamReset(partial_reset_wire))
+        );
+        assert_eq!(
+            retire_server_send_terminal(
+                &selected,
+                &mut driver,
+                &mut pipe,
+                session_id,
+                partial,
+            )
+            .await,
+            WebTransportStreamSendTerminalOutcome::Retired {
+                session_id,
+                stream_id: partial,
+            }
+        );
+
+        let finished = open_server_selected_stream(
+            &selected,
+            &mut driver,
+            &mut pipe,
+            session_id,
+            WebTransportStreamDirection::Uni,
+        )
+        .await;
+        let write = selected
+            .try_write_stream_lease(
+                session_id,
+                finished,
+                TestLease {
+                    bytes: Arc::from(b"fin".as_slice()),
+                },
+                true,
+            )
+            .unwrap();
+        drive_server(&mut driver, &mut pipe);
+        assert_matches!(
+            write.outcome().await,
+            WebTransportStreamWriteLeaseOutcome::Accepted {
+                accepted: 3,
+                complete: true,
+                fin_accepted: true,
+                ..
+            }
+        );
+        pipe.advance().unwrap();
+        assert_matches!(
+            peer.poll(&mut pipe.client),
+            Ok((actual, quiche::h3::Event::WebTransportStream { .. }))
+                if actual == finished
+        );
+        let mut finished_payload = [0; 3];
+        assert_eq!(
+            pipe.client.stream_recv(finished, &mut finished_payload),
+            Ok((3, true))
+        );
+        assert_eq!(&finished_payload, b"fin");
+        assert_eq!(
+            retire_server_send_terminal(
+                &selected,
+                &mut driver,
+                &mut pipe,
+                session_id,
+                finished,
+            )
+            .await,
+            WebTransportStreamSendTerminalOutcome::Retired {
+                session_id,
+                stream_id: finished,
+            }
+        );
+        pipe.advance().unwrap();
+        drive_server(&mut driver, &mut pipe);
+
+        let stopped = open_server_selected_stream(
+            &selected,
+            &mut driver,
+            &mut pipe,
+            session_id,
+            WebTransportStreamDirection::Bidi,
+        )
+        .await;
+        pipe.advance().unwrap();
+        assert_matches!(
+            peer.poll(&mut pipe.client),
+            Ok((actual, quiche::h3::Event::WebTransportStream { .. }))
+                if actual == stopped
+        );
+        let terminal_controller = selected.clone();
+        let terminal = tokio::spawn(async move {
+            terminal_controller
+                .wait_stream_send_terminal(session_id, stopped)
+                .await
+        });
+        tokio::task::yield_now().await;
+        drive_server(&mut driver, &mut pipe);
+        assert!(!terminal.is_finished());
+        let stopped_wire =
+            super::super::webtransport::webtransport_error_to_http3(31);
+        pipe.client
+            .stream_shutdown(stopped, quiche::Shutdown::Read, stopped_wire)
+            .unwrap();
+        pipe.advance().unwrap();
+        drive_server(&mut driver, &mut pipe);
+        assert_eq!(
+            terminal.await.unwrap(),
+            WebTransportStreamSendTerminalOutcome::Stopped {
+                stream_id: stopped,
+                wire_error_code: stopped_wire,
+                application_error_code: Some(31),
+            }
+        );
+        assert_eq!(
+            reset_server_selected_stream(
+                &selected,
+                &mut driver,
+                &mut pipe,
+                session_id,
+                stopped,
+                31,
+            )
+            .await,
+            WebTransportStreamControlOutcome::Closed
+        );
+        pipe.advance().unwrap();
+        assert_eq!(
+            retire_server_send_terminal(
+                &selected,
+                &mut driver,
+                &mut pipe,
+                session_id,
+                stopped,
+            )
+            .await,
+            WebTransportStreamSendTerminalOutcome::Retired {
+                session_id,
+                stream_id: stopped,
+            }
+        );
+
+        drive_server(&mut driver, &mut pipe);
+        let retained_before_turnover =
+            server_retention_stats(&selected, &mut driver, &mut pipe).await;
+        for error_code in 0..16 {
+            let stream_id = open_server_selected_stream(
+                &selected,
+                &mut driver,
+                &mut pipe,
+                session_id,
+                WebTransportStreamDirection::Uni,
+            )
+            .await;
+            assert_eq!(
+                reset_server_selected_stream(
+                    &selected,
+                    &mut driver,
+                    &mut pipe,
+                    session_id,
+                    stream_id,
+                    error_code,
+                )
+                .await,
+                WebTransportStreamControlOutcome::Applied
+            );
+            assert_eq!(
+                retire_server_send_terminal(
+                    &selected,
+                    &mut driver,
+                    &mut pipe,
+                    session_id,
+                    stream_id,
+                )
+                .await,
+                WebTransportStreamSendTerminalOutcome::Retired {
+                    session_id,
+                    stream_id,
+                }
+            );
+            pipe.advance().unwrap();
+            drive_server(&mut driver, &mut pipe);
+        }
+        let retained_after_turnover =
+            server_retention_stats(&selected, &mut driver, &mut pipe).await;
+        assert_eq!(
+            retained_after_turnover.associated_streams,
+            retained_before_turnover.associated_streams
+        );
+        assert_eq!(
+            retained_after_turnover.send_terminal_states,
+            retained_before_turnover.send_terminal_states
+        );
+        assert_eq!(
+            retained_after_turnover.send_terminal_waiters,
+            retained_before_turnover.send_terminal_waiters
+        );
+
         assert_eq!(pipe.server.dgram_send_queue_len(), 0);
         assert_eq!(pipe.server.dgram_recv_queue_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn draft16_requires_reset_and_reports_exact_profile_failure() {
+        let settings = BoundedSelectedWebTransportSettings::default();
+        let mut client_config = bounded_core_config(settings);
+        client_config.enable_reset_stream_at(false);
+        let mut server_config = bounded_core_config(settings);
+        let mut pipe = quiche::test_utils::Pipe::<
+            crate::buf_factory::BufFactory,
+        >::with_client_and_server_config_and_buf(
+            &mut client_config,
+            &mut server_config,
+        )
+        .unwrap();
+        pipe.handshake().unwrap();
+
+        let peer_settings = settings
+            .prepare(BoundedWebTransportEndpoint::Client)
+            .unwrap()
+            .http3;
+        let _peer = quiche::h3::Connection::with_transport(
+            &mut pipe.client,
+            &quiche::h3::Config::from(&peer_settings),
+        )
+        .unwrap();
+        let (mut driver, mut controller) =
+            H3Driver::<ServerHooks>::new_bounded_selected_webtransport(settings)
+                .unwrap();
+        let handshake = HandshakeInfo::new(Instant::now(), None)
+            .with_io_worker_memory_profile(settings.io.expected_profile());
+        driver
+            .on_conn_established(&mut pipe.server, &handshake)
+            .unwrap();
+
+        pipe.advance().unwrap();
+        let result = driver.process_reads(&mut pipe.server);
+        assert!(
+            result
+                .as_ref()
+                .unwrap_err()
+                .downcast_ref::<H3ConnectionError>() ==
+                Some(&H3ConnectionError::BoundedProfile(
+                    BoundedProfileError::PeerHandshakeRequirementsNotMet,
+                ))
+        );
+        assert_eq!(
+            controller.applied_profile(),
+            Err(BoundedProfileError::PeerHandshakeRequirementsNotMet)
+        );
+
+        crate::ApplicationOverQuic::on_conn_close(
+            &mut driver,
+            &mut pipe.server,
+            &crate::metrics::DefaultMetrics,
+            &result,
+        );
+        assert_matches!(
+            controller.recv_event().await,
+            Some(BoundedServerWebTransportEvent::ConnectionShutdown(Some(
+                H3ConnectionError::BoundedProfile(
+                    BoundedProfileError::PeerHandshakeRequirementsNotMet
+                )
+            )))
+        );
+        assert_eq!(
+            controller.applied_profile(),
+            Err(BoundedProfileError::PeerHandshakeRequirementsNotMet)
+        );
+        drop(driver);
+        assert!(controller.recv_event().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn standard_reset_cancellation_does_not_retry_a_partial_prefix() {
+        let settings = BoundedSelectedWebTransportSettings {
+            handshake_profile:
+                BoundedWebTransportHandshakeProfile::BrowserInteroperable,
+            ..BoundedSelectedWebTransportSettings::default()
+        };
+        let mut client_config = bounded_core_config(settings);
+        client_config.enable_reset_stream_at(false);
+        client_config.set_initial_max_stream_data_bidi_remote(1);
+        let mut server_config = bounded_core_config(settings);
+        let mut pipe = quiche::test_utils::Pipe::<
+            crate::buf_factory::BufFactory,
+        >::with_client_and_server_config_and_buf(
+            &mut client_config,
+            &mut server_config,
+        )
+        .unwrap();
+        pipe.handshake().unwrap();
+
+        let mut peer_config = quiche::h3::Config::new().unwrap();
+        peer_config.enable_extended_connect(true);
+        peer_config.enable_webtransport_stream_classification(true);
+        peer_config.enable_webtransport_browser_compatibility(true);
+        peer_config
+            .set_additional_settings(vec![
+                (quiche::h3::SETTINGS_ENABLE_WEBTRANSPORT_DRAFT02, 1),
+                (quiche::h3::SETTINGS_WEBTRANSPORT_MAX_SESSIONS_DRAFT07, 1),
+                (quiche::h3::SETTINGS_H3_DATAGRAM_DRAFT04, 1),
+            ])
+            .unwrap();
+        let mut peer = quiche::h3::Connection::with_transport(
+            &mut pipe.client,
+            &peer_config,
+        )
+        .unwrap();
+        let (mut driver, mut controller) =
+            H3Driver::<ServerHooks>::new_bounded_selected_webtransport(settings)
+                .unwrap();
+        let handshake = HandshakeInfo::new(Instant::now(), None)
+            .with_io_worker_memory_profile(settings.io.expected_profile());
+        driver
+            .on_conn_established(&mut pipe.server, &handshake)
+            .unwrap();
+        pipe.advance().unwrap();
+        drive_server(&mut driver, &mut pipe);
+
+        let session_id = peer
+            .send_request(&mut pipe.client, &legacy_connect_headers(), false)
+            .unwrap();
+        pipe.advance().unwrap();
+        drive_server(&mut driver, &mut pipe);
+        assert_matches!(
+            controller.recv_event().await,
+            Some(BoundedServerWebTransportEvent::Session(
+                WebTransportSessionEvent::Pending { .. }
+            ))
+        );
+        let mut responder = assert_matches!(
+            controller.recv_event().await,
+            Some(BoundedServerWebTransportEvent::ConnectRequested {
+                responder,
+                ..
+            }) => responder
+        );
+        responder
+            .try_send_response(
+                BoundedConnectHeaders::copy_from(
+                    &[quiche::h3::Header::new(b":status", b"200")],
+                    settings.connect_headers,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        drive_server(&mut driver, &mut pipe);
+        assert_matches!(
+            controller.recv_event().await,
+            Some(BoundedServerWebTransportEvent::Session(
+                WebTransportSessionEvent::Accepted { .. }
+            ))
+        );
+
+        let selected = controller.selected();
+        let open_controller = selected.clone();
+        let open = tokio::spawn(async move {
+            open_controller.open_bidirectional_stream(session_id).await
+        });
+        tokio::task::yield_now().await;
+        drive_server(&mut driver, &mut pipe);
+        assert!(!open.is_finished());
+        let stream_id = driver
+            .webtransport
+            .as_ref()
+            .unwrap()
+            .first_opening_stream_id()
+            .unwrap();
+
+        open.abort();
+        assert!(open.await.unwrap_err().is_cancelled());
+        drive_server(&mut driver, &mut pipe);
+        assert_eq!(
+            driver
+                .webtransport
+                .as_ref()
+                .unwrap()
+                .first_opening_stream_id(),
+            None
+        );
+        pipe.advance().unwrap();
+        assert_eq!(
+            pipe.client.stream_recv(stream_id, &mut [0; 1]),
+            Err(quiche::Error::StreamReset(
+                super::super::webtransport::WT_SESSION_GONE
+            ))
+        );
+        assert_eq!(
+            controller
+                .applied_profile()
+                .unwrap()
+                .unwrap()
+                .negotiated_stream_reset_mode(),
+            Some(quiche::h3::WebTransportStreamResetMode::StandardReset)
+        );
+        let stats =
+            server_retention_stats(&selected, &mut driver, &mut pipe).await;
+        assert_eq!(stats.provisional_streams, 0);
+        assert_eq!(stats.stream_open_waiters, 0);
+        assert_eq!(stats.write_leases, 0);
     }
 
     #[test]

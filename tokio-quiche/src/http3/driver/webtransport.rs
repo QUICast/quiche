@@ -557,7 +557,7 @@ where
         /// Whether FIN remains requested.
         fin: bool,
     },
-    /// STOP_SENDING requires a reliable WebTransport-prefix reset.
+    /// STOP_SENDING made the send side terminal and requires reset settlement.
     ResetRequired {
         /// HTTP/3 wire error received in STOP_SENDING.
         wire_error_code: u64,
@@ -819,7 +819,7 @@ pub enum WebTransportStreamReceiveTerminalRetirementOutcome {
     Rejected(WebTransportSelectionError),
 }
 
-/// Outcome of sending RESET_STREAM_AT or STOP_SENDING on a selected stream.
+/// Outcome of resetting or stopping a selected stream direction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WebTransportStreamControlOutcome {
     /// The transport accepted the control operation.
@@ -1654,9 +1654,11 @@ pub enum WebTransportDatagramReadyOutcome {
 /// Calls wait asynchronously for space in the configured command lane, without
 /// blocking the QUIC event loop. Once admitted, the driver owns each supplied
 /// buffer until it returns an outcome. Stream-open commands internally retry
-/// only the draft-16 prefix; payload writes and Datagrams make one transport
-/// admission attempt and return unaccepted ownership to the caller. Connection
-/// teardown resolves every admitted command with a terminal outcome.
+/// only a negotiated reliable association prefix. Standard-reset cancellation
+/// settles immediately instead of retrying the prefix. Payload writes and
+/// Datagrams make one transport admission attempt and return unaccepted
+/// ownership to the caller. Connection teardown resolves every admitted command
+/// with a terminal outcome.
 ///
 /// Buffer-bearing async calls retain their buffer in the caller-owned future
 /// while waiting for lane admission. Adapters requiring a hard aggregate bound
@@ -1755,7 +1757,8 @@ impl WebTransportController {
     /// Opens a bidirectional stream for an exact active Session ID.
     ///
     /// The result contains the physical QUIC stream ID after the complete
-    /// draft-16 prefix has been accepted exactly once. Temporary peer
+    /// WebTransport association prefix has been accepted exactly once.
+    /// Temporary peer
     /// MAX_STREAMS exhaustion keeps this future pending without polling;
     /// [`WebTransportSelectionError::ResourceLimit`] means a configured local
     /// pending/opening bound was reached instead. Cancellation releases the
@@ -1770,7 +1773,8 @@ impl WebTransportController {
     /// Opens a unidirectional stream for an exact active Session ID.
     ///
     /// The result contains the physical QUIC stream ID after the complete
-    /// draft-16 prefix has been accepted exactly once. Temporary peer
+    /// WebTransport association prefix has been accepted exactly once.
+    /// Temporary peer
     /// MAX_STREAMS exhaustion keeps this future pending without polling;
     /// [`WebTransportSelectionError::ResourceLimit`] means a configured local
     /// pending/opening bound was reached instead. Requests are FIFO within one
@@ -2190,7 +2194,7 @@ impl WebTransportController {
         outcome
     }
 
-    /// Sends RESET_STREAM_AT using the draft-16 application-error mapping.
+    /// Resets the stream using the negotiated reset mode and error mapping.
     pub async fn reset_stream(
         &self, session_id: u64, stream_id: u64, error_code: u32,
     ) -> WebTransportStreamControlOutcome {
@@ -3181,6 +3185,7 @@ struct OwnedStream {
     session_id: u64,
     direction: WebTransportStreamDirection,
     local_prefix_len: u64,
+    reset_mode: quiche::h3::WebTransportStreamResetMode,
     locally_initiated: bool,
     send_terminal_observation: SendTerminalObservation,
     receive_terminal_observation: ReceiveTerminalObservation,
@@ -3190,6 +3195,20 @@ impl OwnedStream {
     fn new(
         session_id: u64, direction: WebTransportStreamDirection,
         local_prefix_len: u64, locally_initiated: bool,
+    ) -> Self {
+        Self::new_with_reset_mode(
+            session_id,
+            direction,
+            local_prefix_len,
+            locally_initiated,
+            quiche::h3::WebTransportStreamResetMode::ReliablePrefixReset,
+        )
+    }
+
+    fn new_with_reset_mode(
+        session_id: u64, direction: WebTransportStreamDirection,
+        local_prefix_len: u64, locally_initiated: bool,
+        reset_mode: quiche::h3::WebTransportStreamResetMode,
     ) -> Self {
         let send_terminal_observation = if direction ==
             WebTransportStreamDirection::Bidi ||
@@ -3211,6 +3230,7 @@ impl OwnedStream {
             session_id,
             direction,
             local_prefix_len,
+            reset_mode,
             locally_initiated,
             send_terminal_observation,
             receive_terminal_observation,
@@ -3386,6 +3406,7 @@ enum SessionWork {
 #[derive(Debug)]
 pub(crate) struct Runtime {
     limits: RuntimeLimits,
+    reset_mode: quiche::h3::WebTransportStreamResetMode,
     write_lease_accounting: Arc<WriteLeaseAccounting>,
     sessions: BTreeMap<u64, Session>,
     pending_streams: BTreeMap<u64, AssociatedStream>,
@@ -3502,6 +3523,8 @@ impl Runtime {
                     .max(1),
                 ..limits
             },
+            reset_mode:
+                quiche::h3::WebTransportStreamResetMode::ReliablePrefixReset,
             write_lease_accounting,
             sessions: BTreeMap::new(),
             pending_streams: BTreeMap::new(),
@@ -3565,6 +3588,14 @@ impl Runtime {
             #[cfg(test)]
             commit_errors: VecDeque::new(),
         }
+    }
+
+    pub(crate) fn set_reset_mode(
+        &mut self, reset_mode: quiche::h3::WebTransportStreamResetMode,
+    ) {
+        debug_assert!(self.opening_streams.is_empty());
+        debug_assert!(self.stream_sessions.is_empty());
+        self.reset_mode = reset_mode;
     }
 
     pub(crate) fn observe_request(
@@ -4001,8 +4032,13 @@ impl Runtime {
     }
 
     fn admit_stream(&mut self, stream: AssociatedStream) {
-        let owned =
-            OwnedStream::new(stream.session_id, stream.direction, 0, false);
+        let owned = OwnedStream::new_with_reset_mode(
+            stream.session_id,
+            stream.direction,
+            0,
+            false,
+            self.reset_mode,
+        );
         self.insert_owned_stream(stream.stream_id, owned);
         if let Some(session) = self.sessions.get_mut(&stream.session_id) {
             session.streams.insert(stream.stream_id);
@@ -4450,10 +4486,11 @@ impl Runtime {
             WebTransportStreamDirection::Uni =>
                 quiche::h3::WebTransportStreamDirection::Unidirectional,
         };
-        let reservation = match conn.reserve_webtransport_stream(
+        let reservation = match conn.reserve_webtransport_stream_with_reset_mode(
             qconn,
             request.session_id,
             core_direction,
+            self.reset_mode,
         ) {
             Ok(reservation) => reservation,
             Err(quiche::h3::Error::SettingsError) => {
@@ -4704,6 +4741,15 @@ impl Runtime {
                 opening.reset_after_prefix = Some(WT_SESSION_GONE);
             }
 
+            if let Some(error_code) = opening.reset_after_prefix.filter(|_| {
+                opening.reservation.reset_mode() ==
+                    quiche::h3::WebTransportStreamResetMode::StandardReset
+            }) {
+                shutdown_opening_stream(qconn, &opening.reservation, error_code);
+                self.finish_opening(session_id, stream_id);
+                continue;
+            }
+
             let prefix = opening.reservation.prefix();
             if opening.prefix_offset < prefix.len() {
                 match qconn.stream_send(
@@ -4800,7 +4846,7 @@ impl Runtime {
                 continue;
             }
 
-            let owned = OwnedStream::new(
+            let owned = OwnedStream::new_with_reset_mode(
                 session_id,
                 match opening.reservation.direction() {
                     quiche::h3::WebTransportStreamDirection::Bidirectional =>
@@ -4810,6 +4856,7 @@ impl Runtime {
                 },
                 opening.reservation.prefix_len() as u64,
                 true,
+                opening.reservation.reset_mode(),
             );
             if !self.can_admit_owned_stream(owned) {
                 if let Some(response) = opening.response.take() {
@@ -5962,10 +6009,12 @@ impl Runtime {
         };
         let wire_error = webtransport_error_to_http3(error_code);
         let result = if reset {
-            qconn.stream_shutdown_at(
+            shutdown_stream_send_direction(
+                qconn,
                 stream_id,
                 wire_error,
                 stream.local_prefix_len,
+                stream.reset_mode,
             )
         } else {
             qconn.stream_shutdown(stream_id, quiche::Shutdown::Read, wire_error)
@@ -7120,11 +7169,25 @@ fn shutdown_opening_stream(
     reservation: &quiche::h3::WebTransportStreamReservation, error_code: u64,
 ) {
     stop_opening_receive_side(qconn, reservation, error_code);
-    let _ = qconn.stream_shutdown_at(
+    let _ = shutdown_stream_send_direction(
+        qconn,
         reservation.stream_id(),
         error_code,
         reservation.prefix_len() as u64,
+        reservation.reset_mode(),
     );
+}
+
+fn shutdown_stream_send_direction(
+    qconn: &mut QuicheConnection, stream_id: u64, error_code: u64,
+    reliable_size: u64, reset_mode: quiche::h3::WebTransportStreamResetMode,
+) -> quiche::Result<()> {
+    match reset_mode {
+        quiche::h3::WebTransportStreamResetMode::ReliablePrefixReset =>
+            qconn.stream_shutdown_at(stream_id, error_code, reliable_size),
+        quiche::h3::WebTransportStreamResetMode::StandardReset =>
+            qconn.stream_shutdown(stream_id, quiche::Shutdown::Write, error_code),
+    }
 }
 
 fn shutdown_owned_stream(
@@ -7140,10 +7203,12 @@ fn shutdown_owned_stream(
     if stream.direction == WebTransportStreamDirection::Bidi ||
         stream.locally_initiated
     {
-        let _ = qconn.stream_shutdown_at(
+        let _ = shutdown_stream_send_direction(
+            qconn,
             stream_id,
             error_code,
             stream.local_prefix_len,
+            stream.reset_mode,
         );
     }
 }

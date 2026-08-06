@@ -129,10 +129,16 @@ pub use datagram_socket;
 
 use foundations::telemetry::settings::LogVerbosity;
 use std::io;
+use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Once;
+use std::task::Context;
+use std::task::Poll;
 use tokio::net::UdpSocket;
-use tokio_stream::wrappers::ReceiverStream;
+use tokio::sync::mpsc;
+use tokio::sync::watch;
+use tokio_stream::Stream;
 
 use crate::metrics::Metrics;
 use crate::socket::QuicListener;
@@ -154,12 +160,136 @@ pub use crate::settings::ConnectionParams;
 #[doc(hidden)]
 pub use crate::result::QuicResultExt;
 
+/// One rejected QUIC Initial observed while the listener backlog was full.
+///
+/// Events retain only the latest address sample. `rejected_total` is an exact,
+/// monotonically increasing count, so coalescing never hides how many Initials
+/// were rejected.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InitialBacklogOverflow {
+    /// Local listener address that received the rejected Initial.
+    pub local_addr: SocketAddr,
+    /// Peer address that sent the rejected Initial.
+    pub peer_addr: SocketAddr,
+    /// Exact cumulative overflow rejection count for this listener.
+    pub rejected_total: u64,
+    /// Configured accepted-connection backlog capacity.
+    pub backlog_capacity: usize,
+}
+
+/// Bounded latest-only receiver for listener-backlog overflow events.
+///
+/// Each receiver observes a level-triggered latest event. If several rejections
+/// occur before it polls, the newest event carries their exact cumulative
+/// total.
+#[derive(Debug)]
+pub struct InitialBacklogOverflowEvents {
+    receiver: watch::Receiver<Option<InitialBacklogOverflow>>,
+    last_seen_total: u64,
+}
+
+impl InitialBacklogOverflowEvents {
+    fn new(receiver: watch::Receiver<Option<InitialBacklogOverflow>>) -> Self {
+        Self {
+            receiver,
+            last_seen_total: 0,
+        }
+    }
+
+    /// Receives the next unseen cumulative overflow event.
+    pub async fn recv(&mut self) -> Option<InitialBacklogOverflow> {
+        loop {
+            if let Some(event) = self.try_recv() {
+                return Some(event);
+            }
+            if self.receiver.changed().await.is_err() {
+                return self.try_recv();
+            }
+        }
+    }
+
+    /// Returns the latest event when its cumulative total has not been seen.
+    pub fn try_recv(&mut self) -> Option<InitialBacklogOverflow> {
+        let event = *self.receiver.borrow();
+        let event =
+            event.filter(|event| event.rejected_total > self.last_seen_total)?;
+        self.last_seen_total = event.rejected_total;
+        self.receiver.borrow_and_update();
+        Some(event)
+    }
+
+    /// Returns the latest retained event without marking it observed.
+    pub fn latest(&self) -> Option<InitialBacklogOverflow> {
+        *self.receiver.borrow()
+    }
+}
+
 /// A stream of accepted [`InitialQuicConnection`]s from a [`listen`] call.
 ///
 /// Errors from processing the client's QUIC initials can also be emitted on
 /// this stream. These do not indicate that the listener itself has failed.
-pub type QuicConnectionStream<M> =
-    ReceiverStream<io::Result<InitialQuicConnection<UdpSocket, M>>>;
+pub struct QuicConnectionStream<M: Metrics> {
+    connections: mpsc::Receiver<io::Result<InitialQuicConnection<UdpSocket, M>>>,
+    overflow_events: watch::Receiver<Option<InitialBacklogOverflow>>,
+}
+
+impl<M: Metrics> QuicConnectionStream<M> {
+    pub(crate) fn new(
+        connections: mpsc::Receiver<
+            io::Result<InitialQuicConnection<UdpSocket, M>>,
+        >,
+        overflow_events: watch::Receiver<Option<InitialBacklogOverflow>>,
+    ) -> Self {
+        Self {
+            connections,
+            overflow_events,
+        }
+    }
+
+    /// Receives the next accepted connection or Initial-processing error.
+    pub async fn recv(
+        &mut self,
+    ) -> Option<io::Result<InitialQuicConnection<UdpSocket, M>>> {
+        self.connections.recv().await
+    }
+
+    /// Attempts to receive an accepted connection without waiting.
+    pub fn try_recv(
+        &mut self,
+    ) -> Result<
+        io::Result<InitialQuicConnection<UdpSocket, M>>,
+        mpsc::error::TryRecvError,
+    > {
+        self.connections.try_recv()
+    }
+
+    /// Closes the accepted-connection lane and asks the listener to shut down.
+    pub fn close(&mut self) {
+        self.connections.close();
+    }
+
+    /// Returns an independently consumable bounded overflow-event receiver.
+    pub fn initial_backlog_overflows(&self) -> InitialBacklogOverflowEvents {
+        InitialBacklogOverflowEvents::new(self.overflow_events.clone())
+    }
+
+    /// Returns the latest overflow event without consuming it.
+    pub fn latest_initial_backlog_overflow(
+        &self,
+    ) -> Option<InitialBacklogOverflow> {
+        *self.overflow_events.borrow()
+    }
+}
+
+impl<M: Metrics> Stream for QuicConnectionStream<M> {
+    type Item = io::Result<InitialQuicConnection<UdpSocket, M>>;
+
+    fn poll_next(
+        self: Pin<&mut Self>, cx: &mut Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        self.get_mut().connections.poll_recv(cx)
+    }
+}
 
 /// Starts listening for inbound QUIC connections on the given
 /// [`QuicListener`]s.

@@ -333,12 +333,18 @@ fn validate_bounded_outbound_frame(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WebTransportRequirements {
     Pending,
-    Met(h3::WebTransportHandshakeProfile),
+    Met(WebTransportNegotiatedCapabilities),
     Failed,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct WebTransportNegotiatedCapabilities {
+    handshake_profile: h3::WebTransportHandshakeProfile,
+    reset_mode: h3::WebTransportStreamResetMode,
+}
+
 fn webtransport_requirements(
-    conn: &h3::Connection, qconn: &QuicheConnection,
+    conn: &h3::Connection, qconn: &QuicheConnection, allow_standard_reset: bool,
 ) -> WebTransportRequirements {
     if conn.peer_settings_raw().is_none() {
         return WebTransportRequirements::Pending;
@@ -352,24 +358,40 @@ fn webtransport_requirements(
     } else {
         conn.extended_connect_enabled_by_peer()
     };
-    let transport_met = qconn.dgram_enabled() &&
-        conn.webtransport_dgram_enabled_by_peer(qconn) &&
-        qconn.reset_stream_at_enabled();
-
-    if endpoint_settings_met && transport_met {
-        WebTransportRequirements::Met(profile)
+    let transport_met =
+        qconn.dgram_enabled() && conn.webtransport_dgram_enabled_by_peer(qconn);
+    let reset_mode = if qconn.reset_stream_at_enabled() {
+        Some(h3::WebTransportStreamResetMode::ReliablePrefixReset)
+    } else if allow_standard_reset {
+        Some(h3::WebTransportStreamResetMode::StandardReset)
     } else {
-        WebTransportRequirements::Failed
+        None
+    };
+
+    if !endpoint_settings_met || !transport_met {
+        return WebTransportRequirements::Failed;
     }
+    let Some(reset_mode) = reset_mode else {
+        return WebTransportRequirements::Failed;
+    };
+
+    WebTransportRequirements::Met(WebTransportNegotiatedCapabilities {
+        handshake_profile: profile,
+        reset_mode,
+    })
 }
 
 fn webtransport_connect_requirements(
     conn: &h3::Connection, qconn: &QuicheConnection, headers: &[h3::Header],
+    allow_standard_reset: bool,
 ) -> WebTransportRequirements {
-    match webtransport_requirements(conn, qconn) {
-        WebTransportRequirements::Met(profile)
-            if webtransport::is_connect_for_profile(headers, profile) =>
-            WebTransportRequirements::Met(profile),
+    match webtransport_requirements(conn, qconn, allow_standard_reset) {
+        WebTransportRequirements::Met(capabilities)
+            if webtransport::is_connect_for_profile(
+                headers,
+                capabilities.handshake_profile,
+            ) =>
+            WebTransportRequirements::Met(capabilities),
 
         WebTransportRequirements::Met(_) => WebTransportRequirements::Failed,
         other => other,
@@ -668,6 +690,9 @@ impl H3Event {
             H3ConnectionError::H3(e) => Self::ConnectionError(*e),
             H3ConnectionError::PostAcceptTimeout => Self::ConnectionShutdown(
                 Some(H3ConnectionError::PostAcceptTimeout),
+            ),
+            H3ConnectionError::BoundedProfile(error) => Self::ConnectionShutdown(
+                Some(H3ConnectionError::BoundedProfile(error.clone())),
             ),
             _ => return None,
         })
@@ -1030,6 +1055,13 @@ impl<H: DriverHooks> H3Driver<H> {
             profile.applied.handshake_profile ==
                 BoundedWebTransportHandshakeProfile::BrowserInteroperable &&
                 webtransport::is_legacy_connect(headers)
+        })
+    }
+
+    fn allows_standard_webtransport_reset(&self) -> bool {
+        self.bounded_profile.as_ref().is_some_and(|profile| {
+            profile.applied.handshake_profile ==
+                BoundedWebTransportHandshakeProfile::BrowserInteroperable
         })
     }
 
@@ -1650,6 +1682,7 @@ impl<H: DriverHooks> H3Driver<H> {
                     .as_ref()
                     .ok_or_else(Self::connection_not_present)?,
                 qconn,
+                self.allows_standard_webtransport_reset(),
             ) {
                 WebTransportRequirements::Met(negotiated) => negotiated,
                 WebTransportRequirements::Pending => return Ok(()),
@@ -1660,7 +1693,13 @@ impl<H: DriverHooks> H3Driver<H> {
                     return Err(H3ConnectionError::BoundedProfile(error));
                 },
             };
-            profile.record_live(Ok(profile.negotiated_applied(negotiated)));
+            if let Some(runtime) = self.webtransport.as_mut() {
+                runtime.set_reset_mode(negotiated.reset_mode);
+            }
+            profile.record_live(Ok(profile.negotiated_applied(
+                negotiated.handshake_profile,
+                negotiated.reset_mode,
+            )));
         }
 
         self.settings_received_and_forwarded = true;
@@ -1676,7 +1715,7 @@ impl<H: DriverHooks> H3Driver<H> {
     fn process_write_frame(
         conn: &mut h3::Connection, qconn: &mut QuicheConnection,
         ctx: &mut StreamCtx, h3_event_sender: &H3EventSender<H::Event>,
-        emit_h3_headers_flushed: bool,
+        emit_h3_headers_flushed: bool, allow_standard_reset: bool,
         mut webtransport: Option<&mut WebTransportRuntime>,
     ) -> H3ConnectionResult<()> {
         let Some(frame) = &mut ctx.queued_frame else {
@@ -1698,7 +1737,11 @@ impl<H: DriverHooks> H3Driver<H> {
                         .as_deref()
                         .is_some_and(|runtime| runtime.is_pending(stream_id))
                 {
-                    match webtransport_requirements(conn, qconn) {
+                    match webtransport_requirements(
+                        conn,
+                        qconn,
+                        allow_standard_reset,
+                    ) {
                         WebTransportRequirements::Pending => {
                             webtransport
                                 .as_deref_mut()
@@ -2498,6 +2541,7 @@ impl<H: DriverHooks> H3Driver<H> {
         &mut self, qconn: &mut QuicheConnection, stream_id: u64,
     ) -> H3ConnectionResult<()> {
         let bounded_connect_headers = self.bounded_connect_header_limits();
+        let allow_standard_reset = self.allows_standard_webtransport_reset();
         let emit_h3_headers_flushed =
             H::should_emit_h3_headers_flushed(self, stream_id);
         let h3_event_sender = self.h3_event_sender.clone();
@@ -2521,6 +2565,7 @@ impl<H: DriverHooks> H3Driver<H> {
                 ctx,
                 &h3_event_sender,
                 emit_h3_headers_flushed,
+                allow_standard_reset,
                 self.webtransport.as_mut(),
             ) {
                 Ok(()) => ctx.queued_frame = None,
@@ -2814,8 +2859,11 @@ impl<H: DriverHooks> ApplicationOverQuic for H3Driver<H> {
             .as_ref()
             .is_some_and(WebTransportRuntime::has_deferred_responses) &&
             self.conn.as_ref().is_some_and(|conn| {
-                webtransport_requirements(conn, qconn) !=
-                    WebTransportRequirements::Pending
+                webtransport_requirements(
+                    conn,
+                    qconn,
+                    self.allows_standard_webtransport_reset(),
+                ) != WebTransportRequirements::Pending
             });
         if retry_deferred {
             let deferred = self
@@ -2922,8 +2970,11 @@ impl<H: DriverHooks> ApplicationOverQuic for H3Driver<H> {
                     runtime.has_ready_datagram_waiter(qconn) ||
                     (runtime.has_deferred_responses() &&
                         self.conn.as_ref().is_some_and(|conn| {
-                            webtransport_requirements(conn, qconn) !=
-                                WebTransportRequirements::Pending
+                            webtransport_requirements(
+                                conn,
+                                qconn,
+                                self.allows_standard_webtransport_reset(),
+                            ) != WebTransportRequirements::Pending
                         }))
             }) || (self.webtransport.is_some() &&
                 qconn.dgram_recv_queue_len() != 0);

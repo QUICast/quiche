@@ -40,6 +40,7 @@ use crate::metrics::quic_expensive_metrics_ip_reduce;
 use crate::metrics::Metrics;
 use crate::quic::connection::SharedConnectionIdGenerator;
 use crate::settings::Config;
+use crate::InitialBacklogOverflow;
 use datagram_socket::DatagramSocketRecv;
 use datagram_socket::DatagramSocketSend;
 use foundations::telemetry::log;
@@ -62,6 +63,7 @@ use std::time::Instant;
 use std::time::SystemTime;
 use task_killswitch::spawn_with_killswitch;
 use tokio::sync::mpsc;
+use tokio::sync::watch;
 
 #[cfg(target_os = "linux")]
 use foundations::telemetry::metrics::Counter;
@@ -312,6 +314,8 @@ where
     /// should be 0 outside of `poll_conn_map_commands`.
     conn_map_cmd_buf: Vec<ConnectionMapCommand>,
     accept_sink: mpsc::Sender<io::Result<InitialQuicConnection<Tx, M>>>,
+    initial_backlog_overflow_sink: watch::Sender<Option<InitialBacklogOverflow>>,
+    initial_backlog_overflow_total: u64,
     metrics: M,
     #[cfg(target_os = "linux")]
     udp_drop_count: u32,
@@ -339,9 +343,15 @@ where
     pub(crate) fn new(
         config: Config, socket_tx: Arc<Tx>, socket_rx: Rx,
         local_addr: SocketAddr, incoming_packet_handler: I, metrics: M,
-    ) -> (Self, ConnStream<Tx, M>) {
+    ) -> (
+        Self,
+        ConnStream<Tx, M>,
+        watch::Receiver<Option<InitialBacklogOverflow>>,
+    ) {
         let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
         let (accept_sink, accept_stream) = mpsc::channel(config.listen_backlog);
+        let (initial_backlog_overflow_sink, initial_backlog_overflow_stream) =
+            watch::channel(None);
         let (conn_map_cmd_tx, conn_map_cmd_rx) = connection_map_command_channel(
             config.connection_map_command_capacity,
         );
@@ -359,6 +369,8 @@ where
                 conn_map_cmd_rx,
                 conn_map_cmd_buf: Vec::with_capacity(CONN_MAP_CMD_BATCH_SIZE),
                 accept_sink,
+                initial_backlog_overflow_sink,
+                initial_backlog_overflow_total: 0,
                 #[cfg(target_os = "linux")]
                 udp_drop_count: 0,
                 #[cfg(target_os = "linux")]
@@ -388,6 +400,7 @@ where
 
             },
             accept_stream,
+            initial_backlog_overflow_stream,
         )
     }
 
@@ -471,11 +484,27 @@ where
             // don't create new connections if we're shutting down.
             return Ok(());
         };
-        let Ok(send_permit) = self.accept_sink.try_reserve() else {
-            // drop the connection if the backlog is full. the client will retry.
-            return Err(
-                labels::QuicInvalidInitialPacketError::AcceptQueueOverflow.into(),
-            );
+        let send_permit = match self.accept_sink.try_reserve() {
+            Ok(send_permit) => send_permit,
+            Err(mpsc::error::TrySendError::Closed(())) => return Ok(()),
+            Err(mpsc::error::TrySendError::Full(())) => {
+                self.initial_backlog_overflow_total =
+                    self.initial_backlog_overflow_total.saturating_add(1);
+                self.initial_backlog_overflow_sink.send_replace(Some(
+                    InitialBacklogOverflow {
+                        local_addr,
+                        peer_addr,
+                        rejected_total: self.initial_backlog_overflow_total,
+                        backlog_capacity: self.config.listen_backlog,
+                    },
+                ));
+                // Drop the connection if the backlog is full. The client can
+                // retry while the application receives the bounded event.
+                return Err(
+                    labels::QuicInvalidInitialPacketError::AcceptQueueOverflow
+                        .into(),
+                );
+            },
         };
 
         let scid = conn.source_id().into_owned();
@@ -1109,6 +1138,26 @@ mod tests {
         let _ = h3i::client::sync_client::connect(h3i_config, actions, None);
     }
 
+    fn test_new_connection(
+        id: u8, local_addr: SocketAddr, peer_addr: SocketAddr,
+    ) -> NewConnection {
+        let mut config =
+            crate::http3::driver::test_utils::default_quiche_config();
+        let scid_bytes = [id; 16];
+        let scid = ConnectionId::from_ref(&scid_bytes);
+        let conn = quiche::accept_with_buf_factory::<
+            crate::buf_factory::BufFactory,
+        >(&scid, None, local_addr, peer_addr, &mut config)
+        .unwrap();
+        NewConnection {
+            conn: Box::new(conn),
+            pending_cid: None,
+            initial_pkt: None,
+            cid_generator: None,
+            handshake_start_time: Instant::now(),
+        }
+    }
+
     #[test]
     fn bounded_connection_map_lane_rejects_cap_plus_one_and_latches_overload() {
         let (sender, receiver) = connection_map_command_channel(Some(2));
@@ -1139,6 +1188,86 @@ mod tests {
 
         assert_eq!(receiver.len(), 1024);
         assert!(!receiver.overloaded());
+    }
+
+    #[tokio::test]
+    async fn accept_backlog_overflow_is_typed_bounded_and_recovers() {
+        let quic_settings = QuicSettings {
+            listen_backlog: 1,
+            ..Default::default()
+        };
+        let tls_cert_settings = TlsCertificatePaths {
+            cert: TEST_CERT_FILE,
+            private_key: TEST_KEY_FILE,
+            kind: crate::settings::CertificateKind::X509,
+        };
+        let params = ConnectionParams::new_server(
+            quic_settings,
+            tls_cert_settings,
+            Hooks::default(),
+        );
+        let config = Config::new(&params, SocketCapabilities::default()).unwrap();
+        let local_addr = SocketAddr::from(([127, 0, 0, 1], 4433));
+        let first_peer = SocketAddr::from(([127, 0, 0, 1], 5001));
+        let second_peer = SocketAddr::from(([127, 0, 0, 1], 5002));
+        let third_peer = SocketAddr::from(([127, 0, 0, 1], 5003));
+        let fourth_peer = SocketAddr::from(([127, 0, 0, 1], 5004));
+        let (mut router, mut accepted, overflow_receiver) =
+            InboundPacketRouter::new(
+                config,
+                Arc::new(NoopDatagramSender),
+                AlwaysReadyReceiver,
+                local_addr,
+                NoopInitialHandler,
+                DefaultMetrics,
+            );
+        let mut overflows =
+            crate::InitialBacklogOverflowEvents::new(overflow_receiver);
+
+        router
+            .spawn_new_connection(
+                test_new_connection(1, local_addr, first_peer),
+                local_addr,
+                first_peer,
+            )
+            .unwrap();
+        assert!(router
+            .spawn_new_connection(
+                test_new_connection(2, local_addr, second_peer),
+                local_addr,
+                second_peer,
+            )
+            .is_err());
+        assert!(router
+            .spawn_new_connection(
+                test_new_connection(3, local_addr, third_peer),
+                local_addr,
+                third_peer,
+            )
+            .is_err());
+
+        assert_eq!(
+            overflows.try_recv(),
+            Some(InitialBacklogOverflow {
+                local_addr,
+                peer_addr: third_peer,
+                rejected_total: 2,
+                backlog_capacity: 1,
+            })
+        );
+        assert_eq!(overflows.try_recv(), None);
+
+        drop(accepted.recv().await.unwrap().unwrap());
+        router
+            .spawn_new_connection(
+                test_new_connection(4, local_addr, fourth_peer),
+                local_addr,
+                fourth_peer,
+            )
+            .unwrap();
+        assert!(accepted.try_recv().unwrap().is_ok());
+        assert_eq!(router.initial_backlog_overflow_total, 2);
+        assert_eq!(overflows.try_recv(), None);
     }
 
     #[tokio::test]
@@ -1190,14 +1319,15 @@ mod tests {
             DefaultMetrics,
         );
 
-        let (socket_driver, mut incoming) = InboundPacketRouter::new(
-            config,
-            socket_tx,
-            socket_rx,
-            local_addr,
-            acceptor,
-            DefaultMetrics,
-        );
+        let (socket_driver, mut incoming, _initial_backlog_overflows) =
+            InboundPacketRouter::new(
+                config,
+                socket_tx,
+                socket_rx,
+                local_addr,
+                acceptor,
+                DefaultMetrics,
+            );
         tokio::spawn(socket_driver);
 
         // Start a request and drop it after connection establishment
@@ -1275,14 +1405,15 @@ mod tests {
         let config = Config::new(&params, SocketCapabilities::default()).unwrap();
         let local_addr = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0);
 
-        let (mut ipr, accept_stream) = InboundPacketRouter::new(
-            config,
-            Arc::new(NoopDatagramSender),
-            AlwaysReadyReceiver,
-            local_addr,
-            NoopInitialHandler,
-            DefaultMetrics,
-        );
+        let (mut ipr, accept_stream, _initial_backlog_overflows) =
+            InboundPacketRouter::new(
+                config,
+                Arc::new(NoopDatagramSender),
+                AlwaysReadyReceiver,
+                local_addr,
+                NoopInitialHandler,
+                DefaultMetrics,
+            );
         let conn_map_cmd_tx = ipr.conn_map_cmd_tx.clone();
 
         // Keep polling the IPR in a busy loop until it resolves

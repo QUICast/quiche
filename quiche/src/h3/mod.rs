@@ -1004,7 +1004,21 @@ pub enum WebTransportStreamDirection {
     Unidirectional,
 }
 
-/// A locally reserved draft-16 WebTransport stream and its encoded prefix.
+/// Reset behavior for a locally initiated WebTransport stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WebTransportStreamResetMode {
+    /// Use `RESET_STREAM_AT` to deliver the association prefix reliably.
+    ReliablePrefixReset,
+
+    /// Use ordinary `RESET_STREAM` without reliable prefix delivery.
+    ///
+    /// This mode supports peers that implement an older WebTransport profile
+    /// without negotiating `RESET_STREAM_AT`. It does not satisfy draft-16's
+    /// reliable association-prefix requirement.
+    StandardReset,
+}
+
+/// A locally reserved WebTransport stream and its encoded prefix.
 ///
 /// The reservation consumes the physical stream ID from HTTP/3's shared local
 /// stream namespace immediately. This prevents a later request or extension
@@ -1014,16 +1028,21 @@ pub enum WebTransportStreamDirection {
 /// been accepted by QUIC.
 ///
 /// Dropping an unfinished reservation does not roll back the stream ID, even
-/// when no prefix bytes were accepted. Callers must eventually finish the
-/// reliable prefix and reset the stream, or commit and close the stream.
+/// when no prefix bytes were accepted. In [`ReliablePrefixReset`] mode callers
+/// must eventually finish the reliable prefix and reset the stream, or commit
+/// and close the stream. A [`StandardReset`] reservation can instead be reset
+/// immediately, without guaranteeing delivery of the association prefix.
 ///
 /// [`prefix()`]: Self::prefix
+/// [`ReliablePrefixReset`]: WebTransportStreamResetMode::ReliablePrefixReset
+/// [`StandardReset`]: WebTransportStreamResetMode::StandardReset
 #[derive(Debug)]
 #[must_use = "a WebTransport stream reservation must be committed or settled"]
 pub struct WebTransportStreamReservation {
     stream_id: u64,
     session_id: u64,
     direction: WebTransportStreamDirection,
+    reset_mode: WebTransportStreamResetMode,
     prefix: [u8; 16],
     prefix_len: usize,
 }
@@ -1044,12 +1063,21 @@ impl WebTransportStreamReservation {
         self.direction
     }
 
+    /// Returns the reset behavior fixed when this stream was reserved.
+    pub fn reset_mode(&self) -> WebTransportStreamResetMode {
+        self.reset_mode
+    }
+
     /// Returns the exact signal/type and Session ID bytes to write once.
     pub fn prefix(&self) -> &[u8] {
         &self.prefix[..self.prefix_len]
     }
 
-    /// Returns the reliable prefix size required when the initiator resets.
+    /// Returns the encoded association-prefix size.
+    ///
+    /// This is also the required Reliable Size in [`ReliablePrefixReset`] mode.
+    ///
+    /// [`ReliablePrefixReset`]: WebTransportStreamResetMode::ReliablePrefixReset
     pub fn prefix_len(&self) -> usize {
         self.prefix_len
     }
@@ -2206,6 +2234,27 @@ impl Connection {
         &mut self, conn: &mut super::Connection<F>, session_id: u64,
         direction: WebTransportStreamDirection,
     ) -> Result<WebTransportStreamReservation> {
+        self.reserve_webtransport_stream_with_reset_mode(
+            conn,
+            session_id,
+            direction,
+            WebTransportStreamResetMode::ReliablePrefixReset,
+        )
+    }
+
+    /// Reserves a local WebTransport stream with explicit reset behavior.
+    ///
+    /// [`WebTransportStreamResetMode::ReliablePrefixReset`] requires the peer
+    /// to have negotiated `RESET_STREAM_AT`. [`StandardReset`] supports older
+    /// interoperable peers but cannot guarantee delivery of an association
+    /// prefix that the peer has not received before a reset.
+    ///
+    /// [`StandardReset`]: WebTransportStreamResetMode::StandardReset
+    pub fn reserve_webtransport_stream_with_reset_mode<F: BufFactory>(
+        &mut self, conn: &mut super::Connection<F>, session_id: u64,
+        direction: WebTransportStreamDirection,
+        reset_mode: WebTransportStreamResetMode,
+    ) -> Result<WebTransportStreamReservation> {
         if conn.is_server != self.is_server {
             return Err(Error::InternalError);
         }
@@ -2254,10 +2303,15 @@ impl Connection {
         out.put_varint(session_id)?;
         let prefix_len = out.off();
 
-        conn.stream_reserve_automatic_reset_reliable_size(
-            stream_id,
-            prefix_len as u64,
-        )?;
+        match reset_mode {
+            WebTransportStreamResetMode::ReliablePrefixReset => conn
+                .stream_reserve_automatic_reset_reliable_size(
+                    stream_id,
+                    prefix_len as u64,
+                )?,
+            WebTransportStreamResetMode::StandardReset =>
+                conn.stream_reserve_local(stream_id)?,
+        }
 
         match direction {
             WebTransportStreamDirection::Bidirectional if self.is_server =>
@@ -2272,6 +2326,7 @@ impl Connection {
             stream_id,
             session_id,
             direction,
+            reset_mode,
             prefix,
             prefix_len,
         })
@@ -2301,10 +2356,14 @@ impl Connection {
             return Err(Error::StreamBlocked);
         }
 
-        conn.stream_set_automatic_reset_reliable_size(
-            reservation.stream_id,
-            reservation.prefix_len as u64,
-        )?;
+        if reservation.reset_mode ==
+            WebTransportStreamResetMode::ReliablePrefixReset
+        {
+            conn.stream_set_automatic_reset_reliable_size(
+                reservation.stream_id,
+                reservation.prefix_len as u64,
+            )?;
+        }
         conn.stream_detach_from_app_proto(reservation.stream_id);
         Ok(())
     }
@@ -9780,6 +9839,101 @@ mod tests {
         ));
         assert_eq!(s.server.next_server_bidi_stream_id, next_stream_id);
         assert!(s.pipe.server.streams.get(next_stream_id).is_none());
+    }
+
+    #[test]
+    fn webtransport_standard_reset_reserves_without_peer_extension() {
+        let (mut client_config, mut h3_config) =
+            Session::default_configs().unwrap();
+        let (mut server_config, _) = Session::default_configs().unwrap();
+        for config in [&mut client_config, &mut server_config] {
+            config.set_initial_max_data(1_000_000);
+            config.set_initial_max_streams_bidi(64);
+            config.set_initial_max_streams_uni(64);
+        }
+        server_config.enable_reset_stream_at(true);
+        h3_config
+            .set_additional_settings(vec![(SETTINGS_WT_ENABLED, 1)])
+            .unwrap();
+        h3_config.enable_webtransport_stream_classification(true);
+
+        let pipe = crate::test_utils::Pipe::with_client_and_server_config(
+            &mut client_config,
+            &mut server_config,
+        )
+        .unwrap();
+        let mut s = Session {
+            client: Connection::new(
+                &h3_config,
+                false,
+                pipe.client.dgram_enabled(),
+            )
+            .unwrap(),
+            server: Connection::new(
+                &h3_config,
+                true,
+                pipe.server.dgram_enabled(),
+            )
+            .unwrap(),
+            pipe,
+        };
+        s.handshake().unwrap();
+        assert!(!s.pipe.server.reset_stream_at_enabled());
+
+        let next_stream_id = s.server.next_server_bidi_stream_id;
+        assert!(matches!(
+            s.server.reserve_webtransport_stream(
+                &mut s.pipe.server,
+                0,
+                WebTransportStreamDirection::Bidirectional,
+            ),
+            Err(Error::TransportError(crate::Error::InvalidState))
+        ));
+        assert_eq!(s.server.next_server_bidi_stream_id, next_stream_id);
+
+        let reservation = s
+            .server
+            .reserve_webtransport_stream_with_reset_mode(
+                &mut s.pipe.server,
+                0,
+                WebTransportStreamDirection::Bidirectional,
+                WebTransportStreamResetMode::StandardReset,
+            )
+            .unwrap();
+        assert_eq!(reservation.stream_id(), next_stream_id);
+        assert_eq!(
+            reservation.reset_mode(),
+            WebTransportStreamResetMode::StandardReset
+        );
+        assert_eq!(
+            s.pipe.server.stream_send(
+                reservation.stream_id(),
+                &reservation.prefix()[..1],
+                false,
+            ),
+            Ok(1)
+        );
+        assert_eq!(
+            s.pipe.server.stream_shutdown(
+                reservation.stream_id(),
+                crate::Shutdown::Write,
+                91,
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            s.pipe
+                .server
+                .streams
+                .get(reservation.stream_id())
+                .unwrap()
+                .send
+                .pending_reset(),
+            Some(crate::stream::StreamReset::Reset {
+                error_code: 91,
+                final_size: 0,
+            })
+        );
     }
 
     #[test]

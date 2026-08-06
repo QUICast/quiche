@@ -7298,16 +7298,27 @@ impl<F: BufFactory> Connection<F> {
         if !self.peer_transport_params.reset_stream_at {
             return Err(Error::InvalidState);
         }
-        if stream_id > octets::MAX_VAR_INT || reliable_size > octets::MAX_VAR_INT
-        {
+        if reliable_size > octets::MAX_VAR_INT {
+            return Err(Error::InvalidFrame);
+        }
+        self.stream_reserve_local(stream_id)?;
+        let stream = self
+            .streams
+            .get_mut(stream_id)
+            .ok_or(Error::InvalidStreamState(stream_id))?;
+        stream.set_automatic_reset_reliable_size(reliable_size)
+    }
+
+    pub(crate) fn stream_reserve_local(&mut self, stream_id: u64) -> Result<()> {
+        if stream_id > octets::MAX_VAR_INT {
             return Err(Error::InvalidFrame);
         }
         if !stream::is_local(stream_id, self.is_server) {
             return Err(Error::InvalidStreamState(stream_id));
         }
 
-        let stream = self.get_or_create_stream(stream_id, true)?;
-        stream.set_automatic_reset_reliable_size(reliable_size)
+        self.get_or_create_stream(stream_id, true)?;
+        Ok(())
     }
 
     pub(crate) fn stream_send_offset(&self, stream_id: u64) -> Option<u64> {

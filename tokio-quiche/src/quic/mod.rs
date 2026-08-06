@@ -265,14 +265,15 @@ where
     let socket_tx = Arc::new(socket.send);
     let socket_rx = socket.recv;
 
-    let (router, mut quic_connection_stream) = InboundPacketRouter::new(
-        client_config,
-        Arc::clone(&socket_tx),
-        socket_rx,
-        socket.local_addr,
-        ClientConnector::new(socket_tx, Box::new(quiche_conn)),
-        DefaultMetrics,
-    );
+    let (router, mut quic_connection_stream, _initial_backlog_overflows) =
+        InboundPacketRouter::new(
+            client_config,
+            Arc::clone(&socket_tx),
+            socket_rx,
+            socket.local_addr,
+            ClientConnector::new(socket_tx, Box::new(quiche_conn)),
+            DefaultMetrics,
+        );
 
     // drive the packet router:
     tokio::spawn(async move {
@@ -334,14 +335,15 @@ where
         metrics.clone(),
     );
 
-    let (socket_driver, accept_stream) = InboundPacketRouter::new(
-        config,
-        socket_tx,
-        socket_rx,
-        local_addr,
-        acceptor,
-        metrics.clone(),
-    );
+    let (socket_driver, accept_stream, initial_backlog_overflows) =
+        InboundPacketRouter::new(
+            config,
+            socket_tx,
+            socket_rx,
+            local_addr,
+            acceptor,
+            metrics.clone(),
+        );
 
     crate::metrics::tokio_task::spawn("quic_udp_listener", metrics, async move {
         match socket_driver.await {
@@ -353,5 +355,8 @@ where
             },
         }
     });
-    Ok(QuicConnectionStream::new(accept_stream))
+    Ok(QuicConnectionStream::new(
+        accept_stream,
+        initial_backlog_overflows,
+    ))
 }

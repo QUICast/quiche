@@ -252,6 +252,7 @@ impl ClientHooks {
                     .ok_or_else(H3Driver::<Self>::connection_not_present)?,
                 qconn,
                 &request.headers,
+                driver.allows_standard_webtransport_reset(),
             ) {
                 WebTransportRequirements::Pending => {
                     driver.hooks.queued_webtransport_requests.push_back(request);
@@ -523,6 +524,7 @@ impl DriverHooks for ClientHooks {
                     .ok_or_else(H3Driver::<Self>::connection_not_present)?,
                 qconn,
                 &request.headers,
+                driver.allows_standard_webtransport_reset(),
             );
             match requirements {
                 WebTransportRequirements::Met(_) => {

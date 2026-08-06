@@ -238,6 +238,7 @@ impl ServerHooks {
                     .ok_or_else(H3Driver::<Self>::connection_not_present)?,
                 qconn,
                 &headers,
+                driver.allows_standard_webtransport_reset(),
             );
             match requirements {
                 WebTransportRequirements::Pending => {
@@ -426,6 +427,7 @@ impl DriverHooks for ServerHooks {
                 .ok_or_else(H3Driver::<Self>::connection_not_present)?,
             qconn,
             &request.headers,
+            driver.allows_standard_webtransport_reset(),
         );
         match requirements {
             WebTransportRequirements::Pending => {
