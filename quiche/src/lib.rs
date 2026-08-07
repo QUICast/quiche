@@ -555,20 +555,135 @@ pub enum Shutdown {
     Write = 1,
 }
 
+/// Exact causes preventing a QUIC stream write from making progress.
+///
+/// Multiple fields can be true when independent limits are exhausted in the
+/// same transport turn.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct StreamSendBlockReasons {
+    /// The stream's MAX_STREAM_DATA credit is exhausted.
+    pub stream_flow_control: bool,
+
+    /// The connection's MAX_DATA credit is exhausted.
+    pub connection_flow_control: bool,
+
+    /// The active path's congestion-window admission budget is exhausted.
+    pub congestion_control: bool,
+
+    /// No active network path is available for congestion admission.
+    pub active_path_unavailable: bool,
+
+    /// The configured send-capacity factor exhausted admission before its
+    /// underlying connection and congestion limits.
+    pub send_capacity_factor: bool,
+
+    /// The configured stream-send retained-storage bound rejected the write.
+    pub stream_send_retention: bool,
+}
+
+/// How a caller can safely retry a zero-progress stream write.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StreamSendRetryDisposition {
+    /// An exact stream-writable transition is produced after every reported
+    /// transport limit has cleared.
+    WaitForTransportWritable,
+
+    /// Local configuration or retained-storage state must be changed or
+    /// independently observed before retrying.
+    StateChangeRequired,
+}
+
+impl StreamSendBlockReasons {
+    /// Returns true when no blocking cause is present.
+    pub fn is_empty(self) -> bool {
+        self == Self::default()
+    }
+
+    /// Returns the safe retry disposition for this exact cause set.
+    ///
+    /// Stream and connection flow control and congestion control participate
+    /// in the connection's exact writable-stream wake path. Retention,
+    /// configured send-capacity policy, and unavailable-path state do not have
+    /// an equivalent guaranteed wake. Any such cause therefore makes the
+    /// complete attempt state-change-required, even when transport causes are
+    /// simultaneously present. An empty cause set also fails closed.
+    pub fn retry_disposition(self) -> StreamSendRetryDisposition {
+        if self.is_empty() ||
+            self.active_path_unavailable ||
+            self.send_capacity_factor ||
+            self.stream_send_retention
+        {
+            return StreamSendRetryDisposition::StateChangeRequired;
+        }
+
+        StreamSendRetryDisposition::WaitForTransportWritable
+    }
+}
+
+/// Result of one detailed QUIC stream write attempt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StreamSendOutcome {
+    /// The transport accepted this many payload bytes and accepted FIN when it
+    /// was requested with the complete payload. `Accepted(0)` can therefore
+    /// commit a zero-byte FIN.
+    Accepted(usize),
+
+    /// The transport accepted neither payload nor FIN for the exact reasons.
+    /// [`StreamSendBlockReasons::retry_disposition()`] determines whether an
+    /// exact transport writable wake exists for the complete cause set.
+    Blocked(StreamSendBlockReasons),
+}
+
 /// Non-consuming status of a QUIC stream's local send side.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StreamSendStatus {
-    /// The send side can currently accept the given number of bytes.
+    /// The send side has the given positive transport capacity.
+    ///
+    /// Payload-dependent retained-storage admission can still reject a
+    /// particular write.
     Writable(usize),
 
-    /// Flow or congestion control currently prevents progress.
-    Blocked,
+    /// The exact currently observable limits preventing transport progress.
+    ///
+    /// A prior payload-dependent retained-storage rejection is intentionally
+    /// not inferred by this non-consuming status API.
+    Blocked(StreamSendBlockReasons),
 
     /// The peer sent STOP_SENDING with the given application error code.
     Stopped(u64),
 
     /// FIN or a locally initiated reset closed the send side.
     Closed,
+}
+
+enum StreamDoSendOutcome<T> {
+    Accepted(T),
+    Blocked(StreamSendBlockReasons),
+}
+
+fn stream_send_block_reasons_for_state(
+    stream_flow_control: bool, aggregate_blocked: bool,
+    active_path_available: bool, connection_remaining: u64,
+    congestion_remaining: usize, send_capacity_factor: f64,
+) -> StreamSendBlockReasons {
+    let connection_flow_control = aggregate_blocked && connection_remaining == 0;
+    let congestion_control =
+        aggregate_blocked && active_path_available && congestion_remaining == 0;
+    let factor_forces_zero =
+        send_capacity_factor.is_nan() || send_capacity_factor <= 0.0;
+    let factor_exhausted_early = active_path_available &&
+        connection_remaining > 0 &&
+        congestion_remaining > 0;
+
+    StreamSendBlockReasons {
+        stream_flow_control,
+        connection_flow_control,
+        congestion_control,
+        active_path_unavailable: aggregate_blocked && !active_path_available,
+        send_capacity_factor: aggregate_blocked &&
+            (factor_forces_zero || factor_exhausted_early),
+        stream_send_retention: false,
+    }
 }
 
 /// Direction whose peer stream-count limit increased.
@@ -1642,6 +1757,9 @@ where
     /// Number of stream data bytes that can be buffered.
     tx_cap: usize,
 
+    /// Unscaled congestion-window admission remaining in `tx_cap`.
+    tx_congestion_cap: usize,
+
     /// The send capacity factor.
     tx_cap_factor: f64,
 
@@ -2452,6 +2570,7 @@ impl<F: BufFactory> Connection<F> {
             should_send_max_streams_uni: false,
 
             tx_cap: 0,
+            tx_congestion_cap: 0,
             tx_cap_factor: config.tx_cap_factor,
 
             tx_data: 0,
@@ -6578,7 +6697,30 @@ impl<F: BufFactory> Connection<F> {
     pub fn stream_send(
         &mut self, stream_id: u64, buf: &[u8], fin: bool,
     ) -> Result<usize> {
-        self.stream_do_send(
+        match self.stream_send_detailed(stream_id, buf, fin)? {
+            StreamSendOutcome::Accepted(accepted) => Ok(accepted),
+            StreamSendOutcome::Blocked(_) => Err(Error::Done),
+        }
+    }
+
+    /// Writes data to a stream and reports exact zero-progress causes.
+    ///
+    /// This has the same write, terminal, and error semantics as
+    /// [`stream_send()`], except temporary zero progress is returned as
+    /// [`StreamSendOutcome::Blocked`] instead of [`Error::Done`]. Independent
+    /// stream flow-control, connection flow-control, and congestion limits are
+    /// reported together when they are simultaneously exhausted. Local
+    /// retention, path, and configured send-capacity limits are kept distinct.
+    ///
+    /// A writable notification only means the caller can retry. Recovery from
+    /// a previously reported block is established only by a later
+    /// [`StreamSendOutcome::Accepted`] result.
+    ///
+    /// [`stream_send()`]: Self::stream_send
+    pub fn stream_send_detailed(
+        &mut self, stream_id: u64, buf: &[u8], fin: bool,
+    ) -> Result<StreamSendOutcome> {
+        match self.stream_do_send(
             stream_id,
             buf,
             fin,
@@ -6588,7 +6730,12 @@ impl<F: BufFactory> Connection<F> {
              fin: bool| {
                 stream.send.write(&buf[..cap], fin).map(|v| (v, v))
             },
-        )
+        )? {
+            StreamDoSendOutcome::Accepted(accepted) =>
+                Ok(StreamSendOutcome::Accepted(accepted)),
+            StreamDoSendOutcome::Blocked(reasons) =>
+                Ok(StreamSendOutcome::Blocked(reasons)),
+        }
     }
 
     /// Writes data to a stream with zero copying, instead, it appends the
@@ -6605,7 +6752,7 @@ impl<F: BufFactory> Connection<F> {
     where
         F::Buf: BufSplit,
     {
-        self.stream_do_send(
+        match self.stream_do_send(
             stream_id,
             buf,
             fin,
@@ -6616,12 +6763,15 @@ impl<F: BufFactory> Connection<F> {
                 let (sent, remaining) = stream.send.append_buf(buf, cap, fin)?;
                 Ok((sent, (sent, remaining)))
             },
-        )
+        )? {
+            StreamDoSendOutcome::Accepted(accepted) => Ok(accepted),
+            StreamDoSendOutcome::Blocked(_) => Err(Error::Done),
+        }
     }
 
     fn stream_do_send<B, R, SND>(
         &mut self, stream_id: u64, buf: B, fin: bool, write_fn: SND,
-    ) -> Result<R>
+    ) -> Result<StreamDoSendOutcome<R>>
     where
         B: AsRef<[u8]>,
         SND: FnOnce(&mut stream::Stream<F>, B, usize, bool) -> Result<(usize, R)>,
@@ -6645,6 +6795,7 @@ impl<F: BufFactory> Connection<F> {
         }
 
         let cap = self.tx_cap;
+        let mut block_reasons = self.stream_send_block_reasons(false);
 
         // Get existing stream or create a new one.
         let stream = match self.get_or_create_stream(stream_id, true) {
@@ -6686,30 +6837,45 @@ impl<F: BufFactory> Connection<F> {
 
         // Return early if the stream has been stopped, and collect its state
         // if complete.
-        if let Err(Error::StreamStopped(e)) = stream.send.cap() {
-            let local = stream.local;
-            self.streams.remove_send_terminal(stream_id);
-            self.streams.remove_writable(&priority_key);
+        let stream_cap = match stream.send.cap() {
+            Ok(cap) => cap,
+            Err(Error::StreamStopped(e)) => {
+                let local = stream.local;
+                self.streams.remove_send_terminal(stream_id);
+                self.streams.remove_writable(&priority_key);
 
-            // Only collect the stream if it is complete and not readable.
-            // If it is readable, it will get collected when stream_recv()
-            // is used.
-            //
-            // The stream can't be writable if it has been stopped.
-            if is_complete && !is_readable {
-                self.streams.collect(stream_id, local);
-            }
+                // Only collect the stream if it is complete and not readable.
+                // If it is readable, it will get collected when stream_recv()
+                // is used.
+                //
+                // The stream can't be writable if it has been stopped.
+                if is_complete && !is_readable {
+                    self.streams.collect(stream_id, local);
+                }
 
-            return Err(Error::StreamStopped(e));
+                return Err(Error::StreamStopped(e));
+            },
+            Err(e) => return Err(e),
         };
+
+        if stream.send.is_shutdown() ||
+            (stream.send.is_fin() && (len != 0 || !fin))
+        {
+            return Err(Error::FinalSize);
+        }
 
         // Truncate the input buffer based on the connection's send capacity if
         // necessary.
         //
-        // When the cap is zero, the method returns Ok(0) *only* when the passed
-        // buffer is empty. We return Error::Done otherwise.
-        if cap == 0 && len > 0 {
-            if was_writable {
+        // A zero-capacity write reports Blocked unless the input is empty. An
+        // empty input can still commit FIN and returns Accepted(0).
+        if len > 0 && (cap == 0 || stream_cap == 0) {
+            block_reasons.stream_flow_control = stream_cap == 0;
+            if block_reasons.is_empty() {
+                return Err(Error::InvalidState);
+            }
+
+            if cap == 0 && was_writable {
                 // When `stream_writable_next()` returns a stream, the writable
                 // mark is removed, but because the stream is blocked by the
                 // connection-level send capacity it won't be marked as writable
@@ -6719,7 +6885,7 @@ impl<F: BufFactory> Connection<F> {
                 self.streams.insert_writable(&priority_key);
             }
 
-            return Err(Error::Done);
+            return Ok(StreamDoSendOutcome::Blocked(block_reasons));
         }
 
         let (cap, fin, blocked_by_cap) = if cap < len {
@@ -6730,6 +6896,16 @@ impl<F: BufFactory> Connection<F> {
 
         let (sent, ret) = match write_fn(stream, buf, cap, fin) {
             Ok(v) => v,
+
+            Err(Error::Done) => {
+                self.streams.remove_writable(&priority_key);
+                return Ok(StreamDoSendOutcome::Blocked(
+                    StreamSendBlockReasons {
+                        stream_send_retention: true,
+                        ..StreamSendBlockReasons::default()
+                    },
+                ));
+            },
 
             Err(e) => {
                 self.streams.remove_writable(&priority_key);
@@ -6782,6 +6958,7 @@ impl<F: BufFactory> Connection<F> {
         }
 
         self.tx_cap -= sent;
+        self.tx_congestion_cap = self.tx_congestion_cap.saturating_sub(sent);
 
         self.tx_data += sent as u64;
 
@@ -6808,7 +6985,10 @@ impl<F: BufFactory> Connection<F> {
         });
 
         if sent == 0 && cap > 0 {
-            return Err(Error::Done);
+            // A non-empty append at the stream's current end cannot already be
+            // acknowledged. Treat violating that invariant as an internal
+            // state error rather than fabricating a transport block reason.
+            return Err(Error::InvalidState);
         }
 
         if incremental && writable {
@@ -6826,7 +7006,7 @@ impl<F: BufFactory> Connection<F> {
             )?;
         }
 
-        Ok(ret)
+        Ok(StreamDoSendOutcome::Accepted(ret))
     }
 
     /// Sets the priority for a stream.
@@ -7210,12 +7390,27 @@ impl<F: BufFactory> Connection<F> {
         Err(Error::InvalidStreamState(stream_id))
     }
 
+    fn stream_send_block_reasons(
+        &self, stream_flow_control: bool,
+    ) -> StreamSendBlockReasons {
+        stream_send_block_reasons_for_state(
+            stream_flow_control,
+            self.tx_cap == 0,
+            self.paths.get_active().is_ok(),
+            self.max_tx_data.saturating_sub(self.tx_data),
+            self.tx_congestion_cap,
+            self.tx_cap_factor,
+        )
+    }
+
     /// Returns the local send side's current status without consuming it.
     ///
     /// Unlike [`stream_capacity()`], observing a peer's STOP_SENDING does not
     /// collect stream state. This is useful for event-driven adapters that must
     /// wake an exact stream operation before the application consumes the
-    /// terminal signal.
+    /// terminal signal. This method has no attempted payload length, so it
+    /// cannot prove that retained-storage capacity changed after a detailed
+    /// write reported [`StreamSendBlockReasons::stream_send_retention`].
     ///
     /// [`stream_capacity()`]: Self::stream_capacity
     pub fn stream_send_status(&self, stream_id: u64) -> Result<StreamSendStatus> {
@@ -7231,9 +7426,14 @@ impl<F: BufFactory> Connection<F> {
             return Ok(StreamSendStatus::Closed);
         }
 
-        let capacity = cmp::min(self.tx_cap, stream.send.cap()?);
+        let stream_capacity = stream.send.cap()?;
+        let capacity = cmp::min(self.tx_cap, stream_capacity);
         if capacity == 0 {
-            return Ok(StreamSendStatus::Blocked);
+            let reasons = self.stream_send_block_reasons(stream_capacity == 0);
+            if reasons.is_empty() {
+                return Err(Error::InvalidState);
+            }
+            return Ok(StreamSendStatus::Blocked(reasons));
         }
 
         Ok(StreamSendStatus::Writable(capacity))
@@ -9236,6 +9436,7 @@ impl<F: BufFactory> Connection<F> {
 
         if transmit {
             self.tx_cap = self.tx_cap.saturating_sub(len);
+            self.tx_congestion_cap = self.tx_congestion_cap.saturating_sub(len);
             self.streams.add_tx_buffered(len);
         } else {
             self.multicast_stream_withheld_bytes =
@@ -9260,6 +9461,7 @@ impl<F: BufFactory> Connection<F> {
 
         let retransmitted = stream.send.retransmit(range.offset, range.len);
         self.tx_cap = self.tx_cap.saturating_sub(range.len);
+        self.tx_congestion_cap = self.tx_congestion_cap.saturating_sub(range.len);
 
         let priority_key = Arc::clone(&stream.priority_key);
         let flushable = stream.is_flushable() || (range.len == 0 && range.fin);
@@ -11863,6 +12065,9 @@ impl<F: BufFactory> Connection<F> {
             Ok(p) => p.recovery.cwnd_available() as u64,
             Err(_) => 0,
         };
+
+        self.tx_congestion_cap =
+            usize::try_from(cwin_available).unwrap_or(usize::MAX);
 
         let cap =
             cmp::min(cwin_available, self.max_tx_data - self.tx_data) as usize;

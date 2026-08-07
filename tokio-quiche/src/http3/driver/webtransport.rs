@@ -330,6 +330,8 @@ pub enum WebTransportSelectionError {
         /// Actual owning Session ID.
         owner_session_id: u64,
     },
+    /// A one-use retry token belongs to another controller connection.
+    ForeignController,
     /// The requested operation is invalid for this stream direction.
     WrongDirection,
     /// A configured local ownership bound was reached.
@@ -372,7 +374,10 @@ pub enum WebTransportStreamWriteOutcome {
         /// Whether FIN was accepted with the final payload byte.
         fin_accepted: bool,
     },
-    /// Flow control currently prevents any progress.
+    /// Transport capacity currently prevents any progress.
+    ///
+    /// This `Bytes` compatibility outcome omits the exact reasons. Use the
+    /// generic write-lease API when authoritative block evidence is required.
     Blocked {
         /// Entire unaccepted payload.
         data: Bytes,
@@ -499,6 +504,71 @@ pub trait WebTransportStreamWriteLease: Send + 'static {
     }
 }
 
+/// One-use retry context for an exact zero-progress selected-stream write.
+///
+/// The value is intentionally neither cloneable nor constructible by callers.
+/// Passing it to [`WebTransportController::wait_stream_writable()`] binds the
+/// wait to the exact controller turn that returned the owner, even when other
+/// writes target the same physical stream. The token privately retains one
+/// zero-byte slot in the bounded write-lease accounting envelope until it is
+/// consumed or dropped.
+pub struct WebTransportStreamWriteRetry {
+    session_id: u64,
+    stream_id: u64,
+    reasons: quiche::StreamSendBlockReasons,
+    disposition: quiche::StreamSendRetryDisposition,
+    reservation: WriteLeaseAccountingGuard,
+}
+
+impl fmt::Debug for WebTransportStreamWriteRetry {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WebTransportStreamWriteRetry")
+            .field("session_id", &self.session_id)
+            .field("stream_id", &self.stream_id)
+            .field("reasons", &self.reasons)
+            .field("disposition", &self.disposition)
+            .finish()
+    }
+}
+
+impl WebTransportStreamWriteRetry {
+    /// Returns the exact WebTransport Session ID.
+    pub fn session_id(&self) -> u64 {
+        self.session_id
+    }
+
+    /// Returns the exact physical QUIC stream ID.
+    pub fn stream_id(&self) -> u64 {
+        self.stream_id
+    }
+
+    /// Returns every simultaneous cause from the blocked write turn.
+    pub fn reasons(&self) -> quiche::StreamSendBlockReasons {
+        self.reasons
+    }
+
+    /// Returns the safe retry disposition for the complete cause set.
+    pub fn disposition(&self) -> quiche::StreamSendRetryDisposition {
+        self.disposition
+    }
+
+    fn belongs_to(&self, accounting: &Arc<WriteLeaseAccounting>) -> bool {
+        Arc::ptr_eq(&self.reservation.accounting, accounting)
+    }
+}
+
+fn stream_send_state_change_reasons(
+    reasons: quiche::StreamSendBlockReasons,
+) -> quiche::StreamSendBlockReasons {
+    quiche::StreamSendBlockReasons {
+        active_path_unavailable: reasons.active_path_unavailable,
+        send_capacity_factor: reasons.send_capacity_factor,
+        stream_send_retention: reasons.stream_send_retention,
+        ..quiche::StreamSendBlockReasons::default()
+    }
+}
+
 /// Outcome of one generic selected-stream write-lease operation.
 #[derive(Debug)]
 pub enum WebTransportStreamWriteLeaseOutcome<L>
@@ -516,12 +586,16 @@ where
         /// Whether FIN committed with the complete payload.
         fin_accepted: bool,
     },
-    /// Flow control prevented progress after one payload exposure.
+    /// Transport capacity prevented progress after one payload exposure.
     Blocked {
         /// The exact original owner.
         lease: L,
         /// Whether FIN remains requested.
         fin: bool,
+        /// Exact simultaneous causes reported by the core transport turn.
+        reasons: quiche::StreamSendBlockReasons,
+        /// One-use context for an exact, attempt-bound writable wait.
+        retry: WebTransportStreamWriteRetry,
     },
     /// The bounded command lane was full before payload exposure.
     QueueFull {
@@ -835,6 +909,23 @@ pub enum WebTransportStreamControlOutcome {
 pub enum WebTransportStreamReadyOutcome {
     /// The selected read or write operation can make progress.
     Ready,
+    /// The transport causes from the last blocked write have produced an exact
+    /// writable wake.
+    ///
+    /// This is permission to retry, not proof of write progress. A later write
+    /// can still expose a newly relevant local cause.
+    WriteTransportWake {
+        /// Exact simultaneous causes from the blocked write.
+        reasons: quiche::StreamSendBlockReasons,
+    },
+    /// The last write had a local or otherwise non-waitable blocking cause.
+    WriteStateChangeRequired {
+        /// Exact simultaneous causes from the blocked write turn.
+        blocked_reasons: quiche::StreamSendBlockReasons,
+        /// Only non-waitable causes that require an independently observed
+        /// state change before an unchanged retry is safe.
+        state_change_reasons: quiche::StreamSendBlockReasons,
+    },
     /// STOP_SENDING made a selected write terminal.
     ResetRequired {
         /// HTTP/3 wire error received in STOP_SENDING.
@@ -1106,9 +1197,12 @@ pub struct WebTransportRetentionStats {
     pub queued_commands: usize,
     /// Conservative logical payload bound for those queued commands.
     pub queued_command_payload_bytes_upper_bound: usize,
-    /// Outstanding generic write leases in commands or unconsumed results.
+    /// Outstanding generic write leases in commands or unconsumed results,
+    /// plus one-use retry tokens retaining a zero-byte accounting slot.
     pub write_leases: usize,
-    /// Owner-declared bytes retained by outstanding generic write leases.
+    /// Owner-declared bytes retained while write owners are runtime-owned.
+    /// Returned owners are removed from this value before a retry token is
+    /// exposed.
     pub write_lease_retained_bytes: usize,
     /// Configured outstanding generic write-lease count bound.
     pub max_write_leases: usize,
@@ -1175,6 +1269,8 @@ struct WriteLeaseAccountingState {
 
 #[derive(Debug)]
 pub(crate) struct WriteLeaseAccounting {
+    // This allocation also scopes retry tokens to one driver construction.
+    // Independent drivers must never share it.
     max_count: usize,
     max_retained_bytes: usize,
     state: Mutex<WriteLeaseAccountingState>,
@@ -1304,13 +1400,22 @@ impl Drop for WriteLeaseAccountingGuard {
     }
 }
 
+impl WriteLeaseAccountingGuard {
+    fn release_retained_bytes(&mut self) {
+        let mut state = self.accounting.lock();
+        state.retained_bytes =
+            state.retained_bytes.saturating_sub(self.retained_bytes);
+        self.retained_bytes = 0;
+    }
+}
+
 enum WriteLeaseCompletion<E> {
     Accepted {
         accepted: usize,
         complete: bool,
         fin_accepted: bool,
     },
-    Blocked,
+    Blocked(quiche::StreamSendBlockReasons),
     Closed,
     ResetRequired {
         wire_error_code: u64,
@@ -1343,6 +1448,15 @@ where
         self.lease
             .take()
             .expect("write-lease owner must be returned exactly once")
+    }
+
+    fn take_retry_reservation(&mut self) -> WriteLeaseAccountingGuard {
+        let mut accounting = self
+            .accounting
+            .take()
+            .expect("admitted blocked write must retain its accounting slot");
+        accounting.release_retained_bytes();
+        accounting
     }
 }
 
@@ -1379,6 +1493,8 @@ where
 {
     owner: WriteLeaseOwner<L>,
     completion: Option<WriteLeaseCompletion<L::Error>>,
+    session_id: u64,
+    stream_id: u64,
     declared_len: usize,
     fin: bool,
 }
@@ -1393,6 +1509,9 @@ where
                 WebTransportStreamWriteLeaseProgress::Unknowable;
             WriteLeaseCompletion::ProgressUnknowable
         });
+        let retry_reservation =
+            matches!(&completion, WriteLeaseCompletion::Blocked(_))
+                .then(|| self.owner.take_retry_reservation());
         let lease = self.owner.take();
         match completion {
             WriteLeaseCompletion::Accepted {
@@ -1405,10 +1524,20 @@ where
                 complete,
                 fin_accepted,
             },
-            WriteLeaseCompletion::Blocked =>
+            WriteLeaseCompletion::Blocked(reasons) =>
                 WebTransportStreamWriteLeaseOutcome::Blocked {
                     lease,
                     fin: self.fin,
+                    reasons,
+                    retry: WebTransportStreamWriteRetry {
+                        session_id: self.session_id,
+                        stream_id: self.stream_id,
+                        reasons,
+                        disposition: reasons.retry_disposition(),
+                        reservation: retry_reservation.expect(
+                            "blocked write must transfer its accounting slot",
+                        ),
+                    },
                 },
             WriteLeaseCompletion::Closed =>
                 WebTransportStreamWriteLeaseOutcome::Closed {
@@ -1536,6 +1665,7 @@ fn bytes_write_outcome(
         WebTransportStreamWriteLeaseOutcome::Blocked {
             lease: BytesWriteLease(data),
             fin,
+            ..
         } => WebTransportStreamWriteOutcome::Blocked { data, fin },
         WebTransportStreamWriteLeaseOutcome::QueueFull {
             lease: BytesWriteLease(data),
@@ -2013,6 +2143,8 @@ impl WebTransportController {
         let shared = Arc::new(Mutex::new(WriteLeaseShared {
             owner,
             completion: None,
+            session_id,
+            stream_id,
             declared_len,
             fin,
         }));
@@ -2062,14 +2194,27 @@ impl WebTransportController {
     pub async fn wait_stream_readable(
         &self, session_id: u64, stream_id: u64,
     ) -> WebTransportStreamReadyOutcome {
-        self.wait_stream(session_id, stream_id, false).await
+        self.wait_stream(session_id, stream_id, false, None).await
     }
 
-    /// Waits without polling for one exact selected stream to become writable.
+    /// Waits without polling after one exact selected-stream write blocked.
+    ///
+    /// The one-use context binds readiness to the exact controller turn that
+    /// returned it. Transport-only causes can produce
+    /// [`WebTransportStreamReadyOutcome::WriteTransportWake`]. Local or
+    /// unavailable-path causes instead return
+    /// [`WebTransportStreamReadyOutcome::WriteStateChangeRequired`]. Consuming
+    /// the context prevents repeated wake loops without a new write attempt.
     pub async fn wait_stream_writable(
-        &self, session_id: u64, stream_id: u64,
+        &self, retry: WebTransportStreamWriteRetry,
     ) -> WebTransportStreamReadyOutcome {
-        self.wait_stream(session_id, stream_id, true).await
+        if !retry.belongs_to(&self.write_lease_accounting) {
+            return WebTransportStreamReadyOutcome::Rejected(
+                WebTransportSelectionError::ForeignController,
+            );
+        }
+        self.wait_stream(retry.session_id, retry.stream_id, true, Some(retry))
+            .await
     }
 
     /// Waits for one exact selected stream's local send direction to terminate.
@@ -2168,6 +2313,7 @@ impl WebTransportController {
 
     async fn wait_stream(
         &self, session_id: u64, stream_id: u64, write: bool,
+        retry: Option<WebTransportStreamWriteRetry>,
     ) -> WebTransportStreamReadyOutcome {
         let Ok(permit) = self.sender.reserve().await else {
             return WebTransportStreamReadyOutcome::Rejected(
@@ -2179,6 +2325,7 @@ impl WebTransportController {
             session_id,
             stream_id,
             write,
+            retry,
             response,
         });
         let mut cancellation = CancellationWake::new(
@@ -2577,7 +2724,7 @@ where
                     )),
                     Ok(data) => Ok((
                         data.len(),
-                        qconn.stream_send(self.stream_id, data, fin),
+                        qconn.stream_send_detailed(self.stream_id, data, fin),
                     )),
                     Err(error) => Err((
                         WriteLeaseCompletion::LeaseError(error),
@@ -2588,7 +2735,10 @@ where
 
             match result {
                 Err(result) => result,
-                Ok((actual, Ok(accepted))) => {
+                Ok((
+                    actual,
+                    Ok(quiche::StreamSendOutcome::Accepted(accepted)),
+                )) => {
                     let complete = accepted == actual;
                     let fin_accepted = fin && complete;
                     let progress = if complete {
@@ -2610,8 +2760,8 @@ where
                         progress,
                     )
                 },
-                Ok((_, Err(quiche::Error::Done))) => (
-                    WriteLeaseCompletion::Blocked,
+                Ok((_, Ok(quiche::StreamSendOutcome::Blocked(reasons)))) => (
+                    WriteLeaseCompletion::Blocked(reasons),
                     WebTransportStreamWriteLeaseProgress::ExposedKnownZero,
                 ),
                 Ok((_, Err(quiche::Error::StreamStopped(error_code)))) => (
@@ -2678,6 +2828,7 @@ pub(crate) enum WebTransportCommand {
         session_id: u64,
         stream_id: u64,
         write: bool,
+        retry: Option<WebTransportStreamWriteRetry>,
         response: oneshot::Sender<WebTransportStreamReadyOutcome>,
     },
     WaitSendTerminal {
@@ -3299,6 +3450,7 @@ struct SendTerminalWaiter {
 #[derive(Debug)]
 struct StreamReadyWaiter {
     session_id: u64,
+    retry: Option<WebTransportStreamWriteRetry>,
     response: oneshot::Sender<WebTransportStreamReadyOutcome>,
 }
 
@@ -4359,8 +4511,11 @@ impl Runtime {
                 session_id,
                 stream_id,
                 write,
+                retry,
                 response,
-            } => self.wait_stream(qconn, session_id, stream_id, write, response),
+            } => self.wait_stream(
+                qconn, session_id, stream_id, write, retry, response,
+            ),
             WebTransportCommand::WaitSendTerminal {
                 session_id,
                 stream_id,
@@ -4920,14 +5075,34 @@ impl Runtime {
 
     fn wait_stream(
         &mut self, qconn: &QuicheConnection, session_id: u64, stream_id: u64,
-        write: bool, response: oneshot::Sender<WebTransportStreamReadyOutcome>,
+        write: bool, retry: Option<WebTransportStreamWriteRetry>,
+        response: oneshot::Sender<WebTransportStreamReadyOutcome>,
     ) {
         if response.is_closed() {
             return;
         }
-        if let Some(outcome) =
-            self.stream_ready_outcome(qconn, session_id, stream_id, write)
+        if write != retry.is_some() {
+            let _ = response.send(WebTransportStreamReadyOutcome::Rejected(
+                WebTransportSelectionError::InternalFailure,
+            ));
+            return;
+        }
+        if retry
+            .as_ref()
+            .is_some_and(|retry| !retry.belongs_to(&self.write_lease_accounting))
         {
+            let _ = response.send(WebTransportStreamReadyOutcome::Rejected(
+                WebTransportSelectionError::ForeignController,
+            ));
+            return;
+        }
+        if let Some(outcome) = self.stream_ready_outcome(
+            qconn,
+            session_id,
+            stream_id,
+            write,
+            retry.as_ref(),
+        ) {
             let _ = response.send(outcome);
             return;
         }
@@ -4986,6 +5161,7 @@ impl Runtime {
         };
         waiters.insert(stream_id, StreamReadyWaiter {
             session_id,
+            retry,
             response,
         });
         if !write {
@@ -5002,7 +5178,7 @@ impl Runtime {
 
     fn stream_ready_outcome(
         &self, qconn: &QuicheConnection, session_id: u64, stream_id: u64,
-        write: bool,
+        write: bool, retry: Option<&WebTransportStreamWriteRetry>,
     ) -> Option<WebTransportStreamReadyOutcome> {
         if let Err(error) =
             self.select_stream(session_id, stream_id, write, qconn)
@@ -5022,19 +5198,59 @@ impl Runtime {
             .then_some(WebTransportStreamReadyOutcome::Ready);
         }
 
-        match qconn.stream_send_status(stream_id) {
-            Ok(quiche::StreamSendStatus::Writable(_)) =>
-                Some(WebTransportStreamReadyOutcome::Ready),
-            Ok(quiche::StreamSendStatus::Blocked) => None,
+        let status = match qconn.stream_send_status(stream_id) {
             Ok(quiche::StreamSendStatus::Stopped(error_code)) =>
-                Some(WebTransportStreamReadyOutcome::ResetRequired {
+                return Some(WebTransportStreamReadyOutcome::ResetRequired {
                     wire_error_code: error_code,
                     application_error_code: webtransport_error_from_http3(
                         error_code,
                     ),
                 }),
             Ok(quiche::StreamSendStatus::Closed) | Err(_) =>
-                Some(WebTransportStreamReadyOutcome::Closed),
+                return Some(WebTransportStreamReadyOutcome::Closed),
+            Ok(status) => status,
+        };
+
+        let Some(retry) = retry else {
+            return Some(WebTransportStreamReadyOutcome::Rejected(
+                WebTransportSelectionError::InternalFailure,
+            ));
+        };
+        debug_assert_eq!(retry.session_id, session_id);
+        debug_assert_eq!(retry.stream_id, stream_id);
+
+        if retry.disposition ==
+            quiche::StreamSendRetryDisposition::StateChangeRequired
+        {
+            return Some(
+                WebTransportStreamReadyOutcome::WriteStateChangeRequired {
+                    blocked_reasons: retry.reasons,
+                    state_change_reasons: stream_send_state_change_reasons(
+                        retry.reasons,
+                    ),
+                },
+            );
+        }
+
+        match status {
+            quiche::StreamSendStatus::Writable(_) =>
+                Some(WebTransportStreamReadyOutcome::WriteTransportWake {
+                    reasons: retry.reasons,
+                }),
+            quiche::StreamSendStatus::Blocked(reasons)
+                if reasons.retry_disposition() ==
+                    quiche::StreamSendRetryDisposition::StateChangeRequired =>
+                Some(WebTransportStreamReadyOutcome::WriteStateChangeRequired {
+                    blocked_reasons: retry.reasons,
+                    state_change_reasons: stream_send_state_change_reasons(
+                        reasons,
+                    ),
+                }),
+            quiche::StreamSendStatus::Blocked(_) => None,
+            quiche::StreamSendStatus::Stopped(_) |
+            quiche::StreamSendStatus::Closed => unreachable!(
+                "selected write terminal status handled before readiness"
+            ),
         }
     }
 
@@ -5125,7 +5341,7 @@ impl Runtime {
                 Some(SendTerminalState::Closed),
             Ok(
                 quiche::StreamSendStatus::Writable(_) |
-                quiche::StreamSendStatus::Blocked,
+                quiche::StreamSendStatus::Blocked(_),
             ) => None,
         };
         if let Some(terminal) = terminal {
@@ -5207,7 +5423,7 @@ impl Runtime {
                 SendTerminalState::Closed,
             Ok(
                 quiche::StreamSendStatus::Writable(_) |
-                quiche::StreamSendStatus::Blocked,
+                quiche::StreamSendStatus::Blocked(_),
             ) => return,
         };
         self.send_terminal_waiter_work_total =
@@ -5436,12 +5652,21 @@ impl Runtime {
     fn wake_stream_waiter(
         &mut self, qconn: &QuicheConnection, stream_id: u64, write: bool,
     ) {
-        let Some(stream) = self.stream_sessions.get(&stream_id).copied() else {
+        let waiter = if write {
+            self.writable_waiters.get(&stream_id)
+        } else {
+            self.readable_waiters.get(&stream_id)
+        };
+        let Some(waiter) = waiter else {
             return;
         };
-        let Some(outcome) =
-            self.stream_ready_outcome(qconn, stream.session_id, stream_id, write)
-        else {
+        let Some(outcome) = self.stream_ready_outcome(
+            qconn,
+            waiter.session_id,
+            stream_id,
+            write,
+            waiter.retry.as_ref(),
+        ) else {
             return;
         };
         if let Some(waiter) = self.remove_stream_waiter(stream_id, write) {
@@ -7705,7 +7930,7 @@ mod tests {
         pipe.client.stream_send(2, b"", true).unwrap();
         pipe.advance().unwrap();
         let (ready_response, mut ready) = oneshot::channel();
-        runtime.wait_stream(&pipe.server, 0, 2, false, ready_response);
+        runtime.wait_stream(&pipe.server, 0, 2, false, None, ready_response);
         assert_eq!(
             ready.try_recv().unwrap(),
             WebTransportStreamReadyOutcome::Ready
@@ -7838,7 +8063,7 @@ mod tests {
         own_stream(&mut runtime, 0, 0, WebTransportStreamDirection::Bidi, false);
 
         let (cancelled_wait, cancelled) = oneshot::channel();
-        runtime.wait_stream(&pipe.server, 0, 0, false, cancelled_wait);
+        runtime.wait_stream(&pipe.server, 0, 0, false, None, cancelled_wait);
         assert_eq!(runtime.readable_waiters.len(), 1);
         drop(cancelled);
         runtime.prune_cancelled_stream_waiters();
@@ -7846,7 +8071,7 @@ mod tests {
         assert!(runtime.readable_waiters_per_session.is_empty());
 
         let (wait_response, mut waited) = oneshot::channel();
-        runtime.wait_stream(&pipe.server, 0, 0, false, wait_response);
+        runtime.wait_stream(&pipe.server, 0, 0, false, None, wait_response);
         let wire_error_code = webtransport_error_to_http3(73);
         pipe.client
             .stream_shutdown(0, quiche::Shutdown::Write, wire_error_code)
@@ -7859,7 +8084,7 @@ mod tests {
         );
 
         let (late_wait_response, mut late_wait) = oneshot::channel();
-        runtime.wait_stream(&pipe.server, 0, 0, false, late_wait_response);
+        runtime.wait_stream(&pipe.server, 0, 0, false, None, late_wait_response);
         assert_eq!(
             late_wait.try_recv().unwrap(),
             WebTransportStreamReadyOutcome::Ready
@@ -8021,9 +8246,9 @@ mod tests {
         let mut opened = [0; 1];
         assert_eq!(pipe.server.stream_recv(6, &mut opened), Ok((1, false)));
         let (first_response, first) = oneshot::channel();
-        runtime.wait_stream(&pipe.server, 0, 6, false, first_response);
+        runtime.wait_stream(&pipe.server, 0, 6, false, None, first_response);
         let (full_response, mut full) = oneshot::channel();
-        runtime.wait_stream(&pipe.server, 0, 6, false, full_response);
+        runtime.wait_stream(&pipe.server, 0, 6, false, None, full_response);
         assert_eq!(
             full.try_recv().unwrap(),
             WebTransportStreamReadyOutcome::Rejected(
@@ -8037,7 +8262,14 @@ mod tests {
         assert!(runtime.readable_waiters_per_session.is_empty());
 
         let (replacement_response, mut replacement) = oneshot::channel();
-        runtime.wait_stream(&pipe.server, 0, 6, false, replacement_response);
+        runtime.wait_stream(
+            &pipe.server,
+            0,
+            6,
+            false,
+            None,
+            replacement_response,
+        );
         pipe.client.stream_send(6, b"", true).unwrap();
         pipe.advance().unwrap();
         assert!(runtime.process_owned_readable(&pipe.server, 6));
@@ -8084,6 +8316,7 @@ mod tests {
         let (write_response, mut write_waiter) = oneshot::channel();
         runtime.writable_waiters.insert(0, StreamReadyWaiter {
             session_id: 4,
+            retry: None,
             response: write_response,
         });
         let terminal = assert_matches!(

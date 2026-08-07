@@ -168,6 +168,7 @@ pub use self::webtransport::WebTransportStreamWriteLeaseOutcome;
 pub use self::webtransport::WebTransportStreamWriteLeaseProgress;
 pub use self::webtransport::WebTransportStreamWriteOperation;
 pub use self::webtransport::WebTransportStreamWriteOutcome;
+pub use self::webtransport::WebTransportStreamWriteRetry;
 
 /// Direction of a WebTransport stream carried over HTTP/3.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

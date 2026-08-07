@@ -922,6 +922,13 @@ impl PathMap {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) fn deactivate_active_for_test(&mut self) -> Result<usize> {
+        let path_id = self.get_active_path_id()?;
+        self.get_mut(path_id)?.active = false;
+        Ok(path_id)
+    }
+
     /// Configures path MTU discovery on all existing paths.
     pub fn set_discover_pmtu_on_existing_paths(
         &mut self, discover: bool, max_send_udp_payload_size: usize,

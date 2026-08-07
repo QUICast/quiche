@@ -69,6 +69,7 @@ use super::WebTransportStreamSendTerminalOutcome;
 use super::WebTransportStreamWriteLease;
 use super::WebTransportStreamWriteLeaseOperation;
 use super::WebTransportStreamWriteLeaseOutcome;
+use super::WebTransportStreamWriteRetry;
 use crate::http3::settings::Http3Settings;
 use crate::http3::H3AuditStats;
 use crate::quic::HandshakeInfo;
@@ -1881,10 +1882,13 @@ impl BoundedSelectedWebTransportController {
     }
 
     /// Waits without polling for selected-stream send readiness.
+    ///
+    /// The one-use context preserves the inner controller's exact blocked-write
+    /// turn and prevents crossed owners or repeated waits from sharing a wake.
     pub async fn wait_stream_writable(
-        &self, session_id: u64, stream_id: u64,
+        &self, retry: WebTransportStreamWriteRetry,
     ) -> WebTransportStreamReadyOutcome {
-        self.inner.wait_stream_writable(session_id, stream_id).await
+        self.inner.wait_stream_writable(retry).await
     }
 
     /// Waits for the latched terminal state of a selected send direction.

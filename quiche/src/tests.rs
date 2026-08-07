@@ -6983,6 +6983,362 @@ fn stop_sending_wakes_when_connection_send_capacity_is_exhausted() {
     assert_eq!(pipe.server.stream_writable_next(), None);
 }
 
+#[test]
+fn stream_send_block_reasons_preserve_every_simultaneous_cause() {
+    #[derive(Clone, Copy)]
+    struct Case {
+        stream: bool,
+        connection: bool,
+        congestion: bool,
+    }
+
+    let cases = [
+        Case {
+            stream: true,
+            connection: false,
+            congestion: false,
+        },
+        Case {
+            stream: false,
+            connection: true,
+            congestion: false,
+        },
+        Case {
+            stream: false,
+            connection: false,
+            congestion: true,
+        },
+        Case {
+            stream: true,
+            connection: true,
+            congestion: false,
+        },
+        Case {
+            stream: true,
+            connection: false,
+            congestion: true,
+        },
+        Case {
+            stream: false,
+            connection: true,
+            congestion: true,
+        },
+        Case {
+            stream: true,
+            connection: true,
+            congestion: true,
+        },
+    ];
+
+    for case in cases {
+        let aggregate_blocked = case.connection || case.congestion;
+        let reasons = stream_send_block_reasons_for_state(
+            case.stream,
+            aggregate_blocked,
+            true,
+            u64::from(!case.connection),
+            usize::from(!case.congestion),
+            1.0,
+        );
+        assert_eq!(reasons, StreamSendBlockReasons {
+            stream_flow_control: case.stream,
+            connection_flow_control: case.connection,
+            congestion_control: case.congestion,
+            ..StreamSendBlockReasons::default()
+        });
+        assert!(!reasons.is_empty());
+        assert_eq!(
+            reasons.retry_disposition(),
+            StreamSendRetryDisposition::WaitForTransportWritable
+        );
+
+        let mut client = test_utils::Pipe::default_config("cubic").unwrap();
+        client.set_initial_max_data(if case.connection { 0 } else { 100 });
+        client.set_initial_max_stream_data_bidi_remote(if case.stream {
+            0
+        } else {
+            100
+        });
+        let mut server = test_utils::Pipe::default_config("cubic").unwrap();
+        let mut pipe = test_utils::Pipe::with_client_and_server_config(
+            &mut client,
+            &mut server,
+        )
+        .unwrap();
+        pipe.handshake().unwrap();
+        if case.congestion {
+            pipe.server.tx_cap = 0;
+            pipe.server.tx_congestion_cap = 0;
+        }
+
+        assert_eq!(
+            pipe.server.stream_send_detailed(1, b"x", false),
+            Ok(StreamSendOutcome::Blocked(reasons))
+        );
+    }
+}
+
+#[test]
+fn stream_send_block_reasons_keep_non_transport_limits_distinct() {
+    let unavailable =
+        stream_send_block_reasons_for_state(false, true, false, 1, 1, 1.0);
+    assert_eq!(unavailable, StreamSendBlockReasons {
+        active_path_unavailable: true,
+        ..StreamSendBlockReasons::default()
+    });
+    assert_eq!(
+        unavailable.retry_disposition(),
+        StreamSendRetryDisposition::StateChangeRequired
+    );
+    let factor =
+        stream_send_block_reasons_for_state(false, true, true, 1, 1, 0.5);
+    assert_eq!(factor, StreamSendBlockReasons {
+        send_capacity_factor: true,
+        ..StreamSendBlockReasons::default()
+    });
+    assert_eq!(
+        factor.retry_disposition(),
+        StreamSendRetryDisposition::StateChangeRequired
+    );
+    let mixed =
+        stream_send_block_reasons_for_state(false, true, true, 0, 0, f64::NAN);
+    assert_eq!(mixed, StreamSendBlockReasons {
+        connection_flow_control: true,
+        congestion_control: true,
+        send_capacity_factor: true,
+        ..StreamSendBlockReasons::default()
+    });
+    assert_eq!(
+        mixed.retry_disposition(),
+        StreamSendRetryDisposition::StateChangeRequired
+    );
+    assert_eq!(
+        StreamSendBlockReasons::default().retry_disposition(),
+        StreamSendRetryDisposition::StateChangeRequired
+    );
+
+    let mut client = test_utils::Pipe::default_config("cubic").unwrap();
+    client.set_initial_max_data(0);
+    client.set_initial_max_stream_data_bidi_remote(0);
+    let mut server = test_utils::Pipe::default_config("cubic").unwrap();
+    server.set_send_capacity_factor(0.0);
+    let mut pipe =
+        test_utils::Pipe::with_client_and_server_config(&mut client, &mut server)
+            .unwrap();
+    pipe.handshake().unwrap();
+    pipe.server.tx_congestion_cap = 0;
+    let mixed = StreamSendBlockReasons {
+        stream_flow_control: true,
+        connection_flow_control: true,
+        congestion_control: true,
+        send_capacity_factor: true,
+        ..StreamSendBlockReasons::default()
+    };
+    assert_eq!(
+        pipe.server.stream_send_detailed(1, b"x", false),
+        Ok(StreamSendOutcome::Blocked(mixed))
+    );
+    assert_eq!(
+        mixed.retry_disposition(),
+        StreamSendRetryDisposition::StateChangeRequired
+    );
+}
+
+#[test]
+fn stream_send_detailed_reports_partial_then_simultaneous_flow_control() {
+    let mut client = test_utils::Pipe::default_config("cubic").unwrap();
+    client.set_initial_max_data(4);
+    client.set_initial_max_stream_data_bidi_remote(4);
+    let mut server = test_utils::Pipe::default_config("cubic").unwrap();
+    let mut pipe =
+        test_utils::Pipe::with_client_and_server_config(&mut client, &mut server)
+            .unwrap();
+    pipe.handshake().unwrap();
+
+    assert_eq!(
+        pipe.server.stream_send_detailed(1, b"abcdefgh", false),
+        Ok(StreamSendOutcome::Accepted(4))
+    );
+    let reasons = StreamSendBlockReasons {
+        stream_flow_control: true,
+        connection_flow_control: true,
+        ..StreamSendBlockReasons::default()
+    };
+    assert_eq!(
+        reasons.retry_disposition(),
+        StreamSendRetryDisposition::WaitForTransportWritable
+    );
+    assert_eq!(
+        pipe.server.stream_send_detailed(1, b"efgh", false),
+        Ok(StreamSendOutcome::Blocked(reasons))
+    );
+    assert_eq!(
+        pipe.server.stream_send_status(1),
+        Ok(StreamSendStatus::Blocked(reasons))
+    );
+    assert_eq!(pipe.server.stream_send(1, b"efgh", false), Err(Error::Done));
+}
+
+#[test]
+fn stream_send_detailed_reports_congestion_and_capacity_factor() {
+    let mut pipe = test_utils::Pipe::new("cubic").unwrap();
+    pipe.handshake().unwrap();
+    pipe.server.tx_cap = 0;
+    pipe.server.tx_congestion_cap = 0;
+
+    let congestion = StreamSendBlockReasons {
+        congestion_control: true,
+        ..StreamSendBlockReasons::default()
+    };
+    assert_eq!(
+        pipe.server.stream_send_detailed(1, b"x", false),
+        Ok(StreamSendOutcome::Blocked(congestion))
+    );
+    assert_eq!(
+        congestion.retry_disposition(),
+        StreamSendRetryDisposition::WaitForTransportWritable
+    );
+
+    let mut client = test_utils::Pipe::default_config("cubic").unwrap();
+    let mut server = test_utils::Pipe::default_config("cubic").unwrap();
+    server.set_send_capacity_factor(0.0);
+    let mut pipe =
+        test_utils::Pipe::with_client_and_server_config(&mut client, &mut server)
+            .unwrap();
+    pipe.handshake().unwrap();
+
+    let factor = StreamSendBlockReasons {
+        send_capacity_factor: true,
+        ..StreamSendBlockReasons::default()
+    };
+    assert_eq!(
+        pipe.server.stream_send_detailed(1, b"x", false),
+        Ok(StreamSendOutcome::Blocked(factor))
+    );
+    assert_eq!(
+        factor.retry_disposition(),
+        StreamSendRetryDisposition::StateChangeRequired
+    );
+}
+
+#[test]
+fn stream_send_detailed_reports_retention_without_consuming_state() {
+    let mut client = test_utils::Pipe::default_config("cubic").unwrap();
+    client.set_initial_max_data(30);
+    client.set_initial_max_stream_data_bidi_remote(30);
+    let mut server = test_utils::Pipe::default_config("cubic").unwrap();
+    server.set_stream_send_retention_limits(StreamSendRetentionLimits {
+        max_bytes: 4,
+        max_chunks: 1,
+    });
+    let mut pipe =
+        test_utils::Pipe::with_client_and_server_config(&mut client, &mut server)
+            .unwrap();
+    pipe.handshake().unwrap();
+
+    let before = pipe.server.stream_send_retention_stats();
+    let reasons = StreamSendBlockReasons {
+        stream_send_retention: true,
+        ..StreamSendBlockReasons::default()
+    };
+    assert_eq!(
+        reasons.retry_disposition(),
+        StreamSendRetryDisposition::StateChangeRequired
+    );
+    assert_eq!(
+        pipe.server.stream_send_detailed(1, b"12345", false),
+        Ok(StreamSendOutcome::Blocked(reasons))
+    );
+    assert_eq!(pipe.server.stream_send_retention_stats(), before);
+    assert_eq!(
+        pipe.server.stream_send_detailed(1, b"1234", false),
+        Ok(StreamSendOutcome::Accepted(4))
+    );
+    assert_eq!(pipe.server.stream_send(1, b"x", false), Err(Error::Done));
+    pipe.advance().unwrap();
+    assert_eq!(pipe.server.stream_send_retention_stats().retained_bytes, 0);
+    assert_eq!(
+        pipe.server.stream_send_detailed(1, b"x", false),
+        Ok(StreamSendOutcome::Accepted(1))
+    );
+}
+
+#[test]
+fn stream_send_active_path_recovery_needs_a_capacity_refresh() {
+    let mut pipe = test_utils::Pipe::new("cubic").unwrap();
+    pipe.handshake().unwrap();
+
+    let path_id = pipe.server.paths.deactivate_active_for_test().unwrap();
+    pipe.server.update_tx_cap();
+    let reasons = StreamSendBlockReasons {
+        active_path_unavailable: true,
+        ..StreamSendBlockReasons::default()
+    };
+    assert_eq!(
+        pipe.server.stream_send_detailed(1, b"x", false),
+        Ok(StreamSendOutcome::Blocked(reasons))
+    );
+    assert_eq!(
+        reasons.retry_disposition(),
+        StreamSendRetryDisposition::StateChangeRequired
+    );
+    assert_eq!(pipe.server.stream_writable_next(), None);
+
+    pipe.server.paths.set_active_path(path_id).unwrap();
+    assert_eq!(pipe.server.stream_writable_next(), None);
+
+    pipe.client.stream_send(0, b"refresh", false).unwrap();
+    pipe.advance().unwrap();
+    assert_eq!(pipe.server.stream_writable_next(), Some(1));
+    assert_eq!(
+        pipe.server.stream_send_detailed(1, b"x", false),
+        Ok(StreamSendOutcome::Accepted(1))
+    );
+}
+
+#[test]
+fn stream_send_detailed_preserves_terminal_precedence_and_zero_fin() {
+    let mut client = test_utils::Pipe::default_config("cubic").unwrap();
+    client.set_initial_max_data(0);
+    client.set_initial_max_stream_data_bidi_remote(0);
+    let mut server = test_utils::Pipe::default_config("cubic").unwrap();
+    let mut pipe =
+        test_utils::Pipe::with_client_and_server_config(&mut client, &mut server)
+            .unwrap();
+    pipe.handshake().unwrap();
+
+    assert_eq!(
+        pipe.server.stream_send_detailed(1, b"", true),
+        Ok(StreamSendOutcome::Accepted(0))
+    );
+    assert_eq!(
+        pipe.server.stream_send_status(1),
+        Ok(StreamSendStatus::Closed)
+    );
+    assert_eq!(
+        pipe.server.stream_send_detailed(1, b"x", false),
+        Err(Error::FinalSize)
+    );
+    assert_eq!(
+        pipe.server.stream_send_detailed(2, b"x", false),
+        Err(Error::InvalidStreamState(2))
+    );
+
+    let mut pipe = test_utils::Pipe::new("cubic").unwrap();
+    pipe.handshake().unwrap();
+    pipe.server.stream_send(1, b"request", false).unwrap();
+    pipe.advance().unwrap();
+    pipe.client.stream_shutdown(1, Shutdown::Read, 42).unwrap();
+    pipe.advance().unwrap();
+    pipe.server.tx_cap = 0;
+    pipe.server.tx_congestion_cap = 0;
+    pipe.server.tx_data = pipe.server.max_tx_data;
+    assert_eq!(
+        pipe.server.stream_send_detailed(1, b"x", false),
+        Err(Error::StreamStopped(42))
+    );
+}
+
 #[rstest]
 fn stop_sending_fin(
     #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,

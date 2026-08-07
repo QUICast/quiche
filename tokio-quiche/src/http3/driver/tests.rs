@@ -2631,6 +2631,754 @@ mod server_side_driver {
     }
 
     #[tokio::test]
+    async fn webtransport_write_lease_reports_exact_core_block_reasons() {
+        #[derive(Clone, Copy)]
+        enum Cause {
+            Connection,
+            Congestion,
+            CapacityFactor,
+            Retention,
+            Mixed,
+        }
+
+        for (index, cause) in [
+            Cause::Connection,
+            Cause::Congestion,
+            Cause::CapacityFactor,
+            Cause::Retention,
+            Cause::Mixed,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut client = default_quiche_config();
+            client.set_initial_max_stream_data_bidi_remote(
+                if matches!(cause, Cause::Mixed) {
+                    3
+                } else {
+                    1_000_000
+                },
+            );
+            if matches!(cause, Cause::Mixed) {
+                client.set_initial_max_stream_data_uni(1_000_000);
+            }
+            if matches!(
+                cause,
+                Cause::Congestion |
+                    Cause::CapacityFactor |
+                    Cause::Retention |
+                    Cause::Mixed
+            ) {
+                client.set_initial_max_data(1_000_000);
+            }
+            client.enable_dgram(true, 10, 10);
+            client.enable_reset_stream_at(true);
+
+            let mut server = default_quiche_config();
+            if matches!(cause, Cause::CapacityFactor | Cause::Mixed) {
+                server.set_send_capacity_factor(0.5);
+            }
+            server.enable_dgram(true, 10, 10);
+            server.enable_reset_stream_at(true);
+            let pipe =
+                quiche::test_utils::Pipe::with_client_and_server_config_and_buf(
+                    &mut client,
+                    &mut server,
+                )
+                .unwrap();
+            let mut helper =
+                DriverTestHelper::<ServerHooks>::with_pipe_and_http3_settings(
+                    pipe,
+                    webtransport_settings(),
+                )
+                .unwrap();
+            start_webtransport_driver(&mut helper);
+            let (session_id, to_client, _from_client) =
+                open_pending_webtransport_session(&mut helper);
+            accept_pending_webtransport_session(
+                &mut helper,
+                session_id,
+                &to_client,
+            );
+            let controller = helper
+                .controller
+                .webtransport_controller()
+                .expect("native WebTransport controller");
+            let filler = if matches!(cause, Cause::Mixed) {
+                open_server_webtransport_uni(&mut helper, &controller, session_id)
+                    .await
+            } else {
+                open_server_webtransport_bidi(
+                    &mut helper,
+                    &controller,
+                    session_id,
+                )
+                .await
+            };
+            let blocked = open_server_webtransport_bidi(
+                &mut helper,
+                &controller,
+                session_id,
+            )
+            .await;
+
+            let reasons = match cause {
+                Cause::Connection => {
+                    let capacity =
+                        helper.pipe.server.stream_capacity(filler).unwrap();
+                    assert!(capacity > 0);
+                    assert_eq!(
+                        helper.pipe.server.stream_send(
+                            filler,
+                            &vec![0; capacity],
+                            false,
+                        ),
+                        Ok(capacity)
+                    );
+                    quiche::StreamSendBlockReasons {
+                        connection_flow_control: true,
+                        ..quiche::StreamSendBlockReasons::default()
+                    }
+                },
+                Cause::Congestion => {
+                    let capacity =
+                        helper.pipe.server.stream_capacity(filler).unwrap();
+                    assert!(capacity > 0);
+                    assert_eq!(
+                        helper.pipe.server.stream_send(
+                            filler,
+                            &vec![0; capacity],
+                            false,
+                        ),
+                        Ok(capacity)
+                    );
+                    quiche::StreamSendBlockReasons {
+                        congestion_control: true,
+                        ..quiche::StreamSendBlockReasons::default()
+                    }
+                },
+                Cause::CapacityFactor => {
+                    let capacity =
+                        helper.pipe.server.stream_capacity(filler).unwrap();
+                    assert!(capacity > 0);
+                    assert_eq!(
+                        helper.pipe.server.stream_send(
+                            filler,
+                            &vec![0; capacity],
+                            false,
+                        ),
+                        Ok(capacity)
+                    );
+                    quiche::StreamSendBlockReasons {
+                        send_capacity_factor: true,
+                        ..quiche::StreamSendBlockReasons::default()
+                    }
+                },
+                Cause::Retention => {
+                    let retained =
+                        helper.pipe.server.stream_send_retention_stats();
+                    helper
+                        .pipe
+                        .server
+                        .set_stream_send_retention_limits(
+                            quiche::StreamSendRetentionLimits {
+                                max_bytes: retained.retained_bytes,
+                                max_chunks: retained.retained_chunks,
+                            },
+                        )
+                        .unwrap();
+                    quiche::StreamSendBlockReasons {
+                        stream_send_retention: true,
+                        ..quiche::StreamSendBlockReasons::default()
+                    }
+                },
+                Cause::Mixed => {
+                    let capacity =
+                        helper.pipe.server.stream_capacity(filler).unwrap();
+                    assert!(capacity > 0);
+                    assert_eq!(
+                        helper.pipe.server.stream_send(
+                            filler,
+                            &vec![0; capacity],
+                            false,
+                        ),
+                        Ok(capacity)
+                    );
+                    quiche::StreamSendBlockReasons {
+                        stream_flow_control: true,
+                        send_capacity_factor: true,
+                        ..quiche::StreamSendBlockReasons::default()
+                    }
+                },
+            };
+            let retry_disposition = reasons.retry_disposition();
+            let state_change_reasons = quiche::StreamSendBlockReasons {
+                active_path_unavailable: reasons.active_path_unavailable,
+                send_capacity_factor: reasons.send_capacity_factor,
+                stream_send_retention: reasons.stream_send_retention,
+                ..quiche::StreamSendBlockReasons::default()
+            };
+
+            if !matches!(cause, Cause::Retention) {
+                assert_eq!(
+                    helper.pipe.server.stream_send_status(blocked),
+                    Ok(quiche::StreamSendStatus::Blocked(reasons))
+                );
+            }
+
+            let (lease, log) = mock_write_lease(100 + index as u64, b"x");
+            let pointer = lease.payload.as_ptr() as usize;
+            let write = controller
+                .try_write_stream_lease(session_id, blocked, lease, false)
+                .unwrap();
+            helper.work_loop_iter().unwrap();
+            let outcome = write.outcome().await;
+            assert_eq!(
+                outcome.progress(),
+                WebTransportStreamWriteLeaseProgress::ExposedKnownZero
+            );
+            let (mut lease, retry) = assert_matches!(
+                outcome,
+                WebTransportStreamWriteLeaseOutcome::Blocked {
+                    lease,
+                    fin: false,
+                    reasons: actual,
+                    retry,
+                } if actual == reasons => (lease, retry)
+            );
+            assert_eq!(retry.session_id(), session_id);
+            assert_eq!(retry.stream_id(), blocked);
+            assert_eq!(retry.reasons(), reasons);
+            assert_eq!(retry.disposition(), retry_disposition);
+            assert_eq!(lease.id, 100 + index as u64);
+            assert_eq!(lease.payload.as_ptr() as usize, pointer);
+            assert_eq!(mock_write_lease_log(&log).exposed_pointers, [pointer]);
+
+            if retry_disposition ==
+                quiche::StreamSendRetryDisposition::StateChangeRequired
+            {
+                let wait_controller = controller.clone();
+                let wait = tokio::spawn(async move {
+                    wait_controller.wait_stream_writable(retry).await
+                });
+                tokio::task::yield_now().await;
+                helper.work_loop_iter().unwrap();
+                assert_eq!(
+                    wait.await.unwrap(),
+                    WebTransportStreamReadyOutcome::WriteStateChangeRequired {
+                        blocked_reasons: reasons,
+                        state_change_reasons,
+                    }
+                );
+
+                let blocked_again = controller
+                    .try_write_stream_lease(session_id, blocked, lease, false)
+                    .unwrap();
+                helper.work_loop_iter().unwrap();
+                let (returned, retry) = assert_matches!(
+                    blocked_again.outcome().await,
+                    WebTransportStreamWriteLeaseOutcome::Blocked {
+                        lease,
+                        fin: false,
+                        reasons: actual,
+                        retry,
+                    } if actual == reasons => (lease, retry)
+                );
+                lease = returned;
+                assert_eq!(lease.payload.as_ptr() as usize, pointer);
+                assert_eq!(retry.disposition(), retry_disposition);
+                let wait_controller = controller.clone();
+                let wait = tokio::spawn(async move {
+                    wait_controller.wait_stream_writable(retry).await
+                });
+                tokio::task::yield_now().await;
+                helper.work_loop_iter().unwrap();
+                assert_eq!(
+                    wait.await.unwrap(),
+                    WebTransportStreamReadyOutcome::WriteStateChangeRequired {
+                        blocked_reasons: reasons,
+                        state_change_reasons,
+                    }
+                );
+            } else {
+                drop(retry);
+            }
+            if matches!(cause, Cause::Retention) {
+                let retained_before =
+                    helper.pipe.server.stream_send_retention_stats();
+                assert!(retained_before.retained_bytes > 0);
+                helper.pipe.advance().unwrap();
+                let retained_after =
+                    helper.pipe.server.stream_send_retention_stats();
+                assert!(
+                    retained_after.retained_bytes <
+                        retained_before.retained_bytes
+                );
+
+                let retry = controller
+                    .try_write_stream_lease(session_id, blocked, lease, false)
+                    .unwrap();
+                helper.work_loop_iter().unwrap();
+                let lease = assert_matches!(
+                    retry.outcome().await,
+                    WebTransportStreamWriteLeaseOutcome::Accepted {
+                        lease,
+                        accepted: 1,
+                        complete: true,
+                        fin_accepted: false,
+                    } => lease
+                );
+                assert_eq!(lease.payload.as_ptr() as usize, pointer);
+                assert_eq!(mock_write_lease_log(&log).exposed_pointers, [
+                    pointer, pointer, pointer
+                ]);
+                drop(lease);
+            } else {
+                drop(lease);
+            }
+
+            let stats =
+                webtransport_retention_stats(&mut helper, &controller).await;
+            assert_eq!(stats.write_leases, 0);
+            assert_eq!(stats.write_lease_retained_bytes, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn webtransport_write_retry_tokens_are_attempt_bound() {
+        let mut client = default_quiche_config();
+        client.set_initial_max_data(1_000_000);
+        client.set_initial_max_stream_data_bidi_remote(1_000_000);
+        client.enable_dgram(true, 10, 10);
+        client.enable_reset_stream_at(true);
+
+        let mut server = default_quiche_config();
+        server.set_send_capacity_factor(0.5);
+        server.enable_dgram(true, 10, 10);
+        server.enable_reset_stream_at(true);
+        let pipe =
+            quiche::test_utils::Pipe::with_client_and_server_config_and_buf(
+                &mut client,
+                &mut server,
+            )
+            .unwrap();
+        let mut helper =
+            DriverTestHelper::<ServerHooks>::with_pipe_and_http3_settings(
+                pipe,
+                webtransport_settings(),
+            )
+            .unwrap();
+        start_webtransport_driver(&mut helper);
+        let (session_id, to_client, _from_client) =
+            open_pending_webtransport_session(&mut helper);
+        accept_pending_webtransport_session(&mut helper, session_id, &to_client);
+        let controller = helper
+            .controller
+            .webtransport_controller()
+            .expect("native WebTransport controller");
+        let filler =
+            open_server_webtransport_bidi(&mut helper, &controller, session_id)
+                .await;
+        let blocked =
+            open_server_webtransport_bidi(&mut helper, &controller, session_id)
+                .await;
+        let capacity = helper.pipe.server.stream_capacity(filler).unwrap();
+        assert!(capacity > 0);
+        assert_eq!(
+            helper
+                .pipe
+                .server
+                .stream_send(filler, &vec![0; capacity], false,),
+            Ok(capacity)
+        );
+        let reasons = quiche::StreamSendBlockReasons {
+            send_capacity_factor: true,
+            ..quiche::StreamSendBlockReasons::default()
+        };
+        assert_eq!(
+            helper.pipe.server.stream_send_status(blocked),
+            Ok(quiche::StreamSendStatus::Blocked(reasons))
+        );
+
+        let (first_lease, first_log) = mock_write_lease(120, b"first");
+        let first_pointer = first_lease.payload.as_ptr() as usize;
+        let first = controller
+            .try_write_stream_lease(session_id, blocked, first_lease, false)
+            .unwrap();
+        let (second_lease, second_log) = mock_write_lease(121, b"second");
+        let second_pointer = second_lease.payload.as_ptr() as usize;
+        let second = controller
+            .try_write_stream_lease(session_id, blocked, second_lease, false)
+            .unwrap();
+        helper.work_loop_iter().unwrap();
+
+        let (first_lease, first_retry) = assert_matches!(
+            first.outcome().await,
+            WebTransportStreamWriteLeaseOutcome::Blocked {
+                lease,
+                fin: false,
+                reasons: actual,
+                retry,
+            } if actual == reasons => (lease, retry)
+        );
+        let (second_lease, second_retry) = assert_matches!(
+            second.outcome().await,
+            WebTransportStreamWriteLeaseOutcome::Blocked {
+                lease,
+                fin: false,
+                reasons: actual,
+                retry,
+            } if actual == reasons => (lease, retry)
+        );
+        assert_eq!(first_lease.payload.as_ptr() as usize, first_pointer);
+        assert_eq!(second_lease.payload.as_ptr() as usize, second_pointer);
+        let retained =
+            webtransport_retention_stats(&mut helper, &controller).await;
+        assert_eq!(retained.write_leases, 2);
+        assert_eq!(retained.write_lease_retained_bytes, 0);
+
+        let second_controller = controller.clone();
+        let second_wait = tokio::spawn(async move {
+            second_controller.wait_stream_writable(second_retry).await
+        });
+        tokio::task::yield_now().await;
+        helper.work_loop_iter().unwrap();
+        assert_eq!(
+            second_wait.await.unwrap(),
+            WebTransportStreamReadyOutcome::WriteStateChangeRequired {
+                blocked_reasons: reasons,
+                state_change_reasons: reasons,
+            }
+        );
+
+        let first_controller = controller.clone();
+        let first_wait = tokio::spawn(async move {
+            first_controller.wait_stream_writable(first_retry).await
+        });
+        tokio::task::yield_now().await;
+        helper.work_loop_iter().unwrap();
+        assert_eq!(
+            first_wait.await.unwrap(),
+            WebTransportStreamReadyOutcome::WriteStateChangeRequired {
+                blocked_reasons: reasons,
+                state_change_reasons: reasons,
+            }
+        );
+
+        assert_eq!(mock_write_lease_log(&first_log).exposed_pointers, [
+            first_pointer
+        ]);
+        assert_eq!(mock_write_lease_log(&second_log).exposed_pointers, [
+            second_pointer
+        ]);
+        drop(first_lease);
+        drop(second_lease);
+        let stats = webtransport_retention_stats(&mut helper, &controller).await;
+        assert_eq!(stats.write_leases, 0);
+        assert_eq!(stats.write_lease_retained_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn webtransport_write_retry_tokens_are_controller_bound() {
+        let mut first =
+            DriverTestHelper::<ServerHooks>::with_pipe_and_http3_settings(
+                exact_prefix_capacity_webtransport_pipe(),
+                webtransport_settings(),
+            )
+            .unwrap();
+        start_webtransport_driver(&mut first);
+        let (first_session, first_to_client, _first_from_client) =
+            open_pending_webtransport_session(&mut first);
+        accept_pending_webtransport_session(
+            &mut first,
+            first_session,
+            &first_to_client,
+        );
+        let first_controller = first
+            .controller
+            .webtransport_controller()
+            .expect("first native WebTransport controller");
+        let first_stream = open_server_webtransport_bidi(
+            &mut first,
+            &first_controller,
+            first_session,
+        )
+        .await;
+
+        let mut second =
+            DriverTestHelper::<ServerHooks>::with_pipe_and_http3_settings(
+                exact_prefix_capacity_webtransport_pipe(),
+                webtransport_settings(),
+            )
+            .unwrap();
+        start_webtransport_driver(&mut second);
+        let (second_session, second_to_client, _second_from_client) =
+            open_pending_webtransport_session(&mut second);
+        accept_pending_webtransport_session(
+            &mut second,
+            second_session,
+            &second_to_client,
+        );
+        let second_controller = second
+            .controller
+            .webtransport_controller()
+            .expect("second native WebTransport controller");
+        let second_stream = open_server_webtransport_bidi(
+            &mut second,
+            &second_controller,
+            second_session,
+        )
+        .await;
+        assert_eq!(first_session, second_session);
+        assert_eq!(first_stream, second_stream);
+
+        let reasons = quiche::StreamSendBlockReasons {
+            stream_flow_control: true,
+            ..quiche::StreamSendBlockReasons::default()
+        };
+        let (lease, log) = mock_write_lease(122, b"identity");
+        let pointer = lease.payload.as_ptr() as usize;
+        let write = first_controller
+            .try_write_stream_lease(first_session, first_stream, lease, false)
+            .unwrap();
+        first.work_loop_iter().unwrap();
+        let (lease, retry) = assert_matches!(
+            write.outcome().await,
+            WebTransportStreamWriteLeaseOutcome::Blocked {
+                lease,
+                fin: false,
+                reasons: actual,
+                retry,
+            } if actual == reasons => (lease, retry)
+        );
+        assert_eq!(lease.payload.as_ptr() as usize, pointer);
+        let debug = format!("{retry:?}");
+        assert!(!debug.contains("accounting"));
+        assert!(!debug.contains("reservation"));
+        assert!(!debug.contains("0x"));
+        let retained =
+            webtransport_retention_stats(&mut first, &first_controller).await;
+        assert_eq!(retained.write_leases, 1);
+        assert_eq!(retained.write_lease_retained_bytes, 0);
+
+        let second_before =
+            webtransport_retention_stats(&mut second, &second_controller).await;
+        assert_eq!(
+            second_controller.wait_stream_writable(retry).await,
+            WebTransportStreamReadyOutcome::Rejected(
+                WebTransportSelectionError::ForeignController,
+            )
+        );
+        let second_after =
+            webtransport_retention_stats(&mut second, &second_controller).await;
+        assert_eq!(second_after.waiters, second_before.waiters);
+        assert_eq!(
+            second_after.metadata_index_entries,
+            second_before.metadata_index_entries
+        );
+        let released =
+            webtransport_retention_stats(&mut first, &first_controller).await;
+        assert_eq!(released.write_leases, 0);
+        assert_eq!(released.write_lease_retained_bytes, 0);
+        assert_eq!(lease.payload.as_ptr() as usize, pointer);
+
+        let write = first_controller
+            .try_write_stream_lease(first_session, first_stream, lease, false)
+            .unwrap();
+        first.work_loop_iter().unwrap();
+        let (lease, retry) = assert_matches!(
+            write.outcome().await,
+            WebTransportStreamWriteLeaseOutcome::Blocked {
+                lease,
+                fin: false,
+                reasons: actual,
+                retry,
+            } if actual == reasons => (lease, retry)
+        );
+        let cloned_controller = first_controller.clone();
+        let writable = tokio::spawn(async move {
+            cloned_controller.wait_stream_writable(retry).await
+        });
+        tokio::task::yield_now().await;
+        first.work_loop_iter().unwrap();
+        assert!(!writable.is_finished());
+
+        first.pipe.advance().unwrap();
+        assert_matches!(
+            first.peer_client_poll(),
+            Ok((id, h3::Event::WebTransportStream { .. }))
+                if id == first_stream
+        );
+        first.advance_and_run_loop().unwrap();
+        assert_eq!(
+            writable.await.unwrap(),
+            WebTransportStreamReadyOutcome::WriteTransportWake { reasons }
+        );
+
+        let write = first_controller
+            .try_write_stream_lease(first_session, first_stream, lease, false)
+            .unwrap();
+        first.work_loop_iter().unwrap();
+        let lease = assert_matches!(
+            write.outcome().await,
+            WebTransportStreamWriteLeaseOutcome::Accepted {
+                lease,
+                accepted: 3,
+                complete: false,
+                fin_accepted: false,
+            } => lease
+        );
+        assert_eq!(lease.payload.as_ptr() as usize, pointer);
+        assert_eq!(mock_write_lease_log(&log).exposed_pointers, [
+            pointer, pointer, pointer,
+        ]);
+        drop(lease);
+        let stats =
+            webtransport_retention_stats(&mut first, &first_controller).await;
+        assert_eq!(stats.write_leases, 0);
+        assert_eq!(stats.write_lease_retained_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn webtransport_blocked_write_lease_keeps_owner_through_terminals() {
+        let mut helper =
+            DriverTestHelper::<ServerHooks>::with_pipe_and_http3_settings(
+                exact_prefix_capacity_webtransport_pipe(),
+                webtransport_settings(),
+            )
+            .unwrap();
+        start_webtransport_driver(&mut helper);
+        let (session_id, to_client, _from_client) =
+            open_pending_webtransport_session(&mut helper);
+        accept_pending_webtransport_session(&mut helper, session_id, &to_client);
+        let controller = helper
+            .controller
+            .webtransport_controller()
+            .expect("native WebTransport controller");
+        let stream_id =
+            open_server_webtransport_bidi(&mut helper, &controller, session_id)
+                .await;
+
+        let (lease, log) = mock_write_lease(110, b"terminal");
+        let pointer = lease.payload.as_ptr() as usize;
+        let blocked = controller
+            .try_write_stream_lease(session_id, stream_id, lease, true)
+            .unwrap();
+        helper.work_loop_iter().unwrap();
+        let (lease, retry) = assert_matches!(
+            blocked.outcome().await,
+            WebTransportStreamWriteLeaseOutcome::Blocked {
+                lease,
+                fin: true,
+                reasons,
+                retry,
+            } if reasons.stream_flow_control && retry.disposition() ==
+                quiche::StreamSendRetryDisposition::WaitForTransportWritable =>
+                (lease, retry)
+        );
+        assert_eq!(lease.payload.as_ptr() as usize, pointer);
+
+        receive_server_webtransport_stream(
+            &mut helper,
+            session_id,
+            stream_id,
+            h3::WebTransportStreamDirection::Bidirectional,
+        );
+        let wire_error = webtransport_error_to_http3(73);
+        helper
+            .pipe
+            .client
+            .stream_shutdown(stream_id, quiche::Shutdown::Read, wire_error)
+            .unwrap();
+        helper.advance_and_run_loop().unwrap();
+
+        let stopped_wait_controller = controller.clone();
+        let stopped_wait = tokio::spawn(async move {
+            stopped_wait_controller.wait_stream_writable(retry).await
+        });
+        tokio::task::yield_now().await;
+        helper.work_loop_iter().unwrap();
+        assert_eq!(
+            stopped_wait.await.unwrap(),
+            WebTransportStreamReadyOutcome::ResetRequired {
+                wire_error_code: wire_error,
+                application_error_code: Some(73),
+            }
+        );
+
+        let stopped = controller
+            .try_write_stream_lease(session_id, stream_id, lease, true)
+            .unwrap();
+        helper.work_loop_iter().unwrap();
+        let lease = assert_matches!(
+            stopped.outcome().await,
+            WebTransportStreamWriteLeaseOutcome::ResetRequired {
+                wire_error_code,
+                application_error_code: Some(73),
+                lease,
+                fin: true,
+            } if wire_error_code == wire_error => lease
+        );
+        assert_eq!(lease.id, 110);
+        assert_eq!(lease.payload.as_ptr() as usize, pointer);
+        assert_eq!(mock_write_lease_log(&log).exposed_pointers, [
+            pointer, pointer
+        ]);
+        drop(lease);
+
+        let mut helper =
+            DriverTestHelper::<ServerHooks>::with_pipe_and_http3_settings(
+                exact_prefix_capacity_webtransport_pipe(),
+                webtransport_settings(),
+            )
+            .unwrap();
+        start_webtransport_driver(&mut helper);
+        let (session_id, to_client, _from_client) =
+            open_pending_webtransport_session(&mut helper);
+        accept_pending_webtransport_session(&mut helper, session_id, &to_client);
+        let controller = helper
+            .controller
+            .webtransport_controller()
+            .expect("native WebTransport controller");
+        let stream_id =
+            open_server_webtransport_bidi(&mut helper, &controller, session_id)
+                .await;
+        let (lease, log) = mock_write_lease(111, b"teardown");
+        let pointer = lease.payload.as_ptr() as usize;
+        let blocked = controller
+            .try_write_stream_lease(session_id, stream_id, lease, false)
+            .unwrap();
+        helper.work_loop_iter().unwrap();
+        let lease = assert_matches!(
+            blocked.outcome().await,
+            WebTransportStreamWriteLeaseOutcome::Blocked { lease, .. } => lease
+        );
+        assert_eq!(lease.payload.as_ptr() as usize, pointer);
+
+        let closing = controller
+            .try_write_stream_lease(session_id, stream_id, lease, false)
+            .unwrap();
+        helper.driver.on_conn_close(
+            &mut helper.pipe.server,
+            &TestMetrics::default(),
+            &Ok(()),
+        );
+        let lease = assert_matches!(
+            closing.outcome().await,
+            WebTransportStreamWriteLeaseOutcome::Rejected {
+                error: WebTransportSelectionError::ConnectionClosed,
+                lease,
+                fin: false,
+            } => lease
+        );
+        assert_eq!(lease.id, 111);
+        assert_eq!(lease.payload.as_ptr() as usize, pointer);
+        assert_eq!(mock_write_lease_log(&log).exposed_pointers, [pointer]);
+        drop(lease);
+        assert_eq!(mock_write_lease_log(&log).drops, 1);
+    }
+
+    #[tokio::test]
     async fn webtransport_write_lease_partial_retry_and_wakeup_are_fair() {
         let mut settings = webtransport_settings();
         settings.webtransport_command_capacity = 4;
@@ -2732,11 +3480,66 @@ mod server_side_driver {
         assert_eq!(mock_write_lease_log(&healthy_log).exposures, 1);
         drop(healthy_lease);
 
+        let (retry_lease, retry_log) = mock_write_lease(22, &payload[61..]);
+        let retry_pointer = retry_lease.payload.as_ptr() as usize;
+        let blocked_retry = controller
+            .try_write_stream_lease(session_id, blocked_stream, retry_lease, true)
+            .unwrap();
+        helper.work_loop_iter().unwrap();
+        let (retry_lease, retry_token) = assert_matches!(
+            blocked_retry.outcome().await,
+            WebTransportStreamWriteLeaseOutcome::Blocked {
+                lease,
+                fin: true,
+                reasons,
+                retry,
+            } if reasons == quiche::StreamSendBlockReasons {
+                stream_flow_control: true,
+                ..quiche::StreamSendBlockReasons::default()
+            } && retry.disposition() ==
+                quiche::StreamSendRetryDisposition::WaitForTransportWritable =>
+                    (lease, retry)
+        );
+        assert_eq!(retry_lease.id, 22);
+        assert_eq!(retry_lease.payload.as_ptr() as usize, retry_pointer);
+        assert_eq!(mock_write_lease_log(&retry_log).exposed_pointers, [
+            retry_pointer
+        ]);
+
+        let cancelled_controller = controller.clone();
+        let cancelled_wait = tokio::spawn(async move {
+            cancelled_controller.wait_stream_writable(retry_token).await
+        });
+        tokio::task::yield_now().await;
+        helper.work_loop_iter().unwrap();
+        assert!(!cancelled_wait.is_finished());
+        cancelled_wait.abort();
+        assert!(cancelled_wait.await.unwrap_err().is_cancelled());
+        helper.work_loop_iter().unwrap();
+
+        let blocked_retry = controller
+            .try_write_stream_lease(session_id, blocked_stream, retry_lease, true)
+            .unwrap();
+        helper.work_loop_iter().unwrap();
+        let (retry_lease, retry_token) = assert_matches!(
+            blocked_retry.outcome().await,
+            WebTransportStreamWriteLeaseOutcome::Blocked {
+                lease,
+                fin: true,
+                reasons,
+                retry,
+            } if reasons == quiche::StreamSendBlockReasons {
+                stream_flow_control: true,
+                ..quiche::StreamSendBlockReasons::default()
+            } && retry.disposition() ==
+                quiche::StreamSendRetryDisposition::WaitForTransportWritable =>
+                    (lease, retry)
+        );
+        assert_eq!(retry_lease.payload.as_ptr() as usize, retry_pointer);
+
         let wait_controller = controller.clone();
         let writable = tokio::spawn(async move {
-            wait_controller
-                .wait_stream_writable(session_id, blocked_stream)
-                .await
+            wait_controller.wait_stream_writable(retry_token).await
         });
         tokio::task::yield_now().await;
         helper.work_loop_iter().unwrap();
@@ -2773,10 +3576,14 @@ mod server_side_driver {
         }
         assert_eq!(
             writable.await.unwrap(),
-            WebTransportStreamReadyOutcome::Ready
+            WebTransportStreamReadyOutcome::WriteTransportWake {
+                reasons: quiche::StreamSendBlockReasons {
+                    stream_flow_control: true,
+                    ..quiche::StreamSendBlockReasons::default()
+                }
+            }
         );
 
-        let (retry_lease, retry_log) = mock_write_lease(22, &payload[61..]);
         let retry = controller
             .try_write_stream_lease(session_id, blocked_stream, retry_lease, true)
             .unwrap();
@@ -2791,7 +3598,12 @@ mod server_side_driver {
             } => lease
         );
         assert_eq!(retry_lease.id, 22);
-        assert_eq!(mock_write_lease_log(&retry_log).exposures, 1);
+        assert_eq!(retry_lease.payload.as_ptr() as usize, retry_pointer);
+        assert_eq!(mock_write_lease_log(&retry_log).exposed_pointers, [
+            retry_pointer,
+            retry_pointer,
+            retry_pointer,
+        ]);
         drop(retry_lease);
         helper.pipe.advance().unwrap();
         assert_eq!(
@@ -2802,6 +3614,10 @@ mod server_side_driver {
             Ok((19, true))
         );
         assert_eq!(&received[..19], &payload[61..]);
+
+        let stats = webtransport_retention_stats(&mut helper, &controller).await;
+        assert_eq!(stats.write_leases, 0);
+        assert_eq!(stats.write_lease_retained_bytes, 0);
     }
 
     #[tokio::test]
@@ -3129,10 +3945,34 @@ mod server_side_driver {
         let writable_stream =
             open_server_webtransport_bidi(&mut helper, &controller, session_id)
                 .await;
+        let (writable_lease, writable_log) = mock_write_lease(50, b"x");
+        let writable_pointer = writable_lease.payload.as_ptr() as usize;
+        let writable_attempt = controller
+            .try_write_stream_lease(
+                session_id,
+                writable_stream,
+                writable_lease,
+                false,
+            )
+            .unwrap();
+        helper.work_loop_iter().unwrap();
+        let (writable_lease, writable_retry) = assert_matches!(
+            writable_attempt.outcome().await,
+            WebTransportStreamWriteLeaseOutcome::Blocked {
+                lease,
+                fin: false,
+                reasons,
+                retry,
+            } if reasons.stream_flow_control &&
+                retry.disposition() ==
+                    quiche::StreamSendRetryDisposition::WaitForTransportWritable =>
+                        (lease, retry)
+        );
+        assert_eq!(writable_lease.payload.as_ptr() as usize, writable_pointer);
         let writable_controller = controller.clone();
         let writable = tokio::spawn(async move {
             writable_controller
-                .wait_stream_writable(session_id, writable_stream)
+                .wait_stream_writable(writable_retry)
                 .await
         });
         tokio::task::yield_now().await;
@@ -3148,8 +3988,37 @@ mod server_side_driver {
         helper.advance_and_run_loop().unwrap();
         assert_eq!(
             writable.await.unwrap(),
-            WebTransportStreamReadyOutcome::Ready
+            WebTransportStreamReadyOutcome::WriteTransportWake {
+                reasons: quiche::StreamSendBlockReasons {
+                    stream_flow_control: true,
+                    ..quiche::StreamSendBlockReasons::default()
+                }
+            }
         );
+        let writable_attempt = controller
+            .try_write_stream_lease(
+                session_id,
+                writable_stream,
+                writable_lease,
+                false,
+            )
+            .unwrap();
+        helper.work_loop_iter().unwrap();
+        let writable_lease = assert_matches!(
+            writable_attempt.outcome().await,
+            WebTransportStreamWriteLeaseOutcome::Accepted {
+                lease,
+                accepted: 1,
+                complete: true,
+                fin_accepted: false,
+            } => lease
+        );
+        assert_eq!(writable_lease.payload.as_ptr() as usize, writable_pointer);
+        assert_eq!(mock_write_lease_log(&writable_log).exposed_pointers, [
+            writable_pointer,
+            writable_pointer,
+        ]);
+        drop(writable_lease);
 
         let reset_stream =
             open_server_webtransport_bidi(&mut helper, &controller, session_id)
@@ -3214,11 +4083,33 @@ mod server_side_driver {
         let stopped_stream =
             open_server_webtransport_bidi(&mut helper, &controller, session_id)
                 .await;
+        let (stopped_lease, stopped_log) = mock_write_lease(51, b"stop");
+        let stopped_pointer = stopped_lease.payload.as_ptr() as usize;
+        let stopped_attempt = controller
+            .try_write_stream_lease(
+                session_id,
+                stopped_stream,
+                stopped_lease,
+                false,
+            )
+            .unwrap();
+        helper.work_loop_iter().unwrap();
+        let (stopped_lease, stopped_retry) = assert_matches!(
+            stopped_attempt.outcome().await,
+            WebTransportStreamWriteLeaseOutcome::Blocked {
+                lease,
+                fin: false,
+                reasons,
+                retry,
+            } if reasons.stream_flow_control &&
+                retry.disposition() ==
+                    quiche::StreamSendRetryDisposition::WaitForTransportWritable =>
+                        (lease, retry)
+        );
+        assert_eq!(stopped_lease.payload.as_ptr() as usize, stopped_pointer);
         let stopped_controller = controller.clone();
         let stopped = tokio::spawn(async move {
-            stopped_controller
-                .wait_stream_writable(session_id, stopped_stream)
-                .await
+            stopped_controller.wait_stream_writable(stopped_retry).await
         });
         tokio::task::yield_now().await;
         helper.work_loop_iter().unwrap();
@@ -3246,6 +4137,30 @@ mod server_side_driver {
                 application_error_code: Some(23),
             }
         );
+        let stopped_attempt = controller
+            .try_write_stream_lease(
+                session_id,
+                stopped_stream,
+                stopped_lease,
+                false,
+            )
+            .unwrap();
+        helper.work_loop_iter().unwrap();
+        let stopped_lease = assert_matches!(
+            stopped_attempt.outcome().await,
+            WebTransportStreamWriteLeaseOutcome::ResetRequired {
+                wire_error_code,
+                application_error_code: Some(23),
+                lease,
+                fin: false,
+            } if wire_error_code == webtransport_error_to_http3(23) => lease
+        );
+        assert_eq!(stopped_lease.payload.as_ptr() as usize, stopped_pointer);
+        assert_eq!(mock_write_lease_log(&stopped_log).exposed_pointers, [
+            stopped_pointer,
+            stopped_pointer,
+        ]);
+        drop(stopped_lease);
 
         let closing_controller = controller.clone();
         let closing = tokio::spawn(async move {
@@ -3512,7 +4427,12 @@ mod server_side_driver {
         );
         assert_eq!(
             helper.pipe.server.stream_send_status(stream_id),
-            Ok(quiche::StreamSendStatus::Blocked)
+            Ok(quiche::StreamSendStatus::Blocked(
+                quiche::StreamSendBlockReasons {
+                    stream_flow_control: true,
+                    ..quiche::StreamSendBlockReasons::default()
+                }
+            ))
         );
 
         let wait = wait_for_send_terminal(&controller, session_id, stream_id);
