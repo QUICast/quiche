@@ -70,6 +70,9 @@ use super::WebTransportStreamWriteLease;
 use super::WebTransportStreamWriteLeaseOperation;
 use super::WebTransportStreamWriteLeaseOutcome;
 use super::WebTransportStreamWriteRetry;
+use super::WebTransportTerminalRetentionClaim;
+use super::WebTransportTerminalRetentionOperation;
+use super::WebTransportTerminalRetentionOutcome;
 use crate::http3::settings::Http3Settings;
 use crate::http3::H3AuditStats;
 use crate::quic::HandshakeInfo;
@@ -1604,13 +1607,13 @@ enum BoundedClientConnectOwnerInstall {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct BoundedClientConnectOwnershipStats {
-    current: usize,
-    max: usize,
-    installed_total: u64,
-    terminal_release_total: u64,
-    teardown_release_total: u64,
-    late_install_total: u64,
+pub(super) struct BoundedClientConnectOwnershipStats {
+    pub(super) current: usize,
+    pub(super) max: usize,
+    pub(super) installed_total: u64,
+    pub(super) terminal_release_total: u64,
+    pub(super) teardown_release_total: u64,
+    pub(super) late_install_total: u64,
 }
 
 pub(crate) struct BoundedClientConnectOwnership {
@@ -1714,7 +1717,7 @@ impl BoundedClientConnectOwnership {
         drop(released);
     }
 
-    fn stats(&self) -> BoundedClientConnectOwnershipStats {
+    pub(super) fn stats(&self) -> BoundedClientConnectOwnershipStats {
         let state = self.lock_state();
         BoundedClientConnectOwnershipStats {
             current: usize::from(state.owner.is_some()),
@@ -1817,6 +1820,25 @@ impl BoundedSelectedWebTransportController {
         &self, session_id: u64,
     ) -> WebTransportSessionTerminalOutcome {
         self.inner.wait_session_terminal(session_id).await
+    }
+
+    /// Returns a private claim for take-once terminal retention accounting.
+    pub fn terminal_retention_claim(&self) -> WebTransportTerminalRetentionClaim {
+        self.inner.terminal_retention_claim()
+    }
+
+    /// Attempts a command-free take of authoritative terminal accounting.
+    pub fn try_take_terminal_retention(
+        &self, claim: &WebTransportTerminalRetentionClaim,
+    ) -> WebTransportTerminalRetentionOutcome {
+        self.inner.try_take_terminal_retention(claim)
+    }
+
+    /// Waits command-free for authoritative terminal accounting.
+    pub fn wait_terminal_retention(
+        &self, claim: WebTransportTerminalRetentionClaim,
+    ) -> WebTransportTerminalRetentionOperation {
+        self.inner.wait_terminal_retention(claim)
     }
 
     /// Opens one bidirectional stream for the exact active Session ID.
@@ -2680,6 +2702,7 @@ mod tests {
     use crate::http3::driver::WebTransportSessionCloseReason;
     use crate::http3::driver::WebTransportStreamDirection;
     use crate::http3::driver::WebTransportStreamReceiveTerminal;
+    use crate::http3::driver::WebTransportTerminalRetentionPending;
     use crate::ApplicationOverQuic as _;
     use assert_matches::assert_matches;
 
@@ -3334,6 +3357,43 @@ mod tests {
             bounded_driver.mode(),
             H3ConnectionMode::BoundedSelectedWebTransport
         );
+    }
+
+    #[test]
+    fn bounded_controller_takes_terminal_retention_after_driver_loss() {
+        let settings = BoundedSelectedWebTransportSettings::default();
+        let command_capacity = settings.selected.selected_command_capacity;
+        let (driver, controller) =
+            H3Driver::<ServerHooks>::new_bounded_selected_webtransport(settings)
+                .unwrap();
+        let selected = controller.selected();
+        let claim = selected.terminal_retention_claim();
+        let hook = driver
+            .connection_owner_drop_hook()
+            .expect("bounded WebTransport installs a core-owner hook");
+
+        drop(driver);
+        assert_matches!(
+            selected.try_take_terminal_retention(&claim),
+            WebTransportTerminalRetentionOutcome::Early(
+                WebTransportTerminalRetentionPending {
+                    runtime_settled: true,
+                    connection_owner_attached: true,
+                    connection_owner_dropped: false,
+                    ..
+                }
+            )
+        );
+
+        hook.fire();
+        let stats = assert_matches!(
+            selected.try_take_terminal_retention(&claim),
+            WebTransportTerminalRetentionOutcome::Taken(stats) => stats
+        );
+        assert_eq!(stats.command_capacity, command_capacity);
+        assert_eq!(stats.max_terminal_retention_waiters, 1);
+        assert_eq!(stats.adapter_bytes_upper_bound(), 0);
+        assert_eq!(stats.transport_queued_bytes(), 0);
     }
 
     #[test]

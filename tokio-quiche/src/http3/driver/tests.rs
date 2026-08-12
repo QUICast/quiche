@@ -2105,6 +2105,37 @@ mod server_side_driver {
         stats.await.unwrap().unwrap()
     }
 
+    fn assert_terminal_retention_current_zero(
+        stats: &WebTransportRetentionStats,
+    ) {
+        assert_eq!(stats.sessions, 0);
+        assert_eq!(stats.associated_streams, 0);
+        assert_eq!(stats.provisional_streams, 0);
+        assert_eq!(stats.stream_open_waiters, 0);
+        assert_eq!(stats.session_terminal_waiters, 0);
+        assert_eq!(stats.waiters, 0);
+        assert_eq!(stats.send_terminal_waiters, 0);
+        assert_eq!(stats.send_terminal_states, 0);
+        assert_eq!(stats.send_terminal_overloaded_sessions, 0);
+        assert_eq!(stats.receive_terminal_observations, 0);
+        assert_eq!(stats.receive_terminal_states, 0);
+        assert_eq!(stats.receive_terminal_waiters, 0);
+        assert_eq!(stats.receive_terminal_leases, 0);
+        assert_eq!(stats.receive_terminal_bytes, 0);
+        assert_eq!(stats.bounded_client_connect_owners, 0);
+        assert_eq!(stats.metadata_index_entries, 0);
+        assert_eq!(stats.pending_datagrams, 0);
+        assert_eq!(stats.pending_datagram_payload_bytes, 0);
+        assert_eq!(stats.pending_datagram_allocation_bytes, 0);
+        assert_eq!(stats.terminal_retention_waiters, 0);
+        assert_eq!(stats.queued_commands, 0);
+        assert_eq!(stats.queued_command_payload_bytes_upper_bound, 0);
+        assert_eq!(stats.write_leases, 0);
+        assert_eq!(stats.write_lease_retained_bytes, 0);
+        assert_eq!(stats.adapter_bytes_upper_bound(), 0);
+        assert_eq!(stats.transport_queued_bytes(), 0);
+    }
+
     async fn release_server_webtransport_stream_credit(
         helper: &mut DriverTestHelper<ServerHooks>,
         controller: &WebTransportController, session_id: u64, stream_id: u64,
@@ -10520,5 +10551,356 @@ mod server_side_driver {
             helper.driver.flow_map.is_empty(),
             "flow_map should remain empty when extended connect is disabled"
         );
+    }
+
+    #[tokio::test]
+    async fn webtransport_terminal_retention_follows_event_and_core_teardown() {
+        let mut settings = webtransport_settings();
+        settings.webtransport_command_capacity = 1;
+        let mut helper = webtransport_helper(settings);
+        let (to_client, _from_client) = accept_webtransport_session(&mut helper);
+        let session_id = 0;
+        let controller = helper
+            .controller
+            .webtransport_controller()
+            .expect("native WebTransport controller");
+        let claim = controller.terminal_retention_claim();
+        let hook = helper
+            .driver
+            .connection_owner_drop_hook()
+            .expect("WebTransport driver installs a core-owner hook");
+
+        let (queued, queued_log) = mock_write_lease(500, b"queued");
+        let queued = controller
+            .try_write_stream_lease(session_id, 400, queued, false)
+            .unwrap();
+        let (full, full_log) = mock_write_lease(501, b"full");
+        let full = assert_matches!(
+            controller.try_write_stream_lease(session_id, 404, full, false),
+            Err(WebTransportStreamWriteLeaseOutcome::QueueFull {
+                lease,
+                fin: false,
+            }) => lease
+        );
+        drop(full);
+
+        crate::ApplicationOverQuic::on_conn_close(
+            &mut helper.driver,
+            &mut helper.pipe.server,
+            &crate::metrics::DefaultMetrics,
+            &Ok(()),
+        );
+        assert_eq!(
+            controller.retention_stats().await,
+            Err(WebTransportDatagramError::ConnectionClosed)
+        );
+        expect_session_terminated(
+            &mut helper,
+            session_id,
+            WebTransportSessionCloseReason::ConnectionClosed,
+        );
+        assert_matches!(
+            controller.try_take_terminal_retention(&claim),
+            WebTransportTerminalRetentionOutcome::Early(
+                WebTransportTerminalRetentionPending {
+                    runtime_settled: true,
+                    connection_owner_attached: true,
+                    connection_owner_dropped: false,
+                    write_leases: 1,
+                    ..
+                }
+            )
+        );
+
+        let DriverTestHelper {
+            pipe,
+            driver,
+            controller: h3_controller,
+            peer,
+        } = helper;
+        drop(to_client);
+        drop(peer);
+        drop(pipe);
+        hook.fire();
+
+        let wait_controller = controller.clone();
+        let wait_claim = claim.clone();
+        let wait = tokio::spawn(async move {
+            wait_controller.wait_terminal_retention(wait_claim).await
+        });
+        tokio::task::yield_now().await;
+        assert!(!wait.is_finished());
+        drop(queued);
+        let stats = assert_matches!(
+            wait.await.unwrap(),
+            WebTransportTerminalRetentionOutcome::Taken(stats) => stats
+        );
+        assert_terminal_retention_current_zero(&stats);
+        assert_eq!(stats.write_lease_admitted_total, 1);
+        assert_eq!(stats.write_lease_queue_full_total, 1);
+        assert_eq!(stats.write_lease_abandoned_unexposed_total, 1);
+        assert_eq!(mock_write_lease_log(&queued_log).drops, 1);
+        assert_eq!(mock_write_lease_log(&full_log).drops, 1);
+        assert_eq!(
+            controller.try_take_terminal_retention(&claim),
+            WebTransportTerminalRetentionOutcome::AlreadyTaken
+        );
+
+        drop(h3_controller);
+        drop(driver);
+    }
+
+    #[tokio::test]
+    async fn webtransport_terminal_retention_survives_event_lane_and_driver_loss()
+    {
+        let mut helper = webtransport_helper(webtransport_settings());
+        start_webtransport_driver(&mut helper);
+        let controller = helper
+            .controller
+            .webtransport_controller()
+            .expect("native WebTransport controller");
+        let claim = controller.terminal_retention_claim();
+        let hook = helper
+            .driver
+            .connection_owner_drop_hook()
+            .expect("WebTransport driver installs a core-owner hook");
+        drop(helper.controller.take_event_receiver());
+
+        let error: crate::QuicResult<()> =
+            Err(H3ConnectionError::PostAcceptTimeout.into());
+        crate::ApplicationOverQuic::on_conn_close(
+            &mut helper.driver,
+            &mut helper.pipe.server,
+            &crate::metrics::DefaultMetrics,
+            &error,
+        );
+
+        let DriverTestHelper {
+            pipe,
+            driver,
+            controller: h3_controller,
+            peer,
+        } = helper;
+        drop(h3_controller);
+        drop(driver);
+        drop(peer);
+        drop(pipe);
+        hook.fire();
+
+        let stats = assert_matches!(
+            controller.wait_terminal_retention(claim).await,
+            WebTransportTerminalRetentionOutcome::Taken(stats) => stats
+        );
+        assert_terminal_retention_current_zero(&stats);
+    }
+
+    #[tokio::test]
+    async fn webtransport_terminal_retention_survives_event_lane_overload() {
+        let mut settings = webtransport_settings();
+        settings.event_capacity = 1;
+        let mut helper = webtransport_helper(settings);
+        start_webtransport_driver(&mut helper);
+        let controller = helper
+            .controller
+            .webtransport_controller()
+            .expect("native WebTransport controller");
+        let claim = controller.terminal_retention_claim();
+        let hook = helper
+            .driver
+            .connection_owner_drop_hook()
+            .expect("WebTransport driver installs a core-owner hook");
+        helper
+            .driver
+            .h3_event_sender
+            .send(ServerH3Event::Core(H3Event::IncomingSettings {
+                settings: vec![],
+            }))
+            .unwrap();
+        assert_eq!(
+            helper.driver.h3_event_sender.send(ServerH3Event::Core(
+                H3Event::IncomingSettings { settings: vec![] }
+            )),
+            Err(H3ConnectionError::EventQueueOverloaded)
+        );
+
+        crate::ApplicationOverQuic::on_conn_close(
+            &mut helper.driver,
+            &mut helper.pipe.server,
+            &crate::metrics::DefaultMetrics,
+            &Ok(()),
+        );
+        let DriverTestHelper {
+            pipe,
+            driver,
+            controller: h3_controller,
+            peer,
+        } = helper;
+        drop(h3_controller);
+        drop(driver);
+        drop(peer);
+        drop(pipe);
+        hook.fire();
+        let stats = assert_matches!(
+            controller.wait_terminal_retention(claim).await,
+            WebTransportTerminalRetentionOutcome::Taken(stats) => stats
+        );
+        assert_terminal_retention_current_zero(&stats);
+    }
+
+    #[tokio::test]
+    async fn webtransport_terminal_retention_survives_service_drop() {
+        let helper = webtransport_helper(webtransport_settings());
+        let controller = helper
+            .controller
+            .webtransport_controller()
+            .expect("native WebTransport controller");
+        let claim = controller.terminal_retention_claim();
+        let hook = helper
+            .driver
+            .connection_owner_drop_hook()
+            .expect("WebTransport driver installs a core-owner hook");
+        let DriverTestHelper {
+            pipe,
+            driver,
+            controller: h3_controller,
+            peer,
+        } = helper;
+
+        drop(h3_controller);
+        drop(driver);
+        assert_matches!(
+            controller.try_take_terminal_retention(&claim),
+            WebTransportTerminalRetentionOutcome::Early(
+                WebTransportTerminalRetentionPending {
+                    runtime_settled: true,
+                    connection_owner_dropped: false,
+                    ..
+                }
+            )
+        );
+        drop(peer);
+        drop(pipe);
+        hook.fire();
+        assert_matches!(
+            controller.try_take_terminal_retention(&claim),
+            WebTransportTerminalRetentionOutcome::Taken(_)
+        );
+    }
+
+    #[tokio::test]
+    async fn webtransport_terminal_retention_waits_for_retry_permission() {
+        let mut helper =
+            DriverTestHelper::<ServerHooks>::with_pipe_and_http3_settings(
+                exact_prefix_capacity_webtransport_pipe(),
+                webtransport_settings(),
+            )
+            .unwrap();
+        let (to_client, _from_client) = accept_webtransport_session(&mut helper);
+        let session_id = 0;
+        let controller = helper
+            .controller
+            .webtransport_controller()
+            .expect("native WebTransport controller");
+        let stream_id =
+            open_server_webtransport_bidi(&mut helper, &controller, session_id)
+                .await;
+        let (lease, _log) = mock_write_lease(600, b"blocked");
+        let operation = controller
+            .try_write_stream_lease(session_id, stream_id, lease, false)
+            .unwrap();
+        helper.work_loop_iter().unwrap();
+        let (lease, retry) = assert_matches!(
+            operation.outcome().await,
+            WebTransportStreamWriteLeaseOutcome::Blocked {
+                lease,
+                retry,
+                ..
+            } => (lease, retry)
+        );
+        drop(lease);
+
+        let claim = controller.terminal_retention_claim();
+        let hook = helper
+            .driver
+            .connection_owner_drop_hook()
+            .expect("WebTransport driver installs a core-owner hook");
+        crate::ApplicationOverQuic::on_conn_close(
+            &mut helper.driver,
+            &mut helper.pipe.server,
+            &crate::metrics::DefaultMetrics,
+            &Ok(()),
+        );
+        let DriverTestHelper {
+            pipe,
+            driver,
+            controller: h3_controller,
+            peer,
+        } = helper;
+        drop(to_client);
+        drop(h3_controller);
+        drop(driver);
+        drop(peer);
+        drop(pipe);
+        hook.fire();
+
+        let pending = assert_matches!(
+            controller.try_take_terminal_retention(&claim),
+            WebTransportTerminalRetentionOutcome::Early(pending) => pending
+        );
+        assert_eq!(pending.write_leases, 1);
+        assert_eq!(pending.write_lease_retained_bytes, 0);
+        drop(retry);
+        let stats = assert_matches!(
+            controller.try_take_terminal_retention(&claim),
+            WebTransportTerminalRetentionOutcome::Taken(stats) => stats
+        );
+        assert_terminal_retention_current_zero(&stats);
+    }
+
+    #[tokio::test]
+    async fn webtransport_terminal_retention_survives_transport_failure() {
+        let mut helper = webtransport_helper(webtransport_settings());
+        start_webtransport_driver(&mut helper);
+        let controller = helper
+            .controller
+            .webtransport_controller()
+            .expect("native WebTransport controller");
+        let claim = controller.terminal_retention_claim();
+        let hook = helper
+            .driver
+            .connection_owner_drop_hook()
+            .expect("WebTransport driver installs a core-owner hook");
+        let error: crate::QuicResult<()> = Err(H3ConnectionError::H3(
+            h3::Error::TransportError(quiche::Error::TlsFail),
+        )
+        .into());
+        crate::ApplicationOverQuic::on_conn_close(
+            &mut helper.driver,
+            &mut helper.pipe.server,
+            &crate::metrics::DefaultMetrics,
+            &error,
+        );
+        assert_matches!(
+            helper.driver_recv_core_event(),
+            Ok(H3Event::ConnectionError(h3::Error::TransportError(
+                quiche::Error::TlsFail
+            )))
+        );
+        let DriverTestHelper {
+            pipe,
+            driver,
+            controller: h3_controller,
+            peer,
+        } = helper;
+        drop(h3_controller);
+        drop(driver);
+        drop(peer);
+        drop(pipe);
+        hook.fire();
+        let stats = assert_matches!(
+            controller.wait_terminal_retention(claim).await,
+            WebTransportTerminalRetentionOutcome::Taken(stats) => stats
+        );
+        assert_terminal_retention_current_zero(&stats);
     }
 }

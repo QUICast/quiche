@@ -63,6 +63,7 @@ use super::io::connection_stage::Handshake;
 use super::io::connection_stage::RunningApplication;
 use super::io::worker::Closing;
 use super::io::worker::IoWorkerParams;
+use super::io::worker::OwnedQuicheConnection;
 use super::io::worker::Running;
 use super::io::worker::RunningOrClosing;
 use super::io::worker::WriteState;
@@ -356,6 +357,7 @@ where
             stats: Arc::clone(&self.stats),
             scid: self.params.scid,
         };
+        let owner_drop_hook = app.connection_owner_drop_hook();
         let context = ConnectionStageContext {
             in_pkt: self.params.initial_pkt,
             incoming_pkt_receiver: self.incoming_ev_receiver,
@@ -380,7 +382,10 @@ where
         };
 
         let handshake_fut = async move {
-            let qconn = self.params.quiche_conn;
+            let qconn = OwnedQuicheConnection::new(
+                self.params.quiche_conn,
+                owner_drop_hook,
+            );
             let handshake_done =
                 IoWorker::new(params, conn_stage).run(qconn, context).await;
 
@@ -717,6 +722,18 @@ impl HandshakeInfo {
 /// reference passed to trait methods.
 #[allow(unused_variables)] // for default functions
 pub trait ApplicationOverQuic: Send + 'static {
+    /// Returns an optional preallocated hook that runs after the worker drops
+    /// its owned [`QuicheConnection`].
+    ///
+    /// This is an internal lifecycle boundary for applications that must
+    /// distinguish connection teardown from destruction of core retained
+    /// storage. Implementations must construct the hook before teardown; the
+    /// callback must not block.
+    #[doc(hidden)]
+    fn connection_owner_drop_hook(&self) -> Option<ConnectionOwnerDropHook> {
+        None
+    }
+
     /// Callback to customize the [`ApplicationOverQuic`] after the QUIC
     /// handshake completed successfully.
     ///
@@ -792,6 +809,28 @@ pub trait ApplicationOverQuic: Send + 'static {
         &mut self, qconn: &mut QuicheConnection, metrics: &M,
         connection_result: &QuicResult<()>,
     ) {
+    }
+}
+
+/// Preallocated callback fired after the worker-owned core connection drops.
+///
+/// This type is public only because it appears in [`ApplicationOverQuic`].
+/// Applications outside tokio-quiche cannot construct one.
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct ConnectionOwnerDropHook {
+    callback: Arc<dyn Fn() + Send + Sync>,
+}
+
+impl ConnectionOwnerDropHook {
+    pub(crate) fn new(callback: impl Fn() + Send + Sync + 'static) -> Self {
+        Self {
+            callback: Arc::new(callback),
+        }
+    }
+
+    pub(crate) fn fire(&self) {
+        (self.callback)();
     }
 }
 

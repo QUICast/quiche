@@ -151,6 +151,8 @@ pub use crate::http3::ClientH3Connection;
 pub use crate::http3::ServerH3Connection;
 pub use crate::quic::connection::ApplicationOverQuic;
 pub use crate::quic::connection::ConnectionIdGenerator;
+#[doc(hidden)]
+pub use crate::quic::connection::ConnectionOwnerDropHook;
 pub use crate::quic::connection::InitialQuicConnection;
 pub use crate::quic::connection::QuicConnection;
 pub use crate::result::BoxError;

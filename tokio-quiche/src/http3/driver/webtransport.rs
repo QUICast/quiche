@@ -28,10 +28,16 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::VecDeque;
 use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::Weak;
+use std::task::Context;
+use std::task::Poll;
+use std::task::Waker;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -742,6 +748,7 @@ struct ReceiveTerminalReadShared {
     terminal: WebTransportStreamReceiveTerminal,
     allocation_bytes: usize,
     leased: AtomicBool,
+    _terminal_retention: TerminalReceiveRetentionGuard,
 }
 
 /// Non-cloneable ownership of one selected stream's terminal receive result.
@@ -1193,6 +1200,14 @@ pub struct WebTransportRetentionStats {
     pub pending_datagram_allocation_bytes: usize,
     /// Configured selected-I/O command capacity.
     pub command_capacity: usize,
+    /// Command-independent terminal-accounting waiters currently registered.
+    pub terminal_retention_waiters: usize,
+    /// Intrinsic command-independent terminal-accounting waiter bound.
+    pub max_terminal_retention_waiters: usize,
+    /// Waits rejected because the single terminal-accounting slot was full.
+    pub terminal_retention_waiter_saturation_total: u64,
+    /// Registered terminal-accounting waits cancelled before completion.
+    pub terminal_retention_waiter_cancellation_total: u64,
     /// Selected-I/O commands queued behind this snapshot command.
     pub queued_commands: usize,
     /// Conservative logical payload bound for those queued commands.
@@ -1252,10 +1267,440 @@ impl WebTransportRetentionStats {
             .saturating_add(self.transport_datagram_send_bytes as u64)
             .saturating_add(self.transport_datagram_receive_bytes as u64)
     }
+
+    fn settle_terminal(
+        &mut self, write_leases: Option<WriteLeaseAccountingSnapshot>,
+    ) {
+        self.sessions = 0;
+        self.associated_streams = 0;
+        self.provisional_streams = 0;
+        self.stream_open_waiters = 0;
+        self.session_terminal_waiters = 0;
+        self.waiters = 0;
+        self.send_terminal_waiters = 0;
+        self.send_terminal_states = 0;
+        self.send_terminal_overloaded_sessions = 0;
+        self.receive_terminal_observations = 0;
+        self.receive_terminal_states = 0;
+        self.receive_terminal_waiters = 0;
+        self.receive_terminal_leases = 0;
+        self.receive_terminal_bytes = 0;
+        self.bounded_client_connect_owners = 0;
+        self.metadata_index_entries = 0;
+        self.pending_datagrams = 0;
+        self.pending_datagram_payload_bytes = 0;
+        self.pending_datagram_allocation_bytes = 0;
+        self.terminal_retention_waiters = 0;
+        self.queued_commands = 0;
+        self.queued_command_payload_bytes_upper_bound = 0;
+        self.write_leases = 0;
+        self.write_lease_retained_bytes = 0;
+        self.transport_stream_send_bytes = 0;
+        self.transport_stream_receive_bytes = 0;
+        self.transport_datagram_send_bytes = 0;
+        self.transport_datagram_receive_bytes = 0;
+
+        if let Some(write_leases) = write_leases {
+            self.max_write_leases = write_leases.max_count;
+            self.max_write_lease_retained_bytes = write_leases.max_retained_bytes;
+            self.write_lease_admitted_total = write_leases.admitted_total;
+            self.write_lease_queue_full_total = write_leases.queue_full_total;
+            self.write_lease_resource_limit_total =
+                write_leases.resource_limit_total;
+            self.write_lease_too_large_total = write_leases.too_large_total;
+            self.write_lease_abandoned_unexposed_total =
+                write_leases.abandoned_unexposed_total;
+            self.write_lease_abandoned_zero_total =
+                write_leases.abandoned_zero_total;
+            self.write_lease_abandoned_unknown_total =
+                write_leases.abandoned_unknown_total;
+        }
+    }
+}
+
+/// Exact unresolved ownership preventing terminal retention accounting.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct WebTransportTerminalRetentionPending {
+    /// Whether the selected command lane and runtime have settled.
+    pub runtime_settled: bool,
+    /// Whether a worker installed the core-connection destruction hook.
+    pub connection_owner_attached: bool,
+    /// Whether the worker-owned core connection has been destroyed.
+    pub connection_owner_dropped: bool,
+    /// Outstanding write operations or one-use retry permissions.
+    pub write_leases: usize,
+    /// Owner-declared bytes still retained by outstanding write operations.
+    pub write_lease_retained_bytes: usize,
+    /// Terminal receive results still held outside the cleared runtime.
+    pub receive_terminal_leases: usize,
+    /// Payload backing held by outstanding terminal receive results.
+    pub receive_terminal_bytes: usize,
+}
+
+/// Result of taking one controller's authoritative terminal accounting.
+#[derive(Debug, Eq, PartialEq)]
+pub enum WebTransportTerminalRetentionOutcome {
+    /// The take succeeded and consumed the only authoritative snapshot.
+    Taken(Box<WebTransportRetentionStats>),
+    /// Teardown or external ownership has not settled yet.
+    Early(WebTransportTerminalRetentionPending),
+    /// Another clone already consumed the authoritative snapshot.
+    AlreadyTaken,
+    /// The claim belongs to an independently constructed controller.
+    ForeignController,
+    /// The caller explicitly cancelled its pending wait.
+    Cancelled,
+    /// Another terminal-accounting waiter already occupies the bounded slot.
+    WaiterUnavailable,
+    /// No exact core-owner lifecycle hook was attached before teardown.
+    Unavailable,
+}
+
+/// Opaque capability binding a terminal-accounting take to one controller.
+#[derive(Clone)]
+pub struct WebTransportTerminalRetentionClaim {
+    state: Arc<TerminalRetentionState>,
+}
+
+impl fmt::Debug for WebTransportTerminalRetentionClaim {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WebTransportTerminalRetentionClaim")
+            .finish_non_exhaustive()
+    }
+}
+
+/// One bounded, cancellation-safe terminal-accounting wait operation.
+pub struct WebTransportTerminalRetentionOperation {
+    state: Arc<TerminalRetentionState>,
+    immediate: Option<WebTransportTerminalRetentionOutcome>,
+    registered: bool,
+    completed: bool,
+}
+
+impl fmt::Debug for WebTransportTerminalRetentionOperation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WebTransportTerminalRetentionOperation")
+            .field("registered", &self.registered)
+            .field("completed", &self.completed)
+            .finish_non_exhaustive()
+    }
+}
+
+impl WebTransportTerminalRetentionOperation {
+    /// Cancels this wait without consuming the eventual terminal result.
+    pub fn cancel(mut self) -> WebTransportTerminalRetentionOutcome {
+        if self.registered {
+            self.state.cancel_waiter();
+            self.registered = false;
+        }
+        self.completed = true;
+        WebTransportTerminalRetentionOutcome::Cancelled
+    }
+}
+
+impl Future for WebTransportTerminalRetentionOperation {
+    type Output = WebTransportTerminalRetentionOutcome;
+
+    fn poll(
+        mut self: Pin<&mut Self>, cx: &mut Context<'_>,
+    ) -> Poll<Self::Output> {
+        if let Some(outcome) = self.immediate.take() {
+            self.completed = true;
+            return Poll::Ready(outcome);
+        }
+
+        let (outcome, registered) = self.state.poll_take(cx, self.registered);
+        self.registered = registered;
+        if outcome.is_ready() {
+            self.completed = true;
+        }
+        outcome
+    }
+}
+
+impl Drop for WebTransportTerminalRetentionOperation {
+    fn drop(&mut self) {
+        if !self.completed && self.registered {
+            self.state.cancel_waiter();
+        }
+    }
+}
+
+#[derive(Debug)]
+struct TerminalRetentionInner {
+    runtime_stats: Option<Box<WebTransportRetentionStats>>,
+    runtime_settled: bool,
+    write_lease_accounting: Option<Arc<WriteLeaseAccounting>>,
+    connection_owner_attached: bool,
+    connection_owner_dropped: bool,
+    receive_terminal_leases: usize,
+    receive_terminal_bytes: usize,
+    waiter: Option<Waker>,
+    waiter_saturation_total: u64,
+    waiter_cancellation_total: u64,
+    taken: bool,
+    unavailable: bool,
+}
+
+impl Default for TerminalRetentionInner {
+    fn default() -> Self {
+        Self {
+            runtime_stats: Some(Box::default()),
+            runtime_settled: false,
+            write_lease_accounting: None,
+            connection_owner_attached: false,
+            connection_owner_dropped: false,
+            receive_terminal_leases: 0,
+            receive_terminal_bytes: 0,
+            waiter: None,
+            waiter_saturation_total: 0,
+            waiter_cancellation_total: 0,
+            taken: false,
+            unavailable: false,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct TerminalRetentionState {
+    inner: Mutex<TerminalRetentionInner>,
+}
+
+impl TerminalRetentionState {
+    pub(super) fn new() -> Self {
+        Self {
+            inner: Mutex::new(TerminalRetentionInner::default()),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, TerminalRetentionInner> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    pub(super) fn bind_write_lease_accounting(
+        &self, accounting: &Arc<WriteLeaseAccounting>,
+    ) {
+        self.lock().write_lease_accounting = Some(Arc::clone(accounting));
+    }
+
+    fn write_lease_snapshot(
+        inner: &TerminalRetentionInner,
+    ) -> Option<WriteLeaseAccountingSnapshot> {
+        inner
+            .write_lease_accounting
+            .as_ref()
+            .map(|accounting| accounting.snapshot())
+    }
+
+    fn pending(
+        inner: &TerminalRetentionInner,
+        write_leases: Option<WriteLeaseAccountingSnapshot>,
+    ) -> WebTransportTerminalRetentionPending {
+        let write_leases = write_leases.unwrap_or_default();
+        WebTransportTerminalRetentionPending {
+            runtime_settled: inner.runtime_settled,
+            connection_owner_attached: inner.connection_owner_attached,
+            connection_owner_dropped: inner.connection_owner_dropped,
+            write_leases: write_leases.current,
+            write_lease_retained_bytes: write_leases.retained_bytes,
+            receive_terminal_leases: inner.receive_terminal_leases,
+            receive_terminal_bytes: inner.receive_terminal_bytes,
+        }
+    }
+
+    fn take_locked(
+        inner: &mut TerminalRetentionInner,
+        write_leases: Option<WriteLeaseAccountingSnapshot>,
+    ) -> WebTransportTerminalRetentionOutcome {
+        if inner.taken {
+            return WebTransportTerminalRetentionOutcome::AlreadyTaken;
+        }
+        if inner.unavailable {
+            return WebTransportTerminalRetentionOutcome::Unavailable;
+        }
+
+        let settled = inner.runtime_settled &&
+            inner.connection_owner_dropped &&
+            inner.receive_terminal_leases == 0 &&
+            write_leases.is_none_or(|snapshot| snapshot.current == 0);
+        if !settled {
+            return WebTransportTerminalRetentionOutcome::Early(Self::pending(
+                inner,
+                write_leases,
+            ));
+        }
+
+        let mut stats = inner
+            .runtime_stats
+            .take()
+            .expect("terminal accounting preallocates one snapshot");
+        stats.settle_terminal(write_leases);
+        stats.terminal_retention_waiters = 0;
+        stats.max_terminal_retention_waiters = 1;
+        stats.terminal_retention_waiter_saturation_total =
+            inner.waiter_saturation_total;
+        stats.terminal_retention_waiter_cancellation_total =
+            inner.waiter_cancellation_total;
+        inner.write_lease_accounting = None;
+        inner.taken = true;
+        WebTransportTerminalRetentionOutcome::Taken(stats)
+    }
+
+    fn try_take(&self) -> WebTransportTerminalRetentionOutcome {
+        let mut inner = self.lock();
+        let write_leases = Self::write_lease_snapshot(&inner);
+        let outcome = Self::take_locked(&mut inner, write_leases);
+        let waiter = outcome.is_terminal().then(|| inner.waiter.take()).flatten();
+        drop(inner);
+        if let Some(waiter) = waiter {
+            waiter.wake();
+        }
+        outcome
+    }
+
+    fn poll_take(
+        &self, cx: &mut Context<'_>, registered: bool,
+    ) -> (Poll<WebTransportTerminalRetentionOutcome>, bool) {
+        let mut inner = self.lock();
+        let write_leases = Self::write_lease_snapshot(&inner);
+        let outcome = Self::take_locked(&mut inner, write_leases);
+        if !matches!(outcome, WebTransportTerminalRetentionOutcome::Early(_)) {
+            inner.waiter = None;
+            return (Poll::Ready(outcome), false);
+        }
+        if !registered && inner.waiter.is_some() {
+            inner.waiter_saturation_total =
+                inner.waiter_saturation_total.saturating_add(1);
+            return (
+                Poll::Ready(
+                    WebTransportTerminalRetentionOutcome::WaiterUnavailable,
+                ),
+                false,
+            );
+        }
+        inner.waiter = Some(cx.waker().clone());
+        (Poll::Pending, true)
+    }
+
+    fn cancel_waiter(&self) {
+        let mut inner = self.lock();
+        if inner.waiter.take().is_some() {
+            inner.waiter_cancellation_total =
+                inner.waiter_cancellation_total.saturating_add(1);
+        }
+    }
+
+    fn wake_if_terminal(&self) {
+        let waiter = {
+            let mut inner = self.lock();
+            let write_leases = Self::write_lease_snapshot(&inner);
+            let terminal = inner.unavailable ||
+                inner.taken ||
+                (inner.runtime_settled &&
+                    inner.connection_owner_dropped &&
+                    inner.receive_terminal_leases == 0 &&
+                    write_leases
+                        .is_none_or(|snapshot| snapshot.current == 0));
+            terminal.then(|| inner.waiter.take()).flatten()
+        };
+        if let Some(waiter) = waiter {
+            waiter.wake();
+        }
+    }
+
+    pub(super) fn mark_connection_owner_attached(&self) {
+        self.lock().connection_owner_attached = true;
+    }
+
+    pub(super) fn mark_connection_owner_dropped(&self) {
+        self.lock().connection_owner_dropped = true;
+        self.wake_if_terminal();
+    }
+
+    pub(super) fn mark_runtime_settled(&self, stats: WebTransportRetentionStats) {
+        let mut inner = self.lock();
+        if !inner.runtime_settled && !inner.unavailable {
+            **inner
+                .runtime_stats
+                .as_mut()
+                .expect("terminal accounting preallocates one snapshot") = stats;
+            inner.runtime_settled = true;
+        }
+        drop(inner);
+        self.wake_if_terminal();
+    }
+
+    pub(super) fn mark_driver_dropped(&self) {
+        let mut inner = self.lock();
+        if !inner.connection_owner_attached {
+            inner.unavailable = true;
+            inner.runtime_stats = None;
+            inner.write_lease_accounting = None;
+        }
+        drop(inner);
+        self.wake_if_terminal();
+    }
+
+    pub(super) fn augment_stats(&self, stats: &mut WebTransportRetentionStats) {
+        let inner = self.lock();
+        stats.terminal_retention_waiters = usize::from(inner.waiter.is_some());
+        stats.max_terminal_retention_waiters = 1;
+        stats.terminal_retention_waiter_saturation_total =
+            inner.waiter_saturation_total;
+        stats.terminal_retention_waiter_cancellation_total =
+            inner.waiter_cancellation_total;
+    }
+
+    fn retain_receive_terminal(
+        self: &Arc<Self>, bytes: usize,
+    ) -> TerminalReceiveRetentionGuard {
+        let mut inner = self.lock();
+        inner.receive_terminal_leases =
+            inner.receive_terminal_leases.saturating_add(1);
+        inner.receive_terminal_bytes =
+            inner.receive_terminal_bytes.saturating_add(bytes);
+        TerminalReceiveRetentionGuard {
+            state: Arc::clone(self),
+            bytes,
+        }
+    }
+}
+
+trait TerminalRetentionOutcomeExt {
+    fn is_terminal(&self) -> bool;
+}
+
+impl TerminalRetentionOutcomeExt for WebTransportTerminalRetentionOutcome {
+    fn is_terminal(&self) -> bool {
+        !matches!(self, Self::Early(_))
+    }
+}
+
+#[derive(Debug)]
+struct TerminalReceiveRetentionGuard {
+    state: Arc<TerminalRetentionState>,
+    bytes: usize,
+}
+
+impl Drop for TerminalReceiveRetentionGuard {
+    fn drop(&mut self) {
+        let mut inner = self.state.lock();
+        inner.receive_terminal_leases =
+            inner.receive_terminal_leases.saturating_sub(1);
+        inner.receive_terminal_bytes =
+            inner.receive_terminal_bytes.saturating_sub(self.bytes);
+        drop(inner);
+        self.state.wake_if_terminal();
+    }
 }
 
 #[derive(Debug, Default)]
 struct WriteLeaseAccountingState {
+    closed: bool,
     current: usize,
     retained_bytes: usize,
     admitted_total: u64,
@@ -1267,6 +1712,12 @@ struct WriteLeaseAccountingState {
     abandoned_unknown_total: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WriteLeaseAdmissionError {
+    Closed,
+    ResourceLimit,
+}
+
 #[derive(Debug)]
 pub(crate) struct WriteLeaseAccounting {
     // This allocation also scopes retry tokens to one driver construction.
@@ -1274,11 +1725,13 @@ pub(crate) struct WriteLeaseAccounting {
     max_count: usize,
     max_retained_bytes: usize,
     state: Mutex<WriteLeaseAccountingState>,
+    terminal_retention: Weak<TerminalRetentionState>,
 }
 
 impl WriteLeaseAccounting {
-    pub(crate) fn new(
+    pub(super) fn new(
         max_count: usize, max_retained_bytes_per_lease: usize,
+        terminal_retention: Weak<TerminalRetentionState>,
     ) -> Self {
         let max_count = max_count.max(1);
         Self {
@@ -1286,6 +1739,7 @@ impl WriteLeaseAccounting {
             max_retained_bytes: max_count
                 .saturating_mul(max_retained_bytes_per_lease),
             state: Mutex::new(WriteLeaseAccountingState::default()),
+            terminal_retention,
         }
     }
 
@@ -1297,26 +1751,29 @@ impl WriteLeaseAccounting {
 
     fn try_admit(
         self: &Arc<Self>, retained_bytes: usize,
-    ) -> Option<WriteLeaseAccountingGuard> {
+    ) -> Result<WriteLeaseAccountingGuard, WriteLeaseAdmissionError> {
         let mut state = self.lock();
+        if state.closed {
+            return Err(WriteLeaseAdmissionError::Closed);
+        }
         let Some(next_bytes) = state.retained_bytes.checked_add(retained_bytes)
         else {
             state.resource_limit_total =
                 state.resource_limit_total.saturating_add(1);
-            return None;
+            return Err(WriteLeaseAdmissionError::ResourceLimit);
         };
         if state.current >= self.max_count || next_bytes > self.max_retained_bytes
         {
             state.resource_limit_total =
                 state.resource_limit_total.saturating_add(1);
-            return None;
+            return Err(WriteLeaseAdmissionError::ResourceLimit);
         }
 
         state.current += 1;
         state.retained_bytes = next_bytes;
         state.admitted_total = state.admitted_total.saturating_add(1);
         drop(state);
-        Some(WriteLeaseAccountingGuard {
+        Ok(WriteLeaseAccountingGuard {
             accounting: Arc::clone(self),
             retained_bytes,
         })
@@ -1349,6 +1806,16 @@ impl WriteLeaseAccounting {
                 state.abandoned_unknown_total =
                     state.abandoned_unknown_total.saturating_add(1);
             },
+        }
+    }
+
+    fn close(&self) {
+        self.lock().closed = true;
+    }
+
+    fn notify_terminal_retention(&self) {
+        if let Some(terminal_retention) = self.terminal_retention.upgrade() {
+            terminal_retention.wake_if_terminal();
         }
     }
 
@@ -1397,6 +1864,8 @@ impl Drop for WriteLeaseAccountingGuard {
         state.current = state.current.saturating_sub(1);
         state.retained_bytes =
             state.retained_bytes.saturating_sub(self.retained_bytes);
+        drop(state);
+        self.accounting.notify_terminal_retention();
     }
 }
 
@@ -1809,6 +2278,7 @@ pub struct WebTransportController {
     max_datagram_send_allocation_bytes: usize,
     max_datagram_prefixed_allocation_bytes: usize,
     write_lease_accounting: Arc<WriteLeaseAccounting>,
+    terminal_retention: Arc<TerminalRetentionState>,
 }
 
 pub(crate) struct WebTransportControllerLimits {
@@ -1821,11 +2291,12 @@ pub(crate) struct WebTransportControllerLimits {
 }
 
 impl WebTransportController {
-    pub(crate) fn new(
+    pub(super) fn new(
         sender: mpsc::Sender<WebTransportCommand>,
         limits: WebTransportControllerLimits,
         write_lease_accounting: Arc<WriteLeaseAccounting>,
         cancellation_pending: Arc<AtomicBool>,
+        terminal_retention: Arc<TerminalRetentionState>,
     ) -> Self {
         Self {
             sender,
@@ -1842,6 +2313,50 @@ impl WebTransportController {
             max_datagram_prefixed_allocation_bytes: limits
                 .max_datagram_prefixed_allocation_bytes,
             write_lease_accounting,
+            terminal_retention,
+        }
+    }
+
+    /// Returns an opaque claim for this controller's terminal accounting.
+    ///
+    /// Claims contain no diagnostic identity and can be created before or
+    /// after connection teardown. A claim is accepted by clones of this
+    /// controller and rejected by independently constructed controllers.
+    pub fn terminal_retention_claim(&self) -> WebTransportTerminalRetentionClaim {
+        WebTransportTerminalRetentionClaim {
+            state: Arc::clone(&self.terminal_retention),
+        }
+    }
+
+    /// Attempts to consume the take-once terminal accounting result.
+    ///
+    /// [`WebTransportTerminalRetentionOutcome::Early`] reports exact external
+    /// ownership still preventing completion. This method never registers a
+    /// waiter and never uses the selected command lane.
+    pub fn try_take_terminal_retention(
+        &self, claim: &WebTransportTerminalRetentionClaim,
+    ) -> WebTransportTerminalRetentionOutcome {
+        if !Arc::ptr_eq(&self.terminal_retention, &claim.state) {
+            return WebTransportTerminalRetentionOutcome::ForeignController;
+        }
+        self.terminal_retention.try_take()
+    }
+
+    /// Waits without the selected command lane for terminal accounting.
+    ///
+    /// Exactly one operation can wait at a time. Dropping or explicitly
+    /// cancelling the operation releases that slot without consuming the
+    /// eventual result.
+    pub fn wait_terminal_retention(
+        &self, claim: WebTransportTerminalRetentionClaim,
+    ) -> WebTransportTerminalRetentionOperation {
+        let immediate = (!Arc::ptr_eq(&self.terminal_retention, &claim.state))
+            .then_some(WebTransportTerminalRetentionOutcome::ForeignController);
+        WebTransportTerminalRetentionOperation {
+            state: claim.state,
+            immediate,
+            registered: false,
+            completed: false,
         }
     }
 
@@ -2018,14 +2533,21 @@ impl WebTransportController {
                 fin,
             };
         };
-        let Some(accounting) =
-            self.write_lease_accounting.try_admit(retained_bytes)
-        else {
-            return WebTransportStreamWriteLeaseOutcome::ResourceLimit {
-                lease: owner.take(),
-                fin,
+        let accounting =
+            match self.write_lease_accounting.try_admit(retained_bytes) {
+                Ok(accounting) => accounting,
+                Err(WriteLeaseAdmissionError::Closed) =>
+                    return WebTransportStreamWriteLeaseOutcome::Rejected {
+                        error: WebTransportSelectionError::ConnectionClosed,
+                        lease: owner.take(),
+                        fin,
+                    },
+                Err(WriteLeaseAdmissionError::ResourceLimit) =>
+                    return WebTransportStreamWriteLeaseOutcome::ResourceLimit {
+                        lease: owner.take(),
+                        fin,
+                    },
             };
-        };
         owner.accounting = Some(accounting);
         self.admit_stream_write_lease(
             permit, session_id, stream_id, owner, preflight, fin,
@@ -2076,13 +2598,22 @@ impl WebTransportController {
                 });
             },
         };
-        let Some(accounting) =
-            self.write_lease_accounting.try_admit(retained_bytes)
-        else {
-            return Err(WebTransportStreamWriteLeaseOutcome::ResourceLimit {
-                lease,
-                fin,
-            });
+        let accounting = match self
+            .write_lease_accounting
+            .try_admit(retained_bytes)
+        {
+            Ok(accounting) => accounting,
+            Err(WriteLeaseAdmissionError::Closed) =>
+                return Err(WebTransportStreamWriteLeaseOutcome::Rejected {
+                    error: WebTransportSelectionError::ConnectionClosed,
+                    lease,
+                    fin,
+                }),
+            Err(WriteLeaseAdmissionError::ResourceLimit) =>
+                return Err(WebTransportStreamWriteLeaseOutcome::ResourceLimit {
+                    lease,
+                    fin,
+                }),
         };
         let owner = WriteLeaseOwner {
             lease: Some(lease),
@@ -2589,8 +3120,11 @@ impl WebTransportController {
         };
         let (response, recv) = oneshot::channel();
         permit.send(WebTransportCommand::RetentionStats { response });
-        recv.await
-            .unwrap_or(Err(WebTransportDatagramError::ConnectionClosed))
+        let mut stats = recv
+            .await
+            .unwrap_or(Err(WebTransportDatagramError::ConnectionClosed))?;
+        self.terminal_retention.augment_stats(&mut stats);
+        Ok(stats)
     }
 }
 
@@ -3308,7 +3842,9 @@ pub(super) fn runtime_metadata_upper_bound(
     .checked_add(std::mem::size_of::<u64>())?;
     let fixed_session_bytes = std::mem::size_of::<Session>()
         .checked_add(std::mem::size_of::<SessionWork>())?
-        .checked_add(MAX_CLOSE_MESSAGE_LEN)?;
+        .checked_add(MAX_CLOSE_MESSAGE_LEN)?
+        .checked_add(std::mem::size_of::<TerminalRetentionState>())?
+        .checked_add(std::mem::size_of::<WebTransportRetentionStats>())?;
 
     max_pending_streams
         .checked_mul(pending_value_bytes)?
@@ -3560,6 +4096,7 @@ pub(crate) struct Runtime {
     limits: RuntimeLimits,
     reset_mode: quiche::h3::WebTransportStreamResetMode,
     write_lease_accounting: Arc<WriteLeaseAccounting>,
+    terminal_retention: Arc<TerminalRetentionState>,
     sessions: BTreeMap<u64, Session>,
     pending_streams: BTreeMap<u64, AssociatedStream>,
     pending_by_session: BTreeMap<u64, BTreeSet<u64>>,
@@ -3629,20 +4166,25 @@ pub(crate) struct Runtime {
 impl Runtime {
     #[cfg(test)]
     pub(crate) fn new(limits: RuntimeLimits) -> Self {
+        let terminal_retention = Arc::new(TerminalRetentionState::new());
         let write_lease_accounting = Arc::new(WriteLeaseAccounting::new(
             limits.command_capacity,
             limits.max_write_lease_retained_bytes_per_lease,
+            Arc::downgrade(&terminal_retention),
         ));
+        terminal_retention.bind_write_lease_accounting(&write_lease_accounting);
         Self::new_with_write_lease_accounting(
             limits,
             write_lease_accounting,
             Arc::new(AtomicBool::new(false)),
+            terminal_retention,
         )
     }
 
-    pub(crate) fn new_with_write_lease_accounting(
+    pub(super) fn new_with_write_lease_accounting(
         limits: RuntimeLimits, write_lease_accounting: Arc<WriteLeaseAccounting>,
         cancellation_pending: Arc<AtomicBool>,
+        terminal_retention: Arc<TerminalRetentionState>,
     ) -> Self {
         Self {
             limits: RuntimeLimits {
@@ -3678,6 +4220,7 @@ impl Runtime {
             reset_mode:
                 quiche::h3::WebTransportStreamResetMode::ReliablePrefixReset,
             write_lease_accounting,
+            terminal_retention,
             sessions: BTreeMap::new(),
             pending_streams: BTreeMap::new(),
             pending_by_session: BTreeMap::new(),
@@ -4584,8 +5127,10 @@ impl Runtime {
                 let _ = response.send(Ok(self.datagram_stats()));
             },
             WebTransportCommand::RetentionStats { response } => {
-                let _ = response
-                    .send(Ok(self.retention_stats(qconn, queued_command_items)));
+                let _ =
+                    response
+                        .send(Ok(self
+                            .retention_stats(Some(qconn), queued_command_items)));
             },
         }
     }
@@ -6024,6 +6569,9 @@ impl Runtime {
             terminal,
             allocation_bytes,
             leased: AtomicBool::new(false),
+            _terminal_retention: self
+                .terminal_retention
+                .retain_receive_terminal(allocation_bytes),
         });
         self.receive_terminal_states
             .insert(stream_id, Arc::clone(&shared));
@@ -6978,8 +7526,8 @@ impl Runtime {
         }
     }
 
-    fn retention_stats(
-        &self, qconn: &QuicheConnection, queued_command_items: usize,
+    pub(super) fn retention_stats(
+        &self, qconn: Option<&QuicheConnection>, queued_command_items: usize,
     ) -> WebTransportRetentionStats {
         let associated_streams = self.stream_sessions.len();
         let provisional_streams = self
@@ -7120,6 +7668,10 @@ impl Runtime {
             pending_datagram_allocation_bytes: self
                 .pending_datagram_allocation_bytes,
             command_capacity: self.limits.command_capacity,
+            terminal_retention_waiters: 0,
+            max_terminal_retention_waiters: 1,
+            terminal_retention_waiter_saturation_total: 0,
+            terminal_retention_waiter_cancellation_total: 0,
             queued_commands,
             queued_command_payload_bytes_upper_bound: queued_commands
                 .saturating_mul(self.limits.max_command_payload_bytes),
@@ -7136,11 +7688,19 @@ impl Runtime {
             write_lease_abandoned_zero_total: write_leases.abandoned_zero_total,
             write_lease_abandoned_unknown_total: write_leases
                 .abandoned_unknown_total,
-            transport_stream_send_bytes: qconn.stream_send_queue_byte_size(),
-            transport_stream_receive_bytes: qconn.stream_recv_queue_byte_size(),
-            transport_datagram_send_bytes: qconn.dgram_send_queue_byte_size(),
-            transport_datagram_receive_bytes: qconn.dgram_recv_queue_byte_size(),
+            transport_stream_send_bytes: qconn
+                .map_or(0, QuicheConnection::stream_send_queue_byte_size),
+            transport_stream_receive_bytes: qconn
+                .map_or(0, QuicheConnection::stream_recv_queue_byte_size),
+            transport_datagram_send_bytes: qconn
+                .map_or(0, QuicheConnection::dgram_send_queue_byte_size),
+            transport_datagram_receive_bytes: qconn
+                .map_or(0, QuicheConnection::dgram_recv_queue_byte_size),
         }
+    }
+
+    pub(super) fn close_write_lease_admission(&self) {
+        self.write_lease_accounting.close();
     }
 
     pub(crate) fn settle_command_on_connection_close(
@@ -7508,6 +8068,269 @@ mod tests {
         CloseCapsule::new(code, message.to_string())
             .unwrap()
             .encode()
+    }
+
+    fn terminal_controller() -> (
+        WebTransportController,
+        mpsc::Receiver<WebTransportCommand>,
+        Arc<TerminalRetentionState>,
+        Arc<WriteLeaseAccounting>,
+    ) {
+        let (sender, recv) = mpsc::channel(2);
+        let terminal_retention = Arc::new(TerminalRetentionState::new());
+        let write_lease_accounting = Arc::new(WriteLeaseAccounting::new(
+            2,
+            64,
+            Arc::downgrade(&terminal_retention),
+        ));
+        terminal_retention.bind_write_lease_accounting(&write_lease_accounting);
+        let controller = WebTransportController::new(
+            sender,
+            WebTransportControllerLimits {
+                max_stream_write_bytes: 64,
+                max_stream_write_lease_retained_bytes: 64,
+                max_stream_write_lease_owner_bytes: 64,
+                max_stream_read_bytes: 64,
+                max_datagram_send_allocation_bytes: 0,
+                max_datagram_prefixed_allocation_bytes: 0,
+            },
+            Arc::clone(&write_lease_accounting),
+            Arc::new(AtomicBool::new(false)),
+            Arc::clone(&terminal_retention),
+        );
+        (controller, recv, terminal_retention, write_lease_accounting)
+    }
+
+    #[test]
+    fn terminal_retention_is_controller_bound_bounded_and_take_once() {
+        let (controller, _recv, state, _write_leases) = terminal_controller();
+        let clone = controller.clone();
+        let claim = controller.terminal_retention_claim();
+        assert_eq!(
+            clone.try_take_terminal_retention(&claim),
+            WebTransportTerminalRetentionOutcome::Early(
+                WebTransportTerminalRetentionPending::default()
+            )
+        );
+
+        let (foreign, _recv, _state, _write_leases) = terminal_controller();
+        assert_eq!(
+            foreign.try_take_terminal_retention(&claim),
+            WebTransportTerminalRetentionOutcome::ForeignController
+        );
+        assert_matches!(
+            futures::executor::block_on(
+                foreign.wait_terminal_retention(claim.clone())
+            ),
+            WebTransportTerminalRetentionOutcome::ForeignController
+        );
+
+        let mut first = controller.wait_terminal_retention(claim.clone());
+        let waker = futures::task::noop_waker();
+        let mut context = Context::from_waker(&waker);
+        assert!(Future::poll(Pin::new(&mut first), &mut context).is_pending());
+        assert_eq!(
+            futures::executor::block_on(
+                clone.wait_terminal_retention(claim.clone())
+            ),
+            WebTransportTerminalRetentionOutcome::WaiterUnavailable
+        );
+        assert_eq!(
+            first.cancel(),
+            WebTransportTerminalRetentionOutcome::Cancelled
+        );
+
+        let mut stats = WebTransportRetentionStats {
+            sessions: 1,
+            metadata_index_entries: 4,
+            command_capacity: 2,
+            receive_terminal_states_high_water: 3,
+            ..WebTransportRetentionStats::default()
+        };
+        stats.transport_stream_send_bytes = 128;
+        state.mark_connection_owner_attached();
+        state.mark_runtime_settled(stats);
+        state.mark_connection_owner_dropped();
+
+        let taken = assert_matches!(
+            futures::executor::block_on(
+                clone.wait_terminal_retention(claim.clone())
+            ),
+            WebTransportTerminalRetentionOutcome::Taken(stats) => stats
+        );
+        assert_eq!(taken.sessions, 0);
+        assert_eq!(taken.metadata_index_entries, 0);
+        assert_eq!(taken.transport_stream_send_bytes, 0);
+        assert_eq!(taken.command_capacity, 2);
+        assert_eq!(taken.receive_terminal_states_high_water, 3);
+        assert_eq!(taken.terminal_retention_waiters, 0);
+        assert_eq!(taken.max_terminal_retention_waiters, 1);
+        assert_eq!(taken.terminal_retention_waiter_saturation_total, 1);
+        assert_eq!(taken.terminal_retention_waiter_cancellation_total, 1);
+        assert_eq!(
+            controller.try_take_terminal_retention(&claim),
+            WebTransportTerminalRetentionOutcome::AlreadyTaken
+        );
+        let inner = state.lock();
+        assert!(inner.runtime_stats.is_none());
+        assert!(inner.waiter.is_none());
+    }
+
+    #[test]
+    fn terminal_retention_waits_for_external_write_and_receive_owners() {
+        let (controller, _recv, state, write_leases) = terminal_controller();
+        let claim = controller.terminal_retention_claim();
+        let write = write_leases.try_admit(9).unwrap();
+        let receive = state.retain_receive_terminal(11);
+        state.mark_connection_owner_attached();
+        state.mark_runtime_settled(WebTransportRetentionStats {
+            receive_terminal_states_high_water: 1,
+            receive_terminal_bytes_high_water: 11,
+            ..WebTransportRetentionStats::default()
+        });
+        state.mark_connection_owner_dropped();
+
+        assert_eq!(
+            controller.try_take_terminal_retention(&claim),
+            WebTransportTerminalRetentionOutcome::Early(
+                WebTransportTerminalRetentionPending {
+                    runtime_settled: true,
+                    connection_owner_attached: true,
+                    connection_owner_dropped: true,
+                    write_leases: 1,
+                    write_lease_retained_bytes: 9,
+                    receive_terminal_leases: 1,
+                    receive_terminal_bytes: 11,
+                }
+            )
+        );
+        drop(write);
+        let pending = assert_matches!(
+            controller.try_take_terminal_retention(&claim),
+            WebTransportTerminalRetentionOutcome::Early(pending) => pending
+        );
+        assert_eq!(pending.write_leases, 0);
+        assert_eq!(pending.receive_terminal_leases, 1);
+        drop(receive);
+
+        let stats = assert_matches!(
+            controller.try_take_terminal_retention(&claim),
+            WebTransportTerminalRetentionOutcome::Taken(stats) => stats
+        );
+        assert_eq!(stats.write_leases, 0);
+        assert_eq!(stats.write_lease_retained_bytes, 0);
+        assert_eq!(stats.write_lease_admitted_total, 1);
+        assert_eq!(stats.receive_terminal_states, 0);
+        assert_eq!(stats.receive_terminal_leases, 0);
+        assert_eq!(stats.receive_terminal_bytes, 0);
+        assert_eq!(stats.receive_terminal_states_high_water, 1);
+        assert_eq!(stats.receive_terminal_bytes_high_water, 11);
+    }
+
+    #[test]
+    fn terminal_retention_preserves_late_write_cumulative_totals() {
+        let (controller, _recv, state, write_leases) = terminal_controller();
+        let write = write_leases.try_admit(9).unwrap();
+        state.mark_connection_owner_attached();
+        state.mark_runtime_settled(WebTransportRetentionStats::default());
+        state.mark_connection_owner_dropped();
+
+        let claim = controller.terminal_retention_claim();
+        let mut wait = controller.wait_terminal_retention(claim);
+        let waker = futures::task::noop_waker();
+        let mut context = Context::from_waker(&waker);
+        assert!(Future::poll(Pin::new(&mut wait), &mut context).is_pending());
+        drop(controller);
+        drop(write_leases);
+
+        write.accounting.record_abandonment(
+            WebTransportStreamWriteLeaseProgress::NeverExposed,
+        );
+        drop(write);
+
+        let stats = assert_matches!(
+            futures::executor::block_on(wait),
+            WebTransportTerminalRetentionOutcome::Taken(stats) => stats
+        );
+        assert_eq!(stats.write_lease_admitted_total, 1);
+        assert_eq!(stats.write_lease_abandoned_unexposed_total, 1);
+        assert!(state.lock().write_lease_accounting.is_none());
+    }
+
+    #[test]
+    fn terminal_retention_reports_unavailable_without_owner_hook() {
+        let (controller, _recv, state, _write_leases) = terminal_controller();
+        let claim = controller.terminal_retention_claim();
+        state.mark_runtime_settled(WebTransportRetentionStats::default());
+        state.mark_driver_dropped();
+        assert_eq!(
+            controller.try_take_terminal_retention(&claim),
+            WebTransportTerminalRetentionOutcome::Unavailable
+        );
+    }
+
+    #[test]
+    fn closed_terminal_admission_returns_owner_without_limit_rejection() {
+        let (controller, _recv, _state, write_leases) = terminal_controller();
+        write_leases.close();
+
+        let outcome = futures::executor::block_on(controller.write_stream_lease(
+            0,
+            0,
+            BytesWriteLease(Bytes::from_static(b"owned")),
+            false,
+        ));
+        let lease = match outcome {
+            WebTransportStreamWriteLeaseOutcome::Rejected {
+                error: WebTransportSelectionError::ConnectionClosed,
+                lease,
+                fin: false,
+            } => lease,
+            _ => panic!("closed admission returned an unexpected outcome"),
+        };
+        assert_eq!(lease.0, Bytes::from_static(b"owned"));
+        let accounting = write_leases.snapshot();
+        assert_eq!(accounting.current, 0);
+        assert_eq!(accounting.resource_limit_total, 0);
+    }
+
+    #[test]
+    fn terminal_retention_tracks_an_actual_receive_terminal_lease() {
+        let mut pipe = pipe();
+        let mut runtime = Runtime::new(runtime_limits(8, 8, 8));
+        activate_session(&mut runtime, 0);
+        own_stream(&mut runtime, 0, 2, WebTransportStreamDirection::Uni, false);
+        pipe.client.stream_send(2, b"final", true).unwrap();
+        pipe.advance().unwrap();
+        let terminal = assert_matches!(
+            read_stream(&mut runtime, &mut pipe.server, 0, 2, 64),
+            WebTransportStreamReadOutcome::Terminal(terminal) => terminal
+        );
+        let terminal_retention = Arc::clone(&runtime.terminal_retention);
+        runtime.close_write_lease_admission();
+        runtime.clear();
+        let stats = runtime.retention_stats(Some(&pipe.server), 0);
+        terminal_retention.mark_connection_owner_attached();
+        terminal_retention.mark_runtime_settled(stats);
+        drop(pipe);
+        terminal_retention.mark_connection_owner_dropped();
+
+        let pending = assert_matches!(
+            terminal_retention.try_take(),
+            WebTransportTerminalRetentionOutcome::Early(pending) => pending
+        );
+        assert_eq!(pending.receive_terminal_leases, 1);
+        assert!(pending.receive_terminal_bytes >= terminal.data().len());
+        drop(terminal);
+
+        let stats = assert_matches!(
+            terminal_retention.try_take(),
+            WebTransportTerminalRetentionOutcome::Taken(stats) => stats
+        );
+        assert_eq!(stats.receive_terminal_leases, 0);
+        assert_eq!(stats.receive_terminal_bytes, 0);
+        assert_eq!(stats.receive_terminal_states_high_water, 1);
+        assert!(stats.receive_terminal_bytes_high_water >= 5);
     }
 
     fn activate_session(runtime: &mut Runtime, session_id: u64) {

@@ -87,12 +87,14 @@ use self::webtransport::CapsuleReadMode;
 use self::webtransport::CloseCapsule;
 use self::webtransport::Runtime as WebTransportRuntime;
 use self::webtransport::RuntimeLimits as WebTransportRuntimeLimits;
+use self::webtransport::TerminalRetentionState;
 use self::webtransport::WebTransportCommand;
 use self::webtransport::WT_SESSION_GONE;
 use crate::buf_factory::BufFactory;
 use crate::http3::settings::Http3Settings;
 use crate::http3::H3AuditStats;
 use crate::metrics::Metrics;
+use crate::quic::connection::ConnectionOwnerDropHook;
 use crate::quic::HandshakeInfo;
 use crate::quic::QuicCommand;
 use crate::quic::QuicheConnection;
@@ -169,6 +171,10 @@ pub use self::webtransport::WebTransportStreamWriteLeaseProgress;
 pub use self::webtransport::WebTransportStreamWriteOperation;
 pub use self::webtransport::WebTransportStreamWriteOutcome;
 pub use self::webtransport::WebTransportStreamWriteRetry;
+pub use self::webtransport::WebTransportTerminalRetentionClaim;
+pub use self::webtransport::WebTransportTerminalRetentionOperation;
+pub use self::webtransport::WebTransportTerminalRetentionOutcome;
+pub use self::webtransport::WebTransportTerminalRetentionPending;
 
 /// Direction of a WebTransport stream carried over HTTP/3.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -797,6 +803,10 @@ pub struct H3Driver<H: DriverHooks> {
     webtransport: Option<WebTransportRuntime>,
     /// Bounded native WebTransport selected-I/O command receiver.
     webtransport_cmd_recv: Option<mpsc::Receiver<WebTransportCommand>>,
+    /// Command-independent, take-once terminal retention state.
+    webtransport_terminal_retention: Option<Arc<TerminalRetentionState>>,
+    /// Preallocated callback fired after core connection ownership is dropped.
+    webtransport_connection_owner_drop_hook: Option<ConnectionOwnerDropHook>,
     /// Rotates priority between selected-I/O commands and opening prefixes.
     webtransport_command_turn: bool,
     /// Rotates native Datagram work across ingress, legacy release, and expiry.
@@ -863,20 +873,34 @@ impl<H: DriverHooks> H3Driver<H> {
         };
         let multicast_datagram_channel_id =
             http3_settings.multicast_datagram_channel_id.clone();
-        let (webtransport, webtransport_cmd_recv, webtransport_controller) =
-            if http3_settings.enable_webtransport {
-                let (sender, recv) = mpsc::channel(
-                    http3_settings.webtransport_command_capacity.max(1),
-                );
-                let write_lease_accounting =
-                    Arc::new(webtransport::WriteLeaseAccounting::new(
-                        http3_settings.webtransport_command_capacity,
-                        http3_settings
-                            .webtransport_max_stream_write_lease_retained_bytes,
-                    ));
-                let cancellation_pending =
-                    Arc::new(std::sync::atomic::AtomicBool::new(false));
-                (
+        let (
+            webtransport,
+            webtransport_cmd_recv,
+            webtransport_controller,
+            webtransport_terminal_retention,
+            webtransport_connection_owner_drop_hook,
+        ) = if http3_settings.enable_webtransport {
+            let (sender, recv) = mpsc::channel(
+                http3_settings.webtransport_command_capacity.max(1),
+            );
+            let terminal_retention = Arc::new(TerminalRetentionState::new());
+            let write_lease_accounting =
+                Arc::new(webtransport::WriteLeaseAccounting::new(
+                    http3_settings.webtransport_command_capacity,
+                    http3_settings
+                        .webtransport_max_stream_write_lease_retained_bytes,
+                    Arc::downgrade(&terminal_retention),
+                ));
+            terminal_retention
+                .bind_write_lease_accounting(&write_lease_accounting);
+            let cancellation_pending =
+                Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let terminal_for_drop = Arc::clone(&terminal_retention);
+            let connection_owner_drop_hook =
+                ConnectionOwnerDropHook::new(move || {
+                    terminal_for_drop.mark_connection_owner_dropped();
+                });
+            (
                     Some(WebTransportRuntime::new_with_write_lease_accounting(
                         WebTransportRuntimeLimits {
                             max_pending_streams: http3_settings
@@ -957,6 +981,7 @@ impl<H: DriverHooks> H3Driver<H> {
                         },
                         Arc::clone(&write_lease_accounting),
                         Arc::clone(&cancellation_pending),
+                        Arc::clone(&terminal_retention),
                     )),
                     Some(recv),
                     Some(WebTransportController::new(
@@ -977,11 +1002,14 @@ impl<H: DriverHooks> H3Driver<H> {
                         },
                         write_lease_accounting,
                         cancellation_pending,
+                        Arc::clone(&terminal_retention),
                     )),
+                    Some(terminal_retention),
+                    Some(connection_owner_drop_hook),
                 )
-            } else {
-                (None, None, None)
-            };
+        } else {
+            (None, None, None, None, None)
+        };
 
         (
             H3Driver {
@@ -1009,6 +1037,8 @@ impl<H: DriverHooks> H3Driver<H> {
                 bounded_profile,
                 webtransport,
                 webtransport_cmd_recv,
+                webtransport_terminal_retention,
+                webtransport_connection_owner_drop_hook,
                 webtransport_command_turn: true,
                 webtransport_datagram_turn: 0,
                 deferred_webtransport_capsule_reads: BTreeSet::new(),
@@ -2427,7 +2457,10 @@ impl<H: DriverHooks> H3Driver<H> {
     }
 
     fn close_webtransport_command_lane(&mut self) {
-        let Some(recv) = self.webtransport_cmd_recv.as_mut() else {
+        if let Some(runtime) = self.webtransport.as_ref() {
+            runtime.close_write_lease_admission();
+        }
+        let Some(mut recv) = self.webtransport_cmd_recv.take() else {
             return;
         };
         recv.close();
@@ -2437,6 +2470,47 @@ impl<H: DriverHooks> H3Driver<H> {
             } else {
                 command.reject_connection_closed();
             }
+        }
+        drop(recv);
+    }
+
+    fn webtransport_retention_stats(
+        &self, qconn: Option<&QuicheConnection>,
+    ) -> Option<WebTransportRetentionStats> {
+        let mut stats = self.webtransport.as_ref()?.retention_stats(qconn, 0);
+        if let Some(terminal_retention) = &self.webtransport_terminal_retention {
+            terminal_retention.augment_stats(&mut stats);
+        }
+        if let Some(ownership) = self
+            .bounded_profile
+            .as_ref()
+            .and_then(|profile| profile.client_connect_ownership.as_ref())
+        {
+            let owner = ownership.stats();
+            stats.bounded_client_connect_owners = owner.current;
+            stats.max_bounded_client_connect_owners = owner.max;
+            stats.bounded_client_connect_owner_installed_total =
+                owner.installed_total;
+            stats.bounded_client_connect_owner_terminal_release_total =
+                owner.terminal_release_total;
+            stats.bounded_client_connect_owner_teardown_release_total =
+                owner.teardown_release_total;
+            stats.bounded_client_connect_owner_late_install_total =
+                owner.late_install_total;
+            stats.metadata_index_entries =
+                stats.metadata_index_entries.saturating_add(owner.current);
+        }
+        Some(stats)
+    }
+
+    fn settle_webtransport_terminal_retention(
+        &self, qconn: Option<&QuicheConnection>,
+    ) {
+        let Some(stats) = self.webtransport_retention_stats(qconn) else {
+            return;
+        };
+        if let Some(terminal_retention) = &self.webtransport_terminal_retention {
+            terminal_retention.mark_runtime_settled(stats);
         }
     }
 
@@ -2781,6 +2855,15 @@ impl<H: DriverHooks> H3Driver<H> {
 }
 
 impl<H: DriverHooks> ApplicationOverQuic for H3Driver<H> {
+    fn connection_owner_drop_hook(&self) -> Option<ConnectionOwnerDropHook> {
+        let hook = self.webtransport_connection_owner_drop_hook.as_ref()?;
+        self.webtransport_terminal_retention
+            .as_ref()
+            .expect("WebTransport drop hook requires terminal state")
+            .mark_connection_owner_attached();
+        Some(hook.clone())
+    }
+
     fn on_conn_established(
         &mut self, quiche_conn: &mut QuicheConnection,
         handshake_info: &HandshakeInfo,
@@ -2925,6 +3008,14 @@ impl<H: DriverHooks> ApplicationOverQuic for H3Driver<H> {
             let events = runtime.clear();
             let _ = Self::emit_webtransport_events(&self.h3_event_sender, events);
         }
+        if let Some(ownership) = self
+            .bounded_profile
+            .as_ref()
+            .and_then(|profile| profile.client_connect_ownership.as_ref())
+        {
+            ownership.clear();
+        }
+        self.settle_webtransport_terminal_retention(Some(quiche_conn));
 
         if self.h3_event_sender.overloaded() {
             let _ = quiche_conn.close(
@@ -3027,6 +3118,10 @@ impl<H: DriverHooks> Drop for H3Driver<H> {
             .and_then(|profile| profile.client_connect_ownership.as_ref())
         {
             ownership.clear();
+        }
+        self.settle_webtransport_terminal_retention(None);
+        if let Some(terminal_retention) = &self.webtransport_terminal_retention {
+            terminal_retention.mark_driver_dropped();
         }
         for stream in self.stream_map.values() {
             stream

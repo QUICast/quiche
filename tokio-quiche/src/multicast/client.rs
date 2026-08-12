@@ -42,6 +42,7 @@ use tokio::time::sleep_until;
 use tokio::time::Instant;
 use tokio_util::task::AbortOnDropHandle;
 
+use crate::quic::connection::ConnectionOwnerDropHook;
 use crate::quic::QuicheConnection;
 use crate::ApplicationOverQuic;
 use crate::QuicResult;
@@ -256,6 +257,10 @@ impl<A> ClientDriver<A> {
 }
 
 impl<A: ApplicationOverQuic> ApplicationOverQuic for ClientDriver<A> {
+    fn connection_owner_drop_hook(&self) -> Option<ConnectionOwnerDropHook> {
+        self.inner.connection_owner_drop_hook()
+    }
+
     fn on_conn_established(
         &mut self, qconn: &mut QuicheConnection,
         handshake_info: &crate::quic::HandshakeInfo,

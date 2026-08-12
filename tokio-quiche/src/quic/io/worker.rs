@@ -26,6 +26,8 @@
 
 use std::net::SocketAddr;
 use std::ops::ControlFlow;
+use std::ops::Deref;
+use std::ops::DerefMut;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -46,6 +48,7 @@ use super::utilization_estimator::BandwidthReporter;
 use crate::metrics::labels;
 use crate::metrics::Metrics;
 use crate::quic::connection::ApplicationOverQuic;
+use crate::quic::connection::ConnectionOwnerDropHook;
 use crate::quic::connection::HandshakeError;
 use crate::quic::connection::Incoming;
 use crate::quic::connection::IncomingPacketSource;
@@ -1164,7 +1167,7 @@ pub struct Running<Tx, M, A> {
     pub(crate) params: IoWorkerParams<Tx, M>,
     pub(crate) context: ConnectionStageContext<A>,
     /// See [`QuicConnectionParams::quiche_conn`].
-    pub(crate) qconn: Box<QuicheConnection>,
+    pub(crate) qconn: OwnedQuicheConnection,
 }
 
 impl<Tx, M, A> Running<Tx, M, A> {
@@ -1179,7 +1182,51 @@ pub(crate) struct Closing<Tx, M, A> {
     pub(crate) context: ConnectionStageContext<A>,
     pub(crate) work_loop_result: QuicResult<()>,
     /// See [`QuicConnectionParams::quiche_conn`].
-    pub(crate) qconn: Box<QuicheConnection>,
+    pub(crate) qconn: OwnedQuicheConnection,
+}
+
+pub(crate) struct OwnedQuicheConnection {
+    connection: Option<Box<QuicheConnection>>,
+    owner_drop_hook: Option<ConnectionOwnerDropHook>,
+}
+
+impl OwnedQuicheConnection {
+    pub(crate) fn new(
+        connection: Box<QuicheConnection>,
+        owner_drop_hook: Option<ConnectionOwnerDropHook>,
+    ) -> Self {
+        Self {
+            connection: Some(connection),
+            owner_drop_hook,
+        }
+    }
+}
+
+impl Deref for OwnedQuicheConnection {
+    type Target = QuicheConnection;
+
+    fn deref(&self) -> &Self::Target {
+        self.connection
+            .as_deref()
+            .expect("owned QUIC connection already dropped")
+    }
+}
+
+impl DerefMut for OwnedQuicheConnection {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.connection
+            .as_deref_mut()
+            .expect("owned QUIC connection already dropped")
+    }
+}
+
+impl Drop for OwnedQuicheConnection {
+    fn drop(&mut self) {
+        drop(self.connection.take());
+        if let Some(hook) = self.owner_drop_hook.take() {
+            hook.fire();
+        }
+    }
 }
 
 pub enum RunningOrClosing<Tx, M, A> {
@@ -1193,7 +1240,7 @@ where
     M: Metrics,
 {
     pub(crate) async fn run<A>(
-        mut self, mut qconn: Box<QuicheConnection>,
+        mut self, mut qconn: OwnedQuicheConnection,
         mut ctx: ConnectionStageContext<A>,
     ) -> RunningOrClosing<Tx, M, A>
     where
@@ -1304,7 +1351,7 @@ where
     M: Metrics,
 {
     pub(crate) async fn run<A: ApplicationOverQuic>(
-        mut self, mut qconn: Box<QuicheConnection>,
+        mut self, mut qconn: OwnedQuicheConnection,
         mut ctx: ConnectionStageContext<A>,
     ) -> Closing<Tx, M, A> {
         // Perform a single call to process_reads()/process_writes(),
@@ -1477,6 +1524,26 @@ fn random_u128() -> u128 {
 #[cfg(test)]
 mod pooled_send_buf_tests {
     use super::*;
+
+    #[test]
+    fn owned_connection_fires_preallocated_drop_hook_once() {
+        let mut config =
+            crate::http3::driver::test_utils::default_quiche_config();
+        let pipe = quiche::test_utils::Pipe::<crate::buf_factory::BufFactory>::
+            with_config_and_buf(&mut config)
+            .unwrap();
+        let fires = Arc::new(AtomicUsize::new(0));
+        let fires_on_drop = Arc::clone(&fires);
+        let hook = ConnectionOwnerDropHook::new(move || {
+            fires_on_drop.fetch_add(1, Ordering::AcqRel);
+        });
+        let connection =
+            OwnedQuicheConnection::new(Box::new(pipe.server), Some(hook));
+
+        assert_eq!(fires.load(Ordering::Acquire), 0);
+        drop(connection);
+        assert_eq!(fires.load(Ordering::Acquire), 1);
+    }
 
     // Each test runs on a freshly spawned thread so the thread-local
     // `SEND_BUF_POOL` starts empty (const-initialized) and cannot interfere
