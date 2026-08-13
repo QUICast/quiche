@@ -1086,6 +1086,123 @@ pub struct WebTransportDatagramStats {
     pub terminal_bytes: u64,
 }
 
+/// One authoritative live sample from the QUIC connection owner.
+///
+/// The sequence is monotonically assigned by the driver when it performs the
+/// sample. The path generation is address-free and changes when core quiche
+/// selects a different active path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WebTransportLiveConnectionSnapshot {
+    /// Monotonic sequence assigned to this sampling operation.
+    pub sample_sequence: u64,
+    /// Connection-local generation of the selected active path.
+    pub path_generation: u64,
+    /// Current smoothed round-trip time from the active path.
+    pub smoothed_rtt: Duration,
+    /// Current congestion window in bytes from the active path.
+    pub congestion_window_bytes: usize,
+    /// Current congestion-controlled bytes in flight from the active path.
+    pub bytes_in_flight: usize,
+}
+
+/// Result of one bounded live QUIC connection sampling operation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WebTransportLiveConnectionSnapshotOutcome {
+    /// Exactly one active path was sampled atomically.
+    Sampled(WebTransportLiveConnectionSnapshot),
+    /// No path could carry non-probing packets at the sampling turn.
+    Unavailable {
+        /// Monotonic sequence assigned to this sampling operation.
+        sample_sequence: u64,
+        /// Generation of the most recently selected active path.
+        path_generation: u64,
+    },
+    /// More than one path was eligible at the sampling turn.
+    AmbiguousMultipath {
+        /// Monotonic sequence assigned to this sampling operation.
+        sample_sequence: u64,
+        /// Generation of the most recently selected active path.
+        path_generation: u64,
+        /// Number of simultaneously active paths observed.
+        active_paths: usize,
+    },
+    /// The one per-connection obligation or selected command lane was full.
+    Saturated,
+    /// The caller cancelled an admitted operation before consuming a result.
+    Cancelled,
+    /// The QUIC connection is closing or closed, so no live sample is current.
+    ConnectionClosed,
+    /// The connection-driving task disappeared before completing the sample.
+    DriverGone,
+    /// The connection exhausted its monotonic live-sample sequence space.
+    SequenceExhausted,
+}
+
+/// A cancellation-safe future for one bounded live connection sample.
+///
+/// The operation owns no payload or connection identifier. Dropping it releases
+/// its waiter; if its command was already queued, that single preallocated
+/// obligation remains unavailable only until the driver discards the command.
+#[must_use = "the live snapshot operation must be awaited or cancelled"]
+pub struct WebTransportLiveConnectionSnapshotOperation {
+    state: Arc<LiveConnectionSnapshotState>,
+    immediate: Option<WebTransportLiveConnectionSnapshotOutcome>,
+    admitted: bool,
+    completed: bool,
+}
+
+impl WebTransportLiveConnectionSnapshotOperation {
+    /// Cancels this operation without fabricating or consuming a live sample.
+    pub fn cancel(mut self) -> WebTransportLiveConnectionSnapshotOutcome {
+        let outcome = if let Some(outcome) = self.immediate.take() {
+            outcome
+        } else if self.admitted {
+            self.state.cancel_operation()
+        } else {
+            WebTransportLiveConnectionSnapshotOutcome::Cancelled
+        };
+        self.admitted = false;
+        self.completed = true;
+        outcome
+    }
+}
+
+impl Future for WebTransportLiveConnectionSnapshotOperation {
+    type Output = WebTransportLiveConnectionSnapshotOutcome;
+
+    fn poll(
+        mut self: Pin<&mut Self>, cx: &mut Context<'_>,
+    ) -> Poll<Self::Output> {
+        if let Some(outcome) = self.immediate.take() {
+            self.completed = true;
+            return Poll::Ready(outcome);
+        }
+        if !self.admitted {
+            self.completed = true;
+            return Poll::Ready(
+                WebTransportLiveConnectionSnapshotOutcome::DriverGone,
+            );
+        }
+
+        match self.state.poll_operation(cx) {
+            Poll::Ready(outcome) => {
+                self.admitted = false;
+                self.completed = true;
+                Poll::Ready(outcome)
+            },
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl Drop for WebTransportLiveConnectionSnapshotOperation {
+    fn drop(&mut self) {
+        if !self.completed && self.admitted {
+            let _ = self.state.cancel_operation();
+        }
+    }
+}
+
 /// Point-in-time native WebTransport retention accounting.
 ///
 /// Byte counters distinguish physical `DgramBuffer` allocation from logical
@@ -1208,6 +1325,16 @@ pub struct WebTransportRetentionStats {
     pub terminal_retention_waiter_saturation_total: u64,
     /// Registered terminal-accounting waits cancelled before completion.
     pub terminal_retention_waiter_cancellation_total: u64,
+    /// Live connection snapshot obligations currently retained.
+    pub live_connection_snapshot_requests: usize,
+    /// Intrinsic per-connection live snapshot obligation bound.
+    pub max_live_connection_snapshot_requests: usize,
+    /// Live snapshot requests rejected by the slot or command-lane bound.
+    pub live_connection_snapshot_saturation_total: u64,
+    /// Admitted live snapshot operations cancelled before result consumption.
+    pub live_connection_snapshot_cancellation_total: u64,
+    /// Owner-side live sampling operations performed.
+    pub live_connection_snapshot_sample_total: u64,
     /// Selected-I/O commands queued behind this snapshot command.
     pub queued_commands: usize,
     /// Conservative logical payload bound for those queued commands.
@@ -1291,6 +1418,7 @@ impl WebTransportRetentionStats {
         self.pending_datagram_payload_bytes = 0;
         self.pending_datagram_allocation_bytes = 0;
         self.terminal_retention_waiters = 0;
+        self.live_connection_snapshot_requests = 0;
         self.queued_commands = 0;
         self.queued_command_payload_bytes_upper_bound = 0;
         self.write_leases = 0;
@@ -1315,6 +1443,330 @@ impl WebTransportRetentionStats {
             self.write_lease_abandoned_unknown_total =
                 write_leases.abandoned_unknown_total;
         }
+    }
+}
+
+const MAX_LIVE_CONNECTION_SNAPSHOT_REQUESTS: usize = 1;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LiveConnectionSnapshotLifecycle {
+    Running,
+    ConnectionClosed,
+    DriverGone,
+}
+
+impl LiveConnectionSnapshotLifecycle {
+    fn outcome(self) -> Option<WebTransportLiveConnectionSnapshotOutcome> {
+        match self {
+            Self::Running => None,
+            Self::ConnectionClosed =>
+                Some(WebTransportLiveConnectionSnapshotOutcome::ConnectionClosed),
+            Self::DriverGone =>
+                Some(WebTransportLiveConnectionSnapshotOutcome::DriverGone),
+        }
+    }
+}
+
+struct LiveConnectionSnapshotPending {
+    operation_attached: bool,
+    command_pending: bool,
+    sampling: bool,
+    result: Option<WebTransportLiveConnectionSnapshotOutcome>,
+    waker: Option<Waker>,
+}
+
+struct LiveConnectionSnapshotInner {
+    lifecycle: LiveConnectionSnapshotLifecycle,
+    pending: Option<LiveConnectionSnapshotPending>,
+    next_sample_sequence: Option<u64>,
+    saturation_total: u64,
+    cancellation_total: u64,
+    sample_total: u64,
+}
+
+enum LiveConnectionSnapshotStart {
+    Cancelled,
+    Sequence(u64),
+    SequenceExhausted,
+}
+
+impl Default for LiveConnectionSnapshotInner {
+    fn default() -> Self {
+        Self {
+            lifecycle: LiveConnectionSnapshotLifecycle::Running,
+            pending: None,
+            next_sample_sequence: Some(0),
+            saturation_total: 0,
+            cancellation_total: 0,
+            sample_total: 0,
+        }
+    }
+}
+
+pub(super) struct LiveConnectionSnapshotState {
+    inner: Mutex<LiveConnectionSnapshotInner>,
+}
+
+impl LiveConnectionSnapshotState {
+    pub(super) fn new() -> Self {
+        Self {
+            inner: Mutex::new(LiveConnectionSnapshotInner::default()),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, LiveConnectionSnapshotInner> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn terminal_outcome(
+        &self,
+    ) -> Option<WebTransportLiveConnectionSnapshotOutcome> {
+        self.lock().lifecycle.outcome()
+    }
+
+    fn reject_saturated(&self) -> WebTransportLiveConnectionSnapshotOutcome {
+        let mut inner = self.lock();
+        if let Some(outcome) = inner.lifecycle.outcome() {
+            return outcome;
+        }
+        inner.saturation_total = inner.saturation_total.saturating_add(1);
+        WebTransportLiveConnectionSnapshotOutcome::Saturated
+    }
+
+    fn begin(&self) -> Result<(), WebTransportLiveConnectionSnapshotOutcome> {
+        let mut inner = self.lock();
+        if let Some(outcome) = inner.lifecycle.outcome() {
+            return Err(outcome);
+        }
+        if inner.pending.is_some() {
+            inner.saturation_total = inner.saturation_total.saturating_add(1);
+            return Err(WebTransportLiveConnectionSnapshotOutcome::Saturated);
+        }
+        inner.pending = Some(LiveConnectionSnapshotPending {
+            operation_attached: true,
+            command_pending: true,
+            sampling: false,
+            result: None,
+            waker: None,
+        });
+        Ok(())
+    }
+
+    fn poll_operation(
+        &self, cx: &mut Context<'_>,
+    ) -> Poll<WebTransportLiveConnectionSnapshotOutcome> {
+        let mut inner = self.lock();
+        if let Some(outcome) = inner.lifecycle.outcome() {
+            return Poll::Ready(outcome);
+        }
+        let Some(pending) = inner.pending.as_mut() else {
+            return Poll::Ready(
+                WebTransportLiveConnectionSnapshotOutcome::DriverGone,
+            );
+        };
+        if let Some(outcome) = pending.result.take() {
+            inner.pending = None;
+            return Poll::Ready(outcome);
+        }
+        if pending
+            .waker
+            .as_ref()
+            .is_none_or(|waker| !waker.will_wake(cx.waker()))
+        {
+            pending.waker = Some(cx.waker().clone());
+        }
+        Poll::Pending
+    }
+
+    fn cancel_operation(&self) -> WebTransportLiveConnectionSnapshotOutcome {
+        let mut inner = self.lock();
+        if let Some(outcome) = inner.lifecycle.outcome() {
+            return outcome;
+        }
+        let Some(was_attached) = inner
+            .pending
+            .as_ref()
+            .map(|pending| pending.operation_attached)
+        else {
+            return WebTransportLiveConnectionSnapshotOutcome::Cancelled;
+        };
+        if was_attached {
+            inner.cancellation_total = inner.cancellation_total.saturating_add(1);
+        }
+        let pending = inner
+            .pending
+            .as_mut()
+            .expect("pending live snapshot was checked above");
+        pending.operation_attached = false;
+        pending.result = None;
+        pending.waker = None;
+        if !pending.command_pending && !pending.sampling {
+            inner.pending = None;
+        }
+        WebTransportLiveConnectionSnapshotOutcome::Cancelled
+    }
+
+    fn begin_sampling(&self) -> LiveConnectionSnapshotStart {
+        let mut inner = self.lock();
+        if inner.lifecycle != LiveConnectionSnapshotLifecycle::Running {
+            return LiveConnectionSnapshotStart::Cancelled;
+        }
+        let Some(pending) = inner.pending.as_mut() else {
+            return LiveConnectionSnapshotStart::Cancelled;
+        };
+        pending.command_pending = false;
+        if !pending.operation_attached {
+            inner.pending = None;
+            return LiveConnectionSnapshotStart::Cancelled;
+        }
+        pending.sampling = true;
+        let Some(sequence) = inner.next_sample_sequence else {
+            return LiveConnectionSnapshotStart::SequenceExhausted;
+        };
+        inner.next_sample_sequence = sequence.checked_add(1);
+        inner.sample_total = inner.sample_total.saturating_add(1);
+        LiveConnectionSnapshotStart::Sequence(sequence)
+    }
+
+    fn finish_sample(&self, outcome: WebTransportLiveConnectionSnapshotOutcome) {
+        let waker = {
+            let mut inner = self.lock();
+            if inner.lifecycle != LiveConnectionSnapshotLifecycle::Running {
+                return;
+            }
+            let Some(pending) = inner.pending.as_mut() else {
+                return;
+            };
+            pending.sampling = false;
+            if !pending.operation_attached {
+                inner.pending = None;
+                return;
+            }
+            pending.result = Some(outcome);
+            pending.waker.take()
+        };
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+
+    fn finish_sequence_exhausted(&self) {
+        self.finish_sample(
+            WebTransportLiveConnectionSnapshotOutcome::SequenceExhausted,
+        );
+    }
+
+    fn terminate(&self, lifecycle: LiveConnectionSnapshotLifecycle) {
+        let waker = {
+            let mut inner = self.lock();
+            if inner.lifecycle != LiveConnectionSnapshotLifecycle::Running {
+                return;
+            }
+            inner.lifecycle = lifecycle;
+            inner
+                .pending
+                .take()
+                .and_then(|mut pending| pending.waker.take())
+        };
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+
+    pub(super) fn mark_connection_closed(&self) {
+        self.terminate(LiveConnectionSnapshotLifecycle::ConnectionClosed);
+    }
+
+    pub(super) fn mark_driver_gone(&self) {
+        self.terminate(LiveConnectionSnapshotLifecycle::DriverGone);
+    }
+
+    pub(super) fn augment_stats(&self, stats: &mut WebTransportRetentionStats) {
+        let inner = self.lock();
+        stats.live_connection_snapshot_requests = usize::from(
+            inner.lifecycle == LiveConnectionSnapshotLifecycle::Running &&
+                inner.pending.is_some(),
+        );
+        stats.max_live_connection_snapshot_requests =
+            MAX_LIVE_CONNECTION_SNAPSHOT_REQUESTS;
+        stats.live_connection_snapshot_saturation_total = inner.saturation_total;
+        stats.live_connection_snapshot_cancellation_total =
+            inner.cancellation_total;
+        stats.live_connection_snapshot_sample_total = inner.sample_total;
+    }
+}
+
+pub(crate) struct LiveConnectionSnapshotRequest {
+    state: Arc<LiveConnectionSnapshotState>,
+}
+
+impl LiveConnectionSnapshotRequest {
+    fn new(state: Arc<LiveConnectionSnapshotState>) -> Self {
+        Self { state }
+    }
+
+    pub(crate) fn sample(self, qconn: &QuicheConnection) {
+        if qconn.is_closed() ||
+            qconn.is_draining() ||
+            qconn.local_error().is_some() ||
+            qconn.peer_error().is_some()
+        {
+            self.state.mark_connection_closed();
+            return;
+        }
+        let sample_sequence = match self.state.begin_sampling() {
+            LiveConnectionSnapshotStart::Cancelled => return,
+            LiveConnectionSnapshotStart::Sequence(sequence) => sequence,
+            LiveConnectionSnapshotStart::SequenceExhausted => {
+                self.state.finish_sequence_exhausted();
+                return;
+            },
+        };
+        let outcome = live_connection_snapshot_outcome(
+            sample_sequence,
+            qconn.connection_path_snapshot(),
+        );
+        self.state.finish_sample(outcome);
+    }
+
+    fn connection_closed(self) {
+        self.state.mark_connection_closed();
+    }
+}
+
+fn live_connection_snapshot_outcome(
+    sample_sequence: u64, snapshot: quiche::ConnectionPathSnapshot,
+) -> WebTransportLiveConnectionSnapshotOutcome {
+    match snapshot {
+        quiche::ConnectionPathSnapshot::SingleActive {
+            path_generation,
+            smoothed_rtt,
+            congestion_window_bytes,
+            bytes_in_flight,
+        } => WebTransportLiveConnectionSnapshotOutcome::Sampled(
+            WebTransportLiveConnectionSnapshot {
+                sample_sequence,
+                path_generation,
+                smoothed_rtt,
+                congestion_window_bytes,
+                bytes_in_flight,
+            },
+        ),
+        quiche::ConnectionPathSnapshot::Unavailable { path_generation } =>
+            WebTransportLiveConnectionSnapshotOutcome::Unavailable {
+                sample_sequence,
+                path_generation,
+            },
+        quiche::ConnectionPathSnapshot::AmbiguousMultipath {
+            path_generation,
+            active_paths,
+        } => WebTransportLiveConnectionSnapshotOutcome::AmbiguousMultipath {
+            sample_sequence,
+            path_generation,
+            active_paths,
+        },
     }
 }
 
@@ -2279,6 +2731,7 @@ pub struct WebTransportController {
     max_datagram_prefixed_allocation_bytes: usize,
     write_lease_accounting: Arc<WriteLeaseAccounting>,
     terminal_retention: Arc<TerminalRetentionState>,
+    live_connection_snapshot: Arc<LiveConnectionSnapshotState>,
 }
 
 pub(crate) struct WebTransportControllerLimits {
@@ -2297,6 +2750,7 @@ impl WebTransportController {
         write_lease_accounting: Arc<WriteLeaseAccounting>,
         cancellation_pending: Arc<AtomicBool>,
         terminal_retention: Arc<TerminalRetentionState>,
+        live_connection_snapshot: Arc<LiveConnectionSnapshotState>,
     ) -> Self {
         Self {
             sender,
@@ -2314,6 +2768,65 @@ impl WebTransportController {
                 .max_datagram_prefixed_allocation_bytes,
             write_lease_accounting,
             terminal_retention,
+            live_connection_snapshot,
+        }
+    }
+
+    /// Requests one authoritative owner-side live QUIC path sample.
+    ///
+    /// Admission is nonblocking and bounded to one outstanding obligation per
+    /// connection. A full selected command lane or existing request returns
+    /// [`WebTransportLiveConnectionSnapshotOutcome::Saturated`] immediately.
+    /// The driver stores no sample history, and a closing connection never
+    /// returns a previously sampled value as current.
+    pub fn live_connection_snapshot(
+        &self,
+    ) -> WebTransportLiveConnectionSnapshotOperation {
+        let permit = match self.sender.try_reserve() {
+            Ok(permit) => permit,
+            Err(mpsc::error::TrySendError::Full(())) => {
+                return WebTransportLiveConnectionSnapshotOperation {
+                    state: Arc::clone(&self.live_connection_snapshot),
+                    immediate: Some(
+                        self.live_connection_snapshot.reject_saturated(),
+                    ),
+                    admitted: false,
+                    completed: false,
+                };
+            },
+            Err(mpsc::error::TrySendError::Closed(())) => {
+                return WebTransportLiveConnectionSnapshotOperation {
+                    state: Arc::clone(&self.live_connection_snapshot),
+                    immediate: Some(
+                        self.live_connection_snapshot
+                            .terminal_outcome()
+                            .unwrap_or(
+                            WebTransportLiveConnectionSnapshotOutcome::DriverGone,
+                        ),
+                    ),
+                    admitted: false,
+                    completed: false,
+                };
+            },
+        };
+        if let Err(outcome) = self.live_connection_snapshot.begin() {
+            return WebTransportLiveConnectionSnapshotOperation {
+                state: Arc::clone(&self.live_connection_snapshot),
+                immediate: Some(outcome),
+                admitted: false,
+                completed: false,
+            };
+        }
+        permit.send(WebTransportCommand::LiveConnectionSnapshot(
+            LiveConnectionSnapshotRequest::new(Arc::clone(
+                &self.live_connection_snapshot,
+            )),
+        ));
+        WebTransportLiveConnectionSnapshotOperation {
+            state: Arc::clone(&self.live_connection_snapshot),
+            immediate: None,
+            admitted: true,
+            completed: false,
         }
     }
 
@@ -3124,6 +3637,7 @@ impl WebTransportController {
             .await
             .unwrap_or(Err(WebTransportDatagramError::ConnectionClosed))?;
         self.terminal_retention.augment_stats(&mut stats);
+        self.live_connection_snapshot.augment_stats(&mut stats);
         Ok(stats)
     }
 }
@@ -3342,6 +3856,7 @@ where
 }
 
 pub(crate) enum WebTransportCommand {
+    LiveConnectionSnapshot(LiveConnectionSnapshotRequest),
     WaitSessionTerminal {
         session_id: u64,
         response: oneshot::Sender<WebTransportSessionTerminalOutcome>,
@@ -3427,6 +3942,7 @@ pub(crate) enum WebTransportCommand {
 impl WebTransportCommand {
     pub(crate) fn reject_connection_closed(self) {
         match self {
+            Self::LiveConnectionSnapshot(request) => request.connection_closed(),
             Self::WaitSessionTerminal {
                 session_id,
                 response,
@@ -3844,6 +4360,7 @@ pub(super) fn runtime_metadata_upper_bound(
         .checked_add(std::mem::size_of::<SessionWork>())?
         .checked_add(MAX_CLOSE_MESSAGE_LEN)?
         .checked_add(std::mem::size_of::<TerminalRetentionState>())?
+        .checked_add(std::mem::size_of::<LiveConnectionSnapshotState>())?
         .checked_add(std::mem::size_of::<WebTransportRetentionStats>())?;
 
     max_pending_streams
@@ -5032,6 +5549,8 @@ impl Runtime {
             self.prune_cancelled_send_terminal_waiters();
         }
         match command {
+            WebTransportCommand::LiveConnectionSnapshot(request) =>
+                request.sample(qconn),
             WebTransportCommand::WaitSessionTerminal {
                 session_id,
                 response,
@@ -7672,6 +8191,12 @@ impl Runtime {
             max_terminal_retention_waiters: 1,
             terminal_retention_waiter_saturation_total: 0,
             terminal_retention_waiter_cancellation_total: 0,
+            live_connection_snapshot_requests: 0,
+            max_live_connection_snapshot_requests:
+                MAX_LIVE_CONNECTION_SNAPSHOT_REQUESTS,
+            live_connection_snapshot_saturation_total: 0,
+            live_connection_snapshot_cancellation_total: 0,
+            live_connection_snapshot_sample_total: 0,
             queued_commands,
             queued_command_payload_bytes_upper_bound: queued_commands
                 .saturating_mul(self.limits.max_command_payload_bytes),
@@ -8005,6 +8530,61 @@ mod tests {
 
     type DriverPipe = quiche::test_utils::Pipe<crate::buf_factory::BufFactory>;
 
+    #[test]
+    fn live_connection_snapshot_maps_only_address_free_current_facts() {
+        let single = live_connection_snapshot_outcome(
+            7,
+            quiche::ConnectionPathSnapshot::SingleActive {
+                path_generation: 3,
+                smoothed_rtt: Duration::from_millis(11),
+                congestion_window_bytes: 12_000,
+                bytes_in_flight: 1_200,
+            },
+        );
+        assert_eq!(
+            single,
+            WebTransportLiveConnectionSnapshotOutcome::Sampled(
+                WebTransportLiveConnectionSnapshot {
+                    sample_sequence: 7,
+                    path_generation: 3,
+                    smoothed_rtt: Duration::from_millis(11),
+                    congestion_window_bytes: 12_000,
+                    bytes_in_flight: 1_200,
+                }
+            )
+        );
+        assert_eq!(
+            live_connection_snapshot_outcome(
+                8,
+                quiche::ConnectionPathSnapshot::Unavailable {
+                    path_generation: 4,
+                },
+            ),
+            WebTransportLiveConnectionSnapshotOutcome::Unavailable {
+                sample_sequence: 8,
+                path_generation: 4,
+            }
+        );
+        assert_eq!(
+            live_connection_snapshot_outcome(
+                9,
+                quiche::ConnectionPathSnapshot::AmbiguousMultipath {
+                    path_generation: 5,
+                    active_paths: 2,
+                },
+            ),
+            WebTransportLiveConnectionSnapshotOutcome::AmbiguousMultipath {
+                sample_sequence: 9,
+                path_generation: 5,
+                active_paths: 2,
+            }
+        );
+
+        let diagnostic = format!("{single:?}");
+        assert!(!diagnostic.contains("127.0.0.1"));
+        assert!(!diagnostic.contains("payload"));
+    }
+
     fn runtime_limits(
         global: usize, per_session: usize, work: usize,
     ) -> RuntimeLimits {
@@ -8097,6 +8677,7 @@ mod tests {
             Arc::clone(&write_lease_accounting),
             Arc::new(AtomicBool::new(false)),
             Arc::clone(&terminal_retention),
+            Arc::new(LiveConnectionSnapshotState::new()),
         );
         (controller, recv, terminal_retention, write_lease_accounting)
     }

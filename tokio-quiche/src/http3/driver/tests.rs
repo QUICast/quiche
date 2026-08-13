@@ -2128,6 +2128,7 @@ mod server_side_driver {
         assert_eq!(stats.pending_datagram_payload_bytes, 0);
         assert_eq!(stats.pending_datagram_allocation_bytes, 0);
         assert_eq!(stats.terminal_retention_waiters, 0);
+        assert_eq!(stats.live_connection_snapshot_requests, 0);
         assert_eq!(stats.queued_commands, 0);
         assert_eq!(stats.queued_command_payload_bytes_upper_bound, 0);
         assert_eq!(stats.write_leases, 0);
@@ -10551,6 +10552,254 @@ mod server_side_driver {
             helper.driver.flow_map.is_empty(),
             "flow_map should remain empty when extended connect is disabled"
         );
+    }
+
+    #[tokio::test]
+    async fn webtransport_live_connection_snapshot_is_bounded_and_monotonic() {
+        let mut helper = webtransport_helper(webtransport_settings());
+        start_webtransport_driver(&mut helper);
+        let controller = helper
+            .controller
+            .webtransport_controller()
+            .expect("native WebTransport controller");
+        let cloned = controller.clone();
+
+        let first = controller.live_connection_snapshot();
+        assert_eq!(
+            cloned.live_connection_snapshot().await,
+            WebTransportLiveConnectionSnapshotOutcome::Saturated,
+        );
+        assert_eq!(
+            helper.driver.webtransport_cmd_recv.as_ref().unwrap().len(),
+            1,
+        );
+        helper.work_loop_iter().unwrap();
+        let first = assert_matches!(
+            first.await,
+            WebTransportLiveConnectionSnapshotOutcome::Sampled(sample) => sample
+        );
+        let expected = helper.pipe.server.connection_path_snapshot();
+        assert_matches!(
+            expected,
+            quiche::ConnectionPathSnapshot::SingleActive {
+                path_generation,
+                smoothed_rtt,
+                congestion_window_bytes,
+                bytes_in_flight,
+            } if first.path_generation == path_generation &&
+                first.smoothed_rtt == smoothed_rtt &&
+                first.congestion_window_bytes == congestion_window_bytes &&
+                first.bytes_in_flight == bytes_in_flight
+        );
+        assert_eq!(first.sample_sequence, 0);
+
+        let second = cloned.live_connection_snapshot();
+        helper.work_loop_iter().unwrap();
+        let second = assert_matches!(
+            second.await,
+            WebTransportLiveConnectionSnapshotOutcome::Sampled(sample) => sample
+        );
+        assert_eq!(second.sample_sequence, 1);
+        assert_eq!(second.path_generation, first.path_generation);
+
+        let stats = webtransport_retention_stats(&mut helper, &controller).await;
+        assert_eq!(stats.live_connection_snapshot_requests, 0);
+        assert_eq!(stats.max_live_connection_snapshot_requests, 1);
+        assert_eq!(stats.live_connection_snapshot_saturation_total, 1);
+        assert_eq!(stats.live_connection_snapshot_cancellation_total, 0);
+        assert_eq!(stats.live_connection_snapshot_sample_total, 2);
+        assert!(!std::mem::needs_drop::<WebTransportLiveConnectionSnapshot>());
+    }
+
+    #[tokio::test]
+    async fn webtransport_live_connection_snapshot_cancellation_is_race_free() {
+        let mut helper = webtransport_helper(webtransport_settings());
+        start_webtransport_driver(&mut helper);
+        let controller = helper
+            .controller
+            .webtransport_controller()
+            .expect("native WebTransport controller");
+
+        assert_eq!(
+            controller.live_connection_snapshot().cancel(),
+            WebTransportLiveConnectionSnapshotOutcome::Cancelled,
+        );
+        assert_eq!(
+            controller.live_connection_snapshot().await,
+            WebTransportLiveConnectionSnapshotOutcome::Saturated,
+        );
+        helper.work_loop_iter().unwrap();
+
+        let sampled_then_cancelled = controller.live_connection_snapshot();
+        helper.work_loop_iter().unwrap();
+        assert_eq!(
+            sampled_then_cancelled.cancel(),
+            WebTransportLiveConnectionSnapshotOutcome::Cancelled,
+        );
+
+        let final_sample = controller.live_connection_snapshot();
+        helper.work_loop_iter().unwrap();
+        assert_matches!(
+            final_sample.await,
+            WebTransportLiveConnectionSnapshotOutcome::Sampled(
+                WebTransportLiveConnectionSnapshot {
+                    sample_sequence: 1,
+                    ..
+                }
+            )
+        );
+        let stats = webtransport_retention_stats(&mut helper, &controller).await;
+        assert_eq!(stats.live_connection_snapshot_requests, 0);
+        assert_eq!(stats.live_connection_snapshot_saturation_total, 1);
+        assert_eq!(stats.live_connection_snapshot_cancellation_total, 2);
+        assert_eq!(stats.live_connection_snapshot_sample_total, 2);
+    }
+
+    #[tokio::test]
+    async fn webtransport_live_connection_snapshot_closure_is_terminal() {
+        let mut helper = webtransport_helper(webtransport_settings());
+        start_webtransport_driver(&mut helper);
+        let controller = helper
+            .controller
+            .webtransport_controller()
+            .expect("native WebTransport controller");
+        let sampled_before_close = controller.live_connection_snapshot();
+        helper.work_loop_iter().unwrap();
+
+        crate::ApplicationOverQuic::on_conn_close(
+            &mut helper.driver,
+            &mut helper.pipe.server,
+            &crate::metrics::DefaultMetrics,
+            &Ok(()),
+        );
+        assert_eq!(
+            sampled_before_close.await,
+            WebTransportLiveConnectionSnapshotOutcome::ConnectionClosed,
+        );
+        assert_eq!(
+            controller.live_connection_snapshot().await,
+            WebTransportLiveConnectionSnapshotOutcome::ConnectionClosed,
+        );
+
+        let helper = webtransport_helper(webtransport_settings());
+        let driver_gone = helper
+            .controller
+            .webtransport_controller()
+            .expect("native WebTransport controller");
+        let pending = driver_gone.live_connection_snapshot();
+        let DriverTestHelper {
+            pipe,
+            driver,
+            controller,
+            peer,
+        } = helper;
+        drop(driver);
+        assert_eq!(
+            pending.await,
+            WebTransportLiveConnectionSnapshotOutcome::DriverGone,
+        );
+        assert_eq!(
+            driver_gone.live_connection_snapshot().await,
+            WebTransportLiveConnectionSnapshotOutcome::DriverGone,
+        );
+        drop(controller);
+        drop(peer);
+        drop(pipe);
+    }
+
+    #[tokio::test]
+    async fn webtransport_live_connection_snapshot_reports_lane_saturation() {
+        let mut settings = webtransport_settings();
+        settings.webtransport_command_capacity = 1;
+        let mut helper = webtransport_helper(settings);
+        start_webtransport_driver(&mut helper);
+        let controller = helper
+            .controller
+            .webtransport_controller()
+            .expect("native WebTransport controller");
+
+        let stats_controller = controller.clone();
+        let queued =
+            tokio::spawn(async move { stats_controller.retention_stats().await });
+        tokio::task::yield_now().await;
+        assert_eq!(
+            helper.driver.webtransport_cmd_recv.as_ref().unwrap().len(),
+            1,
+        );
+        assert_eq!(
+            controller.live_connection_snapshot().await,
+            WebTransportLiveConnectionSnapshotOutcome::Saturated,
+        );
+        helper.work_loop_iter().unwrap();
+        assert!(queued.await.unwrap().is_ok());
+
+        let sample = controller.live_connection_snapshot();
+        helper.work_loop_iter().unwrap();
+        assert_matches!(
+            sample.await,
+            WebTransportLiveConnectionSnapshotOutcome::Sampled(_)
+        );
+        let stats = webtransport_retention_stats(&mut helper, &controller).await;
+        assert_eq!(stats.live_connection_snapshot_saturation_total, 1);
+        assert_eq!(stats.live_connection_snapshot_requests, 0);
+    }
+
+    #[tokio::test]
+    async fn webtransport_terminal_retention_preserves_snapshot_totals() {
+        let mut helper = webtransport_helper(webtransport_settings());
+        start_webtransport_driver(&mut helper);
+        let controller = helper
+            .controller
+            .webtransport_controller()
+            .expect("native WebTransport controller");
+        let claim = controller.terminal_retention_claim();
+        let hook = helper
+            .driver
+            .connection_owner_drop_hook()
+            .expect("WebTransport driver installs a core-owner hook");
+
+        let sample = controller.live_connection_snapshot();
+        assert_eq!(
+            controller.live_connection_snapshot().await,
+            WebTransportLiveConnectionSnapshotOutcome::Saturated,
+        );
+        helper.work_loop_iter().unwrap();
+        assert_matches!(
+            sample.await,
+            WebTransportLiveConnectionSnapshotOutcome::Sampled(_)
+        );
+        assert_eq!(
+            controller.live_connection_snapshot().cancel(),
+            WebTransportLiveConnectionSnapshotOutcome::Cancelled,
+        );
+
+        crate::ApplicationOverQuic::on_conn_close(
+            &mut helper.driver,
+            &mut helper.pipe.server,
+            &crate::metrics::DefaultMetrics,
+            &Ok(()),
+        );
+        let DriverTestHelper {
+            pipe,
+            driver,
+            controller: h3_controller,
+            peer,
+        } = helper;
+        drop(h3_controller);
+        drop(driver);
+        drop(peer);
+        drop(pipe);
+        hook.fire();
+
+        let stats = assert_matches!(
+            controller.wait_terminal_retention(claim).await,
+            WebTransportTerminalRetentionOutcome::Taken(stats) => stats
+        );
+        assert_terminal_retention_current_zero(&stats);
+        assert_eq!(stats.max_live_connection_snapshot_requests, 1);
+        assert_eq!(stats.live_connection_snapshot_saturation_total, 1);
+        assert_eq!(stats.live_connection_snapshot_cancellation_total, 1);
+        assert_eq!(stats.live_connection_snapshot_sample_total, 1);
     }
 
     #[tokio::test]

@@ -34,6 +34,7 @@ use tokio_quiche::http3::driver::BoundedConnectHeaders;
 use tokio_quiche::http3::driver::BoundedSelectedWebTransportController;
 use tokio_quiche::http3::driver::BoundedSelectedWebTransportSettings;
 use tokio_quiche::http3::driver::BoundedServerWebTransportEvent;
+use tokio_quiche::http3::driver::WebTransportLiveConnectionSnapshotOutcome;
 use tokio_quiche::http3::driver::WebTransportOpenStreamOutcome;
 use tokio_quiche::http3::driver::WebTransportSessionEvent;
 use tokio_quiche::http3::driver::WebTransportStreamDirection;
@@ -60,11 +61,21 @@ use crate::fixtures::TEST_CERT_FILE;
 use crate::fixtures::TEST_KEY_FILE;
 
 #[derive(Debug)]
-struct PayloadLease(Box<[u8]>);
+struct PayloadLease {
+    payload: Box<[u8]>,
+    offset: usize,
+}
 
 impl PayloadLease {
     fn new(data: &[u8]) -> Self {
-        Self(data.into())
+        Self {
+            payload: data.into(),
+            offset: 0,
+        }
+    }
+
+    fn advance(&mut self, accepted: usize) {
+        self.offset += accepted;
     }
 }
 
@@ -72,15 +83,15 @@ impl WebTransportStreamWriteLease for PayloadLease {
     type Error = std::convert::Infallible;
 
     fn payload_len(&self) -> usize {
-        self.0.len()
+        self.payload.len() - self.offset
     }
 
     fn retained_bytes(&self) -> usize {
-        self.0.len()
+        self.payload.len()
     }
 
     fn as_slice(&mut self) -> Result<&[u8], Self::Error> {
-        Ok(&self.0)
+        Ok(&self.payload[self.offset..])
     }
 }
 
@@ -111,33 +122,58 @@ async fn write_complete(
     selected: &BoundedSelectedWebTransportController, session_id: u64,
     stream_id: u64, payload: &[u8], fin: bool,
 ) {
-    match selected
-        .write_stream_lease(
-            session_id,
-            stream_id,
-            PayloadLease::new(payload),
-            fin,
-        )
-        .await
-    {
-        WebTransportStreamWriteLeaseOutcome::Accepted {
-            lease,
-            accepted,
-            complete,
-            fin_accepted,
-        } => {
-            assert_eq!(lease.0.as_ref(), payload);
-            assert_eq!(accepted, payload.len());
-            assert!(complete);
-            assert_eq!(fin_accepted, fin);
-        },
-        outcome => panic!("bounded stream write failed: {outcome:?}"),
+    let mut lease = PayloadLease::new(payload);
+    loop {
+        match selected
+            .write_stream_lease(session_id, stream_id, lease, fin)
+            .await
+        {
+            WebTransportStreamWriteLeaseOutcome::Accepted {
+                lease: mut returned,
+                accepted,
+                complete,
+                fin_accepted,
+            } => {
+                assert_eq!(returned.payload.as_ref(), payload);
+                assert!(accepted <= returned.payload_len());
+                returned.advance(accepted);
+                if complete {
+                    assert_eq!(returned.offset, payload.len());
+                    assert_eq!(fin_accepted, fin);
+                    return;
+                }
+                assert!(accepted > 0);
+                assert!(!fin_accepted);
+                lease = returned;
+            },
+            WebTransportStreamWriteLeaseOutcome::Blocked {
+                lease: returned,
+                fin: returned_fin,
+                reasons: blocked_reasons,
+                retry,
+            } => {
+                assert_eq!(returned_fin, fin);
+                match selected.wait_stream_writable(retry).await {
+                    WebTransportStreamReadyOutcome::WriteTransportWake {
+                        reasons,
+                    } => assert_eq!(reasons, blocked_reasons),
+                    WebTransportStreamReadyOutcome::Ready => {},
+                    outcome => {
+                        panic!("bounded stream retry failed: {outcome:?}")
+                    },
+                }
+                lease = returned;
+            },
+            outcome => panic!("bounded stream write failed: {outcome:?}"),
+        }
     }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bounded_receive_terminal_udp_loopback() {
     timeout(Duration::from_secs(15), async {
+        const TRAFFIC_CHUNK: &[u8] = &[0x5a; 4096];
+        const TRAFFIC_CHUNKS: usize = 128;
         let settings = BoundedSelectedWebTransportSettings::default();
         let mut server_quic = QuicSettings::default();
         settings.apply_to_quic_settings(&mut server_quic);
@@ -206,19 +242,39 @@ async fn bounded_receive_terminal_udp_loopback() {
                         stream_id,
                     outcome => panic!("bounded stream open failed: {outcome:?}"),
                 };
-            write_complete(
-                &selected,
-                session_id,
-                stream_id,
-                b"final payload",
-                false,
-            )
-            .await;
             payload_queued.send(()).unwrap();
+            let mut max_bytes_in_flight = 0;
+            let mut previous_sequence = None;
+            for _ in 0..TRAFFIC_CHUNKS {
+                write_complete(
+                    &selected,
+                    session_id,
+                    stream_id,
+                    TRAFFIC_CHUNK,
+                    false,
+                )
+                .await;
+                let sample = match selected.live_connection_snapshot().await {
+                    WebTransportLiveConnectionSnapshotOutcome::Sampled(
+                        sample,
+                    ) => sample,
+                    outcome => panic!("live UDP snapshot failed: {outcome:?}"),
+                };
+                if let Some(previous_sequence) = previous_sequence {
+                    assert!(sample.sample_sequence > previous_sequence);
+                }
+                previous_sequence = Some(sample.sample_sequence);
+                max_bytes_in_flight =
+                    max_bytes_in_flight.max(sample.bytes_in_flight);
+            }
+            assert!(
+                max_bytes_in_flight > 0,
+                "no live UDP sample observed bytes in flight",
+            );
             payload_done.await.unwrap();
             write_complete(&selected, session_id, stream_id, b"", true).await;
             client_done.await.unwrap();
-            (session_id, stream_id)
+            (session_id, stream_id, max_bytes_in_flight)
         });
 
         let mut client_quic = QuicSettings::default();
@@ -268,21 +324,26 @@ async fn bounded_receive_terminal_udp_loopback() {
         payload_ready.await.unwrap();
 
         let selected = controller.selected();
-        assert_eq!(
-            selected
-                .wait_stream_readable(selected_session, selected_stream)
-                .await,
-            WebTransportStreamReadyOutcome::Ready
-        );
-        assert_eq!(
-            selected
-                .read_stream(selected_session, selected_stream, 64)
-                .await,
-            WebTransportStreamReadOutcome::Data {
-                data: bytes::Bytes::from_static(b"final payload"),
-                fin: false,
+        let mut received = 0;
+        while received < TRAFFIC_CHUNK.len() * TRAFFIC_CHUNKS {
+            assert_eq!(
+                selected
+                    .wait_stream_readable(selected_session, selected_stream)
+                    .await,
+                WebTransportStreamReadyOutcome::Ready
+            );
+            match selected
+                .read_stream(selected_session, selected_stream, 64 * 1024)
+                .await
+            {
+                WebTransportStreamReadOutcome::Data { data, fin: false } => {
+                    assert!(data.iter().all(|byte| *byte == 0x5a));
+                    received += data.len();
+                },
+                outcome => panic!("unexpected traffic read: {outcome:?}"),
             }
-        );
+        }
+        assert_eq!(received, TRAFFIC_CHUNK.len() * TRAFFIC_CHUNKS);
         payload_consumed.send(()).unwrap();
 
         assert_eq!(
@@ -331,7 +392,13 @@ async fn bounded_receive_terminal_udp_loopback() {
         assert_eq!(stats.receive_terminal_bytes, 0);
         client_finished.send(()).unwrap();
 
-        assert_eq!(server.await.unwrap(), (selected_session, selected_stream));
+        let (server_session, server_stream, max_bytes_in_flight) =
+            server.await.unwrap();
+        assert_eq!(
+            (server_session, server_stream),
+            (selected_session, selected_stream)
+        );
+        assert!(max_bytes_in_flight > 0);
     })
     .await
     .expect("bounded WebTransport UDP loopback timed out");

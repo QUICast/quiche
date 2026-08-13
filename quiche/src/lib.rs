@@ -1709,6 +1709,9 @@ where
     /// The path manager.
     paths: path::PathMap,
 
+    /// Connection-local generation of the selected active send path.
+    active_path_generation: u64,
+
     /// PATH_CHALLENGE receive queue max length.
     path_challenge_recv_max_queue_len: usize,
 
@@ -2541,6 +2544,7 @@ impl<F: BufFactory> Connection<F> {
             recovery_config,
 
             paths,
+            active_path_generation: 0,
             path_challenge_recv_max_queue_len: config
                 .path_challenge_recv_max_queue_len,
             path_challenge_rx_count: 0,
@@ -10843,6 +10847,36 @@ impl<F: BufFactory> Connection<F> {
         self.paths.iter().map(|(_, p)| p.stats())
     }
 
+    /// Atomically samples current address-free active-path transport state.
+    ///
+    /// This is observational: it does not process timers, acknowledgements,
+    /// recovery, path selection, or congestion control. RTT, congestion window,
+    /// and bytes in flight are read from one active path's recovery object in
+    /// this call. quiche currently selects one active path; zero active paths
+    /// report [`ConnectionPathSnapshot::Unavailable`], while multiple active
+    /// paths fail closed as [`ConnectionPathSnapshot::AmbiguousMultipath`].
+    pub fn connection_path_snapshot(&self) -> ConnectionPathSnapshot {
+        let mut active_paths = self
+            .paths
+            .iter()
+            .filter_map(|(_, path)| path.active().then_some(path));
+        let Some(active_path) = active_paths.next() else {
+            return ConnectionPathSnapshot::Unavailable {
+                path_generation: self.active_path_generation,
+            };
+        };
+
+        let additional_active_paths = active_paths.count();
+        if additional_active_paths != 0 {
+            return ConnectionPathSnapshot::AmbiguousMultipath {
+                path_generation: self.active_path_generation,
+                active_paths: additional_active_paths.saturating_add(1),
+            };
+        }
+
+        active_path.connection_snapshot(self.active_path_generation)
+    }
+
     /// Returns whether or not this is a server-side connection.
     pub fn is_server(&self) -> bool {
         self.is_server
@@ -12274,6 +12308,9 @@ impl<F: BufFactory> Connection<F> {
 
     /// Sets the path with identifier 'path_id' to be active.
     fn set_active_path(&mut self, path_id: usize, now: Instant) -> Result<()> {
+        self.paths.get(path_id)?;
+        let previous_path_id = self.paths.get_active_path_id().ok();
+
         if let Ok(old_active_path) = self.paths.get_active_mut() {
             for &e in packet::Epoch::epochs(
                 packet::Epoch::Initial..=packet::Epoch::Application,
@@ -12287,7 +12324,12 @@ impl<F: BufFactory> Connection<F> {
             }
         }
 
-        self.paths.set_active_path(path_id)
+        self.paths.set_active_path(path_id)?;
+        if previous_path_id != Some(path_id) {
+            self.active_path_generation =
+                self.active_path_generation.saturating_add(1);
+        }
+        Ok(())
     }
 
     /// Handles potential connection migration.
@@ -12642,6 +12684,7 @@ pub use crate::packet::ConnectionId;
 pub use crate::packet::Header;
 pub use crate::packet::Type;
 
+pub use crate::path::ConnectionPathSnapshot;
 pub use crate::path::PathEvent;
 pub use crate::path::PathStats;
 pub use crate::path::SocketAddrIter;

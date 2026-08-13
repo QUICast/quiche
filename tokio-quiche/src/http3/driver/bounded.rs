@@ -683,6 +683,7 @@ impl BoundedSelectedWebTransportSettings {
             negotiated_stream_reset_mode: None,
             webtransport_enabled: true,
             max_sessions: 1,
+            max_live_connection_snapshot_requests: 1,
             quic: self.quic,
             connect_headers: self.connect_headers,
             selected: self.selected,
@@ -1469,6 +1470,8 @@ pub struct AppliedBoundedWebTransportProfile {
     pub webtransport_enabled: bool,
     /// Pending plus active session limit.
     pub max_sessions: usize,
+    /// Intrinsic bounded live-connection snapshot obligation limit.
+    pub max_live_connection_snapshot_requests: usize,
     /// Applied and verified QUIC settings.
     pub quic: BoundedWebTransportQuicSettings,
     /// Applied CONNECT field bounds.
@@ -1813,6 +1816,13 @@ impl BoundedSelectedWebTransportController {
             read_permits: Arc::new(Semaphore::new(max_concurrent_reads)),
             client_connect_ownership,
         }
+    }
+
+    /// Requests one bounded authoritative owner-side live QUIC path sample.
+    pub fn live_connection_snapshot(
+        &self,
+    ) -> super::WebTransportLiveConnectionSnapshotOperation {
+        self.inner.live_connection_snapshot()
     }
 
     /// Waits without stream allocation for the exact session to terminate.
@@ -3167,6 +3177,7 @@ mod tests {
         );
         assert_eq!(prepared.applied.datagram_send_items, 0);
         assert_eq!(prepared.applied.datagram_recv_items, 0);
+        assert_eq!(prepared.applied.max_live_connection_snapshot_requests, 1);
         assert!(prepared.applied.retention_limits_frozen);
         assert_eq!(
             prepared.http3.webtransport_max_session_terminal_waiters,
@@ -3915,6 +3926,7 @@ mod tests {
             applied.selected.max_session_terminal_waiters_per_session,
             settings.selected.max_session_terminal_waiters_per_session,
         );
+        assert_eq!(applied.max_live_connection_snapshot_requests, 1);
         assert!(applied.retention_limits_frozen);
         assert!(pipe.server.retention_limits_frozen());
         assert_eq!(

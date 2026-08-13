@@ -149,6 +149,9 @@ pub use self::webtransport::WebTransportDatagramReadyOutcome;
 pub use self::webtransport::WebTransportDatagramSendOperation;
 pub use self::webtransport::WebTransportDatagramSendOutcome;
 pub use self::webtransport::WebTransportDatagramStats;
+pub use self::webtransport::WebTransportLiveConnectionSnapshot;
+pub use self::webtransport::WebTransportLiveConnectionSnapshotOperation;
+pub use self::webtransport::WebTransportLiveConnectionSnapshotOutcome;
 pub use self::webtransport::WebTransportOpenStreamOutcome;
 pub use self::webtransport::WebTransportRetentionStats;
 pub use self::webtransport::WebTransportSelectionError;
@@ -805,6 +808,9 @@ pub struct H3Driver<H: DriverHooks> {
     webtransport_cmd_recv: Option<mpsc::Receiver<WebTransportCommand>>,
     /// Command-independent, take-once terminal retention state.
     webtransport_terminal_retention: Option<Arc<TerminalRetentionState>>,
+    /// Preallocated, single-obligation live connection snapshot state.
+    webtransport_live_connection_snapshot:
+        Option<Arc<webtransport::LiveConnectionSnapshotState>>,
     /// Preallocated callback fired after core connection ownership is dropped.
     webtransport_connection_owner_drop_hook: Option<ConnectionOwnerDropHook>,
     /// Rotates priority between selected-I/O commands and opening prefixes.
@@ -878,12 +884,15 @@ impl<H: DriverHooks> H3Driver<H> {
             webtransport_cmd_recv,
             webtransport_controller,
             webtransport_terminal_retention,
+            webtransport_live_connection_snapshot,
             webtransport_connection_owner_drop_hook,
         ) = if http3_settings.enable_webtransport {
             let (sender, recv) = mpsc::channel(
                 http3_settings.webtransport_command_capacity.max(1),
             );
             let terminal_retention = Arc::new(TerminalRetentionState::new());
+            let live_connection_snapshot =
+                Arc::new(webtransport::LiveConnectionSnapshotState::new());
             let write_lease_accounting =
                 Arc::new(webtransport::WriteLeaseAccounting::new(
                     http3_settings.webtransport_command_capacity,
@@ -1003,12 +1012,14 @@ impl<H: DriverHooks> H3Driver<H> {
                         write_lease_accounting,
                         cancellation_pending,
                         Arc::clone(&terminal_retention),
+                        Arc::clone(&live_connection_snapshot),
                     )),
                     Some(terminal_retention),
+                    Some(live_connection_snapshot),
                     Some(connection_owner_drop_hook),
                 )
         } else {
-            (None, None, None, None, None)
+            (None, None, None, None, None, None)
         };
 
         (
@@ -1038,6 +1049,7 @@ impl<H: DriverHooks> H3Driver<H> {
                 webtransport,
                 webtransport_cmd_recv,
                 webtransport_terminal_retention,
+                webtransport_live_connection_snapshot,
                 webtransport_connection_owner_drop_hook,
                 webtransport_command_turn: true,
                 webtransport_datagram_turn: 0,
@@ -2481,6 +2493,9 @@ impl<H: DriverHooks> H3Driver<H> {
         if let Some(terminal_retention) = &self.webtransport_terminal_retention {
             terminal_retention.augment_stats(&mut stats);
         }
+        if let Some(live_snapshot) = &self.webtransport_live_connection_snapshot {
+            live_snapshot.augment_stats(&mut stats);
+        }
         if let Some(ownership) = self
             .bounded_profile
             .as_ref()
@@ -3003,6 +3018,9 @@ impl<H: DriverHooks> ApplicationOverQuic for H3Driver<H> {
 
         Self::record_quiche_error(quiche_conn, metrics);
 
+        if let Some(live_snapshot) = &self.webtransport_live_connection_snapshot {
+            live_snapshot.mark_connection_closed();
+        }
         self.close_webtransport_command_lane();
         if let Some(runtime) = self.webtransport.as_mut() {
             let events = runtime.clear();
@@ -3108,6 +3126,9 @@ impl<H: DriverHooks> ApplicationOverQuic for H3Driver<H> {
 
 impl<H: DriverHooks> Drop for H3Driver<H> {
     fn drop(&mut self) {
+        if let Some(live_snapshot) = &self.webtransport_live_connection_snapshot {
+            live_snapshot.mark_driver_gone();
+        }
         self.close_webtransport_command_lane();
         if let Some(runtime) = self.webtransport.as_mut() {
             let _ = runtime.clear();

@@ -14920,6 +14920,151 @@ fn send_on_path_test(
     assert_eq!(stats.path_challenge_rx_count, 3);
 }
 
+#[test]
+fn connection_path_snapshot_reports_every_disposition_and_generation() {
+    let mut pipe = test_utils::Pipe::new("cubic").unwrap();
+    pipe.handshake().unwrap();
+
+    let initial_path_id = pipe.server.paths.get_active_path_id().unwrap();
+    assert!(matches!(
+        pipe.server.connection_path_snapshot(),
+        ConnectionPathSnapshot::SingleActive {
+            path_generation: 0,
+            ..
+        }
+    ));
+
+    let second_path = path::Path::new(
+        "127.0.0.1:4322".parse().unwrap(),
+        "127.0.0.1:1235".parse().unwrap(),
+        &pipe.server.recovery_config,
+        pipe.server.path_challenge_recv_max_queue_len,
+        true,
+        None,
+    );
+    let second_path_id =
+        pipe.server.paths.insert_path(second_path, false).unwrap();
+    pipe.server.paths.activate_for_test(second_path_id).unwrap();
+    assert_eq!(
+        pipe.server.connection_path_snapshot(),
+        ConnectionPathSnapshot::AmbiguousMultipath {
+            path_generation: 0,
+            active_paths: 2,
+        }
+    );
+
+    assert_eq!(
+        pipe.server.paths.deactivate_active_for_test().unwrap(),
+        initial_path_id,
+    );
+    assert!(matches!(
+        pipe.server.connection_path_snapshot(),
+        ConnectionPathSnapshot::SingleActive {
+            path_generation: 0,
+            ..
+        }
+    ));
+
+    pipe.server
+        .set_active_path(initial_path_id, Instant::now())
+        .unwrap();
+    assert!(matches!(
+        pipe.server.connection_path_snapshot(),
+        ConnectionPathSnapshot::SingleActive {
+            path_generation: 1,
+            ..
+        }
+    ));
+
+    pipe.server.paths.deactivate_active_for_test().unwrap();
+    assert_eq!(
+        pipe.server.connection_path_snapshot(),
+        ConnectionPathSnapshot::Unavailable { path_generation: 1 }
+    );
+}
+
+#[test]
+fn connection_path_snapshot_tracks_atomic_recovery_transitions() {
+    let mut pipe = test_utils::Pipe::new("cubic").unwrap();
+    let ConnectionPathSnapshot::SingleActive {
+        smoothed_rtt: pre_handshake_rtt,
+        ..
+    } = pipe.server.connection_path_snapshot()
+    else {
+        panic!("initial path is not singly active");
+    };
+    pipe.handshake().unwrap();
+    pipe.advance().unwrap();
+
+    let initial = pipe.server.connection_path_snapshot();
+    let ConnectionPathSnapshot::SingleActive {
+        path_generation,
+        smoothed_rtt: initial_rtt,
+        congestion_window_bytes: initial_cwnd,
+        bytes_in_flight,
+    } = initial
+    else {
+        panic!("initial path is not singly active: {initial:?}");
+    };
+    assert_eq!(path_generation, 0);
+    assert_eq!(bytes_in_flight, 0);
+    assert_ne!(initial_rtt, pre_handshake_rtt);
+
+    pipe.server.stream_send(1, b"snapshot", false).unwrap();
+    let dropped = test_utils::emit_flight(&mut pipe.server).unwrap();
+    assert!(!dropped.is_empty());
+    let in_flight = pipe.server.connection_path_snapshot();
+    let ConnectionPathSnapshot::SingleActive {
+        smoothed_rtt,
+        congestion_window_bytes,
+        bytes_in_flight,
+        ..
+    } = in_flight
+    else {
+        panic!("send path is not singly active: {in_flight:?}");
+    };
+    let path = pipe.server.paths.get_active().unwrap();
+    assert_eq!(smoothed_rtt, path.recovery.rtt());
+    assert_eq!(congestion_window_bytes, path.recovery.cwnd());
+    assert_eq!(bytes_in_flight, path.recovery.bytes_in_flight());
+    assert!(bytes_in_flight > 0);
+    assert_eq!(congestion_window_bytes, initial_cwnd);
+    drop(dropped);
+
+    test_utils::trigger_ack_based_loss(&mut pipe.server, &mut pipe.client);
+    let after_loss = pipe.server.connection_path_snapshot();
+    let ConnectionPathSnapshot::SingleActive {
+        smoothed_rtt: loss_rtt,
+        congestion_window_bytes: loss_cwnd,
+        bytes_in_flight: loss_in_flight,
+        ..
+    } = after_loss
+    else {
+        panic!("loss path is not singly active: {after_loss:?}");
+    };
+    assert!(loss_cwnd < initial_cwnd);
+    assert!(!loss_rtt.is_zero());
+
+    let retransmission = test_utils::emit_flight(&mut pipe.server).unwrap();
+    let retransmitted = pipe.server.connection_path_snapshot();
+    assert!(matches!(
+        retransmitted,
+        ConnectionPathSnapshot::SingleActive {
+            bytes_in_flight,
+            ..
+        } if bytes_in_flight > loss_in_flight
+    ));
+    test_utils::process_flight(&mut pipe.client, retransmission).unwrap();
+    pipe.advance().unwrap();
+    assert!(matches!(
+        pipe.server.connection_path_snapshot(),
+        ConnectionPathSnapshot::SingleActive {
+            bytes_in_flight: 0,
+            ..
+        }
+    ));
+}
+
 #[rstest]
 fn connection_migration(
     #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
@@ -14944,6 +15089,13 @@ fn connection_migration(
     config.set_initial_max_streams_bidi(3);
 
     let mut pipe = pipe_with_exchanged_cids(&mut config, 16, 16, 2);
+    assert!(matches!(
+        pipe.client.connection_path_snapshot(),
+        ConnectionPathSnapshot::SingleActive {
+            path_generation: 0,
+            ..
+        }
+    ));
 
     let server_addr = test_utils::Pipe::server_addr();
     let client_addr_2 = "127.0.0.1:5678".parse().unwrap();
@@ -14983,6 +15135,13 @@ fn connection_migration(
     assert_eq!(pipe.client.migrate(client_addr_2, server_addr), Ok(1));
     assert_eq!(pipe.client.stream_send(0, b"data", true), Ok(4));
     assert_eq!(pipe.advance(), Ok(()));
+    assert!(matches!(
+        pipe.client.connection_path_snapshot(),
+        ConnectionPathSnapshot::SingleActive {
+            path_generation: 1,
+            ..
+        }
+    ));
     assert_eq!(
         pipe.client
             .paths
@@ -15026,6 +15185,13 @@ fn connection_migration(
     assert_eq!(pipe.client.migrate(client_addr_3, server_addr), Ok(2));
     assert_eq!(pipe.client.stream_send(4, b"data", true), Ok(4));
     assert_eq!(pipe.advance(), Ok(()));
+    assert!(matches!(
+        pipe.client.connection_path_snapshot(),
+        ConnectionPathSnapshot::SingleActive {
+            path_generation: 2,
+            ..
+        }
+    ));
     assert_eq!(
         pipe.client
             .paths

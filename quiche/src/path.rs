@@ -67,6 +67,47 @@ pub enum PathState {
     Validated,
 }
 
+/// An address-free atomic snapshot of the connection's active send path.
+///
+/// The three transport values in [`Self::SingleActive`] are read from the same
+/// path recovery state during one connection-owner call. The generation is
+/// connection-local, starts at zero, and advances whenever the selected active
+/// path changes. It does not identify either endpoint or expose an internal
+/// path-map index.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConnectionPathSnapshot {
+    /// No path can currently carry non-probing packets.
+    Unavailable {
+        /// The generation of the most recently selected active path.
+        path_generation: u64,
+    },
+
+    /// Exactly one path can currently carry non-probing packets.
+    SingleActive {
+        /// The generation of the selected active path.
+        path_generation: u64,
+        /// The path's current smoothed round-trip time.
+        smoothed_rtt: Duration,
+        /// The path's current congestion window in bytes.
+        congestion_window_bytes: usize,
+        /// The path's current congestion-controlled bytes in flight.
+        bytes_in_flight: usize,
+    },
+
+    /// More than one path is marked eligible for non-probing packets.
+    ///
+    /// quiche currently selects a single active path. This defensive result
+    /// prevents an observational API from silently choosing one path if
+    /// multipath send semantics are introduced or inconsistent state is
+    /// detected later.
+    AmbiguousMultipath {
+        /// The generation of the most recently selected active path.
+        path_generation: u64,
+        /// The finite number of simultaneously active paths observed.
+        active_paths: usize,
+    },
+}
+
 impl PathState {
     #[cfg(feature = "ffi")]
     pub fn to_c(self) -> libc::ssize_t {
@@ -316,6 +357,17 @@ impl Path {
     #[inline]
     pub fn active(&self) -> bool {
         self.active && self.working() && self.active_dcid_seq.is_some()
+    }
+
+    pub(crate) fn connection_snapshot(
+        &self, path_generation: u64,
+    ) -> ConnectionPathSnapshot {
+        ConnectionPathSnapshot::SingleActive {
+            path_generation,
+            smoothed_rtt: self.recovery.rtt(),
+            congestion_window_bytes: self.recovery.cwnd(),
+            bytes_in_flight: self.recovery.bytes_in_flight(),
+        }
     }
 
     /// Returns whether the path can be used to send non-probing packets.
@@ -927,6 +979,12 @@ impl PathMap {
         let path_id = self.get_active_path_id()?;
         self.get_mut(path_id)?.active = false;
         Ok(path_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn activate_for_test(&mut self, path_id: usize) -> Result<()> {
+        self.get_mut(path_id)?.active = true;
+        Ok(())
     }
 
     /// Configures path MTU discovery on all existing paths.
