@@ -73,6 +73,7 @@ use super::WebTransportStreamWriteRetry;
 use super::WebTransportTerminalRetentionClaim;
 use super::WebTransportTerminalRetentionOperation;
 use super::WebTransportTerminalRetentionOutcome;
+use super::WebTransportTerminalRetentionPending;
 use crate::http3::settings::Http3Settings;
 use crate::http3::H3AuditStats;
 use crate::quic::HandshakeInfo;
@@ -1837,6 +1838,16 @@ impl BoundedSelectedWebTransportController {
         self.inner.terminal_retention_claim()
     }
 
+    /// Reports the terminal-retention settle conditions still outstanding.
+    ///
+    /// Diagnostics only, and strictly read-only: consumes nothing, registers no
+    /// waiter, and cannot affect whether the accounting settles.
+    pub fn terminal_retention_pending(
+        &self,
+    ) -> Option<WebTransportTerminalRetentionPending> {
+        self.inner.terminal_retention_pending()
+    }
+
     /// Attempts a command-free take of authoritative terminal accounting.
     pub fn try_take_terminal_retention(
         &self, claim: &WebTransportTerminalRetentionClaim,
@@ -3405,6 +3416,51 @@ mod tests {
         assert_eq!(stats.max_terminal_retention_waiters, 1);
         assert_eq!(stats.adapter_bytes_upper_bound(), 0);
         assert_eq!(stats.transport_queued_bytes(), 0);
+    }
+
+    #[test]
+    fn terminal_retention_pending_reports_without_disturbing_the_take() {
+        let settings = BoundedSelectedWebTransportSettings::default();
+        let (driver, controller) =
+            H3Driver::<ServerHooks>::new_bounded_selected_webtransport(settings)
+                .unwrap();
+        let selected = controller.selected();
+        let claim = selected.terminal_retention_claim();
+        let hook = driver
+            .connection_owner_drop_hook()
+            .expect("bounded WebTransport installs a core-owner hook");
+
+        drop(driver);
+        // The unmet condition is reportable before the take settles, which is
+        // the whole point: a stalled wait is otherwise only a timeout.
+        let pending = selected
+            .terminal_retention_pending()
+            .expect("an unsettled retention reports its outstanding conditions");
+        assert!(pending.runtime_settled);
+        assert!(pending.connection_owner_attached);
+        assert!(!pending.connection_owner_dropped);
+
+        // Read-only: observing repeatedly must not consume the take-once
+        // result, register a waiter, or change what settles.
+        for _ in 0..8 {
+            assert_matches!(selected.terminal_retention_pending(), Some(_));
+        }
+        assert_matches!(
+            selected.try_take_terminal_retention(&claim),
+            WebTransportTerminalRetentionOutcome::Early(_)
+        );
+
+        hook.fire();
+        let stats = assert_matches!(
+            selected.try_take_terminal_retention(&claim),
+            WebTransportTerminalRetentionOutcome::Taken(stats) => stats
+        );
+        // Observation must not have inflated the waiter accounting.
+        assert_eq!(stats.max_terminal_retention_waiters, 1);
+        assert_eq!(stats.terminal_retention_waiters, 0);
+
+        // Nothing outstanding to report once the result is taken.
+        assert_matches!(selected.terminal_retention_pending(), None);
     }
 
     #[test]

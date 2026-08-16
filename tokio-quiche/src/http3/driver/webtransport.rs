@@ -1948,6 +1948,28 @@ impl TerminalRetentionState {
             .map(|accounting| accounting.snapshot())
     }
 
+    /// Reports which settle conditions are still outstanding, without taking
+    /// the take-once result and without registering a waiter.
+    ///
+    /// The settle condition is a conjunction, and until it holds a take yields
+    /// [`WebTransportTerminalRetentionOutcome::Early`], which the pending
+    /// future's poll converts into `Poll::Pending`. An owner waiting on
+    /// terminal retention therefore observes only a timeout and cannot say
+    /// which condition it is waiting for. This exposes exactly that, for
+    /// diagnostics, and is deliberately read-only so that observing can never
+    /// change whether the accounting settles.
+    ///
+    /// `None` means there is nothing outstanding to report, because the result
+    /// was already taken or is unavailable.
+    fn pending_snapshot(&self) -> Option<WebTransportTerminalRetentionPending> {
+        let inner = self.lock();
+        if inner.taken || inner.unavailable {
+            return None;
+        }
+        let write_leases = Self::write_lease_snapshot(&inner);
+        Some(Self::pending(&inner, write_leases))
+    }
+
     fn pending(
         inner: &TerminalRetentionInner,
         write_leases: Option<WriteLeaseAccountingSnapshot>,
@@ -2839,6 +2861,22 @@ impl WebTransportController {
         WebTransportTerminalRetentionClaim {
             state: Arc::clone(&self.terminal_retention),
         }
+    }
+
+    /// Reports the terminal-retention settle conditions still outstanding.
+    ///
+    /// Diagnostics only, and strictly read-only: this consumes nothing,
+    /// registers no waiter, and cannot affect whether the accounting settles.
+    /// It exists because a stalled terminal-retention wait is otherwise
+    /// indistinguishable from any other timeout, leaving an owner unable to
+    /// report which of the conjoined conditions it is blocked on.
+    ///
+    /// `None` means nothing is outstanding to report, because the result was
+    /// already taken or is unavailable.
+    pub fn terminal_retention_pending(
+        &self,
+    ) -> Option<WebTransportTerminalRetentionPending> {
+        self.terminal_retention.pending_snapshot()
     }
 
     /// Attempts to consume the take-once terminal accounting result.
