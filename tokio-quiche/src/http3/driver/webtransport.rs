@@ -1814,6 +1814,22 @@ pub struct WebTransportTerminalRetentionClaim {
     state: Arc<TerminalRetentionState>,
 }
 
+impl WebTransportTerminalRetentionClaim {
+    /// Reports the terminal-retention settle conditions still outstanding.
+    ///
+    /// Diagnostics only, and strictly read-only: consumes nothing, registers no
+    /// waiter, and cannot affect whether the accounting settles. `None` means
+    /// nothing is outstanding, because the result was taken or is unavailable.
+    ///
+    /// Available on the claim as well as the controller because an owner
+    /// normally drops the controller before awaiting the retention, and
+    /// retaining it purely to observe would risk changing what settles. A claim
+    /// only shares the accounting state, so holding one cannot.
+    pub fn pending(&self) -> Option<WebTransportTerminalRetentionPending> {
+        self.state.pending_snapshot()
+    }
+}
+
 impl fmt::Debug for WebTransportTerminalRetentionClaim {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter

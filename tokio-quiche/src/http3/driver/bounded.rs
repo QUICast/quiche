@@ -3464,6 +3464,47 @@ mod tests {
     }
 
     #[test]
+    fn terminal_retention_pending_is_observable_without_holding_the_controller() {
+        let settings = BoundedSelectedWebTransportSettings::default();
+        let (driver, controller) =
+            H3Driver::<ServerHooks>::new_bounded_selected_webtransport(settings)
+                .unwrap();
+        let selected = controller.selected();
+        // An owner awaiting retention drops the controller first, so the
+        // diagnostic path must work from a claim alone.
+        let diagnostic = selected.terminal_retention_claim();
+        let claim = selected.terminal_retention_claim();
+        let hook = driver
+            .connection_owner_drop_hook()
+            .expect("bounded WebTransport installs a core-owner hook");
+
+        drop(driver);
+        drop(selected);
+        drop(controller);
+
+        let pending = diagnostic
+            .pending()
+            .expect("a claim reports outstanding conditions without the controller");
+        assert!(!pending.connection_owner_dropped);
+
+        hook.fire();
+        assert_matches!(
+            diagnostic.pending(),
+            Some(WebTransportTerminalRetentionPending {
+                connection_owner_dropped: true,
+                ..
+            })
+        );
+        // Observation is repeatable and does not consume the take-once result;
+        // that the take still settles is asserted by the test above, which
+        // retains a controller to perform it.
+        for _ in 0..4 {
+            assert_matches!(diagnostic.pending(), Some(_));
+        }
+        drop(claim);
+    }
+
+    #[test]
     fn every_bounded_wire_value_rejects_max_varint_plus_one() {
         let invalid = octets::MAX_VAR_INT + 1;
         let cases = [
