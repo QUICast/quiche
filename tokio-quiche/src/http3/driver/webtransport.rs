@@ -4625,9 +4625,28 @@ enum SessionPhase {
     Terminal(SessionTerminalFact),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AssociatedTeardownState {
+    Open,
+    // A locally committed close is terminal here, but associated teardown is
+    // held until the peer performs its required CONNECT close/reset response.
+    AwaitingPeerConnectClose,
+    Draining,
+    Complete,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SessionClassificationState {
+    Pending,
+    Active,
+    AwaitingPeerConnectClose,
+    Terminal,
+}
+
 #[derive(Debug)]
 struct Session {
     phase: SessionPhase,
+    associated_teardown: AssociatedTeardownState,
     application_visible: bool,
     parser: CapsuleParser,
     streams: BTreeSet<u64>,
@@ -4643,6 +4662,7 @@ impl Session {
     fn pending(application_visible: bool) -> Self {
         Self {
             phase: SessionPhase::Pending,
+            associated_teardown: AssociatedTeardownState::Open,
             application_visible,
             parser: CapsuleParser::default(),
             streams: BTreeSet::new(),
@@ -4975,10 +4995,7 @@ impl Runtime {
         let terminal = SessionTerminalFact::Rejected { status };
         session.phase = SessionPhase::Terminal(terminal.clone());
         session.terminal_stream_error = WT_BUFFERED_STREAM_REJECTED;
-        self.work.push_back(SessionWork::Terminate {
-            session_id,
-            error_code: WT_BUFFERED_STREAM_REJECTED,
-        });
+        self.queue_associated_teardown(session_id, WT_BUFFERED_STREAM_REJECTED);
         self.cancel_openings(
             session_id,
             WT_BUFFERED_STREAM_REJECTED,
@@ -5039,6 +5056,8 @@ impl Runtime {
             close,
             output_queued: false,
         };
+        session.associated_teardown =
+            AssociatedTeardownState::AwaitingPeerConnectClose;
         self.cancel_openings(
             session_id,
             WT_SESSION_GONE,
@@ -5105,13 +5124,41 @@ impl Runtime {
             error_code: close.error_code,
             message: close.message.clone(),
         };
-        let events = self.terminate(session_id, reason);
+        let events = self.terminate_after_local_close(session_id, reason);
+        self.mark_connect_send_closed(session_id);
+        events
+    }
+
+    pub(crate) fn local_connect_fin_committed(
+        &mut self, session_id: u64,
+    ) -> Vec<WebTransportSessionEvent> {
+        let events = if self.is_active(session_id) {
+            self.terminate_after_local_close(
+                session_id,
+                WebTransportSessionCloseReason::Clean,
+            )
+        } else {
+            self.terminate(session_id, WebTransportSessionCloseReason::Clean)
+        };
         self.mark_connect_send_closed(session_id);
         events
     }
 
     pub(crate) fn terminate(
         &mut self, session_id: u64, reason: WebTransportSessionCloseReason,
+    ) -> Vec<WebTransportSessionEvent> {
+        self.terminate_with_teardown(session_id, reason, false)
+    }
+
+    fn terminate_after_local_close(
+        &mut self, session_id: u64, reason: WebTransportSessionCloseReason,
+    ) -> Vec<WebTransportSessionEvent> {
+        self.terminate_with_teardown(session_id, reason, true)
+    }
+
+    fn terminate_with_teardown(
+        &mut self, session_id: u64, reason: WebTransportSessionCloseReason,
+        await_peer_connect_close: bool,
     ) -> Vec<WebTransportSessionEvent> {
         let Some(session) = self.sessions.get_mut(&session_id) else {
             return Vec::new();
@@ -5130,11 +5177,16 @@ impl Runtime {
         let terminal = SessionTerminalFact::Terminated(reason.clone());
         session.phase = SessionPhase::Terminal(terminal.clone());
         session.terminal_stream_error = error_code;
+        let defer_associated_teardown =
+            await_peer_connect_close && !session.connect_recv_closed;
+        if defer_associated_teardown {
+            session.associated_teardown =
+                AssociatedTeardownState::AwaitingPeerConnectClose;
+        }
         self.deferred_responses.remove(&session_id);
-        self.work.push_back(SessionWork::Terminate {
-            session_id,
-            error_code,
-        });
+        if !defer_associated_teardown {
+            self.queue_associated_teardown(session_id, error_code);
+        }
         self.cancel_openings(
             session_id,
             error_code,
@@ -5157,6 +5209,50 @@ impl Runtime {
             .collect()
     }
 
+    fn queue_associated_teardown(&mut self, session_id: u64, error_code: u64) {
+        let Some(session) = self.sessions.get_mut(&session_id) else {
+            return;
+        };
+        if matches!(
+            session.associated_teardown,
+            AssociatedTeardownState::Draining | AssociatedTeardownState::Complete
+        ) {
+            return;
+        }
+        session.associated_teardown = AssociatedTeardownState::Draining;
+        self.work.push_back(SessionWork::Terminate {
+            session_id,
+            error_code,
+        });
+    }
+
+    fn associated_teardown_waiting_for_peer(&self, session_id: u64) -> bool {
+        self.sessions.get(&session_id).is_some_and(|session| {
+            session.associated_teardown ==
+                AssociatedTeardownState::AwaitingPeerConnectClose
+        })
+    }
+
+    fn complete_associated_teardown_if_empty(&mut self, session_id: u64) {
+        let empty = !self.pending_by_session.contains_key(&session_id) &&
+            !self.opening_by_session.contains_key(&session_id) &&
+            !self.pending_opens_per_session.contains_key(&session_id) &&
+            self.sessions
+                .get(&session_id)
+                .is_some_and(|session| session.streams.is_empty());
+        if !empty {
+            return;
+        }
+        let Some(session) = self.sessions.get_mut(&session_id) else {
+            return;
+        };
+        if session.associated_teardown != AssociatedTeardownState::Draining {
+            return;
+        }
+        session.associated_teardown = AssociatedTeardownState::Complete;
+        self.remove_terminal_if_closed(session_id);
+    }
+
     pub(crate) fn classify(
         &mut self, stream: AssociatedStream, qconn: &mut QuicheConnection,
     ) -> Vec<WebTransportSessionEvent> {
@@ -5166,8 +5262,8 @@ impl Runtime {
             return Vec::new();
         }
 
-        match self.sessions.get(&stream.session_id).map(|s| &s.phase) {
-            Some(SessionPhase::Active) => {
+        match self.session_classification_state(stream.session_id) {
+            Some(SessionClassificationState::Active) => {
                 if self.can_admit_associated_stream(stream) {
                     self.admit_stream(stream);
                     vec![associated_event(stream)]
@@ -5176,7 +5272,7 @@ impl Runtime {
                     Vec::new()
                 }
             },
-            Some(SessionPhase::Pending) => {
+            Some(SessionClassificationState::Pending) => {
                 if self.can_buffer(stream.session_id) {
                     self.buffer_stream(stream);
                 } else {
@@ -5184,7 +5280,15 @@ impl Runtime {
                 }
                 Vec::new()
             },
-            Some(SessionPhase::Closing { .. } | SessionPhase::Terminal(_)) => {
+            Some(SessionClassificationState::AwaitingPeerConnectClose) => {
+                if self.can_buffer(stream.session_id) {
+                    self.buffer_stream(stream);
+                } else {
+                    shutdown_stream(qconn, stream, WT_BUFFERED_STREAM_REJECTED);
+                }
+                Vec::new()
+            },
+            Some(SessionClassificationState::Terminal) => {
                 shutdown_stream(qconn, stream, WT_SESSION_GONE);
                 Vec::new()
             },
@@ -5200,6 +5304,22 @@ impl Runtime {
                 Vec::new()
             },
         }
+    }
+
+    fn session_classification_state(
+        &self, session_id: u64,
+    ) -> Option<SessionClassificationState> {
+        let session = self.sessions.get(&session_id)?;
+        Some(match session.phase {
+            SessionPhase::Active => SessionClassificationState::Active,
+            SessionPhase::Pending => SessionClassificationState::Pending,
+            SessionPhase::Closing { .. } | SessionPhase::Terminal(_)
+                if session.associated_teardown ==
+                    AssociatedTeardownState::AwaitingPeerConnectClose =>
+                SessionClassificationState::AwaitingPeerConnectClose,
+            SessionPhase::Closing { .. } | SessionPhase::Terminal(_) =>
+                SessionClassificationState::Terminal,
+        })
     }
 
     fn can_buffer(&self, session_id: u64) -> bool {
@@ -5357,10 +5477,8 @@ impl Runtime {
         session.connect_recv_closed = true;
         if matches!(session.phase, SessionPhase::Terminal(_)) {
             session.peer_close_fin_pending = session.peer_close_received;
-            self.work.push_back(SessionWork::Terminate {
-                session_id,
-                error_code: session.terminal_stream_error,
-            });
+            let error_code = session.terminal_stream_error;
+            self.queue_associated_teardown(session_id, error_code);
             return Vec::new();
         }
         self.terminate(session_id, WebTransportSessionCloseReason::Clean)
@@ -5379,12 +5497,7 @@ impl Runtime {
             return;
         };
         session.connect_send_closed = true;
-        if matches!(session.phase, SessionPhase::Terminal(_)) {
-            self.work.push_back(SessionWork::Terminate {
-                session_id,
-                error_code: session.terminal_stream_error,
-            });
-        }
+        self.remove_terminal_if_closed(session_id);
     }
 
     pub(crate) fn forget_non_session_request(&mut self, stream_id: u64) {
@@ -5996,6 +6109,10 @@ impl Runtime {
             work += 1;
 
             let session_id = opening.reservation.session_id();
+            if self.associated_teardown_waiting_for_peer(session_id) {
+                self.requeue_opening(stream_id, opening);
+                continue;
+            }
             if opening
                 .response
                 .as_ref()
@@ -6189,6 +6306,7 @@ impl Runtime {
                 self.opening_by_session.remove(&session_id);
             }
         }
+        self.complete_associated_teardown_if_empty(session_id);
     }
 
     fn wait_stream(
@@ -7848,6 +7966,12 @@ impl Runtime {
             remaining -= 1;
             match work {
                 SessionWork::Admit(session_id) => {
+                    // Local close can overtake an already queued admission.
+                    // Consume that stale item as one bounded work unit while
+                    // retaining the stream for the peer-close barrier.
+                    if self.associated_teardown_waiting_for_peer(session_id) {
+                        continue;
+                    }
                     let Some(stream_id) = self
                         .pending_by_session
                         .get(&session_id)
@@ -7898,7 +8022,9 @@ impl Runtime {
                         if more {
                             self.work.push_back(work);
                         } else {
-                            self.remove_terminal_if_closed(session_id);
+                            self.complete_associated_teardown_if_empty(
+                                session_id,
+                            );
                         }
                         continue;
                     }
@@ -7925,12 +8051,14 @@ impl Runtime {
                         {
                             self.work.push_back(work);
                         } else {
-                            self.remove_terminal_if_closed(session_id);
+                            self.complete_associated_teardown_if_empty(
+                                session_id,
+                            );
                         }
                         continue;
                     }
 
-                    self.remove_terminal_if_closed(session_id);
+                    self.complete_associated_teardown_if_empty(session_id);
                 },
             }
         }
@@ -8044,6 +8172,8 @@ impl Runtime {
     fn remove_terminal_if_closed(&mut self, session_id: u64) {
         let remove = self.sessions.get(&session_id).is_some_and(|session| {
             matches!(session.phase, SessionPhase::Terminal(_)) &&
+                session.associated_teardown ==
+                    AssociatedTeardownState::Complete &&
                 session.connect_recv_closed &&
                 session.connect_send_closed
         });
@@ -10350,5 +10480,133 @@ mod tests {
         runtime.mark_connect_send_closed(0);
         assert!(runtime.process_work(&mut pipe.server).is_empty());
         assert_eq!(runtime.session_count(), 0);
+    }
+
+    #[test]
+    fn local_close_consumes_stale_admission_as_one_work_unit() {
+        let mut pipe = pipe();
+        pipe.client.stream_send(4, b"pending", false).unwrap();
+        pipe.advance().unwrap();
+
+        let mut runtime = Runtime::new(runtime_limits(1, 1, 1));
+        assert!(runtime.classify(stream(0, 4), &mut pipe.server).is_empty());
+        assert!(matches!(
+            runtime.observe_request(0, true),
+            RequestObservation::Observed(events)
+                if events == vec![WebTransportSessionEvent::Pending {
+                    session_id: 0,
+                }]
+        ));
+        assert_eq!(runtime.activate(0), vec![
+            WebTransportSessionEvent::Accepted { session_id: 0 }
+        ]);
+        assert_eq!(runtime.work.len(), 1);
+
+        assert!(runtime.begin_local_close(
+            0,
+            CloseCapsule::new(22, "bounded".to_string()).unwrap(),
+        ));
+        assert_eq!(runtime.local_close_committed(0), vec![
+            WebTransportSessionEvent::Terminated {
+                session_id: 0,
+                reason: WebTransportSessionCloseReason::Local {
+                    error_code: 22,
+                    message: "bounded".to_string(),
+                },
+            }
+        ]);
+
+        // Closing performs no work-queue scan. The stale admission is consumed
+        // by the existing one-item callback budget without exposing teardown.
+        assert_eq!(runtime.work.len(), 1);
+        assert!(runtime.process_work(&mut pipe.server).is_empty());
+        assert_eq!(runtime.pending_stream_count(), 1);
+        assert_eq!(runtime.active_stream_count(), 0);
+        assert!(!runtime.has_work());
+        pipe.advance().unwrap();
+        assert!(pipe.client.stream_capacity(4).is_ok());
+
+        assert!(runtime.mark_connect_recv_closed(0).is_empty());
+        assert!(runtime.process_work(&mut pipe.server).is_empty());
+        assert_eq!(runtime.pending_stream_count(), 0);
+        assert!(!runtime.has_work());
+        pipe.advance().unwrap();
+        assert_eq!(
+            pipe.client.stream_capacity(4),
+            Err(quiche::Error::StreamStopped(WT_SESSION_GONE))
+        );
+    }
+
+    #[test]
+    fn local_close_barrier_buffers_streams_and_isolates_sibling_session() {
+        let mut pipe = pipe();
+        let mut runtime = Runtime::new(runtime_limits(8, 8, 2));
+        activate_session(&mut runtime, 0);
+        activate_session(&mut runtime, 4);
+        runtime.sessions.get_mut(&0).unwrap().application_visible = true;
+
+        for stream_id in [8, 12, 16] {
+            pipe.client.stream_send(stream_id, b"open", false).unwrap();
+        }
+        pipe.advance().unwrap();
+        assert_eq!(runtime.classify(stream(0, 8), &mut pipe.server), vec![
+            associated_event(stream(0, 8))
+        ]);
+        assert_eq!(runtime.classify(stream(4, 12), &mut pipe.server), vec![
+            associated_event(stream(4, 12))
+        ]);
+
+        assert!(runtime.begin_local_close(
+            0,
+            CloseCapsule::new(23, "ordered".to_string()).unwrap(),
+        ));
+        assert_eq!(runtime.local_close_committed(0), vec![
+            WebTransportSessionEvent::Terminated {
+                session_id: 0,
+                reason: WebTransportSessionCloseReason::Local {
+                    error_code: 23,
+                    message: "ordered".to_string(),
+                },
+            }
+        ]);
+
+        // A stream classified after local termination remains bounded and
+        // provisional until the peer proves that it observed the CONNECT
+        // close. The sibling session remains independently active.
+        assert!(runtime.classify(stream(0, 16), &mut pipe.server).is_empty());
+        assert_eq!(runtime.pending_stream_count(), 1);
+        assert_eq!(runtime.active_stream_count(), 2);
+        assert!(runtime.associated_teardown_waiting_for_peer(0));
+        assert!(!runtime.has_work());
+        for _ in 0..32 {
+            assert!(runtime.process_work(&mut pipe.server).is_empty());
+        }
+        assert_eq!(runtime.pending_stream_count(), 1);
+        assert!(runtime.stream_sessions.contains_key(&8));
+        assert!(runtime.stream_sessions.contains_key(&12));
+
+        // Duplicate peer-close callbacks cannot duplicate teardown work.
+        assert!(runtime.mark_connect_recv_closed(0).is_empty());
+        assert!(runtime.mark_connect_recv_closed(0).is_empty());
+        runtime.mark_connect_send_closed(0);
+        runtime.mark_connect_send_closed(0);
+        for _ in 0..4 {
+            assert!(runtime.process_work(&mut pipe.server).is_empty());
+        }
+        assert!(!runtime.sessions.contains_key(&0));
+        assert!(runtime.sessions.contains_key(&4));
+        assert_eq!(runtime.pending_stream_count(), 0);
+        assert_eq!(runtime.active_stream_count(), 1);
+        assert_eq!(runtime.stream_sessions.get(&12).unwrap().session_id, 4);
+        assert!(!runtime.has_work());
+
+        pipe.advance().unwrap();
+        for stream_id in [8, 16] {
+            assert_eq!(
+                pipe.client.stream_capacity(stream_id),
+                Err(quiche::Error::StreamStopped(WT_SESSION_GONE))
+            );
+        }
+        assert!(pipe.client.stream_capacity(12).is_ok());
     }
 }

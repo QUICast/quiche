@@ -255,6 +255,89 @@ mod client_side_driver {
         );
     }
 
+    #[test]
+    fn client_local_close_reaches_peer_before_associated_teardown() {
+        let mut helper = webtransport_helper();
+        start_webtransport_driver(&mut helper);
+        let (session_id, _body) =
+            open_pending_webtransport_session(&mut helper, 70);
+        peer_response_status(&mut helper, session_id, 200);
+        helper.advance_and_run_loop().unwrap();
+        expect_session_event(&mut helper, WebTransportSessionEvent::Accepted {
+            session_id,
+        });
+        assert_matches!(
+            helper.driver_recv_client_event().unwrap(),
+            ClientH3Event::Core(H3Event::IncomingHeaders(headers))
+                if headers.stream_id == session_id
+        );
+
+        let associated = [0x40, 0x41, 0x00, b'o', b'p', b'e', b'n'];
+        helper
+            .pipe
+            .server
+            .stream_send(1, &associated, false)
+            .unwrap();
+        helper.advance_and_run_loop().unwrap();
+        expect_session_event(
+            &mut helper,
+            WebTransportSessionEvent::AssociatedStream {
+                session_id,
+                stream_id: 1,
+                direction: WebTransportStreamDirection::Bidi,
+                prefix_len: 3,
+            },
+        );
+
+        helper
+            .controller
+            .close_webtransport_session(
+                session_id,
+                15,
+                "client close".to_string(),
+            )
+            .unwrap();
+        assert_eq!(helper.process_commands().unwrap(), 1);
+        expect_session_event(&mut helper, WebTransportSessionEvent::Terminated {
+            session_id,
+            reason: WebTransportSessionCloseReason::Local {
+                error_code: 15,
+                message: "client close".to_string(),
+            },
+        });
+
+        for _ in 0..4 {
+            helper.work_loop_iter().unwrap();
+        }
+        helper.pipe.advance().unwrap();
+        assert_eq!(helper.peer_server_poll(), Ok((session_id, h3::Event::Data)));
+        assert_eq!(
+            helper.peer_server_recv_body_vec(session_id, 2048).unwrap(),
+            super::server_side_driver::webtransport_close_capsule(
+                15,
+                "client close",
+            )
+        );
+        assert_eq!(
+            helper.peer_server_poll(),
+            Ok((session_id, h3::Event::Finished))
+        );
+        assert!(helper.pipe.server.stream_capacity(1).is_ok());
+
+        helper.peer_server_send_body(session_id, &[], true).unwrap();
+        helper.advance_and_run_loop().unwrap();
+        assert_eq!(
+            helper.pipe.server.stream_capacity(1),
+            Err(quiche::Error::StreamStopped(webtransport::WT_SESSION_GONE))
+        );
+        while let Ok(event) = helper.controller.event_receiver_mut().try_recv() {
+            assert!(!matches!(
+                event,
+                ClientH3Event::Core(H3Event::WebTransportSession(_))
+            ));
+        }
+    }
+
     #[tokio::test]
     async fn client_selected_streams_use_role_correct_physical_ids() {
         let mut helper = webtransport_helper();
@@ -1798,7 +1881,9 @@ mod server_side_driver {
         data
     }
 
-    fn webtransport_close_capsule(error_code: u32, message: &str) -> Vec<u8> {
+    pub(super) fn webtransport_close_capsule(
+        error_code: u32, message: &str,
+    ) -> Vec<u8> {
         let mut data = Vec::new();
         encode_varint(webtransport::WT_CLOSE_SESSION, &mut data);
         encode_varint((4 + message.len()) as u64, &mut data);
@@ -8823,6 +8908,393 @@ mod server_side_driver {
     }
 
     #[test]
+    fn webtransport_clean_connect_fin_precedes_associated_teardown() {
+        let mut helper = webtransport_helper(webtransport_settings());
+        let (to_client, _from_client) = accept_webtransport_session(&mut helper);
+        let associated = webtransport_stream_data(
+            WEBTRANSPORT_BIDI_STREAM_TYPE,
+            0,
+            b"clean close",
+        );
+        helper
+            .pipe
+            .client
+            .stream_send(4, &associated, false)
+            .unwrap();
+        helper.advance_and_run_loop().unwrap();
+        expect_associated_stream(
+            &mut helper,
+            0,
+            4,
+            WebTransportStreamDirection::Bidi,
+            associated.len() - b"clean close".len(),
+        );
+
+        to_client
+            .try_send(OutboundFrame::Body(Bytes::new(), true))
+            .unwrap();
+        helper.work_loop_iter().unwrap();
+        expect_session_terminated(
+            &mut helper,
+            0,
+            WebTransportSessionCloseReason::Clean,
+        );
+        for _ in 0..4 {
+            helper.work_loop_iter().unwrap();
+        }
+
+        helper.pipe.advance().unwrap();
+        assert_eq!(helper.peer_client_poll(), Ok((0, h3::Event::Data)));
+        let body = helper.peer_client_recv_body_vec(0, 1);
+        assert!(
+            matches!(body, Ok(ref bytes) if bytes.is_empty()) ||
+                body == Err(h3::Error::Done)
+        );
+        assert_eq!(helper.peer_client_poll(), Ok((0, h3::Event::Finished)));
+        assert!(helper.pipe.client.stream_capacity(4).is_ok());
+
+        helper.peer_client_send_body(0, &[], true).unwrap();
+        helper.advance_and_run_loop().unwrap();
+        assert_eq!(
+            helper.pipe.client.stream_capacity(4),
+            Err(quiche::Error::StreamStopped(webtransport::WT_SESSION_GONE))
+        );
+    }
+
+    #[test]
+    fn webtransport_local_close_reaches_peer_before_associated_teardown() {
+        let mut helper = webtransport_helper(webtransport_settings());
+        let (_to_client, _from_client) = accept_webtransport_session(&mut helper);
+        let bidi = webtransport_stream_data(
+            WEBTRANSPORT_BIDI_STREAM_TYPE,
+            0,
+            b"bidi remains open",
+        );
+        let uni = webtransport_stream_data(
+            WEBTRANSPORT_UNI_STREAM_TYPE,
+            0,
+            b"uni remains open",
+        );
+        helper.pipe.client.stream_send(4, &bidi, false).unwrap();
+        helper.pipe.client.stream_send(18, &uni, false).unwrap();
+        helper.advance_and_run_loop().unwrap();
+        expect_associated_stream(
+            &mut helper,
+            0,
+            4,
+            WebTransportStreamDirection::Bidi,
+            bidi.len() - b"bidi remains open".len(),
+        );
+        expect_associated_stream(
+            &mut helper,
+            0,
+            18,
+            WebTransportStreamDirection::Uni,
+            uni.len() - b"uni remains open".len(),
+        );
+
+        helper
+            .controller
+            .close_webtransport_session(0, 17, "ordered close".to_string())
+            .unwrap();
+        assert_eq!(helper.process_commands().unwrap(), 1);
+        expect_session_terminated(
+            &mut helper,
+            0,
+            WebTransportSessionCloseReason::Local {
+                error_code: 17,
+                message: "ordered close".to_string(),
+            },
+        );
+
+        // Reproduce the owner ordering that used to enqueue associated RESET
+        // and STOP frames before the socket flush carrying the close capsule.
+        for _ in 0..4 {
+            helper.work_loop_iter().unwrap();
+        }
+        helper.pipe.advance().unwrap();
+        assert_eq!(helper.peer_client_poll(), Ok((0, h3::Event::Data)));
+        assert_eq!(
+            helper.peer_client_recv_body_vec(0, 2048).unwrap(),
+            webtransport_close_capsule(17, "ordered close")
+        );
+        assert_eq!(helper.peer_client_poll(), Ok((0, h3::Event::Finished)));
+        assert!(helper.pipe.client.stream_capacity(4).is_ok());
+        assert!(helper.pipe.client.stream_capacity(18).is_ok());
+
+        // Closing the peer's CONNECT direction is the draft-required response
+        // and releases the associated-stream teardown barrier.
+        helper.peer_client_send_body(0, &[], true).unwrap();
+        helper.advance_and_run_loop().unwrap();
+        assert_eq!(
+            helper.pipe.client.stream_capacity(4),
+            Err(quiche::Error::StreamStopped(webtransport::WT_SESSION_GONE))
+        );
+        assert_eq!(
+            helper.pipe.client.stream_capacity(18),
+            Err(quiche::Error::StreamStopped(webtransport::WT_SESSION_GONE))
+        );
+        assert_no_webtransport_session_event(&mut helper);
+    }
+
+    #[test]
+    fn webtransport_connect_reset_and_stop_release_local_close_once() {
+        for (shutdown, error_code, closes_peer_send) in [
+            (quiche::Shutdown::Write, 0x71, true),
+            (quiche::Shutdown::Read, 0x72, false),
+        ] {
+            let mut helper = webtransport_helper(webtransport_settings());
+            let (_to_client, _from_client) =
+                accept_webtransport_session(&mut helper);
+            let associated = webtransport_stream_data(
+                WEBTRANSPORT_BIDI_STREAM_TYPE,
+                0,
+                b"race",
+            );
+            helper
+                .pipe
+                .client
+                .stream_send(4, &associated, false)
+                .unwrap();
+            helper.advance_and_run_loop().unwrap();
+            expect_associated_stream(
+                &mut helper,
+                0,
+                4,
+                WebTransportStreamDirection::Bidi,
+                associated.len() - b"race".len(),
+            );
+
+            helper
+                .controller
+                .close_webtransport_session(0, 20, "race".to_string())
+                .unwrap();
+            assert_eq!(helper.process_commands().unwrap(), 1);
+            expect_session_terminated(
+                &mut helper,
+                0,
+                WebTransportSessionCloseReason::Local {
+                    error_code: 20,
+                    message: "race".to_string(),
+                },
+            );
+            helper
+                .pipe
+                .client
+                .stream_shutdown(0, shutdown, error_code)
+                .unwrap();
+            helper.advance_and_run_loop().unwrap();
+
+            if closes_peer_send {
+                assert_eq!(
+                    helper.pipe.client.stream_capacity(4),
+                    Err(quiche::Error::StreamStopped(
+                        webtransport::WT_SESSION_GONE
+                    ))
+                );
+            } else {
+                assert!(helper.pipe.client.stream_capacity(4).is_ok());
+                helper.peer_client_send_body(0, &[], true).unwrap();
+                helper.advance_and_run_loop().unwrap();
+                assert_eq!(
+                    helper.pipe.client.stream_capacity(4),
+                    Err(quiche::Error::StreamStopped(
+                        webtransport::WT_SESSION_GONE
+                    ))
+                );
+            }
+            assert_no_webtransport_session_event(&mut helper);
+            for _ in 0..4 {
+                helper.work_loop_iter().unwrap();
+            }
+            assert_no_webtransport_session_event(&mut helper);
+        }
+    }
+
+    #[tokio::test]
+    async fn webtransport_local_close_preserves_partial_write_owner() {
+        let mut helper =
+            DriverTestHelper::<ServerHooks>::with_pipe_and_http3_settings(
+                payload_backpressured_webtransport_pipe(),
+                webtransport_settings(),
+            )
+            .unwrap();
+        let (_to_client, _from_client) = accept_webtransport_session(&mut helper);
+        let controller = helper
+            .controller
+            .webtransport_controller()
+            .expect("native WebTransport controller");
+        let stream_id =
+            open_server_webtransport_bidi(&mut helper, &controller, 0).await;
+        helper.pipe.advance().unwrap();
+        assert_matches!(
+            helper.peer_client_poll(),
+            Ok((id, h3::Event::WebTransportStream { .. })) if id == stream_id
+        );
+
+        let (lease, log) = mock_write_lease(0x640, &[0xa5; 128]);
+        let original_pointer = lease.payload.as_ptr() as usize;
+        let operation = controller
+            .try_write_stream_lease(0, stream_id, lease, false)
+            .unwrap();
+        helper.work_loop_iter().unwrap();
+        let lease = assert_matches!(
+            operation.outcome().await,
+            WebTransportStreamWriteLeaseOutcome::Accepted {
+                lease,
+                accepted,
+                complete: false,
+                fin_accepted: false,
+            } if accepted > 0 && accepted < 128 => lease
+        );
+        assert_eq!(lease.payload.as_ptr() as usize, original_pointer);
+        assert_eq!(mock_write_lease_log(&log).exposed_pointers, vec![
+            original_pointer
+        ]);
+
+        helper
+            .controller
+            .close_webtransport_session(0, 18, "partial".to_string())
+            .unwrap();
+        assert_eq!(helper.process_commands().unwrap(), 1);
+        expect_session_terminated(
+            &mut helper,
+            0,
+            WebTransportSessionCloseReason::Local {
+                error_code: 18,
+                message: "partial".to_string(),
+            },
+        );
+        helper.work_loop_iter().unwrap();
+        helper.pipe.advance().unwrap();
+        assert_eq!(helper.peer_client_poll(), Ok((0, h3::Event::Data)));
+        assert_eq!(
+            helper.peer_client_recv_body_vec(0, 2048).unwrap(),
+            webtransport_close_capsule(18, "partial")
+        );
+        assert_eq!(helper.peer_client_poll(), Ok((0, h3::Event::Finished)));
+        assert!(helper.pipe.client.stream_capacity(stream_id).is_ok());
+
+        helper.peer_client_send_body(0, &[], true).unwrap();
+        helper.advance_and_run_loop().unwrap();
+        assert_eq!(
+            helper.pipe.client.stream_capacity(stream_id),
+            Err(quiche::Error::StreamStopped(webtransport::WT_SESSION_GONE))
+        );
+        assert_eq!(lease.payload.as_ptr() as usize, original_pointer);
+        drop(lease);
+        assert_eq!(mock_write_lease_log(&log).drops, 1);
+    }
+
+    #[tokio::test]
+    async fn webtransport_local_close_holds_partially_open_stream() {
+        let mut helper =
+            DriverTestHelper::<ServerHooks>::with_pipe_and_http3_settings(
+                prefix_backpressured_webtransport_pipe(),
+                webtransport_settings(),
+            )
+            .unwrap();
+        let (_to_client, _from_client) = accept_webtransport_session(&mut helper);
+        let controller = helper
+            .controller
+            .webtransport_controller()
+            .expect("native WebTransport controller");
+        let open_controller = controller.clone();
+        let open = tokio::spawn(async move {
+            open_controller.open_bidirectional_stream(0).await
+        });
+        tokio::task::yield_now().await;
+        helper.work_loop_iter().unwrap();
+        let stream_id = helper
+            .driver
+            .webtransport
+            .as_ref()
+            .unwrap()
+            .first_opening_stream_id()
+            .expect("prefix-blocked stream remains opening");
+        assert!(!open.is_finished());
+
+        helper
+            .controller
+            .close_webtransport_session(0, 19, "opening".to_string())
+            .unwrap();
+        assert_eq!(helper.process_commands().unwrap(), 1);
+        assert_eq!(
+            open.await.unwrap(),
+            WebTransportOpenStreamOutcome::Rejected(
+                WebTransportSelectionError::ClosingSession,
+            )
+        );
+        expect_session_terminated(
+            &mut helper,
+            0,
+            WebTransportSessionCloseReason::Local {
+                error_code: 19,
+                message: "opening".to_string(),
+            },
+        );
+        for _ in 0..4 {
+            helper.work_loop_iter().unwrap();
+            assert_eq!(
+                helper
+                    .driver
+                    .webtransport
+                    .as_ref()
+                    .unwrap()
+                    .first_opening_stream_id(),
+                Some(stream_id),
+            );
+        }
+
+        helper.pipe.advance().unwrap();
+        assert_eq!(helper.peer_client_poll(), Ok((0, h3::Event::Data)));
+        assert_eq!(
+            helper.peer_client_recv_body_vec(0, 2048).unwrap(),
+            webtransport_close_capsule(19, "opening")
+        );
+        assert_eq!(helper.peer_client_poll(), Ok((0, h3::Event::Finished)));
+
+        helper.peer_client_send_body(0, &[], true).unwrap();
+        let mut classified = false;
+        let mut reset = false;
+        for _ in 0..16 {
+            helper.pipe.advance().unwrap();
+            helper.work_loop_iter().unwrap();
+            helper.pipe.advance().unwrap();
+            match helper.peer_client_poll() {
+                Ok((id, h3::Event::WebTransportStream { .. }))
+                    if id == stream_id =>
+                    classified = true,
+                Err(h3::Error::Done) => {},
+                other => panic!("unexpected opening-stream event: {other:?}"),
+            }
+            if classified {
+                match helper.pipe.client.stream_recv(stream_id, &mut [0; 1]) {
+                    Err(quiche::Error::StreamReset(error_code))
+                        if error_code == webtransport::WT_SESSION_GONE =>
+                        reset = true,
+                    Err(quiche::Error::Done) => {},
+                    other => panic!("unexpected opening-stream read: {other:?}"),
+                }
+            }
+            if classified && reset {
+                break;
+            }
+        }
+        assert!(classified, "opening stream prefix was not delivered");
+        assert!(reset, "opening stream was not reset after peer close");
+        assert_eq!(
+            helper
+                .driver
+                .webtransport
+                .as_ref()
+                .unwrap()
+                .first_opening_stream_id(),
+            None,
+        );
+    }
+
+    #[test]
     fn webtransport_local_close_rejects_oversized_message_before_queueing() {
         let mut helper = webtransport_helper(webtransport_settings());
         let (_to_client, _from_client) = accept_webtransport_session(&mut helper);
@@ -10800,6 +11272,93 @@ mod server_side_driver {
         assert_eq!(stats.live_connection_snapshot_saturation_total, 1);
         assert_eq!(stats.live_connection_snapshot_cancellation_total, 1);
         assert_eq!(stats.live_connection_snapshot_sample_total, 1);
+    }
+
+    #[tokio::test]
+    async fn webtransport_local_close_barrier_reaches_exact_terminal_zero() {
+        let mut helper = webtransport_helper(webtransport_settings());
+        let (to_client, _from_client) = accept_webtransport_session(&mut helper);
+        let controller = helper
+            .controller
+            .webtransport_controller()
+            .expect("native WebTransport controller");
+        let claim = controller.terminal_retention_claim();
+        let hook = helper
+            .driver
+            .connection_owner_drop_hook()
+            .expect("WebTransport driver installs a core-owner hook");
+        let associated = webtransport_stream_data(
+            WEBTRANSPORT_BIDI_STREAM_TYPE,
+            0,
+            b"retained until peer close",
+        );
+        helper
+            .pipe
+            .client
+            .stream_send(4, &associated, false)
+            .unwrap();
+        helper.advance_and_run_loop().unwrap();
+        expect_associated_stream(
+            &mut helper,
+            0,
+            4,
+            WebTransportStreamDirection::Bidi,
+            associated.len() - b"retained until peer close".len(),
+        );
+
+        helper
+            .controller
+            .close_webtransport_session(0, 24, "terminal".to_string())
+            .unwrap();
+        assert_eq!(helper.process_commands().unwrap(), 1);
+        expect_session_terminated(
+            &mut helper,
+            0,
+            WebTransportSessionCloseReason::Local {
+                error_code: 24,
+                message: "terminal".to_string(),
+            },
+        );
+        helper.work_loop_iter().unwrap();
+        helper.pipe.advance().unwrap();
+        assert_eq!(helper.peer_client_poll(), Ok((0, h3::Event::Data)));
+        assert_eq!(
+            helper.peer_client_recv_body_vec(0, 2048).unwrap(),
+            webtransport_close_capsule(24, "terminal")
+        );
+        assert_eq!(helper.peer_client_poll(), Ok((0, h3::Event::Finished)));
+        helper.peer_client_send_body(0, &[], true).unwrap();
+        helper.advance_and_run_loop().unwrap();
+        assert_eq!(
+            helper.pipe.client.stream_capacity(4),
+            Err(quiche::Error::StreamStopped(webtransport::WT_SESSION_GONE))
+        );
+
+        crate::ApplicationOverQuic::on_conn_close(
+            &mut helper.driver,
+            &mut helper.pipe.server,
+            &crate::metrics::DefaultMetrics,
+            &Ok(()),
+        );
+        let DriverTestHelper {
+            pipe,
+            driver,
+            controller: h3_controller,
+            peer,
+        } = helper;
+        drop(to_client);
+        drop(h3_controller);
+        drop(driver);
+        drop(peer);
+        drop(pipe);
+        hook.fire();
+
+        let stats = assert_matches!(
+            controller.wait_terminal_retention(claim).await,
+            WebTransportTerminalRetentionOutcome::Taken(stats) => stats
+        );
+        assert_terminal_retention_current_zero(&stats);
+        assert!(stats.receive_terminal_observations_high_water >= 1);
     }
 
     #[tokio::test]

@@ -1907,16 +1907,10 @@ impl<H: DriverHooks> H3Driver<H> {
                         let events = webtransport.as_deref_mut().map_or_else(
                             Vec::new,
                             |runtime| {
-                                runtime.terminate(
-                                    stream_id,
-                                    WebTransportSessionCloseReason::Clean,
-                                )
+                                runtime.local_connect_fin_committed(stream_id)
                             },
                         );
                         Self::emit_webtransport_events(h3_event_sender, events)?;
-                        if let Some(runtime) = webtransport.as_deref_mut() {
-                            runtime.mark_connect_send_closed(stream_id);
-                        }
                         fin_result?;
                     }
                     Ok(())
@@ -1934,19 +1928,12 @@ impl<H: DriverHooks> H3Driver<H> {
 
                 if res.is_ok() {
                     let fin_result = Self::on_fin_sent(ctx);
-                    let events = webtransport.as_deref_mut().map_or_else(
-                        Vec::new,
-                        |runtime| {
-                            runtime.terminate(
-                                stream_id,
-                                WebTransportSessionCloseReason::Clean,
-                            )
-                        },
-                    );
+                    let events = webtransport
+                        .as_deref_mut()
+                        .map_or_else(Vec::new, |runtime| {
+                            runtime.local_connect_fin_committed(stream_id)
+                        });
                     Self::emit_webtransport_events(h3_event_sender, events)?;
-                    if let Some(runtime) = webtransport.as_deref_mut() {
-                        runtime.mark_connect_send_closed(stream_id);
-                    }
                     fin_result?;
                 }
                 res.map_err(H3ConnectionError::from)
@@ -3360,8 +3347,10 @@ impl<H: DriverHooks> H3Controller<H> {
     /// Queues WT_CLOSE_SESSION followed by FIN for an active session.
     ///
     /// The session becomes terminal only after H3 accepts the complete capsule
-    /// and FIN. Duplicate, unknown, pending, or already-terminal session IDs
-    /// are ignored by the driver.
+    /// and FIN. Associated-stream teardown follows the peer's required CONNECT
+    /// close or reset response, so the close is authoritative before
+    /// `WT_SESSION_GONE` is exposed remotely. Duplicate, unknown, pending, or
+    /// already-terminal session IDs are ignored by the driver.
     pub fn close_webtransport_session(
         &self, session_id: u64, error_code: u32, message: String,
     ) -> Result<(), WebTransportSessionCloseError> {

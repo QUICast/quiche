@@ -3482,9 +3482,9 @@ mod tests {
         drop(selected);
         drop(controller);
 
-        let pending = diagnostic
-            .pending()
-            .expect("a claim reports outstanding conditions without the controller");
+        let pending = diagnostic.pending().expect(
+            "a claim reports outstanding conditions without the controller",
+        );
         assert!(!pending.connection_owner_dropped);
 
         hook.fire();
