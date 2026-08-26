@@ -44,6 +44,7 @@ use tokio_quiche::InitialQuicConnection;
 pub mod async_callbacks;
 pub mod connection_close;
 pub mod headers;
+pub mod listener_lifecycle;
 pub mod migration;
 pub mod qlog_compression;
 pub mod stream_limit;

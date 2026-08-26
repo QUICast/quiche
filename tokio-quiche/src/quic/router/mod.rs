@@ -63,6 +63,7 @@ use std::time::Instant;
 use std::time::SystemTime;
 use task_killswitch::spawn_with_killswitch;
 use tokio::sync::mpsc;
+use tokio::sync::oneshot;
 use tokio::sync::watch;
 
 #[cfg(target_os = "linux")]
@@ -82,6 +83,25 @@ type ConnStream<Tx, M> = mpsc::Receiver<io::Result<InitialQuicConnection<Tx, M>>
 const PACKET_RX_YIELD_AFTER: usize = 30;
 /// `ConnectionMapCommand` processing batch size to amortize receive operations.
 const CONN_MAP_CMD_BATCH_SIZE: usize = 128;
+
+#[derive(Debug)]
+struct ConnectionMapCommandLaneSaturated;
+
+impl std::fmt::Display for ConnectionMapCommandLaneSaturated {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("bounded Connection-ID map command lane saturated")
+    }
+}
+
+impl std::error::Error for ConnectionMapCommandLaneSaturated {}
+
+pub(crate) fn is_connection_map_command_lane_saturation(
+    error: &io::Error,
+) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|source| source.is::<ConnectionMapCommandLaneSaturated>())
+}
 
 pub(crate) const fn connection_map_command_slot_upper_bound() -> usize {
     size_of::<ConnectionMapCommand>() + 2 * MAX_CONN_ID_LEN + usize::BITS as usize
@@ -305,6 +325,7 @@ where
     config: Config,
     conns: ConnectionMap,
     incoming_packet_handler: I,
+    listener_shutdown_rx: oneshot::Receiver<()>,
     shutdown_tx: Option<mpsc::Sender<()>>,
     shutdown_rx: mpsc::Receiver<()>,
     conn_map_cmd_tx: ConnectionMapCommandSender,
@@ -347,7 +368,9 @@ where
         Self,
         ConnStream<Tx, M>,
         watch::Receiver<Option<InitialBacklogOverflow>>,
+        oneshot::Sender<()>,
     ) {
+        let (listener_shutdown_tx, listener_shutdown_rx) = oneshot::channel();
         let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
         let (accept_sink, accept_stream) = mpsc::channel(config.listen_backlog);
         let (initial_backlog_overflow_sink, initial_backlog_overflow_stream) =
@@ -363,6 +386,7 @@ where
                 socket_rx,
                 conns: ConnectionMap::default(),
                 incoming_packet_handler,
+                listener_shutdown_rx,
                 shutdown_tx: Some(shutdown_tx),
                 shutdown_rx,
                 conn_map_cmd_tx,
@@ -401,6 +425,7 @@ where
             },
             accept_stream,
             initial_backlog_overflow_stream,
+            listener_shutdown_tx,
         )
     }
 
@@ -914,7 +939,7 @@ where
 
         if cmd_rx.overloaded() {
             return Poll::Ready(Err(io::Error::other(
-                "bounded Connection-ID map command lane saturated",
+                ConnectionMapCommandLaneSaturated,
             )));
         }
 
@@ -992,8 +1017,13 @@ where
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
         loop {
             // First, check whether the app stopped accepting connections.
-            if self.shutdown_tx.is_some() && self.accept_sink.is_closed() {
-                self.shutdown_tx = None;
+            if self.shutdown_tx.is_some() &&
+                (self.accept_sink.is_closed() ||
+                    Pin::new(&mut self.listener_shutdown_rx)
+                        .poll(cx)
+                        .is_ready())
+            {
+                self.shutdown_tx.take();
             }
 
             // Second, check if all connections have shut down and we can exit.
@@ -1090,6 +1120,12 @@ mod tests {
     use crate::http3::settings::Http3Settings;
     use crate::metrics::DefaultMetrics;
     use crate::quic::connection::SimpleConnectionIdGenerator;
+    use crate::quic::listener::completion_from_router_result;
+    use crate::quic::listener::spawn_listener_task;
+    use crate::quic::listener::QuicListenerCompletion;
+    use crate::quic::listener::QuicListenerFailure;
+    use crate::quic::listener::QuicListenerTerminal;
+    use crate::quic::listener::QuicListenerTerminalOutcome;
     use crate::settings::Config;
     use crate::settings::Hooks;
     use crate::settings::QuicSettings;
@@ -1103,6 +1139,8 @@ mod tests {
     use futures::FutureExt as _;
     use h3i::actions::h3::Action;
     use std::net::Ipv4Addr;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::net::UdpSocket;
@@ -1155,6 +1193,31 @@ mod tests {
             initial_pkt: None,
             cid_generator: None,
             handshake_start_time: Instant::now(),
+        }
+    }
+
+    fn test_server_config(quic_settings: QuicSettings) -> Config {
+        let tls_cert_settings = TlsCertificatePaths {
+            cert: TEST_CERT_FILE,
+            private_key: TEST_KEY_FILE,
+            kind: crate::settings::CertificateKind::X509,
+        };
+        let params = ConnectionParams::new_server(
+            quic_settings,
+            tls_cert_settings,
+            Hooks::default(),
+        );
+        Config::new(&params, SocketCapabilities::default()).unwrap()
+    }
+
+    fn connection_map_sender_is_closed(
+        sender: &ConnectionMapCommandSender,
+    ) -> bool {
+        match &sender.inner {
+            ConnectionMapCommandSenderInner::Unbounded(sender) =>
+                sender.is_closed(),
+            ConnectionMapCommandSenderInner::Bounded { sender, .. } =>
+                sender.is_closed(),
         }
     }
 
@@ -1212,7 +1275,7 @@ mod tests {
         let second_peer = SocketAddr::from(([127, 0, 0, 1], 5002));
         let third_peer = SocketAddr::from(([127, 0, 0, 1], 5003));
         let fourth_peer = SocketAddr::from(([127, 0, 0, 1], 5004));
-        let (mut router, mut accepted, overflow_receiver) =
+        let (mut router, mut accepted, overflow_receiver, _listener_shutdown) =
             InboundPacketRouter::new(
                 config,
                 Arc::new(NoopDatagramSender),
@@ -1271,6 +1334,175 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn listener_terminal_waits_for_all_accepted_connections_and_resources()
+    {
+        for active_count in [1usize, 3] {
+            let config = test_server_config(QuicSettings {
+                listen_backlog: active_count,
+                ..Default::default()
+            });
+            let local_addr = SocketAddr::from(([127, 0, 0, 1], 4433));
+            let socket = Arc::new(NoopDatagramSender);
+            let socket_weak = Arc::downgrade(&socket);
+            let handler_dropped = Arc::new(AtomicBool::new(false));
+            let (mut router, mut accepted, _overflows, listener_shutdown) =
+                InboundPacketRouter::new(
+                    config,
+                    Arc::clone(&socket),
+                    PendingReceiver,
+                    local_addr,
+                    DropAwareInitialHandler(Arc::clone(&handler_dropped)),
+                    DefaultMetrics,
+                );
+            drop(socket);
+            let connection_map = router.conn_map_cmd_tx.clone();
+
+            for index in 0..active_count {
+                let peer =
+                    SocketAddr::from(([127, 0, 0, 1], 5000 + index as u16));
+                router
+                    .spawn_new_connection(
+                        test_new_connection((index + 1) as u8, local_addr, peer),
+                        local_addr,
+                        peer,
+                    )
+                    .unwrap();
+            }
+
+            let mut active = Vec::with_capacity(active_count);
+            for _ in 0..active_count {
+                active.push(accepted.recv().await.unwrap().unwrap());
+            }
+
+            let (terminal, state) = QuicListenerTerminal::new_pair();
+            let observer = spawn_listener_task(
+                DefaultMetrics,
+                async move { completion_from_router_result(router.await) },
+                state,
+            );
+            drop(listener_shutdown);
+            tokio::task::yield_now().await;
+            assert_eq!(terminal.try_take(), QuicListenerTerminalOutcome::Pending);
+
+            while active.len() > 1 {
+                drop(active.pop());
+                tokio::task::yield_now().await;
+                assert_eq!(
+                    terminal.try_take(),
+                    QuicListenerTerminalOutcome::Pending
+                );
+            }
+            drop(active.pop());
+
+            assert_eq!(
+                terminal.wait().await,
+                QuicListenerTerminalOutcome::Taken(QuicListenerCompletion::Clean)
+            );
+            observer.await.unwrap();
+            assert!(handler_dropped.load(Ordering::Acquire));
+            assert!(socket_weak.upgrade().is_none());
+            assert!(connection_map_sender_is_closed(&connection_map));
+            assert!(accepted.recv().await.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn backlog_saturation_cannot_report_false_clean_completion() {
+        let config = test_server_config(QuicSettings {
+            listen_backlog: 1,
+            ..Default::default()
+        });
+        let local_addr = SocketAddr::from(([127, 0, 0, 1], 4433));
+        let first_peer = SocketAddr::from(([127, 0, 0, 1], 5001));
+        let second_peer = SocketAddr::from(([127, 0, 0, 1], 5002));
+        let (mut router, accepted, overflow, listener_shutdown) =
+            InboundPacketRouter::new(
+                config,
+                Arc::new(NoopDatagramSender),
+                PendingReceiver,
+                local_addr,
+                NoopInitialHandler,
+                DefaultMetrics,
+            );
+        router
+            .spawn_new_connection(
+                test_new_connection(1, local_addr, first_peer),
+                local_addr,
+                first_peer,
+            )
+            .unwrap();
+        assert!(router
+            .spawn_new_connection(
+                test_new_connection(2, local_addr, second_peer),
+                local_addr,
+                second_peer,
+            )
+            .is_err());
+        assert_eq!(overflow.borrow().unwrap().rejected_total, 1);
+
+        let (terminal, state) = QuicListenerTerminal::new_pair();
+        let observer = spawn_listener_task(
+            DefaultMetrics,
+            async move { completion_from_router_result(router.await) },
+            state,
+        );
+        drop(listener_shutdown);
+        tokio::task::yield_now().await;
+        assert_eq!(terminal.try_take(), QuicListenerTerminalOutcome::Pending);
+
+        drop(accepted);
+        assert_eq!(
+            terminal.wait().await,
+            QuicListenerTerminalOutcome::Taken(QuicListenerCompletion::Clean)
+        );
+        observer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn connection_map_saturation_is_projected_before_resource_release() {
+        let config = test_server_config(QuicSettings {
+            connection_map_command_capacity: Some(1),
+            ..Default::default()
+        });
+        let local_addr = SocketAddr::from(([127, 0, 0, 1], 4433));
+        let (router, _accepted, _overflow, _listener_shutdown) =
+            InboundPacketRouter::new(
+                config,
+                Arc::new(NoopDatagramSender),
+                PendingReceiver,
+                local_addr,
+                NoopInitialHandler,
+                DefaultMetrics,
+            );
+        let connection_map = router.conn_map_cmd_tx.clone();
+        let command = |value| {
+            ConnectionMapCommand::UnmapCid(
+                ConnectionId::from_ref(&[value]).into_owned(),
+            )
+        };
+        connection_map.send(command(1)).unwrap();
+        assert_eq!(
+            connection_map.send(command(2)),
+            Err(ConnectionMapCommandSendError)
+        );
+
+        let (terminal, state) = QuicListenerTerminal::new_pair();
+        let observer = spawn_listener_task(
+            DefaultMetrics,
+            async move { completion_from_router_result(router.await) },
+            state,
+        );
+        assert_eq!(
+            terminal.wait().await,
+            QuicListenerTerminalOutcome::Taken(QuicListenerCompletion::Failed(
+                QuicListenerFailure::ConnectionMapCommandLaneSaturated
+            ))
+        );
+        observer.await.unwrap();
+        assert!(connection_map_sender_is_closed(&connection_map));
+    }
+
+    #[tokio::test]
     async fn test_timeout() {
         // Configure a short idle timeout to speed up connection reclamation as
         // quiche doesn't support time mocking
@@ -1319,15 +1551,19 @@ mod tests {
             DefaultMetrics,
         );
 
-        let (socket_driver, mut incoming, _initial_backlog_overflows) =
-            InboundPacketRouter::new(
-                config,
-                socket_tx,
-                socket_rx,
-                local_addr,
-                acceptor,
-                DefaultMetrics,
-            );
+        let (
+            socket_driver,
+            mut incoming,
+            _initial_backlog_overflows,
+            _listener_shutdown,
+        ) = InboundPacketRouter::new(
+            config,
+            socket_tx,
+            socket_rx,
+            local_addr,
+            acceptor,
+            DefaultMetrics,
+        );
         tokio::spawn(socket_driver);
 
         // Start a request and drop it after connection establishment
@@ -1379,8 +1615,35 @@ mod tests {
         }
     }
 
+    struct PendingReceiver;
+
+    impl DatagramSocketRecv for PendingReceiver {
+        fn poll_recv(
+            &mut self, _cx: &mut Context, _buf: &mut tokio::io::ReadBuf,
+        ) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
     struct NoopInitialHandler;
     impl InitialPacketHandler for NoopInitialHandler {
+        fn handle_initials(
+            &mut self, _incoming: Incoming, _hdr: Header<'static>,
+            _quiche_config: &mut quiche::Config,
+        ) -> io::Result<Option<NewConnection>> {
+            Ok(None)
+        }
+    }
+
+    struct DropAwareInitialHandler(Arc<AtomicBool>);
+
+    impl Drop for DropAwareInitialHandler {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    impl InitialPacketHandler for DropAwareInitialHandler {
         fn handle_initials(
             &mut self, _incoming: Incoming, _hdr: Header<'static>,
             _quiche_config: &mut quiche::Config,
@@ -1405,15 +1668,19 @@ mod tests {
         let config = Config::new(&params, SocketCapabilities::default()).unwrap();
         let local_addr = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0);
 
-        let (mut ipr, accept_stream, _initial_backlog_overflows) =
-            InboundPacketRouter::new(
-                config,
-                Arc::new(NoopDatagramSender),
-                AlwaysReadyReceiver,
-                local_addr,
-                NoopInitialHandler,
-                DefaultMetrics,
-            );
+        let (
+            mut ipr,
+            accept_stream,
+            _initial_backlog_overflows,
+            _listener_shutdown,
+        ) = InboundPacketRouter::new(
+            config,
+            Arc::new(NoopDatagramSender),
+            AlwaysReadyReceiver,
+            local_addr,
+            NoopInitialHandler,
+            DefaultMetrics,
+        );
         let conn_map_cmd_tx = ipr.conn_map_cmd_tx.clone();
 
         // Keep polling the IPR in a busy loop until it resolves

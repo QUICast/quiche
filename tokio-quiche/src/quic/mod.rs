@@ -106,6 +106,7 @@ mod addr_validation_token;
 pub(crate) mod connection;
 mod hooks;
 mod io;
+mod listener;
 pub mod raw;
 mod router;
 
@@ -133,6 +134,11 @@ pub use self::connection::QuicCommand;
 pub use self::connection::QuicConnectionStats;
 pub use self::connection::SimpleConnectionIdGenerator;
 pub use self::hooks::ConnectionHook;
+pub use self::listener::QuicListenerCompletion;
+pub use self::listener::QuicListenerFailure;
+pub use self::listener::QuicListenerTerminal;
+pub use self::listener::QuicListenerTerminalOutcome;
+pub use self::listener::QuicListenerTerminalWait;
 
 /// Alias of [quiche::Connection] used internally by the crate.
 pub type QuicheConnection = quiche::Connection<crate::buf_factory::BufFactory>;
@@ -265,15 +271,19 @@ where
     let socket_tx = Arc::new(socket.send);
     let socket_rx = socket.recv;
 
-    let (router, mut quic_connection_stream, _initial_backlog_overflows) =
-        InboundPacketRouter::new(
-            client_config,
-            Arc::clone(&socket_tx),
-            socket_rx,
-            socket.local_addr,
-            ClientConnector::new(socket_tx, Box::new(quiche_conn)),
-            DefaultMetrics,
-        );
+    let (
+        router,
+        mut quic_connection_stream,
+        _initial_backlog_overflows,
+        listener_shutdown,
+    ) = InboundPacketRouter::new(
+        client_config,
+        Arc::clone(&socket_tx),
+        socket_rx,
+        socket.local_addr,
+        ClientConnector::new(socket_tx, Box::new(quiche_conn)),
+        DefaultMetrics,
+    );
 
     // drive the packet router:
     tokio::spawn(async move {
@@ -287,11 +297,13 @@ where
         }
     });
 
-    Ok(quic_connection_stream
+    let connection = quic_connection_stream
         .recv()
         .await
         .ok_or("unable to establish connection")??
-        .start(app))
+        .start(app);
+    drop(listener_shutdown);
+    Ok(connection)
 }
 
 pub(crate) fn start_listener<M>(
@@ -335,18 +347,25 @@ where
         metrics.clone(),
     );
 
-    let (socket_driver, accept_stream, initial_backlog_overflows) =
-        InboundPacketRouter::new(
-            config,
-            socket_tx,
-            socket_rx,
-            local_addr,
-            acceptor,
-            metrics.clone(),
-        );
+    let (
+        socket_driver,
+        accept_stream,
+        initial_backlog_overflows,
+        listener_shutdown,
+    ) = InboundPacketRouter::new(
+        config,
+        socket_tx,
+        socket_rx,
+        local_addr,
+        acceptor,
+        metrics.clone(),
+    );
 
-    crate::metrics::tokio_task::spawn("quic_udp_listener", metrics, async move {
-        match socket_driver.await {
+    let (listener_terminal, listener_terminal_state) =
+        QuicListenerTerminal::new_pair();
+    let listener = async move {
+        let result = socket_driver.await;
+        match &result {
             Ok(()) => {
                 log::trace!("incoming packet router finished");
             },
@@ -354,9 +373,17 @@ where
                 log::error!("incoming packet router failed"; "error"=>error);
             },
         }
-    });
+        listener::completion_from_router_result(result)
+    };
+    drop(listener::spawn_listener_task(
+        metrics,
+        listener,
+        listener_terminal_state,
+    ));
     Ok(QuicConnectionStream::new(
         accept_stream,
         initial_backlog_overflows,
+        listener_terminal,
+        listener_shutdown,
     ))
 }

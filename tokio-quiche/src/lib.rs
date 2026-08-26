@@ -137,6 +137,7 @@ use std::task::Context;
 use std::task::Poll;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
+use tokio::sync::oneshot;
 use tokio::sync::watch;
 use tokio_stream::Stream;
 
@@ -155,6 +156,11 @@ pub use crate::quic::connection::ConnectionIdGenerator;
 pub use crate::quic::connection::ConnectionOwnerDropHook;
 pub use crate::quic::connection::InitialQuicConnection;
 pub use crate::quic::connection::QuicConnection;
+pub use crate::quic::QuicListenerCompletion;
+pub use crate::quic::QuicListenerFailure;
+pub use crate::quic::QuicListenerTerminal;
+pub use crate::quic::QuicListenerTerminalOutcome;
+pub use crate::quic::QuicListenerTerminalWait;
 pub use crate::result::BoxError;
 pub use crate::result::QuicResult;
 pub use crate::settings::ConnectionParams;
@@ -230,9 +236,13 @@ impl InitialBacklogOverflowEvents {
 ///
 /// Errors from processing the client's QUIC initials can also be emitted on
 /// this stream. These do not indicate that the listener itself has failed.
+/// Retain [`QuicConnectionStream::listener_terminal`] before closing or
+/// dropping the stream when authoritative listener cleanup must be observed.
 pub struct QuicConnectionStream<M: Metrics> {
     connections: mpsc::Receiver<io::Result<InitialQuicConnection<UdpSocket, M>>>,
     overflow_events: watch::Receiver<Option<InitialBacklogOverflow>>,
+    listener_terminal: QuicListenerTerminal,
+    listener_shutdown: Option<oneshot::Sender<()>>,
 }
 
 impl<M: Metrics> QuicConnectionStream<M> {
@@ -241,10 +251,14 @@ impl<M: Metrics> QuicConnectionStream<M> {
             io::Result<InitialQuicConnection<UdpSocket, M>>,
         >,
         overflow_events: watch::Receiver<Option<InitialBacklogOverflow>>,
+        listener_terminal: QuicListenerTerminal,
+        listener_shutdown: oneshot::Sender<()>,
     ) -> Self {
         Self {
             connections,
             overflow_events,
+            listener_terminal,
+            listener_shutdown: Some(listener_shutdown),
         }
     }
 
@@ -268,6 +282,17 @@ impl<M: Metrics> QuicConnectionStream<M> {
     /// Closes the accepted-connection lane and asks the listener to shut down.
     pub fn close(&mut self) {
         self.connections.close();
+        drop(self.listener_shutdown.take());
+    }
+
+    /// Returns the bounded terminal capability for this listener.
+    ///
+    /// Retain this capability before dropping the accepted-connection stream
+    /// to observe when the listener task and all listener-owned resources have
+    /// actually been released. Clones compete for one terminal result and do
+    /// not keep the listener alive.
+    pub fn listener_terminal(&self) -> QuicListenerTerminal {
+        self.listener_terminal.clone()
     }
 
     /// Returns an independently consumable bounded overflow-event receiver.
@@ -280,6 +305,12 @@ impl<M: Metrics> QuicConnectionStream<M> {
         &self,
     ) -> Option<InitialBacklogOverflow> {
         *self.overflow_events.borrow()
+    }
+}
+
+impl<M: Metrics> Drop for QuicConnectionStream<M> {
+    fn drop(&mut self) {
+        self.close();
     }
 }
 
@@ -302,7 +333,10 @@ impl<M: Metrics> Stream for QuicConnectionStream<M> {
 /// (optionally) validating its IP address.
 ///
 /// The task shuts down when the returned stream is closed (or dropped) and all
-/// previously-yielded connections are closed.
+/// previously-yielded connections are closed. A stream's
+/// [`QuicConnectionStream::listener_terminal`] capability distinguishes clean
+/// completion from listener failure after all listener-owned resources have
+/// been released.
 pub fn listen_with_capabilities<M>(
     sockets: impl IntoIterator<Item = QuicListener>, params: ConnectionParams,
     metrics: M,
