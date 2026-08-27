@@ -904,11 +904,16 @@ impl<H: DriverHooks> H3Driver<H> {
                 .bind_write_lease_accounting(&write_lease_accounting);
             let cancellation_pending =
                 Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let terminal_for_attach = Arc::clone(&terminal_retention);
             let terminal_for_drop = Arc::clone(&terminal_retention);
-            let connection_owner_drop_hook =
-                ConnectionOwnerDropHook::new(move || {
+            let connection_owner_drop_hook = ConnectionOwnerDropHook::new(
+                move || {
+                    terminal_for_attach.mark_connection_owner_attached();
+                },
+                move || {
                     terminal_for_drop.mark_connection_owner_dropped();
-                });
+                },
+            );
             (
                     Some(WebTransportRuntime::new_with_write_lease_accounting(
                         WebTransportRuntimeLimits {
@@ -2858,12 +2863,7 @@ impl<H: DriverHooks> H3Driver<H> {
 
 impl<H: DriverHooks> ApplicationOverQuic for H3Driver<H> {
     fn connection_owner_drop_hook(&self) -> Option<ConnectionOwnerDropHook> {
-        let hook = self.webtransport_connection_owner_drop_hook.as_ref()?;
-        self.webtransport_terminal_retention
-            .as_ref()
-            .expect("WebTransport drop hook requires terminal state")
-            .mark_connection_owner_attached();
-        Some(hook.clone())
+        self.webtransport_connection_owner_drop_hook.clone()
     }
 
     fn on_conn_established(

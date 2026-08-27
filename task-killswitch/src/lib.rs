@@ -258,6 +258,7 @@ pub fn killed_signal() -> impl Future<Output = ()> + Send + 'static {
 mod tests {
     use super::*;
     use futures_util::future;
+    use std::sync::Arc;
     use std::time::Duration;
     use tokio::sync::oneshot;
 
@@ -333,5 +334,24 @@ mod tests {
             .await
             .expect("killed() signal should have resolved")
             .expect("signal task should join successfully");
+    }
+
+    #[tokio::test]
+    async fn active_killswitch_refuses_and_drops_an_unpolled_future() {
+        let killswitch = TaskKillswitch::with_leaked_storage();
+        killswitch.activate();
+        let polled = Arc::new(AtomicBool::new(false));
+        let polled_in_task = Arc::clone(&polled);
+        let (drop_signal, dropped) = TaskAbortSignal::new();
+
+        let task = killswitch.spawn_task(async move {
+            polled_in_task.store(true, Ordering::Release);
+            std::future::pending::<()>().await;
+            drop(drop_signal);
+        });
+
+        assert!(task.is_none());
+        dropped.await.unwrap();
+        assert!(!polled.load(Ordering::Acquire));
     }
 }

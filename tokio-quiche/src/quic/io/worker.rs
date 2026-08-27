@@ -52,6 +52,7 @@ use crate::quic::connection::ConnectionOwnerDropHook;
 use crate::quic::connection::HandshakeError;
 use crate::quic::connection::Incoming;
 use crate::quic::connection::IncomingPacketSource;
+use crate::quic::connection::InstalledConnectionOwnerDropHook;
 use crate::quic::connection::IoWorkerMemoryProfile;
 use crate::quic::connection::QuicConnectionStats;
 use crate::quic::connection::SharedConnectionIdGenerator;
@@ -1187,7 +1188,7 @@ pub(crate) struct Closing<Tx, M, A> {
 
 pub(crate) struct OwnedQuicheConnection {
     connection: Option<Box<QuicheConnection>>,
-    owner_drop_hook: Option<ConnectionOwnerDropHook>,
+    owner_drop_hook: Option<InstalledConnectionOwnerDropHook>,
 }
 
 impl OwnedQuicheConnection {
@@ -1195,10 +1196,12 @@ impl OwnedQuicheConnection {
         connection: Box<QuicheConnection>,
         owner_drop_hook: Option<ConnectionOwnerDropHook>,
     ) -> Self {
-        Self {
+        let mut owner = Self {
             connection: Some(connection),
-            owner_drop_hook,
-        }
+            owner_drop_hook: None,
+        };
+        owner.owner_drop_hook = owner_drop_hook.map(|hook| hook.install());
+        owner
     }
 }
 
@@ -1223,9 +1226,7 @@ impl DerefMut for OwnedQuicheConnection {
 impl Drop for OwnedQuicheConnection {
     fn drop(&mut self) {
         drop(self.connection.take());
-        if let Some(hook) = self.owner_drop_hook.take() {
-            hook.fire();
-        }
+        drop(self.owner_drop_hook.take());
     }
 }
 
@@ -1526,22 +1527,37 @@ mod pooled_send_buf_tests {
     use super::*;
 
     #[test]
-    fn owned_connection_fires_preallocated_drop_hook_once() {
+    fn owned_connection_installs_and_fires_preallocated_hook_once() {
         let mut config =
             crate::http3::driver::test_utils::default_quiche_config();
         let pipe = quiche::test_utils::Pipe::<crate::buf_factory::BufFactory>::
             with_config_and_buf(&mut config)
             .unwrap();
+        let attachments = Arc::new(AtomicUsize::new(0));
+        let attachments_on_install = Arc::clone(&attachments);
         let fires = Arc::new(AtomicUsize::new(0));
         let fires_on_drop = Arc::clone(&fires);
-        let hook = ConnectionOwnerDropHook::new(move || {
-            fires_on_drop.fetch_add(1, Ordering::AcqRel);
-        });
+        let hook = ConnectionOwnerDropHook::new(
+            move || {
+                attachments_on_install.fetch_add(1, Ordering::AcqRel);
+            },
+            move || {
+                fires_on_drop.fetch_add(1, Ordering::AcqRel);
+            },
+        );
+        let unused_clone = hook.clone();
+
+        drop(unused_clone);
+        assert_eq!(attachments.load(Ordering::Acquire), 0);
+        assert_eq!(fires.load(Ordering::Acquire), 0);
+
         let connection =
             OwnedQuicheConnection::new(Box::new(pipe.server), Some(hook));
 
+        assert_eq!(attachments.load(Ordering::Acquire), 1);
         assert_eq!(fires.load(Ordering::Acquire), 0);
         drop(connection);
+        assert_eq!(attachments.load(Ordering::Acquire), 1);
         assert_eq!(fires.load(Ordering::Acquire), 1);
     }
 

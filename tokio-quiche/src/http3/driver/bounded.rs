@@ -3392,7 +3392,8 @@ mod tests {
         let claim = selected.terminal_retention_claim();
         let hook = driver
             .connection_owner_drop_hook()
-            .expect("bounded WebTransport installs a core-owner hook");
+            .expect("bounded WebTransport installs a core-owner hook")
+            .install();
 
         drop(driver);
         assert_matches!(
@@ -3407,7 +3408,7 @@ mod tests {
             )
         );
 
-        hook.fire();
+        drop(hook);
         let stats = assert_matches!(
             selected.try_take_terminal_retention(&claim),
             WebTransportTerminalRetentionOutcome::Taken(stats) => stats
@@ -3416,6 +3417,27 @@ mod tests {
         assert_eq!(stats.max_terminal_retention_waiters, 1);
         assert_eq!(stats.adapter_bytes_upper_bound(), 0);
         assert_eq!(stats.transport_queued_bytes(), 0);
+    }
+
+    #[test]
+    fn uninstalled_connection_owner_capability_settles_unavailable() {
+        let settings = BoundedSelectedWebTransportSettings::default();
+        let (driver, controller) =
+            H3Driver::<ServerHooks>::new_bounded_selected_webtransport(settings)
+                .unwrap();
+        let selected = controller.selected();
+        let claim = selected.terminal_retention_claim();
+        let hook = driver
+            .connection_owner_drop_hook()
+            .expect("bounded WebTransport creates an owner capability");
+
+        drop(hook);
+        drop(driver);
+
+        assert_eq!(
+            selected.try_take_terminal_retention(&claim),
+            WebTransportTerminalRetentionOutcome::Unavailable
+        );
     }
 
     #[test]
@@ -3428,7 +3450,8 @@ mod tests {
         let claim = selected.terminal_retention_claim();
         let hook = driver
             .connection_owner_drop_hook()
-            .expect("bounded WebTransport installs a core-owner hook");
+            .expect("bounded WebTransport installs a core-owner hook")
+            .install();
 
         drop(driver);
         // The unmet condition is reportable before the take settles, which is
@@ -3450,7 +3473,7 @@ mod tests {
             WebTransportTerminalRetentionOutcome::Early(_)
         );
 
-        hook.fire();
+        drop(hook);
         let stats = assert_matches!(
             selected.try_take_terminal_retention(&claim),
             WebTransportTerminalRetentionOutcome::Taken(stats) => stats
@@ -3476,7 +3499,8 @@ mod tests {
         let claim = selected.terminal_retention_claim();
         let hook = driver
             .connection_owner_drop_hook()
-            .expect("bounded WebTransport installs a core-owner hook");
+            .expect("bounded WebTransport installs a core-owner hook")
+            .install();
 
         drop(driver);
         drop(selected);
@@ -3487,7 +3511,7 @@ mod tests {
         );
         assert!(!pending.connection_owner_dropped);
 
-        hook.fire();
+        drop(hook);
         assert_matches!(
             diagnostic.pending(),
             Some(WebTransportTerminalRetentionPending {

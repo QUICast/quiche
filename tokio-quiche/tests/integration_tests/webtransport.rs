@@ -29,6 +29,7 @@ use std::time::Duration;
 use assert_matches::assert_matches;
 use futures::StreamExt;
 use tokio::sync::oneshot;
+use tokio::sync::watch;
 use tokio::time::timeout;
 use tokio_quiche::http3::driver::BoundedClientWebTransportEvent;
 use tokio_quiche::http3::driver::BoundedConnectHeaders;
@@ -46,6 +47,7 @@ use tokio_quiche::http3::driver::WebTransportStreamReceiveTerminal;
 use tokio_quiche::http3::driver::WebTransportStreamReceiveTerminalRetirementOutcome;
 use tokio_quiche::http3::driver::WebTransportStreamWriteLease;
 use tokio_quiche::http3::driver::WebTransportStreamWriteLeaseOutcome;
+use tokio_quiche::http3::driver::WebTransportTerminalRetentionOutcome;
 use tokio_quiche::listen;
 use tokio_quiche::metrics::DefaultMetrics;
 use tokio_quiche::quic::connect_with_config;
@@ -249,6 +251,71 @@ impl tokio_quiche::ApplicationOverQuic for PeerFacingOrderClientDriver {
     }
 }
 
+struct GracefulCloseClientDriver {
+    inner: ClientH3Driver,
+    close: watch::Receiver<bool>,
+    close_sent: bool,
+}
+
+impl tokio_quiche::ApplicationOverQuic for GracefulCloseClientDriver {
+    fn connection_owner_drop_hook(&self) -> Option<ConnectionOwnerDropHook> {
+        self.inner.connection_owner_drop_hook()
+    }
+
+    fn on_conn_established(
+        &mut self, qconn: &mut tokio_quiche::quic::QuicheConnection,
+        handshake_info: &tokio_quiche::quic::HandshakeInfo,
+    ) -> QuicResult<()> {
+        self.inner.on_conn_established(qconn, handshake_info)
+    }
+
+    fn should_act(&self) -> bool {
+        self.inner.should_act()
+    }
+
+    async fn wait_for_data(
+        &mut self, qconn: &mut tokio_quiche::quic::QuicheConnection,
+    ) -> QuicResult<()> {
+        if self.close_sent {
+            return self.inner.wait_for_data(qconn).await;
+        }
+        if *self.close.borrow() {
+            return Ok(());
+        }
+        tokio::select! {
+            result = self.inner.wait_for_data(qconn) => result,
+            changed = self.close.changed() => {
+                let _ = changed;
+                Ok(())
+            },
+        }
+    }
+
+    fn process_reads(
+        &mut self, qconn: &mut tokio_quiche::quic::QuicheConnection,
+    ) -> QuicResult<()> {
+        self.inner.process_reads(qconn)
+    }
+
+    fn process_writes(
+        &mut self, qconn: &mut tokio_quiche::quic::QuicheConnection,
+    ) -> QuicResult<()> {
+        self.inner.process_writes(qconn)?;
+        if !self.close_sent && *self.close.borrow_and_update() {
+            self.close_sent = true;
+            let _ = qconn.close(true, 0, b"terminal retention test");
+        }
+        Ok(())
+    }
+
+    fn on_conn_close<M: tokio_quiche::metrics::Metrics>(
+        &mut self, qconn: &mut tokio_quiche::quic::QuicheConnection, metrics: &M,
+        connection_result: &QuicResult<()>,
+    ) {
+        self.inner.on_conn_close(qconn, metrics, connection_result);
+    }
+}
+
 impl PayloadLease {
     fn new(data: &[u8]) -> Self {
         Self {
@@ -299,6 +366,34 @@ fn response_headers(
 ) -> BoundedConnectHeaders {
     BoundedConnectHeaders::copy_from(&[Header::new(b":status", b"200")], limits)
         .unwrap()
+}
+
+fn assert_terminal_current_zero(
+    stats: &tokio_quiche::http3::driver::WebTransportRetentionStats,
+) {
+    assert_eq!(stats.sessions, 0);
+    assert_eq!(stats.associated_streams, 0);
+    assert_eq!(stats.provisional_streams, 0);
+    assert_eq!(stats.stream_open_waiters, 0);
+    assert_eq!(stats.session_terminal_waiters, 0);
+    assert_eq!(stats.waiters, 0);
+    assert_eq!(stats.send_terminal_waiters, 0);
+    assert_eq!(stats.send_terminal_states, 0);
+    assert_eq!(stats.receive_terminal_observations, 0);
+    assert_eq!(stats.receive_terminal_states, 0);
+    assert_eq!(stats.receive_terminal_waiters, 0);
+    assert_eq!(stats.receive_terminal_leases, 0);
+    assert_eq!(stats.receive_terminal_bytes, 0);
+    assert_eq!(stats.bounded_client_connect_owners, 0);
+    assert_eq!(stats.metadata_index_entries, 0);
+    assert_eq!(stats.pending_datagrams, 0);
+    assert_eq!(stats.terminal_retention_waiters, 0);
+    assert_eq!(stats.live_connection_snapshot_requests, 0);
+    assert_eq!(stats.queued_commands, 0);
+    assert_eq!(stats.write_leases, 0);
+    assert_eq!(stats.write_lease_retained_bytes, 0);
+    assert_eq!(stats.adapter_bytes_upper_bound(), 0);
+    assert_eq!(stats.transport_queued_bytes(), 0);
 }
 
 async fn write_complete(
@@ -585,6 +680,120 @@ async fn bounded_receive_terminal_udp_loopback() {
     })
     .await
     .expect("bounded WebTransport UDP loopback timed out");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bounded_established_graceful_close_returns_terminal_zero() {
+    timeout(Duration::from_secs(15), async {
+        let settings = BoundedSelectedWebTransportSettings::default();
+        let mut server_quic = QuicSettings::default();
+        settings.apply_to_quic_settings(&mut server_quic);
+        let server_socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let server_addr = server_socket.local_addr().unwrap();
+        let server_params = ConnectionParams::new_server(
+            server_quic,
+            TlsCertificatePaths {
+                cert: TEST_CERT_FILE,
+                private_key: TEST_KEY_FILE,
+                kind: CertificateKind::X509,
+            },
+            Hooks::default(),
+        );
+        let mut incoming =
+            listen(vec![server_socket], server_params, DefaultMetrics)
+                .unwrap()
+                .remove(0);
+        let (server_ready, ready) = oneshot::channel();
+
+        let server = tokio::spawn(async move {
+            let initial = incoming.next().await.unwrap().unwrap();
+            let (driver, mut controller) =
+                ServerH3Driver::new_bounded_selected_webtransport(settings)
+                    .unwrap();
+            let selected = controller.selected();
+            let claim = selected.terminal_retention_claim();
+            let _connection = initial.start(driver);
+            let (session_id, mut responder) = loop {
+                match controller.recv_event().await.unwrap() {
+                    BoundedServerWebTransportEvent::ConnectRequested {
+                        session_id,
+                        responder,
+                        ..
+                    } => break (session_id, responder),
+                    BoundedServerWebTransportEvent::ProfileViolation =>
+                        panic!("bounded server profile violation"),
+                    _ => {},
+                }
+            };
+            responder
+                .try_send_response(response_headers(
+                    controller.connect_header_limits(),
+                ))
+                .unwrap();
+            loop {
+                match controller.recv_event().await.unwrap() {
+                    BoundedServerWebTransportEvent::Session(
+                        WebTransportSessionEvent::Accepted {
+                            session_id: accepted,
+                        },
+                    ) if accepted == session_id => break,
+                    BoundedServerWebTransportEvent::ProfileViolation =>
+                        panic!("bounded server profile violation"),
+                    _ => {},
+                }
+            }
+            server_ready.send(()).unwrap();
+
+            let stats = match selected.wait_terminal_retention(claim).await {
+                WebTransportTerminalRetentionOutcome::Taken(stats) => stats,
+                outcome => panic!("terminal accounting failed: {outcome:?}"),
+            };
+            assert_terminal_current_zero(&stats);
+        });
+
+        let mut client_quic = QuicSettings::default();
+        settings.apply_to_quic_settings(&mut client_quic);
+        let client_params =
+            ConnectionParams::new_client(client_quic, None, Hooks::default());
+        let client_socket =
+            tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client_socket.connect(server_addr).await.unwrap();
+        let socket = Socket::try_from(client_socket).unwrap();
+        let (driver, mut controller) =
+            ClientH3Driver::new_bounded_selected_webtransport(settings).unwrap();
+        let (close, close_rx) = watch::channel(false);
+        let driver = GracefulCloseClientDriver {
+            inner: driver,
+            close: close_rx,
+            close_sent: false,
+        };
+        let _connection = connect_with_config(
+            socket,
+            Some("localhost"),
+            &client_params,
+            driver,
+        )
+        .await
+        .unwrap();
+        controller
+            .try_connect(7, connect_headers(controller.connect_header_limits()))
+            .unwrap();
+        loop {
+            match controller.recv_event().await.unwrap() {
+                BoundedClientWebTransportEvent::Session(
+                    WebTransportSessionEvent::Accepted { .. },
+                ) => break,
+                BoundedClientWebTransportEvent::ProfileViolation =>
+                    panic!("bounded client profile violation"),
+                _ => {},
+            }
+        }
+        ready.await.unwrap();
+        close.send(true).unwrap();
+        server.await.unwrap();
+    })
+    .await
+    .expect("graceful terminal-retention UDP test timed out");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

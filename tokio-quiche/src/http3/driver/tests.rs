@@ -11228,7 +11228,8 @@ mod server_side_driver {
         let hook = helper
             .driver
             .connection_owner_drop_hook()
-            .expect("WebTransport driver installs a core-owner hook");
+            .expect("WebTransport driver installs a core-owner hook")
+            .install();
 
         let sample = controller.live_connection_snapshot();
         assert_eq!(
@@ -11261,7 +11262,7 @@ mod server_side_driver {
         drop(driver);
         drop(peer);
         drop(pipe);
-        hook.fire();
+        drop(hook);
 
         let stats = assert_matches!(
             controller.wait_terminal_retention(claim).await,
@@ -11286,7 +11287,8 @@ mod server_side_driver {
         let hook = helper
             .driver
             .connection_owner_drop_hook()
-            .expect("WebTransport driver installs a core-owner hook");
+            .expect("WebTransport driver installs a core-owner hook")
+            .install();
         let associated = webtransport_stream_data(
             WEBTRANSPORT_BIDI_STREAM_TYPE,
             0,
@@ -11351,7 +11353,7 @@ mod server_side_driver {
         drop(driver);
         drop(peer);
         drop(pipe);
-        hook.fire();
+        drop(hook);
 
         let stats = assert_matches!(
             controller.wait_terminal_retention(claim).await,
@@ -11376,7 +11378,8 @@ mod server_side_driver {
         let hook = helper
             .driver
             .connection_owner_drop_hook()
-            .expect("WebTransport driver installs a core-owner hook");
+            .expect("WebTransport driver installs a core-owner hook")
+            .install();
 
         let (queued, queued_log) = mock_write_lease(500, b"queued");
         let queued = controller
@@ -11429,7 +11432,7 @@ mod server_side_driver {
         drop(to_client);
         drop(peer);
         drop(pipe);
-        hook.fire();
+        drop(hook);
 
         let wait_controller = controller.clone();
         let wait_claim = claim.clone();
@@ -11471,7 +11474,8 @@ mod server_side_driver {
         let hook = helper
             .driver
             .connection_owner_drop_hook()
-            .expect("WebTransport driver installs a core-owner hook");
+            .expect("WebTransport driver installs a core-owner hook")
+            .install();
         drop(helper.controller.take_event_receiver());
 
         let error: crate::QuicResult<()> =
@@ -11493,7 +11497,7 @@ mod server_side_driver {
         drop(driver);
         drop(peer);
         drop(pipe);
-        hook.fire();
+        drop(hook);
 
         let stats = assert_matches!(
             controller.wait_terminal_retention(claim).await,
@@ -11516,7 +11520,8 @@ mod server_side_driver {
         let hook = helper
             .driver
             .connection_owner_drop_hook()
-            .expect("WebTransport driver installs a core-owner hook");
+            .expect("WebTransport driver installs a core-owner hook")
+            .install();
         helper
             .driver
             .h3_event_sender
@@ -11547,7 +11552,7 @@ mod server_side_driver {
         drop(driver);
         drop(peer);
         drop(pipe);
-        hook.fire();
+        drop(hook);
         let stats = assert_matches!(
             controller.wait_terminal_retention(claim).await,
             WebTransportTerminalRetentionOutcome::Taken(stats) => stats
@@ -11566,7 +11571,8 @@ mod server_side_driver {
         let hook = helper
             .driver
             .connection_owner_drop_hook()
-            .expect("WebTransport driver installs a core-owner hook");
+            .expect("WebTransport driver installs a core-owner hook")
+            .install();
         let DriverTestHelper {
             pipe,
             driver,
@@ -11588,7 +11594,7 @@ mod server_side_driver {
         );
         drop(peer);
         drop(pipe);
-        hook.fire();
+        drop(hook);
         assert_matches!(
             controller.try_take_terminal_retention(&claim),
             WebTransportTerminalRetentionOutcome::Taken(_)
@@ -11631,7 +11637,8 @@ mod server_side_driver {
         let hook = helper
             .driver
             .connection_owner_drop_hook()
-            .expect("WebTransport driver installs a core-owner hook");
+            .expect("WebTransport driver installs a core-owner hook")
+            .install();
         crate::ApplicationOverQuic::on_conn_close(
             &mut helper.driver,
             &mut helper.pipe.server,
@@ -11649,7 +11656,7 @@ mod server_side_driver {
         drop(driver);
         drop(peer);
         drop(pipe);
-        hook.fire();
+        drop(hook);
 
         let pending = assert_matches!(
             controller.try_take_terminal_retention(&claim),
@@ -11677,7 +11684,8 @@ mod server_side_driver {
         let hook = helper
             .driver
             .connection_owner_drop_hook()
-            .expect("WebTransport driver installs a core-owner hook");
+            .expect("WebTransport driver installs a core-owner hook")
+            .install();
         let error: crate::QuicResult<()> = Err(H3ConnectionError::H3(
             h3::Error::TransportError(quiche::Error::TlsFail),
         )
@@ -11704,7 +11712,7 @@ mod server_side_driver {
         drop(driver);
         drop(peer);
         drop(pipe);
-        hook.fire();
+        drop(hook);
         let stats = assert_matches!(
             controller.wait_terminal_retention(claim).await,
             WebTransportTerminalRetentionOutcome::Taken(stats) => stats

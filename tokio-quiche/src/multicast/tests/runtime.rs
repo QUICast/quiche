@@ -525,6 +525,110 @@ impl ApplicationOverQuic for ProbeReadinessTestApp {
     }
 }
 
+struct OwnerHookTestApp {
+    hook: crate::ConnectionOwnerDropHook,
+}
+
+impl OwnerHookTestApp {
+    fn new() -> (Self, Arc<AtomicU64>, Arc<AtomicU64>) {
+        let attached = Arc::new(AtomicU64::new(0));
+        let dropped = Arc::new(AtomicU64::new(0));
+        let attached_callback = Arc::clone(&attached);
+        let dropped_callback = Arc::clone(&dropped);
+        let hook = crate::ConnectionOwnerDropHook::new(
+            move || {
+                attached_callback.fetch_add(1, Ordering::AcqRel);
+            },
+            move || {
+                dropped_callback.fetch_add(1, Ordering::AcqRel);
+            },
+        );
+        (Self { hook }, attached, dropped)
+    }
+}
+
+impl ApplicationOverQuic for OwnerHookTestApp {
+    fn connection_owner_drop_hook(
+        &self,
+    ) -> Option<crate::ConnectionOwnerDropHook> {
+        Some(self.hook.clone())
+    }
+
+    fn on_conn_established(
+        &mut self, _qconn: &mut QuicheConnection,
+        _handshake_info: &crate::quic::HandshakeInfo,
+    ) -> QuicResult<()> {
+        Ok(())
+    }
+
+    fn should_act(&self) -> bool {
+        true
+    }
+
+    fn wait_for_data(
+        &mut self, _qconn: &mut QuicheConnection,
+    ) -> impl Future<Output = QuicResult<()>> + Send {
+        pending()
+    }
+
+    fn process_reads(
+        &mut self, _qconn: &mut QuicheConnection,
+    ) -> QuicResult<()> {
+        Ok(())
+    }
+
+    fn process_writes(
+        &mut self, _qconn: &mut QuicheConnection,
+    ) -> QuicResult<()> {
+        Ok(())
+    }
+}
+
+fn assert_forwarded_owner_hook_is_transactional<A: ApplicationOverQuic>(
+    app: A, attached: Arc<AtomicU64>, dropped: Arc<AtomicU64>,
+) {
+    let hook = app
+        .connection_owner_drop_hook()
+        .expect("wrapped application forwards its owner capability");
+    let unused_clone = hook.clone();
+
+    drop(unused_clone);
+    assert_eq!(attached.load(Ordering::Acquire), 0);
+    assert_eq!(dropped.load(Ordering::Acquire), 0);
+
+    let installed = hook.install();
+    assert_eq!(attached.load(Ordering::Acquire), 1);
+    drop(app);
+    assert_eq!(dropped.load(Ordering::Acquire), 0);
+    drop(installed);
+    assert_eq!(dropped.load(Ordering::Acquire), 1);
+}
+
+#[test]
+fn multicast_wrappers_preserve_owner_capability_transaction() {
+    let (app, attached, dropped) = OwnerHookTestApp::new();
+    let (client, _controller) = ClientDriver::new(app, test_settings()).unwrap();
+    assert_forwarded_owner_hook_is_transactional(client, attached, dropped);
+
+    let (app, attached, dropped) = OwnerHookTestApp::new();
+    let (server_control, _controller) =
+        ServerControlDriver::new(app, test_server_control_settings()).unwrap();
+    assert_forwarded_owner_hook_is_transactional(
+        server_control,
+        attached,
+        dropped,
+    );
+
+    let (app, attached, dropped) = OwnerHookTestApp::new();
+    let (server_publish, _controller) =
+        ServerDriver::new(app, test_server_settings()).unwrap();
+    assert_forwarded_owner_hook_is_transactional(
+        server_publish,
+        attached,
+        dropped,
+    );
+}
+
 #[tokio::test]
 async fn server_control_driver_resyncs_inner_probe_creation() {
     const BUDGET: usize = 1;

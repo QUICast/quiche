@@ -722,13 +722,15 @@ impl HandshakeInfo {
 /// reference passed to trait methods.
 #[allow(unused_variables)] // for default functions
 pub trait ApplicationOverQuic: Send + 'static {
-    /// Returns an optional preallocated hook that runs after the worker drops
-    /// its owned [`QuicheConnection`].
+    /// Returns an optional preallocated capability for observing the worker's
+    /// owned [`QuicheConnection`].
     ///
     /// This is an internal lifecycle boundary for applications that must
     /// distinguish connection teardown from destruction of core retained
-    /// storage. Implementations must construct the hook before teardown; the
-    /// callback must not block.
+    /// storage. Obtaining or cloning the capability must be side-effect free.
+    /// The worker installs it synchronously while constructing its unique core
+    /// owner, and the installed guard reports completion only after that owner
+    /// destroys the connection. Both callbacks must not block.
     #[doc(hidden)]
     fn connection_owner_drop_hook(&self) -> Option<ConnectionOwnerDropHook> {
         None
@@ -812,25 +814,52 @@ pub trait ApplicationOverQuic: Send + 'static {
     }
 }
 
-/// Preallocated callback fired after the worker-owned core connection drops.
+struct ConnectionOwnerDropCallbacks {
+    attached: Box<dyn Fn() + Send + Sync>,
+    dropped: Box<dyn Fn() + Send + Sync>,
+}
+
+/// Preallocated capability installed alongside the worker-owned connection.
 ///
 /// This type is public only because it appears in [`ApplicationOverQuic`].
 /// Applications outside tokio-quiche cannot construct one.
 #[doc(hidden)]
 #[derive(Clone)]
 pub struct ConnectionOwnerDropHook {
-    callback: Arc<dyn Fn() + Send + Sync>,
+    callbacks: Arc<ConnectionOwnerDropCallbacks>,
 }
 
 impl ConnectionOwnerDropHook {
-    pub(crate) fn new(callback: impl Fn() + Send + Sync + 'static) -> Self {
+    pub(crate) fn new(
+        attached: impl Fn() + Send + Sync + 'static,
+        dropped: impl Fn() + Send + Sync + 'static,
+    ) -> Self {
         Self {
-            callback: Arc::new(callback),
+            callbacks: Arc::new(ConnectionOwnerDropCallbacks {
+                attached: Box::new(attached),
+                dropped: Box::new(dropped),
+            }),
         }
     }
 
-    pub(crate) fn fire(&self) {
-        (self.callback)();
+    pub(crate) fn install(self) -> InstalledConnectionOwnerDropHook {
+        (self.callbacks.attached)();
+        InstalledConnectionOwnerDropHook {
+            callbacks: Some(self.callbacks),
+        }
+    }
+}
+
+/// Non-cloneable guard owned exclusively by [`OwnedQuicheConnection`].
+pub(crate) struct InstalledConnectionOwnerDropHook {
+    callbacks: Option<Arc<ConnectionOwnerDropCallbacks>>,
+}
+
+impl Drop for InstalledConnectionOwnerDropHook {
+    fn drop(&mut self) {
+        if let Some(callbacks) = self.callbacks.take() {
+            (callbacks.dropped)();
+        }
     }
 }
 
@@ -929,4 +958,250 @@ pub struct ConnectionShutdownBehaviour {
     pub error_code: u64,
     /// The reason phrase to send to the peer.
     pub reason: Vec<u8>,
+}
+
+#[cfg(test)]
+mod owner_retention_tests {
+    use assert_matches::assert_matches;
+
+    use super::*;
+    use crate::buf_factory::BufFactory;
+    use crate::http3::driver::BoundedSelectedWebTransportSettings;
+    use crate::http3::driver::WebTransportRetentionStats;
+    use crate::http3::driver::WebTransportTerminalRetentionOutcome;
+    use crate::metrics::DefaultMetrics;
+    use crate::quic::raw::wrap_quiche_conn;
+    use crate::quic::raw::ConnWrapperResult;
+    use crate::socket::Socket;
+    use crate::ServerH3Driver;
+
+    struct InitialFixture {
+        wrapped: ConnWrapperResult<tokio::net::UdpSocket, DefaultMetrics>,
+        _client: QuicheConnection,
+        _peer_socket: tokio::net::UdpSocket,
+    }
+
+    async fn initial_fixture() -> InitialFixture {
+        let mut config =
+            crate::http3::driver::test_utils::default_quiche_config();
+        let pipe = quiche::test_utils::Pipe::<BufFactory>::with_config_and_buf(
+            &mut config,
+        )
+        .unwrap();
+
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_socket =
+            tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        socket
+            .connect(peer_socket.local_addr().unwrap())
+            .await
+            .unwrap();
+        peer_socket
+            .connect(socket.local_addr().unwrap())
+            .await
+            .unwrap();
+        let socket = Socket::try_from(socket).unwrap();
+        let wrapped = wrap_quiche_conn(pipe.server, socket, DefaultMetrics);
+
+        InitialFixture {
+            wrapped,
+            _client: pipe.client,
+            _peer_socket: peer_socket,
+        }
+    }
+
+    fn assert_terminal_current_zero(stats: &WebTransportRetentionStats) {
+        assert_eq!(stats.sessions, 0);
+        assert_eq!(stats.associated_streams, 0);
+        assert_eq!(stats.provisional_streams, 0);
+        assert_eq!(stats.stream_open_waiters, 0);
+        assert_eq!(stats.session_terminal_waiters, 0);
+        assert_eq!(stats.waiters, 0);
+        assert_eq!(stats.send_terminal_waiters, 0);
+        assert_eq!(stats.send_terminal_states, 0);
+        assert_eq!(stats.receive_terminal_observations, 0);
+        assert_eq!(stats.receive_terminal_states, 0);
+        assert_eq!(stats.receive_terminal_waiters, 0);
+        assert_eq!(stats.receive_terminal_leases, 0);
+        assert_eq!(stats.receive_terminal_bytes, 0);
+        assert_eq!(stats.metadata_index_entries, 0);
+        assert_eq!(stats.pending_datagrams, 0);
+        assert_eq!(stats.terminal_retention_waiters, 0);
+        assert_eq!(stats.live_connection_snapshot_requests, 0);
+        assert_eq!(stats.queued_commands, 0);
+        assert_eq!(stats.write_leases, 0);
+        assert_eq!(stats.write_lease_retained_bytes, 0);
+        assert_eq!(stats.adapter_bytes_upper_bound(), 0);
+        assert_eq!(stats.transport_queued_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn unpolled_handshake_future_settles_unavailable_for_all_clones() {
+        let fixture = initial_fixture().await;
+        let (driver, controller) =
+            ServerH3Driver::new_bounded_selected_webtransport(
+                BoundedSelectedWebTransportSettings::default(),
+            )
+            .unwrap();
+        let selected = controller.selected();
+        let selected_clone = selected.clone();
+        let claim = selected.terminal_retention_claim();
+        let clone_claim = claim.clone();
+        let (_connection, handshake) = fixture.wrapped.conn.handshake_fut(driver);
+
+        assert!(
+            !selected
+                .terminal_retention_pending()
+                .unwrap()
+                .connection_owner_attached
+        );
+        drop(handshake);
+
+        assert_eq!(
+            selected.try_take_terminal_retention(&claim),
+            WebTransportTerminalRetentionOutcome::Unavailable
+        );
+        assert_eq!(
+            selected_clone.try_take_terminal_retention(&clone_claim),
+            WebTransportTerminalRetentionOutcome::Unavailable
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn queued_handshake_abort_before_first_poll_is_unavailable() {
+        let fixture = initial_fixture().await;
+        let (driver, controller) =
+            ServerH3Driver::new_bounded_selected_webtransport(
+                BoundedSelectedWebTransportSettings::default(),
+            )
+            .unwrap();
+        let selected = controller.selected();
+        let claim = selected.terminal_retention_claim();
+        let (_connection, handshake) = fixture.wrapped.conn.handshake_fut(driver);
+
+        let task = tokio::spawn(handshake);
+        task.abort();
+        let error = match task.await {
+            Ok(_) => panic!("aborted handshake unexpectedly completed"),
+            Err(error) => error,
+        };
+        assert!(error.is_cancelled());
+        assert_eq!(
+            selected.try_take_terminal_retention(&claim),
+            WebTransportTerminalRetentionOutcome::Unavailable
+        );
+    }
+
+    #[tokio::test]
+    async fn caller_cancellation_after_install_returns_final_zero_once() {
+        let fixture = initial_fixture().await;
+        let (driver, controller) =
+            ServerH3Driver::new_bounded_selected_webtransport(
+                BoundedSelectedWebTransportSettings::default(),
+            )
+            .unwrap();
+        let selected = controller.selected();
+        let selected_clone = selected.clone();
+        let claim = selected.terminal_retention_claim();
+        let (_connection, handshake) = fixture.wrapped.conn.handshake_fut(driver);
+        let mut handshake = Box::pin(handshake);
+
+        assert!(futures::poll!(&mut handshake).is_pending());
+        assert!(
+            selected
+                .terminal_retention_pending()
+                .unwrap()
+                .connection_owner_attached
+        );
+        drop(handshake);
+
+        let stats = assert_matches!(
+            selected.try_take_terminal_retention(&claim),
+            WebTransportTerminalRetentionOutcome::Taken(stats) => stats
+        );
+        assert_terminal_current_zero(&stats);
+        assert_eq!(
+            selected_clone.try_take_terminal_retention(&claim),
+            WebTransportTerminalRetentionOutcome::AlreadyTaken
+        );
+    }
+
+    #[tokio::test]
+    async fn timeout_before_owner_install_is_unavailable() {
+        let fixture = initial_fixture().await;
+        let (driver, controller) =
+            ServerH3Driver::new_bounded_selected_webtransport(
+                BoundedSelectedWebTransportSettings::default(),
+            )
+            .unwrap();
+        let selected = controller.selected();
+        let claim = selected.terminal_retention_claim();
+        let (_connection, handshake) = fixture.wrapped.conn.handshake_fut(driver);
+        let deferred = async move {
+            std::future::pending::<()>().await;
+            handshake.await
+        };
+
+        assert!(tokio::time::timeout(Duration::ZERO, deferred)
+            .await
+            .is_err());
+        assert_eq!(
+            selected.try_take_terminal_retention(&claim),
+            WebTransportTerminalRetentionOutcome::Unavailable
+        );
+    }
+
+    #[test]
+    fn runtime_shutdown_after_install_returns_final_zero() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (selected, claim, guards) = runtime.block_on(async {
+            let fixture = initial_fixture().await;
+            let (driver, controller) =
+                ServerH3Driver::new_bounded_selected_webtransport(
+                    BoundedSelectedWebTransportSettings::default(),
+                )
+                .unwrap();
+            let selected = controller.selected();
+            let claim = selected.terminal_retention_claim();
+            let ConnWrapperResult {
+                conn,
+                incoming_tx,
+                conn_close_rx,
+                worker_shutdown_rx,
+            } = fixture.wrapped;
+            let (_connection, handshake) = conn.handshake_fut(driver);
+            let task = tokio::spawn(handshake);
+            tokio::task::yield_now().await;
+            assert!(
+                selected
+                    .terminal_retention_pending()
+                    .unwrap()
+                    .connection_owner_attached
+            );
+            (
+                selected,
+                claim,
+                (
+                    controller,
+                    task,
+                    incoming_tx,
+                    conn_close_rx,
+                    worker_shutdown_rx,
+                    fixture._client,
+                    fixture._peer_socket,
+                ),
+            )
+        });
+
+        drop(runtime);
+        drop(guards);
+        let stats = assert_matches!(
+            selected.try_take_terminal_retention(&claim),
+            WebTransportTerminalRetentionOutcome::Taken(stats) => stats
+        );
+        assert_terminal_current_zero(&stats);
+    }
 }
