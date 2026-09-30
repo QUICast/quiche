@@ -8908,6 +8908,271 @@ mod server_side_driver {
     }
 
     #[test]
+    fn webtransport_receive_last_fin_retires_connect() {
+        for drop_events_first in [false, true] {
+            let mut helper = webtransport_helper(webtransport_settings());
+            let (_to_client, _from_client) =
+                accept_webtransport_session(&mut helper);
+            helper
+                .controller
+                .close_webtransport_session(0, 134, "receive last".to_string())
+                .unwrap();
+            helper.process_commands().unwrap();
+            expect_session_terminated(
+                &mut helper,
+                0,
+                WebTransportSessionCloseReason::Local {
+                    error_code: 134,
+                    message: "receive last".to_string(),
+                },
+            );
+            helper.advance_and_run_loop().unwrap();
+            assert_eq!(helper.peer_client_poll(), Ok((0, h3::Event::Data)));
+            assert_eq!(
+                helper.peer_client_recv_body_vec(0, 2048).unwrap(),
+                webtransport_close_capsule(134, "receive last")
+            );
+            assert_eq!(helper.peer_client_poll(), Ok((0, h3::Event::Finished)));
+            let ctx = &helper.driver.stream_map[&0];
+            assert!(ctx.fin_or_reset_sent);
+            assert!(!ctx.fin_or_reset_recv);
+
+            let mut events = helper.controller.take_event_receiver();
+            // Discard earlier informational events, but retain the receiver
+            // in the late-drop case to observe cleanup ordering and duplicates.
+            while events.try_recv().is_ok() {}
+            if drop_events_first {
+                drop(events);
+                helper.work_loop_iter().unwrap();
+                assert!(helper.pipe.server.local_error().is_none());
+            } else {
+                helper.peer_client_send_body(0, &[], true).unwrap();
+                helper.pipe.advance().unwrap();
+                helper
+                    .driver
+                    .process_reads(&mut helper.pipe.server)
+                    .unwrap();
+                assert!(helper.driver.stream_map.is_empty());
+                assert!(helper.pipe.server.local_error().is_none());
+                helper
+                    .driver
+                    .process_h3_fin(&mut helper.pipe.server, 0)
+                    .unwrap();
+                let mut closed = 0;
+                while let Ok(event) = events.try_recv() {
+                    match event {
+                        ServerH3Event::Core(H3Event::StreamClosed {
+                            stream_id: 0,
+                        }) => closed += 1,
+                        ServerH3Event::Core(H3Event::WebTransportSession(
+                            WebTransportSessionEvent::Terminated { .. },
+                        )) => panic!(
+                            "receive FIN must not replace the first close cause"
+                        ),
+                        _ => {},
+                    }
+                }
+                assert_eq!(closed, 1);
+                drop(events);
+            }
+            if drop_events_first {
+                helper.peer_client_send_body(0, &[], true).unwrap();
+                helper.pipe.advance().unwrap();
+                helper
+                    .driver
+                    .process_reads(&mut helper.pipe.server)
+                    .unwrap();
+            }
+            assert!(helper.driver.stream_map.is_empty());
+            helper.work_loop_iter().unwrap();
+            let error = helper.pipe.server.local_error().unwrap();
+            assert!(error.is_app);
+            assert_eq!(error.error_code, h3::WireErrorCode::NoError as u64);
+            helper
+                .driver
+                .process_h3_fin(&mut helper.pipe.server, 0)
+                .unwrap();
+            assert!(helper.driver.stream_map.is_empty());
+        }
+    }
+
+    #[test]
+    fn webtransport_send_last_fin_retires_connect() {
+        let mut helper = webtransport_helper(webtransport_settings());
+        let (_to_client, _from_client) = accept_webtransport_session(&mut helper);
+        helper
+            .peer_client_send_body(
+                0,
+                &webtransport_close_capsule(134, "peer first"),
+                true,
+            )
+            .unwrap();
+        helper.advance_and_run_loop().unwrap();
+        expect_session_terminated(
+            &mut helper,
+            0,
+            WebTransportSessionCloseReason::Peer {
+                error_code: 134,
+                message: "peer first".to_string(),
+            },
+        );
+        assert!(helper.driver.stream_map.is_empty());
+        assert!(helper.pipe.server.local_error().is_none());
+        drop(helper.controller.take_event_receiver());
+        helper.work_loop_iter().unwrap();
+        assert_eq!(
+            helper.pipe.server.local_error().unwrap().error_code,
+            h3::WireErrorCode::NoError as u64
+        );
+    }
+
+    #[test]
+    fn receive_last_fin_preserves_backpressured_regular_body() {
+        let mut helper = DriverTestHelper::<ServerHooks>::new().unwrap();
+        helper.complete_handshake().unwrap();
+        helper
+            .peer_client_send_request(make_request_headers("POST"), false)
+            .unwrap();
+        helper.advance_and_run_loop().unwrap();
+        let request = assert_matches!(helper.driver_recv_server_event().unwrap(),
+            ServerH3Event::Headers { incoming_headers, .. } => incoming_headers);
+        let sender = request.send.get_ref().unwrap();
+        let mut receiver = request.recv;
+        sender
+            .try_send(OutboundFrame::Headers(make_response_headers(), None))
+            .unwrap();
+        helper.advance_and_run_loop().unwrap();
+        sender
+            .try_send(OutboundFrame::Body(Bytes::new(), true))
+            .unwrap();
+        helper.advance_and_run_loop().unwrap();
+        // Fill the actual bounded body lane. FIN is then held behind its last
+        // payload, independently of both transport directions being finished.
+        for _ in 0..STREAM_CAPACITY {
+            helper.peer_client_send_body(0, b"x", false).unwrap();
+            helper.advance_and_run_loop().unwrap();
+        }
+        helper.peer_client_send_body(0, &[], true).unwrap();
+        helper.advance_and_run_loop().unwrap();
+        assert!(helper.driver.stream_map[&0].both_directions_done());
+        drop(helper.controller.take_event_receiver());
+        helper.work_loop_iter().unwrap();
+        assert!(helper.pipe.server.local_error().is_none());
+        for _ in 0..STREAM_CAPACITY {
+            assert_matches!(receiver.try_recv(), Ok(InboundFrame::Body(bytes, false)) if bytes.as_ref() == b"x");
+        }
+        helper.work_loop_iter().unwrap();
+        assert_matches!(receiver.try_recv(), Ok(InboundFrame::Body(bytes, true)) if bytes.is_empty());
+        assert!(helper.driver.stream_map.is_empty());
+        assert_eq!(
+            helper.pipe.server.local_error().unwrap().error_code,
+            h3::WireErrorCode::NoError as u64
+        );
+    }
+
+    #[test]
+    fn webtransport_receive_fin_preserves_blocked_close_output() {
+        let mut helper = webtransport_helper(webtransport_settings());
+        let (_to_client, _from_client) = accept_webtransport_session(&mut helper);
+        helper
+            .controller
+            .close_webtransport_session(0, 134, "x".repeat(512))
+            .unwrap();
+        helper.process_commands().unwrap();
+        let ctx = &helper.driver.stream_map[&0];
+        let (pointer, remaining) = assert_matches!(ctx.queued_frame.as_ref(),
+            Some(OutboundFrame::WebTransportClose { capsule }) => (capsule.as_ptr(), capsule.len()));
+        assert!(remaining > 0 && remaining < 512);
+        assert!(!ctx.fin_or_reset_sent);
+        helper.peer_client_send_body(0, &[], true).unwrap();
+        helper.pipe.advance().unwrap();
+        helper
+            .driver
+            .process_reads(&mut helper.pipe.server)
+            .unwrap();
+        let ctx = &helper.driver.stream_map[&0];
+        assert!(ctx.fin_or_reset_recv);
+        assert!(!ctx.fin_or_reset_sent);
+        assert_matches!(ctx.queued_frame.as_ref(),
+            Some(OutboundFrame::WebTransportClose { capsule }) if capsule.as_ptr() == pointer && capsule.len() == remaining);
+        drop(helper.controller.take_event_receiver());
+        helper.work_loop_iter().unwrap();
+        assert!(helper.pipe.server.local_error().is_none());
+        assert!(helper.driver.stream_map.contains_key(&0));
+    }
+
+    #[tokio::test]
+    async fn webtransport_receive_last_fin_preserves_other_stream_and_flow() {
+        let mut helper = webtransport_helper(webtransport_settings());
+        let (_to_client, _from_client) = accept_webtransport_session(&mut helper);
+        let other = helper
+            .peer_client_send_request(make_request_headers("POST"), false)
+            .unwrap();
+        helper.advance_and_run_loop().unwrap();
+        let request = assert_matches!(helper.driver_recv_server_event().unwrap(),
+            ServerH3Event::Headers { incoming_headers, .. } => incoming_headers);
+        assert_eq!(request.stream_id, other);
+        let sender = request.send.get_ref().unwrap();
+        // A known ordinary request routes to the legacy DATAGRAM lane.
+        // No associated flow ownership is installed on this POST's StreamCtx.
+        let flow_id = other / 4;
+        let mut datagram = Vec::new();
+        encode_varint(flow_id, &mut datagram);
+        datagram.extend_from_slice(b"independent flow");
+        helper.pipe.client.dgram_send(&datagram).unwrap();
+        helper.advance_and_run_loop().unwrap();
+        let (flow_send, mut flow_recv) = assert_matches!(helper.driver_recv_core_event().unwrap(),
+            H3Event::NewFlow { flow_id: id, send, recv } if id == flow_id => (send, recv));
+        assert_matches!(flow_recv.try_recv(), Ok(InboundFrame::Datagram(_)));
+        helper
+            .controller
+            .close_webtransport_session(0, 134, "other owners".to_string())
+            .unwrap();
+        helper.process_commands().unwrap();
+        helper.advance_and_run_loop().unwrap();
+        helper.peer_client_send_body(0, &[], true).unwrap();
+        helper.advance_and_run_loop().unwrap();
+        assert!(!helper.driver.stream_map.contains_key(&0));
+        assert!(helper.driver.stream_map.contains_key(&other));
+        assert!(helper.driver.flow_map.contains_key(&flow_id));
+        drop(helper.controller.take_event_receiver());
+        helper.work_loop_iter().unwrap();
+        assert!(helper.pipe.server.local_error().is_none());
+        // The unrelated request still makes progress after CONNECT retirement.
+        helper.pipe.client.dgram_send(&datagram).unwrap();
+        helper.advance_and_run_loop().unwrap();
+        assert_matches!(flow_recv.try_recv(), Ok(InboundFrame::Datagram(_)));
+        sender
+            .try_send(OutboundFrame::Headers(make_response_headers(), None))
+            .unwrap();
+        helper.advance_and_run_loop().unwrap();
+        sender
+            .try_send(OutboundFrame::Body(
+                Bytes::from_static(b"still live"),
+                true,
+            ))
+            .unwrap();
+        helper.peer_client_send_body(other, &[], true).unwrap();
+        helper.advance_and_run_loop().unwrap();
+        assert!(helper.driver.stream_map.is_empty());
+        assert!(helper.pipe.server.local_error().is_none());
+        flow_send
+            .get_ref()
+            .unwrap()
+            .try_send(OutboundFrame::FlowShutdown {
+                flow_id,
+                stream_id: 77,
+            })
+            .unwrap();
+        helper.work_loop_iter().unwrap();
+        assert!(helper.driver.flow_map.is_empty());
+        assert_eq!(
+            helper.pipe.server.local_error().unwrap().error_code,
+            h3::WireErrorCode::NoError as u64
+        );
+    }
+
+    #[test]
     fn webtransport_clean_connect_fin_precedes_associated_teardown() {
         let mut helper = webtransport_helper(webtransport_settings());
         let (to_client, _from_client) = accept_webtransport_session(&mut helper);

@@ -1511,11 +1511,11 @@ impl<H: DriverHooks> H3Driver<H> {
     fn process_h3_fin(
         &mut self, qconn: &mut QuicheConnection, stream_id: u64,
     ) -> H3ConnectionResult<()> {
-        if self
+        let webtransport_session = self
             .webtransport
             .as_ref()
-            .is_some_and(|runtime| runtime.is_session(stream_id))
-        {
+            .is_some_and(|runtime| runtime.is_session(stream_id));
+        if webtransport_session {
             let finish = if self
                 .webtransport
                 .as_ref()
@@ -1572,6 +1572,16 @@ impl<H: DriverHooks> H3Driver<H> {
             .is_some_and(|runtime| runtime.has_peer_close_fin(stream_id))
         {
             self.process_writable_stream(qconn, stream_id)?;
+        }
+        // Capsule bodies are consumed internally, so receive-last CONNECT FIN
+        // has no application body handoff left to drain. Regular H3 bodies
+        // must retain their existing backpressure-aware cleanup path.
+        if webtransport_session &&
+            self.stream_map
+                .get(&stream_id)
+                .is_some_and(StreamCtx::both_directions_done)
+        {
+            return self.cleanup_stream(qconn, stream_id);
         }
         Ok(())
     }

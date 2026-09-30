@@ -31,10 +31,12 @@ use futures::StreamExt;
 use tokio::sync::oneshot;
 use tokio::sync::watch;
 use tokio::time::timeout;
+use tokio_quiche::http3::driver::BoundedClientWebTransportController;
 use tokio_quiche::http3::driver::BoundedClientWebTransportEvent;
 use tokio_quiche::http3::driver::BoundedConnectHeaders;
 use tokio_quiche::http3::driver::BoundedSelectedWebTransportController;
 use tokio_quiche::http3::driver::BoundedSelectedWebTransportSettings;
+use tokio_quiche::http3::driver::BoundedServerWebTransportController;
 use tokio_quiche::http3::driver::BoundedServerWebTransportEvent;
 use tokio_quiche::http3::driver::WebTransportLiveConnectionSnapshotOutcome;
 use tokio_quiche::http3::driver::WebTransportOpenStreamOutcome;
@@ -794,6 +796,287 @@ async fn bounded_established_graceful_close_returns_terminal_zero() {
     })
     .await
     .expect("graceful terminal-retention UDP test timed out");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bounded_receive_last_connect_fin_udp_finalizes() {
+    timeout(
+        Duration::from_secs(10),
+        bounded_connect_fin_completion(true),
+    )
+    .await
+    .expect("receive-last completion must precede the 56s idle expiry");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bounded_send_last_connect_fin_udp_finalizes() {
+    timeout(
+        Duration::from_secs(10),
+        bounded_connect_fin_completion(false),
+    )
+    .await
+    .expect("send-last completion must precede the 56s idle expiry");
+}
+
+async fn server_session_event(
+    controller: &mut BoundedServerWebTransportController,
+) -> WebTransportSessionEvent {
+    loop {
+        match controller
+            .recv_event()
+            .await
+            .expect("server event lane ended")
+        {
+            BoundedServerWebTransportEvent::Session(
+                WebTransportSessionEvent::Pending { .. },
+            ) => {},
+            BoundedServerWebTransportEvent::Session(event) => return event,
+            BoundedServerWebTransportEvent::ProfileViolation =>
+                panic!("server profile violation"),
+            _ => {},
+        }
+    }
+}
+
+async fn client_session_event(
+    controller: &mut BoundedClientWebTransportController,
+) -> WebTransportSessionEvent {
+    loop {
+        match controller
+            .recv_event()
+            .await
+            .expect("client event lane ended")
+        {
+            BoundedClientWebTransportEvent::Session(
+                WebTransportSessionEvent::Pending { .. },
+            ) => {},
+            BoundedClientWebTransportEvent::Session(event) => return event,
+            BoundedClientWebTransportEvent::ProfileViolation =>
+                panic!("client profile violation"),
+            _ => {},
+        }
+    }
+}
+
+async fn bounded_connect_fin_completion(server_first: bool) {
+    let settings = BoundedSelectedWebTransportSettings::default();
+    let mut server_quic = QuicSettings::default();
+    settings.apply_to_quic_settings(&mut server_quic);
+    let server_socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let server_addr = server_socket.local_addr().unwrap();
+    let server_params = ConnectionParams::new_server(
+        server_quic,
+        TlsCertificatePaths {
+            cert: TEST_CERT_FILE,
+            private_key: TEST_KEY_FILE,
+            kind: CertificateKind::X509,
+        },
+        Hooks::default(),
+    );
+    let mut incoming = listen(vec![server_socket], server_params, DefaultMetrics)
+        .unwrap()
+        .remove(0);
+    let accept = tokio::spawn(async move {
+        let mut servers = Vec::new();
+        for _ in 0..2 {
+            let initial = incoming.next().await.unwrap().unwrap();
+            let (driver, mut controller) =
+                ServerH3Driver::new_bounded_selected_webtransport(settings)
+                    .unwrap();
+            let connection = initial.start(driver);
+            let mut responder = loop {
+                match controller.recv_event().await.unwrap() {
+                    BoundedServerWebTransportEvent::ConnectRequested {
+                        session_id: 0,
+                        responder,
+                        ..
+                    } => break responder,
+                    BoundedServerWebTransportEvent::ProfileViolation =>
+                        panic!("server profile violation"),
+                    _ => {},
+                }
+            };
+            responder
+                .try_send_response(response_headers(
+                    controller.connect_header_limits(),
+                ))
+                .unwrap();
+            assert_matches!(
+                server_session_event(&mut controller).await,
+                WebTransportSessionEvent::Accepted { session_id: 0 }
+            );
+            servers.push((controller, connection, responder));
+        }
+        (servers, incoming)
+    });
+    let mut clients = Vec::new();
+    for _ in 0..2 {
+        let mut client_quic = QuicSettings::default();
+        settings.apply_to_quic_settings(&mut client_quic);
+        let client_params =
+            ConnectionParams::new_client(client_quic, None, Hooks::default());
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        socket.connect(server_addr).await.unwrap();
+        let (driver, mut controller) =
+            ClientH3Driver::new_bounded_selected_webtransport(settings).unwrap();
+        let connection = connect_with_config(
+            Socket::try_from(socket).unwrap(),
+            Some("localhost"),
+            &client_params,
+            driver,
+        )
+        .await
+        .unwrap();
+        controller
+            .try_connect(134, connect_headers(controller.connect_header_limits()))
+            .unwrap();
+        assert_matches!(
+            client_session_event(&mut controller).await,
+            WebTransportSessionEvent::Accepted { session_id: 0 }
+        );
+        clients.push((controller, connection));
+    }
+    let (mut servers, _incoming) = accept.await.unwrap();
+    let (mut server, _server_connection, _responder) = servers.remove(0);
+    let (mut client, _client_connection) = clients.remove(0);
+    let selected = server.selected();
+    let peer = client.selected();
+    let claim = selected.terminal_retention_claim();
+    let peer_claim = peer.terminal_retention_claim();
+
+    // Hold both a receive-terminal payload and an accepted write result across
+    // real worker destruction. CONNECT FIN cannot settle either independent
+    // owner.
+    let incoming_stream = assert_matches!(peer.open_unidirectional_stream(0).await,
+        WebTransportOpenStreamOutcome::Opened { stream_id } => stream_id);
+    write_complete(&peer, 0, incoming_stream, b"held receive", true).await;
+    assert_matches!(server_session_event(&mut server).await,
+        WebTransportSessionEvent::AssociatedStream { stream_id, .. } if stream_id == incoming_stream);
+    assert_eq!(
+        selected.wait_stream_readable(0, incoming_stream).await,
+        WebTransportStreamReadyOutcome::Ready
+    );
+    let receive_owner = assert_matches!(selected.read_stream(0, incoming_stream, 64).await,
+        WebTransportStreamReadOutcome::Terminal(owner) => owner);
+    assert_eq!(receive_owner.data(), b"held receive");
+    assert_eq!(
+        receive_owner.terminal(),
+        WebTransportStreamReceiveTerminal::Fin
+    );
+    let outgoing_stream = assert_matches!(selected.open_unidirectional_stream(0).await,
+        WebTransportOpenStreamOutcome::Opened { stream_id } => stream_id);
+    let write_owner = PayloadLease::new(b"held write");
+    let pointer = write_owner.payload.as_ptr();
+    let write = selected
+        .try_write_stream_lease(0, outgoing_stream, write_owner, false)
+        .unwrap();
+    let before = selected.retention_stats().await.unwrap();
+    assert_eq!(before.write_leases, 1);
+    assert_eq!(before.receive_terminal_leases, 1);
+    assert_matches!(
+        client_session_event(&mut client).await,
+        WebTransportSessionEvent::AssociatedStream { .. }
+    );
+
+    let started = std::time::Instant::now();
+    if server_first {
+        server
+            .close_session(0, 134, "CONNECT completion".to_string())
+            .unwrap();
+    } else {
+        client
+            .close_session(0, 134, "CONNECT completion".to_string())
+            .unwrap();
+    }
+    let local = WebTransportSessionCloseReason::Local {
+        error_code: 134,
+        message: "CONNECT completion".to_string(),
+    };
+    let remote = WebTransportSessionCloseReason::Peer {
+        error_code: 134,
+        message: "CONNECT completion".to_string(),
+    };
+    let (server_reason, client_reason) = if server_first {
+        (local, remote)
+    } else {
+        (remote, local)
+    };
+    assert_matches!(server_session_event(&mut server).await,
+        WebTransportSessionEvent::Terminated { session_id: 0, reason } if reason == server_reason);
+    assert_matches!(client_session_event(&mut client).await,
+        WebTransportSessionEvent::Terminated { session_id: 0, reason } if reason == client_reason);
+    drop(server);
+    // Keep the peer controller alive: only the server's normal idle-close
+    // predicate may initiate QUIC closure. The sibling stays live throughout.
+    let wait = selected.wait_terminal_retention(claim.clone());
+    tokio::pin!(wait);
+    let peer_stats = timeout(Duration::from_secs(5), async {
+        tokio::select! {
+            outcome = &mut wait => panic!("held owners prematurely settled: {outcome:?}"),
+            outcome = peer.wait_terminal_retention(peer_claim) => assert_matches!(outcome, WebTransportTerminalRetentionOutcome::Taken(stats) => stats),
+        }
+    }).await.expect("target connection must finish before idle expiry");
+    assert_terminal_current_zero(&peer_stats);
+    assert_matches!(selected.try_take_terminal_retention(&claim),
+        WebTransportTerminalRetentionOutcome::Early(pending) if pending.write_leases == 1 && pending.receive_terminal_leases == 1);
+    let returned = assert_matches!(write.outcome().await,
+        WebTransportStreamWriteLeaseOutcome::Accepted { lease, accepted: 10, complete: true, fin_accepted: false } => lease);
+    assert_eq!(returned.payload.as_ptr(), pointer);
+    assert_eq!(receive_owner.data(), b"held receive");
+    drop(returned);
+    drop(receive_owner);
+    let stats = assert_matches!(wait.await, WebTransportTerminalRetentionOutcome::Taken(stats) => stats);
+    assert_terminal_current_zero(&stats);
+    assert!(stats.receive_terminal_observations_high_water > 0);
+    assert_eq!(
+        selected.try_take_terminal_retention(&claim),
+        WebTransportTerminalRetentionOutcome::AlreadyTaken
+    );
+    eprintln!(
+        "CONNECT completion server_first={server_first}: {:?}",
+        started.elapsed()
+    );
+
+    let (mut sibling_server, _server_connection, _sibling_responder) =
+        servers.remove(0);
+    let (mut sibling_client, _client_connection) = clients.remove(0);
+    let sender = sibling_server.selected();
+    let receiver = sibling_client.selected();
+    let stream = assert_matches!(sender.open_unidirectional_stream(0).await,
+        WebTransportOpenStreamOutcome::Opened { stream_id } => stream_id);
+    write_complete(&sender, 0, stream, b"sibling still live", false).await;
+    assert_matches!(client_session_event(&mut sibling_client).await, WebTransportSessionEvent::AssociatedStream { stream_id, .. } if stream_id == stream);
+    assert_eq!(
+        receiver.wait_stream_readable(0, stream).await,
+        WebTransportStreamReadyOutcome::Ready
+    );
+    assert_eq!(
+        receiver.read_stream(0, stream, 64).await,
+        WebTransportStreamReadOutcome::Data {
+            data: b"sibling still live".as_slice().into(),
+            fin: false
+        }
+    );
+    // Clean up the control via its working send-last path on either version.
+    sibling_client
+        .close_session(0, 135, "sibling cleanup".to_string())
+        .unwrap();
+    assert_matches!(
+        server_session_event(&mut sibling_server).await,
+        WebTransportSessionEvent::Terminated { .. }
+    );
+    assert_matches!(
+        client_session_event(&mut sibling_client).await,
+        WebTransportSessionEvent::Terminated { .. }
+    );
+    drop(sibling_server);
+    for endpoint in [&sender, &receiver] {
+        let result = endpoint
+            .wait_terminal_retention(endpoint.terminal_retention_claim())
+            .await;
+        let stats = assert_matches!(result, WebTransportTerminalRetentionOutcome::Taken(stats) => stats);
+        assert_terminal_current_zero(&stats);
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
