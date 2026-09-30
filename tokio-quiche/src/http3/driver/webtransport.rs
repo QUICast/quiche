@@ -5117,14 +5117,18 @@ impl Runtime {
         let Some(session) = self.sessions.get(&session_id) else {
             return Vec::new();
         };
-        let SessionPhase::Closing { close, .. } = &session.phase else {
-            return Vec::new();
+        let events = if let SessionPhase::Closing { close, .. } = &session.phase {
+            let reason = WebTransportSessionCloseReason::Local {
+                error_code: close.error_code,
+                message: close.message.clone(),
+            };
+            self.terminate_after_local_close(session_id, reason)
+        } else {
+            Vec::new()
         };
-        let reason = WebTransportSessionCloseReason::Local {
-            error_code: close.error_code,
-            message: close.message.clone(),
-        };
-        let events = self.terminate_after_local_close(session_id, reason);
+        // A peer terminal may win while local output is flow-control blocked.
+        // Committing that retained suffix still closes our CONNECT direction,
+        // without replacing the first terminal reason.
         self.mark_connect_send_closed(session_id);
         events
     }

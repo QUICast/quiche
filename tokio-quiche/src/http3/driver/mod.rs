@@ -70,6 +70,7 @@ use tokio_stream::StreamExt;
 use tokio_util::sync::PollSender;
 
 use self::bounded::BoundedClientConnectOwnership;
+use self::bounded::BoundedConnectCloseOwnership;
 use self::bounded::PreparedBoundedProfile;
 use self::hooks::DriverHooks;
 use self::hooks::InboundHeaders;
@@ -528,6 +529,7 @@ struct H3EventSender<E> {
     sender: mpsc::Sender<E>,
     state: Arc<H3EventLaneState>,
     bounded_client_connect_ownership: Option<Arc<BoundedClientConnectOwnership>>,
+    bounded_connect_close_ownership: Option<Arc<BoundedConnectCloseOwnership>>,
 }
 
 impl<E> Clone for H3EventSender<E> {
@@ -539,6 +541,9 @@ impl<E> Clone for H3EventSender<E> {
                 .bounded_client_connect_ownership
                 .as_ref()
                 .map(Arc::clone),
+            bounded_connect_close_ownership: self
+                .bounded_connect_close_ownership
+                .clone(),
         }
     }
 }
@@ -559,7 +564,16 @@ impl<E> H3EventSender<E> {
                 self.state
                     .receiver_closed_total
                     .fetch_add(1, Ordering::Relaxed);
-                Err(H3ConnectionError::ControllerWentAway)
+                if self.bounded_connect_close_ownership.is_some() {
+                    // A bounded observer drop is not protocol cancellation.
+                    // Finish owned CONNECT work, including when a concurrent
+                    // GOAWAY or response notification finds the receiver gone.
+                    // The existing idle predicate closes after peer CONNECT
+                    // closure; a full lane remains a terminal overload above.
+                    Ok(())
+                } else {
+                    Err(H3ConnectionError::ControllerWentAway)
+                }
             },
         }
     }
@@ -573,6 +587,9 @@ impl<E> H3EventSender<E> {
     }
 
     fn observe_webtransport_event(&self, event: &WebTransportSessionEvent) {
+        if let Some(ownership) = &self.bounded_connect_close_ownership {
+            ownership.observe(event);
+        }
         if let Some(ownership) = &self.bounded_client_connect_ownership {
             ownership.observe_event(event);
         }
@@ -872,10 +889,15 @@ impl<H: DriverHooks> H3Driver<H> {
             .as_ref()
             .and_then(|profile| profile.client_connect_ownership.as_ref())
             .map(Arc::clone);
+        let bounded_connect_close_ownership = bounded_profile
+            .as_ref()
+            .map(|profile| Arc::clone(&profile.connect_close_ownership));
         let h3_event_sender = H3EventSender {
             sender: event_sender,
             state: Arc::clone(&h3_event_state),
             bounded_client_connect_ownership,
+            bounded_connect_close_ownership: bounded_connect_close_ownership
+                .clone(),
         };
         let multicast_datagram_channel_id =
             http3_settings.multicast_datagram_channel_id.clone();
@@ -1071,6 +1093,7 @@ impl<H: DriverHooks> H3Driver<H> {
                 h3_event_recv: Some(h3_event_recv),
                 h3_event_state,
                 webtransport: webtransport_controller,
+                bounded_connect_close_ownership,
             },
         )
     }
@@ -1154,6 +1177,14 @@ impl<H: DriverHooks> H3Driver<H> {
     fn insert_stream(&mut self, stream_id: u64, ctx: StreamCtx) {
         self.stream_map.insert(stream_id, ctx);
         self.max_stream_seen = self.max_stream_seen.max(stream_id);
+    }
+
+    fn register_bounded_connect_output(
+        &self, stream_id: u64, send: &OutboundFrameSender,
+    ) {
+        if let Some(profile) = &self.bounded_profile {
+            profile.connect_close_ownership.install(stream_id, send);
+        }
     }
 
     /// Fetches body chunks from the [`quiche::h3::Connection`] and forwards
@@ -2141,6 +2172,7 @@ impl<H: DriverHooks> H3Driver<H> {
                 WaitForStream::Downstream(WaitForDownstreamData {
                     stream_id: id,
                     chan: Some(chan),
+                    ..
                 }) if stream_id == *id => {
                     chan.close();
                 },
@@ -2323,6 +2355,19 @@ impl<H: DriverHooks> H3Driver<H> {
                 };
                 if !webtransport.begin_local_close(session_id, close.clone()) {
                     return Ok(());
+                }
+                // The readiness future may own the receiver (and an earlier
+                // queued frame). Close it in place to wake and drain it before
+                // taking over output; otherwise stale readiness could later
+                // overwrite a partially committed close capsule.
+                if self.bounded_profile.is_some() {
+                    for pending in self.waiting_streams.iter_mut() {
+                        if let WaitForStream::Downstream(wait) = pending {
+                            if wait.stream_id == session_id {
+                                wait.close();
+                            }
+                        }
+                    }
                 }
                 self.process_writable_stream(qconn, session_id)?;
             },
@@ -2751,6 +2796,11 @@ impl<H: DriverHooks> H3Driver<H> {
                         runtime.local_close_waiting(stream_id)
                     });
                 if local_close_waiting {
+                    if ctx.recv.is_none() && self.bounded_profile.is_some() {
+                        // The closed readiness receiver must first return its
+                        // already-admitted output, in order.
+                        break;
+                    }
                     if let Some(recv) = ctx.recv.as_mut() {
                         recv.close();
                         if let Ok(frame) = recv.try_recv() {
@@ -2833,6 +2883,29 @@ impl<H: DriverHooks> H3Driver<H> {
                             err,
                         );
                         ctx.handle_sent_reset(err);
+                        if self.bounded_profile.is_some() &&
+                            self.webtransport.as_ref().is_some_and(|runtime| {
+                                runtime.is_session(stream_id)
+                            })
+                        {
+                            let events = self
+                                .webtransport
+                                .as_mut()
+                                .unwrap()
+                                .output_failed(stream_id);
+                            Self::emit_webtransport_events(
+                                &self.h3_event_sender,
+                                events,
+                            )?;
+                            return self.shutdown_stream(
+                                qconn,
+                                stream_id,
+                                StreamShutdown::Both {
+                                    read_error_code: err,
+                                    write_error_code: err,
+                                },
+                            );
+                        }
                         if ctx.both_directions_done() {
                             return self.cleanup_stream(qconn, stream_id);
                         }
@@ -3019,6 +3092,9 @@ impl<H: DriverHooks> ApplicationOverQuic for H3Driver<H> {
             live_snapshot.mark_connection_closed();
         }
         self.close_webtransport_command_lane();
+        if let Some(profile) = &self.bounded_profile {
+            profile.connect_close_ownership.clear();
+        }
         if let Some(runtime) = self.webtransport.as_mut() {
             let events = runtime.clear();
             let _ = Self::emit_webtransport_events(&self.h3_event_sender, events);
@@ -3127,6 +3203,9 @@ impl<H: DriverHooks> Drop for H3Driver<H> {
             live_snapshot.mark_driver_gone();
         }
         self.close_webtransport_command_lane();
+        if let Some(profile) = &self.bounded_profile {
+            profile.connect_close_ownership.clear();
+        }
         if let Some(runtime) = self.webtransport.as_mut() {
             let _ = runtime.clear();
         }
@@ -3265,6 +3344,7 @@ pub struct H3Controller<H: DriverHooks> {
     h3_event_state: Arc<H3EventLaneState>,
     /// Native selected-I/O controller when draft-16 support is enabled.
     webtransport: Option<WebTransportController>,
+    bounded_connect_close_ownership: Option<Arc<BoundedConnectCloseOwnership>>,
 }
 
 impl<H: DriverHooks> H3Controller<H> {
@@ -3361,6 +3441,12 @@ impl<H: DriverHooks> H3Controller<H> {
     /// close or reset response, so the close is authoritative before
     /// `WT_SESSION_GONE` is exposed remotely. Duplicate, unknown, pending, or
     /// already-terminal session IDs are ignored by the driver.
+    ///
+    /// In bounded mode, successful admission for an active session retains its
+    /// CONNECT output independently of the response capability and controller.
+    /// Later drops cannot replace the accepted close with abandonment. This is
+    /// not transmission, peer receipt, or settlement: peer termination, output
+    /// failure and connection failure retain their existing typed outcomes.
     pub fn close_webtransport_session(
         &self, session_id: u64, error_code: u32, message: String,
     ) -> Result<(), WebTransportSessionCloseError> {
@@ -3375,6 +3461,9 @@ impl<H: DriverHooks> H3Controller<H> {
                 // `into_boxed_str()` discards caller over-capacity before the
                 // accepted command can retain the message.
                 let message = message.into_boxed_str().into_string();
+                if let Some(ownership) = &self.bounded_connect_close_ownership {
+                    ownership.accept(session_id);
+                }
                 permit.send(
                     H3Command::CloseWebTransportSession {
                         session_id,

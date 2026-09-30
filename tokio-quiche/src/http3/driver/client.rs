@@ -291,6 +291,9 @@ impl ClientHooks {
         // log::info!("sent h3 request"; "stream_id" => stream_id);
         let (mut stream_ctx, send, recv) =
             StreamCtx::new(stream_id, driver.stream_channel_capacity());
+        if is_webtransport {
+            driver.register_bounded_connect_output(stream_id, &send);
+        }
 
         if body_finished {
             // `send_request()` already sent FIN for bodyless requests, so

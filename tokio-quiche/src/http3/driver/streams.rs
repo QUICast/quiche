@@ -106,6 +106,7 @@ impl StreamCtx {
         WaitForStream::Downstream(WaitForDownstreamData {
             stream_id,
             chan: self.recv.take(),
+            waker: None,
         })
     }
 
@@ -232,6 +233,21 @@ impl Future for WaitForStream {
 pub(crate) struct WaitForDownstreamData {
     pub(crate) stream_id: u64,
     pub(crate) chan: Option<OutboundFrameStream>,
+    waker: Option<std::task::Waker>,
+}
+
+impl WaitForDownstreamData {
+    pub(crate) fn close(&mut self) {
+        if let Some(chan) = &mut self.chan {
+            chan.close();
+        }
+        // Receiver::close wakes blocked senders, not this receive future.
+        // Schedule its existing FuturesUnordered entry so admitted frames and
+        // the closed receiver return to the stream owner without polling.
+        if let Some(waker) = &self.waker {
+            waker.wake_by_ref();
+        }
+    }
 }
 
 pub(crate) struct ReceivedDownstreamData {
@@ -248,6 +264,13 @@ impl Future for WaitForDownstreamData {
     ) -> Poll<Self::Output> {
         // Unwraps below are Ok because chan will only be None after first
         // Poll::Ready, which is fine to panic for non fused future.
+        if self
+            .waker
+            .as_ref()
+            .is_none_or(|waker| !waker.will_wake(cx.waker()))
+        {
+            self.waker = Some(cx.waker().clone());
+        }
         self.chan.as_mut().unwrap().poll_recv(cx).map(|data| {
             ReceivedDownstreamData {
                 stream_id: self.stream_id,

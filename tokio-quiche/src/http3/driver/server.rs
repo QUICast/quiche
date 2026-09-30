@@ -329,6 +329,9 @@ impl ServerHooks {
 
         let (mut stream_ctx, send, recv) =
             StreamCtx::new(stream_id, driver.stream_channel_capacity());
+        if is_webtransport && has_body {
+            driver.register_bounded_connect_output(stream_id, &send);
+        }
 
         // When Extended CONNECT is enabled, extract the datagram flow ID
         // from the request headers and register it in flow_map. This

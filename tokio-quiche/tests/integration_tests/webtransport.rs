@@ -802,7 +802,7 @@ async fn bounded_established_graceful_close_returns_terminal_zero() {
 async fn bounded_receive_last_connect_fin_udp_finalizes() {
     timeout(
         Duration::from_secs(10),
-        bounded_connect_fin_completion(true),
+        bounded_connect_fin_completion(true, false),
     )
     .await
     .expect("receive-last completion must precede the 56s idle expiry");
@@ -812,7 +812,7 @@ async fn bounded_receive_last_connect_fin_udp_finalizes() {
 async fn bounded_send_last_connect_fin_udp_finalizes() {
     timeout(
         Duration::from_secs(10),
-        bounded_connect_fin_completion(false),
+        bounded_connect_fin_completion(false, false),
     )
     .await
     .expect("send-last completion must precede the 56s idle expiry");
@@ -858,7 +858,29 @@ async fn client_session_event(
     }
 }
 
-async fn bounded_connect_fin_completion(server_first: bool) {
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn accepted_close_service_first_udp_preserves_exact_reason() {
+    timeout(
+        Duration::from_secs(10),
+        bounded_connect_fin_completion(true, true),
+    )
+    .await
+    .expect("accepted service close must settle without peer drop");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn accepted_close_client_first_udp_preserves_exact_reason() {
+    timeout(
+        Duration::from_secs(10),
+        bounded_connect_fin_completion(false, true),
+    )
+    .await
+    .expect("accepted client close must settle without server drop");
+}
+
+async fn bounded_connect_fin_completion(
+    server_first: bool, drop_after_admission: bool,
+) {
     let settings = BoundedSelectedWebTransportSettings::default();
     let mut server_quic = QuicSettings::default();
     settings.apply_to_quic_settings(&mut server_quic);
@@ -937,7 +959,7 @@ async fn bounded_connect_fin_completion(server_first: bool) {
         clients.push((controller, connection));
     }
     let (mut servers, _incoming) = accept.await.unwrap();
-    let (mut server, _server_connection, _responder) = servers.remove(0);
+    let (mut server, _server_connection, responder) = servers.remove(0);
     let (mut client, _client_connection) = clients.remove(0);
     let selected = server.selected();
     let peer = client.selected();
@@ -1001,11 +1023,25 @@ async fn bounded_connect_fin_completion(server_first: bool) {
     } else {
         (remote, local)
     };
-    assert_matches!(server_session_event(&mut server).await,
-        WebTransportSessionEvent::Terminated { session_id: 0, reason } if reason == server_reason);
-    assert_matches!(client_session_event(&mut client).await,
-        WebTransportSessionEvent::Terminated { session_id: 0, reason } if reason == client_reason);
-    drop(server);
+    let mut client = Some(client);
+    if drop_after_admission && server_first {
+        drop(responder);
+        drop(server);
+        assert_matches!(client_session_event(client.as_mut().unwrap()).await,
+            WebTransportSessionEvent::Terminated { session_id: 0, reason } if reason == client_reason);
+    } else {
+        if drop_after_admission {
+            drop(client.take());
+        }
+        assert_matches!(server_session_event(&mut server).await,
+            WebTransportSessionEvent::Terminated { session_id: 0, reason } if reason == server_reason);
+        if let Some(client) = &mut client {
+            assert_matches!(client_session_event(client).await,
+                WebTransportSessionEvent::Terminated { session_id: 0, reason } if reason == client_reason);
+        }
+        drop(server);
+        drop(responder);
+    }
     // Keep the peer controller alive: only the server's normal idle-close
     // predicate may initiate QUIC closure. The sibling stays live throughout.
     let wait = selected.wait_terminal_retention(claim.clone());
