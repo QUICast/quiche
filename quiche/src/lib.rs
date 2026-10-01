@@ -11570,6 +11570,15 @@ impl<F: BufFactory> Connection<F> {
                 })?;
                 debug_assert_eq!(max_data_delta, expected_max_data_delta);
 
+                // Draining suppresses readable notification. If receive
+                // termination arrives after send ACK, no later application
+                // read will collect this stream. Preserve unobserved STOP.
+                let collect = stream.recv.is_draining() &&
+                    stream.is_complete() &&
+                    !(priority_key.writable.is_linked() &&
+                        stream.send.is_stopped());
+                let local = stream.local;
+
                 if !was_readable && stream.is_readable() {
                     self.streams.insert_readable(&priority_key);
                 }
@@ -11582,6 +11591,10 @@ impl<F: BufFactory> Connection<F> {
                 if !was_reset {
                     self.reset_stream_remote_count =
                         self.reset_stream_remote_count.saturating_add(1);
+                }
+                if collect {
+                    self.streams.collect(stream_id, local);
+                    self.multicast_stream_deliveries.remove(&stream_id);
                 }
             },
 
@@ -11677,6 +11690,14 @@ impl<F: BufFactory> Connection<F> {
                     error => error,
                 })?;
 
+                // Match reset/ACK collection for a drained receive direction:
+                // FIN can be the final obligation, with no readable event.
+                let collect = was_draining &&
+                    stream.is_complete() &&
+                    !(priority_key.writable.is_linked() &&
+                        stream.send.is_stopped());
+                let local = stream.local;
+
                 if !was_readable && stream.is_readable() {
                     self.streams.insert_readable(&priority_key);
                 }
@@ -11689,6 +11710,10 @@ impl<F: BufFactory> Connection<F> {
                     // the received data as consumed, which might trigger a flow
                     // control update.
                     self.flow_control.add_consumed(max_off_delta);
+                }
+                if collect {
+                    self.streams.collect(stream_id, local);
+                    self.multicast_stream_deliveries.remove(&stream_id);
                 }
             },
 

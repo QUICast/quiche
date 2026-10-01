@@ -5475,6 +5475,51 @@ mod server_side_driver {
     }
 
     #[tokio::test]
+    async fn int139_local_open_remains_owned_under_pressure() {
+        let mut settings = webtransport_settings();
+        settings.webtransport_max_active_streams = 1;
+        settings.webtransport_max_active_streams_per_session = 1;
+        let mut helper =
+            DriverTestHelper::<ServerHooks>::with_pipe_and_http3_settings(
+                dgram_enabled_pipe(),
+                settings,
+            )
+            .unwrap();
+        start_webtransport_driver(&mut helper);
+        let (session, response, _body) =
+            open_pending_webtransport_session(&mut helper);
+        accept_pending_webtransport_session(&mut helper, session, &response);
+        let controller = helper.controller.webtransport_controller().unwrap();
+        let first =
+            open_server_webtransport_bidi(&mut helper, &controller, session)
+                .await;
+        assert_eq!(first, 1);
+        let mut operation = Box::pin(
+            controller
+                .try_open_stream_obligation(
+                    session,
+                    WebTransportStreamDirection::Bidi,
+                )
+                .unwrap(),
+        );
+        let _ = futures::poll!(&mut operation);
+        helper.work_loop_iter().unwrap();
+        assert!(
+            futures::poll!(&mut operation).is_pending(),
+            "recoverable local capacity must retain the exact opening"
+        );
+        assert_eq!(
+            helper
+                .driver
+                .webtransport
+                .as_ref()
+                .unwrap()
+                .active_stream_count(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn webtransport_stream_limit_waits_for_max_streams_credit() {
         let mut helper =
             DriverTestHelper::<ServerHooks>::with_pipe_and_http3_settings(
@@ -6069,6 +6114,246 @@ mod server_side_driver {
 
         open.abort();
         assert!(open.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn open_obligation_provisional_release_and_opposite_direction() {
+        let mut settings = webtransport_settings();
+        settings.webtransport_max_pending_streams = 1;
+        settings.webtransport_max_pending_streams_per_session = 1;
+        let mut helper =
+            DriverTestHelper::<ServerHooks>::with_pipe_and_http3_settings(
+                prefix_backpressured_webtransport_pipe(),
+                settings,
+            )
+            .unwrap();
+        start_webtransport_driver(&mut helper);
+        let (session, response, _body) =
+            open_pending_webtransport_session(&mut helper);
+        accept_pending_webtransport_session(&mut helper, session, &response);
+        let controller = helper.controller.webtransport_controller().unwrap();
+        let legacy_controller = controller.clone();
+        let legacy = tokio::spawn(async move {
+            legacy_controller.open_bidirectional_stream(session).await
+        });
+        tokio::task::yield_now().await;
+        helper.work_loop_iter().unwrap();
+        assert!(!legacy.is_finished());
+        let mut waiting = Box::pin(
+            controller
+                .try_open_stream_obligation(
+                    session,
+                    WebTransportStreamDirection::Uni,
+                )
+                .unwrap(),
+        );
+        helper.work_loop_iter().unwrap();
+        assert!(futures::poll!(&mut waiting).is_pending());
+        let stats = webtransport_retention_stats(&mut helper, &controller).await;
+        assert_eq!(stats.provisional_streams, 1);
+        assert_eq!(stats.open_obligations, 1);
+        // Peer consumption raises actual stream credit and finishes the held
+        // prefix. The active slot stays owned, but provisional capacity frees.
+        let mut opened = None;
+        for _ in 0..32 {
+            helper.pipe.advance().unwrap();
+            let _ = helper.peer_client_poll();
+            helper.advance_and_run_loop().unwrap();
+            if let std::task::Poll::Ready(result) = futures::poll!(&mut waiting) {
+                opened = Some(result.unwrap().accept().unwrap());
+                break;
+            }
+        }
+        assert!(
+            opened.is_some(),
+            "provisional release failed to resume uni open"
+        );
+        assert_matches!(
+            legacy.await.unwrap(),
+            WebTransportOpenStreamOutcome::Opened { .. }
+        );
+        assert_eq!(opened.unwrap() & 3, 3);
+    }
+
+    #[tokio::test]
+    async fn open_obligation_peer_credit_alone_and_with_local_pressure() {
+        for active_limit in [1, 8] {
+            let mut settings = webtransport_settings();
+            settings.webtransport_max_active_streams = active_limit;
+            settings.webtransport_max_active_streams_per_session = active_limit;
+            let mut helper =
+                DriverTestHelper::<ServerHooks>::with_pipe_and_http3_settings(
+                    single_server_stream_each_direction_webtransport_pipe(),
+                    settings,
+                )
+                .unwrap();
+            start_webtransport_driver(&mut helper);
+            let (session, response, _body) =
+                open_pending_webtransport_session(&mut helper);
+            accept_pending_webtransport_session(&mut helper, session, &response);
+            let controller = helper.controller.webtransport_controller().unwrap();
+            let first = controller
+                .try_open_stream_obligation(
+                    session,
+                    WebTransportStreamDirection::Bidi,
+                )
+                .unwrap();
+            helper.work_loop_iter().unwrap();
+            let first = first.await.unwrap();
+            assert_eq!(helper.pipe.server.peer_streams_left_bidi(), 0);
+            let mut next = Box::pin(
+                controller
+                    .try_open_stream_obligation(
+                        session,
+                        WebTransportStreamDirection::Bidi,
+                    )
+                    .unwrap(),
+            );
+            helper.work_loop_iter().unwrap();
+            assert!(futures::poll!(&mut next).is_pending());
+            if active_limit == 8 {
+                let uni = controller
+                    .try_open_stream_obligation(
+                        session,
+                        WebTransportStreamDirection::Uni,
+                    )
+                    .unwrap();
+                helper.work_loop_iter().unwrap();
+                assert_eq!(uni.await.unwrap().accept().unwrap() & 3, 3);
+                helper.work_loop_iter().unwrap();
+                helper.work_loop_iter().unwrap();
+            }
+            let before =
+                webtransport_retention_stats(&mut helper, &controller).await;
+            for _ in 0..32 {
+                helper.work_loop_iter().unwrap();
+            }
+            assert_eq!(
+                webtransport_retention_stats(&mut helper, &controller)
+                    .await
+                    .stream_open_waiter_work_total,
+                before.stream_open_waiter_work_total
+            );
+            drop(first);
+            let mut opened = false;
+            for _ in 0..64 {
+                helper.advance_and_run_loop().unwrap();
+                let _ = helper.peer_client_poll();
+                let _ = helper.pipe.client.stream_recv(1, &mut [0; 32]);
+                let _ = helper.pipe.client.stream_capacity(1);
+                if let std::task::Poll::Ready(result) = futures::poll!(&mut next)
+                {
+                    assert_eq!(result.unwrap().accept().unwrap(), 5);
+                    opened = true;
+                    break;
+                }
+            }
+            assert!(opened, "genuine MAX_STREAMS and local release must resume");
+            helper.work_loop_iter().unwrap();
+            assert_eq!(
+                webtransport_retention_stats(&mut helper, &controller)
+                    .await
+                    .open_obligations,
+                0
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn open_obligation_cancellation_at_each_prefix_boundary() {
+        for prefix_credit in 0..=3 {
+            let mut client = default_quiche_config();
+            client.set_initial_max_stream_data_bidi_remote(prefix_credit);
+            client.enable_dgram(true, 10, 10);
+            client.enable_reset_stream_at(true);
+            let mut server = default_quiche_config();
+            server.enable_dgram(true, 10, 10);
+            server.enable_reset_stream_at(true);
+            let pipe = DriverPipe::with_client_and_server_config_and_buf(
+                &mut client,
+                &mut server,
+            )
+            .unwrap();
+            let mut helper =
+                DriverTestHelper::<ServerHooks>::with_pipe_and_http3_settings(
+                    pipe,
+                    webtransport_settings(),
+                )
+                .unwrap();
+            start_webtransport_driver(&mut helper);
+            let (session, response, _body) =
+                open_pending_webtransport_session(&mut helper);
+            accept_pending_webtransport_session(&mut helper, session, &response);
+            let controller = helper.controller.webtransport_controller().unwrap();
+            let operation = controller
+                .try_open_stream_obligation(
+                    session,
+                    WebTransportStreamDirection::Bidi,
+                )
+                .unwrap();
+            helper.work_loop_iter().unwrap();
+            assert_eq!(
+                operation.cancel(),
+                super::super::WebTransportOpenExposure::Reserved {
+                    stream_id: 1,
+                    prefix_bytes_accepted: prefix_credit as usize,
+                }
+            );
+            helper.work_loop_iter().unwrap();
+            let stats =
+                webtransport_retention_stats(&mut helper, &controller).await;
+            assert_eq!(stats.open_obligations, 1);
+            // Reliable reservation with zero credit cannot be silently undone.
+            if prefix_credit <= 1 {
+                assert_eq!(stats.provisional_streams, 1);
+                // No credit increase is supplied here. Cancellation is not
+                // authority to forget a zero/partial reliable reservation.
+                for _ in 0..8 {
+                    helper.work_loop_iter().unwrap();
+                }
+                assert_eq!(
+                    webtransport_retention_stats(&mut helper, &controller)
+                        .await
+                        .open_obligations,
+                    1
+                );
+                continue;
+            }
+            let mut received_prefix = Vec::new();
+            let mut reset = false;
+            for _ in 0..32 {
+                helper.pipe.advance().unwrap();
+                let mut bytes = [0; 8];
+                match helper.pipe.client.stream_recv(1, &mut bytes) {
+                    Ok((len, false)) =>
+                        received_prefix.extend_from_slice(&bytes[..len]),
+                    Err(quiche::Error::StreamReset(code)) => {
+                        assert_eq!(code, webtransport::WT_SESSION_GONE);
+                        reset = true;
+                    },
+                    Err(
+                        quiche::Error::Done |
+                        quiche::Error::InvalidStreamState(_),
+                    ) => {},
+                    other => panic!("unexpected prefix read: {other:?}"),
+                }
+                helper.advance_and_run_loop().unwrap();
+            }
+            assert_eq!(
+                received_prefix,
+                webtransport_stream_data(
+                    h3::WEBTRANSPORT_BIDI_STREAM_SIGNAL,
+                    session,
+                    b""
+                )
+            );
+            assert!(reset, "reset must follow the exact reliable prefix");
+            let stats =
+                webtransport_retention_stats(&mut helper, &controller).await;
+            assert_eq!(stats.open_obligations, 0);
+            assert_eq!(stats.provisional_streams, 0);
+            assert_eq!(stats.associated_streams, 0);
+        }
     }
 
     #[tokio::test]

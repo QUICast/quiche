@@ -368,6 +368,16 @@ pub enum WebTransportOpenStreamOutcome {
     },
 }
 
+mod open;
+pub(super) use open::metadata_upper_bound as open_obligation_metadata_upper_bound;
+use open::OpenResponse;
+use open::OpenShared;
+pub use open::WebTransportOpenAdmissionError;
+pub use open::WebTransportOpenExposure;
+pub use open::WebTransportOpenFailure;
+pub use open::WebTransportOpenOperation;
+pub use open::WebTransportOpenedStream;
+
 /// Outcome of one bounded selected-stream write.
 #[derive(Debug, Eq, PartialEq)]
 pub enum WebTransportStreamWriteOutcome {
@@ -1229,6 +1239,23 @@ pub struct WebTransportRetentionStats {
     pub stream_open_waiter_work_total: u64,
     /// Open requests rejected by configured aggregate or per-session bounds.
     pub stream_open_waiter_saturation_total: u64,
+    /// Outstanding capacity-waiting open owners, including queued offers.
+    pub open_obligations: usize,
+    /// Admitted opens waiting on local capacity and/or peer stream credit.
+    pub waiting_open_obligations: usize,
+    /// Reserved/open result records, including accept notifications not yet
+    /// consumed by the driver and cancelled streams awaiting core collection.
+    pub retained_open_handoffs: usize,
+    /// Independent aggregate open-owner bound (selected command capacity).
+    pub max_open_obligations: usize,
+    /// Independent per-session open-owner bound (pending-stream setting).
+    pub max_open_obligations_per_session: usize,
+    /// Peak outstanding open owners, including callers holding offers.
+    pub open_obligations_high_water: usize,
+    /// Capacity-waiting open registrations admitted since construction.
+    pub open_obligation_admitted_total: u64,
+    /// Registrations refused by the independent owner bound.
+    pub open_obligation_saturation_total: u64,
     /// Pending exact-session terminal registrations.
     pub session_terminal_waiters: usize,
     /// Configured aggregate session-terminal waiter bound.
@@ -1402,6 +1429,8 @@ impl WebTransportRetentionStats {
         self.associated_streams = 0;
         self.provisional_streams = 0;
         self.stream_open_waiters = 0;
+        self.waiting_open_obligations = 0;
+        self.retained_open_handoffs = 0;
         self.session_terminal_waiters = 0;
         self.waiters = 0;
         self.send_terminal_waiters = 0;
@@ -1773,6 +1802,8 @@ fn live_connection_snapshot_outcome(
 /// Exact unresolved ownership preventing terminal retention accounting.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct WebTransportTerminalRetentionPending {
+    /// Open operations/offers still owned outside or inside the driver.
+    pub open_obligations: usize,
     /// Whether the selected command lane and runtime have settled.
     pub runtime_settled: bool,
     /// Whether a worker installed the core-connection destruction hook.
@@ -1905,6 +1936,14 @@ struct TerminalRetentionInner {
     connection_owner_dropped: bool,
     receive_terminal_leases: usize,
     receive_terminal_bytes: usize,
+    open_obligations: usize,
+    open_obligations_per_session: BTreeMap<u64, usize>,
+    max_open_obligations: usize,
+    max_open_obligations_per_session: usize,
+    open_obligations_high_water: usize,
+    open_obligation_admitted_total: u64,
+    open_obligation_saturation_total: u64,
+    open_admission_closed: bool,
     waiter: Option<Waker>,
     waiter_saturation_total: u64,
     waiter_cancellation_total: u64,
@@ -1922,6 +1961,14 @@ impl Default for TerminalRetentionInner {
             connection_owner_dropped: false,
             receive_terminal_leases: 0,
             receive_terminal_bytes: 0,
+            open_obligations: 0,
+            open_obligations_per_session: BTreeMap::new(),
+            max_open_obligations: 0,
+            max_open_obligations_per_session: 0,
+            open_obligations_high_water: 0,
+            open_obligation_admitted_total: 0,
+            open_obligation_saturation_total: 0,
+            open_admission_closed: false,
             waiter: None,
             waiter_saturation_total: 0,
             waiter_cancellation_total: 0,
@@ -1992,6 +2039,7 @@ impl TerminalRetentionState {
     ) -> WebTransportTerminalRetentionPending {
         let write_leases = write_leases.unwrap_or_default();
         WebTransportTerminalRetentionPending {
+            open_obligations: inner.open_obligations,
             runtime_settled: inner.runtime_settled,
             connection_owner_attached: inner.connection_owner_attached,
             connection_owner_dropped: inner.connection_owner_dropped,
@@ -2015,6 +2063,7 @@ impl TerminalRetentionState {
 
         let settled = inner.runtime_settled &&
             inner.connection_owner_dropped &&
+            inner.open_obligations == 0 &&
             inner.receive_terminal_leases == 0 &&
             write_leases.is_none_or(|snapshot| snapshot.current == 0);
         if !settled {
@@ -2029,6 +2078,7 @@ impl TerminalRetentionState {
             .take()
             .expect("terminal accounting preallocates one snapshot");
         stats.settle_terminal(write_leases);
+        Self::augment_open_stats(inner, &mut stats);
         stats.terminal_retention_waiters = 0;
         stats.max_terminal_retention_waiters = 1;
         stats.terminal_retention_waiter_saturation_total =
@@ -2092,6 +2142,7 @@ impl TerminalRetentionState {
                 inner.taken ||
                 (inner.runtime_settled &&
                     inner.connection_owner_dropped &&
+                    inner.open_obligations == 0 &&
                     inner.receive_terminal_leases == 0 &&
                     write_leases
                         .is_none_or(|snapshot| snapshot.current == 0));
@@ -2137,12 +2188,27 @@ impl TerminalRetentionState {
 
     pub(super) fn augment_stats(&self, stats: &mut WebTransportRetentionStats) {
         let inner = self.lock();
+        Self::augment_open_stats(&inner, stats);
         stats.terminal_retention_waiters = usize::from(inner.waiter.is_some());
         stats.max_terminal_retention_waiters = 1;
         stats.terminal_retention_waiter_saturation_total =
             inner.waiter_saturation_total;
         stats.terminal_retention_waiter_cancellation_total =
             inner.waiter_cancellation_total;
+    }
+
+    fn augment_open_stats(
+        inner: &TerminalRetentionInner, stats: &mut WebTransportRetentionStats,
+    ) {
+        stats.open_obligations = inner.open_obligations;
+        stats.max_open_obligations = inner.max_open_obligations;
+        stats.max_open_obligations_per_session =
+            inner.max_open_obligations_per_session;
+        stats.open_obligations_high_water = inner.open_obligations_high_water;
+        stats.open_obligation_admitted_total =
+            inner.open_obligation_admitted_total;
+        stats.open_obligation_saturation_total =
+            inner.open_obligation_saturation_total;
     }
 
     fn retain_receive_terminal(
@@ -3910,6 +3976,7 @@ where
 }
 
 pub(crate) enum WebTransportCommand {
+    OpenObligation(Arc<OpenShared>),
     LiveConnectionSnapshot(LiveConnectionSnapshotRequest),
     WaitSessionTerminal {
         session_id: u64,
@@ -3996,6 +4063,11 @@ pub(crate) enum WebTransportCommand {
 impl WebTransportCommand {
     pub(crate) fn reject_connection_closed(self) {
         match self {
+            Self::OpenObligation(shared) => {
+                shared.finish(WebTransportOpenStreamOutcome::Rejected(
+                    WebTransportSelectionError::ConnectionClosed,
+                ));
+            },
             Self::LiveConnectionSnapshot(request) => request.connection_closed(),
             Self::WaitSessionTerminal {
                 session_id,
@@ -4566,14 +4638,14 @@ struct OpeningStream {
     reservation: quiche::h3::WebTransportStreamReservation,
     prefix_offset: usize,
     reset_after_prefix: Option<u64>,
-    response: Option<oneshot::Sender<WebTransportOpenStreamOutcome>>,
+    response: Option<OpenResponse>,
 }
 
 #[derive(Debug)]
 struct PendingOpen {
     session_id: u64,
     direction: WebTransportStreamDirection,
-    response: oneshot::Sender<WebTransportOpenStreamOutcome>,
+    response: OpenResponse,
 }
 
 #[derive(Debug)]
@@ -4679,7 +4751,11 @@ impl Session {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SessionWork {
     Admit(u64),
-    Terminate { session_id: u64, error_code: u64 },
+    Terminate {
+        session_id: u64,
+        error_code: u64,
+        after_stream: Option<u64>,
+    },
 }
 
 #[derive(Debug)]
@@ -4698,6 +4774,17 @@ pub(crate) struct Runtime {
     pending_bidi_opens: VecDeque<PendingOpen>,
     pending_uni_opens: VecDeque<PendingOpen>,
     pending_opens_per_session: BTreeMap<u64, usize>,
+    capacity_opens: VecDeque<PendingOpen>,
+    capacity_open_work: usize,
+    open_obligation_turn: u8,
+    open_offers: BTreeMap<u64, Arc<OpenShared>>,
+    open_offer_work: usize,
+    open_offer_cursor: Option<u64>,
+    open_collection_work: usize,
+    reserved_open_ids: BTreeMap<u64, OwnedStream>,
+    reserved_opens_per_session: BTreeMap<u64, usize>,
+    reserved_bidi_opens: usize,
+    reserved_bidi_opens_per_session: BTreeMap<u64, usize>,
     bidi_open_credit_ready: bool,
     uni_open_credit_ready: bool,
     pending_open_turn_bidi: bool,
@@ -4777,6 +4864,12 @@ impl Runtime {
         cancellation_pending: Arc<AtomicBool>,
         terminal_retention: Arc<TerminalRetentionState>,
     ) -> Self {
+        {
+            let mut inner = terminal_retention.lock();
+            inner.max_open_obligations = limits.command_capacity;
+            inner.max_open_obligations_per_session =
+                limits.max_pending_streams_per_session;
+        }
         Self {
             limits: RuntimeLimits {
                 max_session_work_per_callback: limits
@@ -4822,6 +4915,17 @@ impl Runtime {
             pending_bidi_opens: VecDeque::new(),
             pending_uni_opens: VecDeque::new(),
             pending_opens_per_session: BTreeMap::new(),
+            capacity_opens: VecDeque::with_capacity(limits.command_capacity),
+            capacity_open_work: 0,
+            open_obligation_turn: 0,
+            open_offers: BTreeMap::new(),
+            open_offer_work: 0,
+            open_offer_cursor: None,
+            open_collection_work: 0,
+            reserved_open_ids: BTreeMap::new(),
+            reserved_opens_per_session: BTreeMap::new(),
+            reserved_bidi_opens: 0,
+            reserved_bidi_opens_per_session: BTreeMap::new(),
             bidi_open_credit_ready: false,
             uni_open_credit_ready: false,
             pending_open_turn_bidi: true,
@@ -5227,6 +5331,7 @@ impl Runtime {
         self.work.push_back(SessionWork::Terminate {
             session_id,
             error_code,
+            after_stream: None,
         });
     }
 
@@ -5346,8 +5451,13 @@ impl Runtime {
     }
 
     fn can_admit_owned_stream(&mut self, stream: OwnedStream) -> bool {
-        if self.stream_sessions.len() >= self.limits.max_active_streams ||
-            self.active_stream_count_for_session(stream.session_id) >=
+        if self.stream_sessions.len() + self.reserved_open_ids.len() >=
+            self.limits.max_active_streams ||
+            self.active_stream_count_for_session(stream.session_id) +
+                self.reserved_opens_per_session
+                    .get(&stream.session_id)
+                    .copied()
+                    .unwrap_or(0) >=
                 self.limits.max_active_streams_per_session
         {
             return false;
@@ -5355,12 +5465,17 @@ impl Runtime {
         if !stream.has_receive_direction() {
             return true;
         }
-        let available = self.receive_terminal_observations <
+        let available = self.receive_terminal_observations +
+            self.reserved_bidi_opens <
             self.limits.max_receive_terminal_states &&
             self.receive_terminal_observations_per_session
                 .get(&stream.session_id)
                 .copied()
-                .unwrap_or(0) <
+                .unwrap_or(0) +
+                self.reserved_bidi_opens_per_session
+                    .get(&stream.session_id)
+                    .copied()
+                    .unwrap_or(0) <
                 self.limits.max_receive_terminal_states_per_session;
         if !available {
             self.receive_terminal_state_saturation_total = self
@@ -5436,7 +5551,9 @@ impl Runtime {
     }
 
     fn insert_owned_stream(&mut self, stream_id: u64, stream: OwnedStream) {
-        if stream.has_receive_direction() {
+        if stream.receive_terminal_observation ==
+            ReceiveTerminalObservation::Active
+        {
             self.receive_terminal_observations =
                 self.receive_terminal_observations.saturating_add(1);
             let count = self
@@ -5456,6 +5573,7 @@ impl Runtime {
             self.work.push_back(SessionWork::Terminate {
                 session_id,
                 error_code: WT_BUFFERED_STREAM_REJECTED,
+                after_stream: None,
             });
         }
     }
@@ -5680,6 +5798,14 @@ impl Runtime {
             return Err(error);
         }
 
+        if self
+            .open_offers
+            .get(&stream_id)
+            .is_some_and(|offer| !offer.is_accepted())
+        {
+            return Err(WebTransportSelectionError::UnknownStream);
+        }
+
         let Some(stream) = self.stream_sessions.get(&stream_id).copied() else {
             return Err(if qconn.stream_closed(stream_id) {
                 WebTransportSelectionError::StaleStream
@@ -5714,12 +5840,31 @@ impl Runtime {
         queued_command_items: usize,
     ) {
         if self.cancellation_pending.swap(false, Ordering::AcqRel) {
+            self.schedule_open_obligation_work();
             self.prune_cancelled_pending_opens();
             self.prune_cancelled_session_terminal_waiters();
             self.prune_cancelled_stream_waiters();
             self.prune_cancelled_send_terminal_waiters();
         }
         match command {
+            WebTransportCommand::OpenObligation(shared) => {
+                if shared.is_cancelled() {
+                    return;
+                }
+                if let Some(error) =
+                    self.selection_error(shared.session_id, qconn)
+                {
+                    shared.finish(WebTransportOpenStreamOutcome::Rejected(error));
+                    return;
+                }
+                self.capacity_opens.push_back(PendingOpen {
+                    session_id: shared.session_id,
+                    direction: shared.direction,
+                    response: OpenResponse::Obligation(shared),
+                });
+                self.capacity_open_work = self.capacity_opens.len();
+                self.schedule_open_collection();
+            },
             WebTransportCommand::LiveConnectionSnapshot(request) =>
                 request.sample(qconn),
             WebTransportCommand::WaitSessionTerminal {
@@ -5771,6 +5916,7 @@ impl Runtime {
                 qconn, session_id, stream_id, response,
             ),
             WebTransportCommand::PruneCancelledWaiters => {
+                self.schedule_open_obligation_work();
                 self.prune_cancelled_pending_opens();
                 self.prune_cancelled_session_terminal_waiters();
                 self.prune_cancelled_stream_waiters();
@@ -5858,7 +6004,7 @@ impl Runtime {
         let request = PendingOpen {
             session_id,
             direction,
-            response,
+            response: OpenResponse::Legacy(response),
         };
         if let Some(request) = self.start_open_request(conn, qconn, request) {
             self.set_open_credit_ready(direction, false);
@@ -5876,12 +6022,13 @@ impl Runtime {
             WebTransportStreamDirection::Uni =>
                 quiche::h3::WebTransportStreamDirection::Unidirectional,
         };
-        let reservation = match conn.reserve_webtransport_stream_with_reset_mode(
+        let reservation = match request.response.reserve(
+            conn,
             qconn,
             request.session_id,
             core_direction,
             self.reset_mode,
-        ) {
+        )? {
             Ok(reservation) => reservation,
             Err(quiche::h3::Error::SettingsError) => {
                 let _ = request.response.send(
@@ -5904,6 +6051,28 @@ impl Runtime {
             },
         };
         let stream_id = reservation.stream_id();
+        if let OpenResponse::Obligation(shared) = &request.response {
+            self.open_offers.insert(stream_id, Arc::clone(shared));
+            let owned = OwnedStream::new_with_reset_mode(
+                request.session_id,
+                request.direction,
+                reservation.prefix_len() as u64,
+                true,
+                reservation.reset_mode(),
+            );
+            self.reserved_open_ids.insert(stream_id, owned);
+            *self
+                .reserved_opens_per_session
+                .entry(request.session_id)
+                .or_default() += 1;
+            if request.direction == WebTransportStreamDirection::Bidi {
+                self.reserved_bidi_opens += 1;
+                *self
+                    .reserved_bidi_opens_per_session
+                    .entry(request.session_id)
+                    .or_default() += 1;
+            }
+        }
         self.opening_streams.insert(stream_id, OpeningStream {
             reservation,
             prefix_offset: 0,
@@ -5921,6 +6090,7 @@ impl Runtime {
     pub(crate) fn stream_credit_available(
         &mut self, direction: quiche::StreamCreditDirection,
     ) {
+        self.capacity_open_work = self.capacity_opens.len();
         match direction {
             quiche::StreamCreditDirection::Bidirectional => {
                 if !self.pending_bidi_opens.is_empty() {
@@ -5941,19 +6111,38 @@ impl Runtime {
     ) -> usize {
         let mut work = 0;
         while work < max_work {
-            let pending_first = self.open_work_pending_turn;
-            let progressed = if pending_first {
-                self.process_pending_open(conn, qconn) ||
-                    self.process_opening_streams(conn, qconn, 1) != 0
-            } else {
-                self.process_opening_streams(conn, qconn, 1) != 0 ||
-                    self.process_pending_open(conn, qconn)
-            };
+            let mut progressed = false;
+            for delta in 0..3 {
+                let class = (self.open_obligation_turn + delta) % 3;
+                progressed = match class {
+                    0 if self.open_offer_work != 0 => {
+                        self.process_open_offer(qconn);
+                        true
+                    },
+                    0 => false,
+                    1 => self.process_capacity_open(conn, qconn),
+                    _ => {
+                        let pending_first = self.open_work_pending_turn;
+                        self.open_work_pending_turn = !pending_first;
+                        if pending_first {
+                            self.process_pending_open(conn, qconn) ||
+                                self.process_opening_streams(conn, qconn, 1) !=
+                                    0
+                        } else {
+                            self.process_opening_streams(conn, qconn, 1) != 0 ||
+                                self.process_pending_open(conn, qconn)
+                        }
+                    },
+                };
+                if progressed {
+                    self.open_obligation_turn = (class + 1) % 3;
+                    break;
+                }
+            }
             if !progressed {
                 break;
             }
             work += 1;
-            self.open_work_pending_turn = !pending_first;
         }
         work
     }
@@ -6120,7 +6309,7 @@ impl Runtime {
             if opening
                 .response
                 .as_ref()
-                .is_some_and(oneshot::Sender::is_closed)
+                .is_some_and(OpenResponse::is_closed)
             {
                 opening.response = None;
                 opening.reset_after_prefix = Some(WT_SESSION_GONE);
@@ -6146,12 +6335,23 @@ impl Runtime {
 
             let prefix = opening.reservation.prefix();
             if opening.prefix_offset < prefix.len() {
-                match qconn.stream_send(
-                    stream_id,
-                    &prefix[opening.prefix_offset..],
-                    false,
-                ) {
-                    Ok(written) => opening.prefix_offset += written,
+                let result = match self.open_offers.get(&stream_id) {
+                    Some(shared) => shared.write_prefix(
+                        qconn,
+                        stream_id,
+                        prefix,
+                        opening.prefix_offset,
+                    ),
+                    None => qconn.stream_send(
+                        stream_id,
+                        &prefix[opening.prefix_offset..],
+                        false,
+                    ),
+                };
+                match result {
+                    Ok(written) => {
+                        opening.prefix_offset += written;
+                    },
                     Err(quiche::Error::Done | quiche::Error::StreamLimit) => {
                         self.requeue_opening(stream_id, opening);
                         continue;
@@ -6252,7 +6452,9 @@ impl Runtime {
                 true,
                 opening.reservation.reset_mode(),
             );
-            if !self.can_admit_owned_stream(owned) {
+            if !self.reserved_open_ids.contains_key(&stream_id) &&
+                !self.can_admit_owned_stream(owned)
+            {
                 if let Some(response) = opening.response.take() {
                     let _ =
                         response.send(WebTransportOpenStreamOutcome::Rejected(
@@ -6278,8 +6480,17 @@ impl Runtime {
                     .is_ok()
             });
             if !delivered {
-                self.remove_owned_stream(stream_id);
-                shutdown_owned_stream(qconn, stream_id, owned, WT_SESSION_GONE);
+                if self.reserved_open_ids.contains_key(&stream_id) {
+                    self.abandon_open_offer(qconn, stream_id);
+                } else {
+                    self.remove_owned_stream(stream_id);
+                    shutdown_owned_stream(
+                        qconn,
+                        stream_id,
+                        owned,
+                        WT_SESSION_GONE,
+                    );
+                }
             }
             self.finish_opening(session_id, stream_id);
         }
@@ -6304,6 +6515,35 @@ impl Runtime {
     }
 
     fn finish_opening(&mut self, session_id: u64, stream_id: u64) {
+        if let Some(mut owned) = self.reserved_open_ids.remove(&stream_id) {
+            decrement_session_count(
+                &mut self.reserved_opens_per_session,
+                session_id,
+            );
+            if owned.direction == WebTransportStreamDirection::Bidi {
+                self.reserved_bidi_opens -= 1;
+                decrement_session_count(
+                    &mut self.reserved_bidi_opens_per_session,
+                    session_id,
+                );
+            }
+            if !self.stream_sessions.contains_key(&stream_id) {
+                // Never-accepted streams remain charged until actual QUIC
+                // collection; the provider owns both observation retirements.
+                owned.send_terminal_observation =
+                    SendTerminalObservation::Retired;
+                if owned.has_receive_direction() {
+                    owned.receive_terminal_observation =
+                        ReceiveTerminalObservation::Retired;
+                }
+                self.insert_owned_stream(stream_id, owned);
+                if let Some(session) = self.sessions.get_mut(&session_id) {
+                    session.streams.insert(stream_id);
+                }
+                self.schedule_open_collection();
+            }
+        }
+        self.capacity_open_work = self.capacity_opens.len();
         if let Some(streams) = self.opening_by_session.get_mut(&session_id) {
             streams.remove(&stream_id);
             if streams.is_empty() {
@@ -6506,6 +6746,17 @@ impl Runtime {
         if let Some(error) = self.selection_error(session_id, qconn) {
             let _ = response
                 .send(WebTransportStreamSendTerminalOutcome::Rejected(error));
+            return;
+        }
+        if self
+            .open_offers
+            .get(&stream_id)
+            .is_some_and(|offer| !offer.is_accepted())
+        {
+            let _ =
+                response.send(WebTransportStreamSendTerminalOutcome::Rejected(
+                    WebTransportSelectionError::UnknownStream,
+                ));
             return;
         }
         if let Some(terminal) = self.send_terminal_states.get(&stream_id) {
@@ -6729,6 +6980,17 @@ impl Runtime {
         &mut self, qconn: &QuicheConnection, session_id: u64, stream_id: u64,
         response: oneshot::Sender<WebTransportStreamSendTerminalOutcome>,
     ) {
+        if self
+            .open_offers
+            .get(&stream_id)
+            .is_some_and(|offer| !offer.is_accepted())
+        {
+            let _ =
+                response.send(WebTransportStreamSendTerminalOutcome::Rejected(
+                    WebTransportSelectionError::UnknownStream,
+                ));
+            return;
+        }
         if let Some(error) = self.selection_error(session_id, qconn) {
             let _ = response
                 .send(WebTransportStreamSendTerminalOutcome::Rejected(error));
@@ -6784,6 +7046,7 @@ impl Runtime {
             let _ = waiter.response.send(outcome);
         }
         let _ = response.send(outcome);
+        self.schedule_open_collection();
     }
 
     fn retire_send_terminal_observation(
@@ -7013,6 +7276,23 @@ impl Runtime {
         &mut self, session_id: u64, error_code: u64,
         selection_error: WebTransportSelectionError,
     ) {
+        for request in &self.capacity_opens {
+            if request.session_id == session_id {
+                if let OpenResponse::Obligation(shared) = &request.response {
+                    shared.finish(WebTransportOpenStreamOutcome::Rejected(
+                        selection_error,
+                    ));
+                }
+            }
+        }
+        for offer in self.open_offers.values() {
+            if offer.session_id == session_id {
+                offer.finish(WebTransportOpenStreamOutcome::Rejected(
+                    selection_error,
+                ));
+            }
+        }
+        self.schedule_open_obligation_work();
         self.reject_pending_open_requests(session_id, selection_error);
         let stream_ids: Vec<_> = self
             .opening_by_session
@@ -7301,6 +7581,18 @@ impl Runtime {
             WebTransportStreamReceiveTerminalRetirementOutcome,
         >,
     ) {
+        if self
+            .open_offers
+            .get(&stream_id)
+            .is_some_and(|offer| !offer.is_accepted())
+        {
+            let _ = response.send(
+                WebTransportStreamReceiveTerminalRetirementOutcome::Rejected(
+                    WebTransportSelectionError::UnknownStream,
+                ),
+            );
+            return;
+        }
         if let Some(error) = self.selection_error(session_id, qconn) {
             let outcome = match error {
                 WebTransportSelectionError::TerminalSession =>
@@ -7403,6 +7695,8 @@ impl Runtime {
 
         self.remove_receive_terminal_state(stream_id);
         self.retire_receive_terminal_observation(stream_id, stream);
+        self.schedule_open_collection();
+        self.capacity_open_work = self.capacity_opens.len();
         if let Some(waiter) = self.remove_stream_waiter(stream_id, false) {
             let _ = waiter.response.send(WebTransportStreamReadyOutcome::Closed);
         }
@@ -7950,7 +8244,11 @@ impl Runtime {
     }
 
     pub(crate) fn has_work(&self) -> bool {
-        !self.work.is_empty() || self.has_ready_pending_open()
+        !self.work.is_empty() ||
+            self.has_ready_pending_open() ||
+            self.capacity_open_work != 0 ||
+            self.open_offer_work != 0 ||
+            self.open_collection_work != 0
     }
 
     fn has_ready_pending_open(&self) -> bool {
@@ -8008,6 +8306,7 @@ impl Runtime {
                 SessionWork::Terminate {
                     session_id,
                     error_code,
+                    after_stream,
                 } => {
                     if let Some(stream_id) = self
                         .pending_by_session
@@ -8036,7 +8335,17 @@ impl Runtime {
                     let owned = self
                         .sessions
                         .get(&session_id)
-                        .and_then(|session| session.streams.first().copied())
+                        .and_then(|session| match after_stream {
+                            Some(id) => session
+                                .streams
+                                .range((
+                                    std::ops::Bound::Excluded(id),
+                                    std::ops::Bound::Unbounded,
+                                ))
+                                .next()
+                                .copied(),
+                            None => session.streams.first().copied(),
+                        })
                         .and_then(|stream_id| {
                             self.stream_sessions
                                 .get(&stream_id)
@@ -8047,13 +8356,36 @@ impl Runtime {
                         shutdown_owned_stream(
                             qconn, stream_id, stream, error_code,
                         );
-                        self.remove_owned_stream(stream_id);
                         if self
-                            .sessions
-                            .get(&session_id)
-                            .is_some_and(|session| !session.streams.is_empty())
+                            .open_offers
+                            .get(&stream_id)
+                            .is_some_and(|offer| !offer.is_accepted())
                         {
-                            self.work.push_back(work);
+                            self.abandon_open_offer(qconn, stream_id);
+                        } else {
+                            self.remove_owned_stream(stream_id);
+                        }
+                        // An unaccepted stream can remain through reset ACK.
+                        // Advance the teardown cursor rather than spinning on
+                        // it or withholding teardown from a sibling stream.
+                        let more = self.sessions.get(&session_id).is_some_and(
+                            |session| {
+                                session
+                                    .streams
+                                    .range((
+                                        std::ops::Bound::Excluded(stream_id),
+                                        std::ops::Bound::Unbounded,
+                                    ))
+                                    .next()
+                                    .is_some()
+                            },
+                        );
+                        if more {
+                            self.work.push_back(SessionWork::Terminate {
+                                session_id,
+                                error_code,
+                                after_stream: Some(stream_id),
+                            });
                         } else {
                             self.complete_associated_teardown_if_empty(
                                 session_id,
@@ -8074,6 +8406,9 @@ impl Runtime {
         &mut self, qconn: &QuicheConnection, mut remaining: usize,
     ) {
         let to_scan = remaining
+            .min(self.pending_streams.len() + self.stream_sessions.len());
+        self.open_collection_work = self
+            .open_collection_work
             .min(self.pending_streams.len() + self.stream_sessions.len());
         let mut scanned = 0;
         while scanned < to_scan && remaining != 0 {
@@ -8100,8 +8435,21 @@ impl Runtime {
             self.maintenance_cursor = Some(stream_id);
             scanned += 1;
             remaining -= 1;
+            self.open_collection_work =
+                self.open_collection_work.saturating_sub(1);
 
             if !qconn.stream_closed(stream_id) {
+                continue;
+            }
+            // stream_closed() means directional FIN/reset, not reclamation.
+            // A never-accepted opening retains its slot and obligation until
+            // the known reserved stream actually leaves the core stream map.
+            if self
+                .open_offers
+                .get(&stream_id)
+                .is_some_and(|offer| !offer.is_accepted()) &&
+                !matches!(qconn.stream_send_status(stream_id), Err(quiche::Error::InvalidStreamState(id)) if id == stream_id)
+            {
                 continue;
             }
             if let Some(stream) = self.pending_streams.get(&stream_id).copied() {
@@ -8135,6 +8483,12 @@ impl Runtime {
 
     fn remove_owned_stream(&mut self, stream_id: u64) -> Option<OwnedStream> {
         let stream = self.stream_sessions.remove(&stream_id)?;
+        self.capacity_open_work = self.capacity_opens.len();
+        if let Some(offer) = self.open_offers.remove(&stream_id) {
+            offer.finish(WebTransportOpenStreamOutcome::Rejected(
+                WebTransportSelectionError::TerminalSession,
+            ));
+        }
         if stream.send_terminal_observation == SendTerminalObservation::Overloaded
         {
             decrement_session_count(
@@ -8157,6 +8511,7 @@ impl Runtime {
         if let Some(session) = self.sessions.get_mut(&stream.session_id) {
             session.streams.remove(&stream_id);
         }
+        self.complete_associated_teardown_if_empty(stream.session_id);
         Some(stream)
     }
 
@@ -8164,6 +8519,7 @@ impl Runtime {
         &mut self, session_id: u64, stream_id: u64,
     ) -> Option<AssociatedStream> {
         let stream = self.pending_streams.remove(&stream_id)?;
+        self.capacity_open_work = self.capacity_opens.len();
         if let Some(ids) = self.pending_by_session.get_mut(&session_id) {
             ids.remove(&stream_id);
             if ids.is_empty() {
@@ -8265,6 +8621,11 @@ impl Runtime {
             .saturating_add(self.opening_by_session.len())
             .saturating_add(self.pending_open_count())
             .saturating_add(self.pending_opens_per_session.len())
+            .saturating_add(self.capacity_opens.len())
+            .saturating_add(self.open_offers.len())
+            .saturating_add(self.reserved_open_ids.len())
+            .saturating_add(self.reserved_opens_per_session.len())
+            .saturating_add(self.reserved_bidi_opens_per_session.len())
             .saturating_add(waiters)
             .saturating_add(self.session_terminal_waiters.len())
             .saturating_add(self.send_terminal_waiters_per_session.len())
@@ -8288,11 +8649,13 @@ impl Runtime {
             queued_command_items.min(self.limits.command_capacity);
         let write_leases = self.write_lease_accounting.snapshot();
 
-        WebTransportRetentionStats {
+        let mut stats = WebTransportRetentionStats {
             sessions: self.sessions.len(),
             associated_streams,
             provisional_streams,
             stream_open_waiters: self.pending_open_count(),
+            waiting_open_obligations: self.capacity_opens.len(),
+            retained_open_handoffs: self.open_offers.len(),
             max_stream_open_waiters: self.limits.max_pending_streams,
             max_stream_open_waiters_per_session: self
                 .limits
@@ -8409,10 +8772,14 @@ impl Runtime {
                 .map_or(0, QuicheConnection::dgram_send_queue_byte_size),
             transport_datagram_receive_bytes: qconn
                 .map_or(0, QuicheConnection::dgram_recv_queue_byte_size),
-        }
+            ..WebTransportRetentionStats::default()
+        };
+        self.terminal_retention.augment_stats(&mut stats);
+        stats
     }
 
     pub(super) fn close_write_lease_admission(&self) {
+        self.terminal_retention.lock().open_admission_closed = true;
         self.write_lease_accounting.close();
     }
 
@@ -8443,6 +8810,26 @@ impl Runtime {
     }
 
     pub(crate) fn clear(&mut self) -> Vec<WebTransportSessionEvent> {
+        for request in self.capacity_opens.drain(..) {
+            let _ =
+                request
+                    .response
+                    .send(WebTransportOpenStreamOutcome::Rejected(
+                        WebTransportSelectionError::ConnectionClosed,
+                    ));
+        }
+        for (_, offer) in std::mem::take(&mut self.open_offers) {
+            offer.finish(WebTransportOpenStreamOutcome::Rejected(
+                WebTransportSelectionError::ConnectionClosed,
+            ));
+        }
+        self.capacity_open_work = 0;
+        self.open_offer_work = 0;
+        self.open_collection_work = 0;
+        self.reserved_open_ids.clear();
+        self.reserved_opens_per_session.clear();
+        self.reserved_bidi_opens = 0;
+        self.reserved_bidi_opens_per_session.clear();
         let events = self
             .sessions
             .iter()
@@ -8674,6 +9061,19 @@ fn shutdown_opening_stream(
         reservation.prefix_len() as u64,
         reservation.reset_mode(),
     );
+    consume_unaccepted_stop(qconn, reservation.stream_id());
+}
+
+fn consume_unaccepted_stop(qconn: &mut QuicheConnection, stream_id: u64) {
+    // No application has accepted this send direction. Receive shutdown may
+    // have been the last obligation after the reset/prefix were ACKed. This
+    // existing API consumes the provider's STOP and collects only if complete.
+    if matches!(
+        qconn.stream_send_status(stream_id),
+        Ok(quiche::StreamSendStatus::Stopped(_))
+    ) {
+        let _ = qconn.stream_capacity(stream_id);
+    }
 }
 
 fn shutdown_stream_send_direction(
@@ -8715,6 +9115,7 @@ fn shutdown_owned_stream(
 mod tests {
     use super::*;
     use assert_matches::assert_matches;
+    use futures::FutureExt;
 
     type DriverPipe = quiche::test_utils::Pipe<crate::buf_factory::BufFactory>;
 
@@ -8871,6 +9272,157 @@ mod tests {
     }
 
     #[test]
+    fn open_obligation_failed_owner_collection_continues_at_budget_one() {
+        let mut pipe = pipe();
+        pipe.server.stream_send(3, b"x", true).unwrap();
+        pipe.server
+            .stream_send(7, b"retained sibling", false)
+            .unwrap();
+        pipe.advance().unwrap();
+        assert_eq!(pipe.client.stream_recv(3, &mut [0; 1]), Ok((1, true)));
+        pipe.client.send_ack_eliciting().unwrap();
+        pipe.advance().unwrap();
+        assert!(pipe.server.stream_closed(3));
+        assert_eq!(
+            pipe.server.stream_send_status(3),
+            Err(quiche::Error::InvalidStreamState(3))
+        );
+
+        let (controller, mut recv, state, _leases) = terminal_controller();
+        {
+            let mut inner = state.lock();
+            inner.max_open_obligations = 2;
+            inner.max_open_obligations_per_session = 2;
+        }
+        let operation = controller
+            .try_open_stream_obligation(0, WebTransportStreamDirection::Uni)
+            .unwrap();
+        let WebTransportCommand::OpenObligation(shared) =
+            recv.try_recv().unwrap()
+        else {
+            panic!("registered open")
+        };
+        shared.finish(WebTransportOpenStreamOutcome::Rejected(
+            WebTransportSelectionError::InternalFailure,
+        ));
+        let mut runtime = Runtime::new(runtime_limits(8, 8, 1));
+        runtime.open_offers.insert(3, shared);
+        runtime.reserved_open_ids.insert(
+            3,
+            OwnedStream::new(0, WebTransportStreamDirection::Uni, 0, true),
+        );
+        runtime.reserved_opens_per_session.insert(0, 1);
+        runtime.insert_owned_stream(
+            7,
+            OwnedStream::new(0, WebTransportStreamDirection::Uni, 0, true),
+        );
+        runtime.maintenance_cursor = Some(3);
+        runtime.finish_opening(0, 3);
+        assert!(operation.now_or_never().unwrap().is_err());
+        assert_eq!(state.lock().open_obligations, 1);
+        runtime.process_work(&mut pipe.server); // visits the live sibling first
+        assert!(
+            runtime.has_work(),
+            "failed owner must retain its continuation"
+        );
+        let mut turns = 0;
+        while runtime.has_work() {
+            runtime.process_work(&mut pipe.server);
+            turns += 1;
+            assert!(turns <= 2);
+        }
+        assert_eq!(state.lock().open_obligations, 0);
+        assert!(runtime.stream_sessions.contains_key(&7));
+        assert!(!runtime.stream_sessions.contains_key(&3));
+    }
+
+    #[test]
+    fn open_obligation_lane_bounds_and_last_controller_cancellation() {
+        let (controller, mut recv, state, _leases) = terminal_controller();
+        {
+            let mut inner = state.lock();
+            inner.max_open_obligations = 2;
+            inner.max_open_obligations_per_session = 2;
+        }
+        let first = controller
+            .try_open_stream_obligation(0, WebTransportStreamDirection::Uni)
+            .unwrap();
+        let second = controller
+            .try_open_stream_obligation(0, WebTransportStreamDirection::Bidi)
+            .unwrap();
+        assert!(matches!(
+            controller
+                .try_open_stream_obligation(0, WebTransportStreamDirection::Uni),
+            Err(WebTransportOpenAdmissionError::QueueFull)
+        ));
+        let command = recv.try_recv().unwrap();
+        assert!(matches!(
+            controller
+                .try_open_stream_obligation(0, WebTransportStreamDirection::Uni),
+            Err(WebTransportOpenAdmissionError::RegistrationFull)
+        ));
+        drop(controller);
+        assert_eq!(first.cancel(), WebTransportOpenExposure::Unreserved);
+        // The operation retains only a bounded cancellation sender, not the
+        // driver. Its wake survives the last public controller's destruction.
+        let queued = recv.try_recv().unwrap();
+        assert!(matches!(
+            recv.try_recv(),
+            Ok(WebTransportCommand::PruneCancelledWaiters)
+        ));
+        command.reject_connection_closed();
+        queued.reject_connection_closed();
+        assert_eq!(
+            second.now_or_never().unwrap().unwrap_err().outcome,
+            WebTransportOpenStreamOutcome::Rejected(
+                WebTransportSelectionError::ConnectionClosed
+            )
+        );
+        assert_eq!(state.lock().open_obligations, 0);
+    }
+
+    #[test]
+    fn open_obligation_admission_close_race_settles_once() {
+        for _ in 0..64 {
+            let (controller, mut recv, state, _leases) = terminal_controller();
+            {
+                let mut inner = state.lock();
+                inner.max_open_obligations = 2;
+                inner.max_open_obligations_per_session = 2;
+            }
+            let barrier = std::sync::Barrier::new(2);
+            let operation = std::thread::scope(|scope| {
+                let task = scope.spawn(|| {
+                    barrier.wait();
+                    controller.try_open_stream_obligation(
+                        0,
+                        WebTransportStreamDirection::Uni,
+                    )
+                });
+                barrier.wait();
+                state.lock().open_admission_closed = true;
+                recv.close();
+                while let Ok(command) = recv.try_recv() {
+                    command.reject_connection_closed();
+                }
+                drop(recv);
+                task.join().unwrap()
+            });
+            match operation {
+                Ok(operation) => assert_eq!(
+                    operation.now_or_never().unwrap().unwrap_err().outcome,
+                    WebTransportOpenStreamOutcome::Rejected(
+                        WebTransportSelectionError::ConnectionClosed
+                    )
+                ),
+                Err(error) =>
+                    assert_eq!(error, WebTransportOpenAdmissionError::DriverGone),
+            }
+            assert_eq!(state.lock().open_obligations, 0);
+        }
+    }
+
+    #[test]
     fn terminal_retention_is_controller_bound_bounded_and_take_once() {
         let (controller, _recv, state, _write_leases) = terminal_controller();
         let clone = controller.clone();
@@ -8963,6 +9515,7 @@ mod tests {
             controller.try_take_terminal_retention(&claim),
             WebTransportTerminalRetentionOutcome::Early(
                 WebTransportTerminalRetentionPending {
+                    open_obligations: 0,
                     runtime_settled: true,
                     connection_owner_attached: true,
                     connection_owner_dropped: true,

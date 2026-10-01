@@ -153,7 +153,12 @@ pub use self::webtransport::WebTransportDatagramStats;
 pub use self::webtransport::WebTransportLiveConnectionSnapshot;
 pub use self::webtransport::WebTransportLiveConnectionSnapshotOperation;
 pub use self::webtransport::WebTransportLiveConnectionSnapshotOutcome;
+pub use self::webtransport::WebTransportOpenAdmissionError;
+pub use self::webtransport::WebTransportOpenExposure;
+pub use self::webtransport::WebTransportOpenFailure;
+pub use self::webtransport::WebTransportOpenOperation;
 pub use self::webtransport::WebTransportOpenStreamOutcome;
+pub use self::webtransport::WebTransportOpenedStream;
 pub use self::webtransport::WebTransportRetentionStats;
 pub use self::webtransport::WebTransportSelectionError;
 pub use self::webtransport::WebTransportSessionCloseError;
@@ -2983,6 +2988,9 @@ impl<H: DriverHooks> ApplicationOverQuic for H3Driver<H> {
     fn process_reads(&mut self, qconn: &mut QuicheConnection) -> QuicResult<()> {
         self.ensure_event_lane_available()?;
         self.process_raw_stream_reads(qconn)?;
+        if let Some(runtime) = self.webtransport.as_mut() {
+            runtime.schedule_open_collection();
+        }
 
         loop {
             match self.conn_mut()?.poll(qconn) {

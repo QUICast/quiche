@@ -549,6 +549,139 @@ fn assert_received_reliable_reset(
 }
 
 #[test]
+fn draining_receive_last_collects_after_send_ack() {
+    for reliable in [false, true] {
+        for peer_terminal in 0..3 {
+            for drain in [true, false] {
+                let mut pipe = reset_stream_at_pipe(64);
+                pipe.client.stream_send(0, b"prefix", false).unwrap();
+                if drain {
+                    pipe.client.stream_shutdown(0, Shutdown::Read, 77).unwrap();
+                }
+                if reliable {
+                    pipe.client.stream_shutdown_at(0, 77, 3).unwrap();
+                } else {
+                    pipe.client.stream_shutdown(0, Shutdown::Write, 77).unwrap();
+                }
+                let first = pipe.client.next_pkt_num;
+                let flight = test_utils::emit_flight(&mut pipe.client).unwrap();
+                let end = pipe.client.next_pkt_num;
+                assert!(!flight.is_empty());
+                test_utils::process_flight(&mut pipe.server, flight).unwrap();
+                // Deliberately deliver ACK alone. The peer's automatic reset must
+                // not ride in this packet and conceal receive-last ordering.
+                ack_client_packet_range(&mut pipe, first, end);
+                let stream = pipe.client.streams.get(0).unwrap();
+                assert!(stream.send.is_complete());
+                assert_eq!(stream.recv.is_draining(), drain);
+                assert!(!stream.is_complete());
+                let terminal = match peer_terminal {
+                    0 => frame::Frame::Stream {
+                        stream_id: 0,
+                        data: RangeBuf::from(b"late", 0, true),
+                    },
+                    1 => frame::Frame::ResetStream {
+                        stream_id: 0,
+                        error_code: 91,
+                        final_size: 4,
+                    },
+                    _ => frame::Frame::ResetStreamAt {
+                        stream_id: 0,
+                        error_code: 91,
+                        final_size: 4,
+                        reliable_size: 0,
+                    },
+                };
+                let mut packet = [0; 1280];
+                let written = test_utils::encode_pkt(
+                    &mut pipe.server,
+                    Type::Short,
+                    &[terminal],
+                    &mut packet,
+                )
+                .unwrap();
+                pipe.client_recv(&mut packet[..written]).unwrap();
+                if !drain {
+                    assert!(!pipe.client.streams.is_collected(0));
+                    let mut buf = [0; 4];
+                    if peer_terminal == 0 {
+                        assert_eq!(
+                            pipe.client.stream_recv(0, &mut buf),
+                            Ok((4, true))
+                        );
+                        assert_eq!(&buf, b"late");
+                    } else {
+                        assert_eq!(
+                            pipe.client.stream_recv(0, &mut buf),
+                            Err(Error::StreamReset(91))
+                        );
+                    }
+                }
+                assert!(
+                    pipe.client.streams.is_collected(0),
+                    "reliable={reliable} terminal={peer_terminal}"
+                );
+                assert_eq!(
+                    pipe.client.stream_send_status(0),
+                    Err(Error::InvalidStreamState(0))
+                );
+                assert_eq!(pipe.client.streams.tx_buffered(), 0);
+                assert_eq!(pipe.client.stream_send_queue_byte_size(), 0);
+                assert_eq!(pipe.client.stream_recv_queue_byte_size(), 0);
+            }
+        }
+    }
+}
+
+#[test]
+fn draining_receive_last_preserves_unobserved_stop() {
+    let mut pipe = reset_stream_at_pipe(64);
+    pipe.client.stream_send(0, b"prefix", false).unwrap();
+    let mut packet = [0; 1280];
+    let written = test_utils::encode_pkt(
+        &mut pipe.server,
+        Type::Short,
+        &[frame::Frame::StopSending {
+            stream_id: 0,
+            error_code: 91,
+        }],
+        &mut packet,
+    )
+    .unwrap();
+    pipe.client_recv(&mut packet[..written]).unwrap();
+    pipe.client.stream_shutdown(0, Shutdown::Read, 77).unwrap();
+    let first = pipe.client.next_pkt_num;
+    let flight = test_utils::emit_flight(&mut pipe.client).unwrap();
+    let end = pipe.client.next_pkt_num;
+    // The synthetic STOP has no server recovery entry. Do not feed its ACK
+    // back into that recovery instance; acknowledge the real client flight.
+    assert!(!flight.is_empty());
+    ack_client_packet_range(&mut pipe, first, end);
+    assert!(pipe.client.streams.get(0).unwrap().send.is_complete());
+    let written = test_utils::encode_pkt(
+        &mut pipe.server,
+        Type::Short,
+        &[frame::Frame::Stream {
+            stream_id: 0,
+            data: RangeBuf::from(b"", 0, true),
+        }],
+        &mut packet,
+    )
+    .unwrap();
+    pipe.client_recv(&mut packet[..written]).unwrap();
+    assert!(!pipe.client.streams.is_collected(0));
+    assert_eq!(
+        pipe.client.stream_send_status(0),
+        Ok(StreamSendStatus::Stopped(91))
+    );
+    assert_eq!(
+        pipe.client.stream_capacity(0),
+        Err(Error::StreamStopped(91))
+    );
+    assert!(pipe.client.streams.is_collected(0));
+}
+
+#[test]
 fn reset_stream_at_public_api_delivers_prefix_and_waits_for_ack() {
     let mut pipe = reset_stream_at_pipe(64);
     let stream_id = 2;

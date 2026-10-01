@@ -878,6 +878,103 @@ async fn accepted_close_client_first_udp_preserves_exact_reason() {
     .expect("accepted client close must settle without server drop");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn open_obligation_udp_retirement_releases_capacity_without_retry() {
+    timeout(Duration::from_secs(10), async {
+        let mut settings = BoundedSelectedWebTransportSettings::default();
+        settings.selected.max_active_streams = 1;
+        settings.selected.max_pending_streams = 2;
+        let mut quic = QuicSettings::default();
+        settings.apply_to_quic_settings(&mut quic);
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = socket.local_addr().unwrap();
+        let params = ConnectionParams::new_server(quic, TlsCertificatePaths {
+            cert: TEST_CERT_FILE, private_key: TEST_KEY_FILE, kind: CertificateKind::X509,
+        }, Hooks::default());
+        let mut incoming = listen(vec![socket], params, DefaultMetrics).unwrap().remove(0);
+        let accept = tokio::spawn(async move {
+            let initial = incoming.next().await.unwrap().unwrap();
+            let (driver, mut controller) = ServerH3Driver::new_bounded_selected_webtransport(settings).unwrap();
+            let connection = initial.start(driver);
+            let mut responder = loop {
+                if let BoundedServerWebTransportEvent::ConnectRequested { responder, .. } = controller.recv_event().await.unwrap() {
+                    break responder;
+                }
+            };
+            responder.try_send_response(response_headers(controller.connect_header_limits())).unwrap();
+            assert_matches!(server_session_event(&mut controller).await, WebTransportSessionEvent::Accepted { .. });
+            (controller, connection, responder, incoming)
+        });
+        let client_settings = BoundedSelectedWebTransportSettings::default();
+        let mut quic = QuicSettings::default();
+        client_settings.apply_to_quic_settings(&mut quic);
+        let params = ConnectionParams::new_client(quic, None, Hooks::default());
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        socket.connect(addr).await.unwrap();
+        let (driver, mut client) = ClientH3Driver::new_bounded_selected_webtransport(client_settings).unwrap();
+        let _connection = connect_with_config(Socket::try_from(socket).unwrap(), Some("localhost"), &params, driver).await.unwrap();
+        client.try_connect(139, connect_headers(client.connect_header_limits())).unwrap();
+        assert_matches!(client_session_event(&mut client).await, WebTransportSessionEvent::Accepted { .. });
+        let (mut server, _connection, responder, _listener) = accept.await.unwrap();
+        let selected = server.selected();
+        let peer = client.selected();
+        let claim = selected.terminal_retention_claim();
+        let peer_claim = peer.terminal_retention_claim();
+
+        // The receive-terminal owner, not merely FIN, holds the only slot.
+        let incoming = peer.try_open_stream_obligation(0, WebTransportStreamDirection::Uni).unwrap().await.unwrap().accept().unwrap();
+        write_complete(&peer, 0, incoming, b"held capacity", true).await;
+        assert_matches!(server_session_event(&mut server).await,
+            WebTransportSessionEvent::AssociatedStream { stream_id, .. } if stream_id == incoming);
+        selected.wait_stream_readable(0, incoming).await;
+        let held = assert_matches!(selected.read_stream(0, incoming, 64).await,
+            WebTransportStreamReadOutcome::Terminal(owner) => owner);
+        assert_eq!(held.data(), b"held capacity");
+        let mut waiting = Box::pin(selected.try_open_stream_obligation(0, WebTransportStreamDirection::Uni).unwrap());
+        let before = selected.retention_stats().await.unwrap();
+        assert_eq!(before.associated_streams, 1);
+        assert_eq!(before.open_obligations, 1);
+        assert!(futures::poll!(&mut waiting).is_pending());
+        assert_matches!(selected.retire_stream_receive_terminal(0, incoming).await,
+            WebTransportStreamReceiveTerminalRetirementOutcome::OutstandingRead { .. });
+        assert!(futures::poll!(&mut waiting).is_pending());
+        drop(held);
+        assert_matches!(selected.retire_stream_receive_terminal(0, incoming).await,
+            WebTransportStreamReceiveTerminalRetirementOutcome::Retired { .. });
+
+        // No retry, socket traffic generator, timer or stats polling drives it.
+        let outgoing = waiting.await.unwrap().accept().unwrap();
+        write_complete(&selected, 0, outgoing, b"resumed exactly once", true).await;
+        assert_matches!(client_session_event(&mut client).await,
+            WebTransportSessionEvent::AssociatedStream { stream_id, .. } if stream_id == outgoing);
+        peer.wait_stream_readable(0, outgoing).await;
+        let data = assert_matches!(peer.read_stream(0, outgoing, 64).await,
+            WebTransportStreamReadOutcome::Terminal(owner) => owner);
+        assert_eq!(data.data(), b"resumed exactly once");
+        drop(data);
+
+        server.close_session(0, 139, "capacity wait complete".into()).unwrap();
+        assert_matches!(server_session_event(&mut server).await,
+            WebTransportSessionEvent::Terminated { reason: WebTransportSessionCloseReason::Local { error_code: 139, .. }, .. });
+        assert_matches!(client_session_event(&mut client).await,
+            WebTransportSessionEvent::Terminated { reason: WebTransportSessionCloseReason::Peer { error_code: 139, .. }, .. });
+        drop(responder);
+        drop(server);
+        drop(client);
+        for (controller, claim) in [(selected, claim), (peer, peer_claim)] {
+            let stats = assert_matches!(controller.wait_terminal_retention(claim).await,
+                WebTransportTerminalRetentionOutcome::Taken(stats) => stats);
+            assert_eq!(stats.open_obligations, 0);
+            assert_eq!(stats.associated_streams, 0);
+            assert_eq!(stats.provisional_streams, 0);
+            assert_eq!(stats.waiters, 0);
+            assert_eq!(stats.receive_terminal_leases, 0);
+            assert_eq!(stats.transport_queued_bytes(), 0);
+            assert!(stats.open_obligation_admitted_total > 0);
+        }
+    }).await.expect("local open obligation or terminal settlement stalled");
+}
+
 async fn bounded_connect_fin_completion(
     server_first: bool, drop_after_admission: bool,
 ) {

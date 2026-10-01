@@ -1146,6 +1146,13 @@ impl BoundedSelectedWebTransportSettings {
             mem::size_of::<WebTransportCommand>(),
             "selected command lane",
         )?;
+        let selected_open_obligation_metadata =
+            webtransport::open_obligation_metadata_upper_bound(
+                self.selected.selected_command_capacity,
+            )
+            .ok_or(BoundedProfileError::ArithmeticOverflow(
+                "selected open obligations",
+            ))?;
         let bounded_connect_close_metadata = mem::size_of::<
             BoundedConnectCloseOwnership,
         >() + 2 * mem::size_of::<usize>();
@@ -1284,6 +1291,7 @@ impl BoundedSelectedWebTransportSettings {
             bounded_client_connect_owner_metadata,
             bounded_connect_close_metadata,
             selected_command_lane,
+            selected_open_obligation_metadata,
             h3_command_lane,
             h3_command_payloads,
             h3_event_lane,
@@ -1322,6 +1330,7 @@ impl BoundedSelectedWebTransportSettings {
             bounded_client_connect_owner_metadata,
             bounded_connect_close_metadata,
             selected_command_lane,
+            selected_open_obligation_metadata,
             h3_command_lane,
             h3_command_payloads,
             h3_event_lane,
@@ -1345,6 +1354,9 @@ impl BoundedSelectedWebTransportSettings {
 /// Checked dynamic user-space envelope components for one connection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BoundedDynamicMemoryComponents {
+    /// Independent waiting-open registrations, reservation/offer indexes, and
+    /// caller-held result owners. No payload backing is retained here.
+    pub selected_open_obligation_metadata: usize,
     /// Copied stream payload backing retained through ACK/reset/stop.
     pub stream_send_backing: usize,
     /// In-structure metadata for retained stream-send chunks.
@@ -1516,6 +1528,16 @@ pub struct AppliedBoundedWebTransportProfile {
 }
 
 impl AppliedBoundedWebTransportProfile {
+    /// Independent aggregate open-operation/result ownership bound.
+    pub fn max_open_obligations(&self) -> usize {
+        self.selected.selected_command_capacity
+    }
+
+    /// Independent per-session open-operation/result ownership bound.
+    pub fn max_open_obligations_per_session(&self) -> usize {
+        self.selected.max_pending_streams
+    }
+
     /// Returns the exact WebTransport handshake selected from peer SETTINGS.
     ///
     /// A successfully published applied profile always returns `Some`. The
@@ -1888,6 +1910,17 @@ pub struct BoundedSelectedWebTransportController {
 }
 
 impl BoundedSelectedWebTransportController {
+    /// Registers a bounded, cancellation-safe open that waits for genuine local
+    /// capacity and peer stream credit. Success must be explicitly accepted.
+    pub fn try_open_stream_obligation(
+        &self, session_id: u64, direction: super::WebTransportStreamDirection,
+    ) -> Result<
+        super::WebTransportOpenOperation,
+        super::WebTransportOpenAdmissionError,
+    > {
+        self.inner.try_open_stream_obligation(session_id, direction)
+    }
+
     fn new(
         inner: WebTransportController, max_concurrent_reads: usize,
         client_connect_ownership: Option<Arc<BoundedClientConnectOwnership>>,
@@ -2805,6 +2838,7 @@ fn check_setting(
 
 #[cfg(test)]
 mod tests {
+    use crate::http3::driver::WebTransportSelectionError;
     use futures_util::FutureExt;
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
@@ -2995,6 +3029,12 @@ mod tests {
     impl BoundedCloseHarness {
         async fn active(peer_credit: u64) -> Self {
             let settings = BoundedSelectedWebTransportSettings::default();
+            Self::with_settings(settings, peer_credit).await
+        }
+
+        async fn with_settings(
+            settings: BoundedSelectedWebTransportSettings, peer_credit: u64,
+        ) -> Self {
             let mut config = bounded_core_config(settings);
             let mut peer_config = bounded_core_config(settings);
             peer_config.set_initial_max_stream_data_bidi_local(peer_credit);
@@ -3117,6 +3157,456 @@ mod tests {
                 Ok((0, quiche::h3::Event::Finished))
             );
         }
+    }
+
+    #[tokio::test]
+    async fn open_obligation_precommit_stop_settles_after_failure_delivery() {
+        let mut h = BoundedCloseHarness::active(4096).await;
+        let selected = h.controller.as_ref().unwrap().selected();
+        // Hold the application commit, not QUIC prefix acceptance or recovery.
+        for _ in 0..512 {
+            h.driver
+                .webtransport
+                .as_mut()
+                .unwrap()
+                .inject_commit_error(quiche::h3::Error::StreamBlocked);
+        }
+        let mut operation = Box::pin(
+            selected
+                .try_open_stream_obligation(0, WebTransportStreamDirection::Bidi)
+                .unwrap(),
+        );
+        h.turn();
+        assert!(futures::poll!(&mut operation).is_pending());
+        h.pipe.advance().unwrap();
+        assert_matches!(
+            h.peer.poll(&mut h.pipe.client),
+            Ok((1, quiche::h3::Event::WebTransportStream { .. }))
+        );
+        h.pipe
+            .client
+            .stream_shutdown(1, quiche::Shutdown::Read, 77)
+            .unwrap();
+        h.pipe.client.stream_send(1, &[], true).unwrap();
+        for _ in 0..16 {
+            h.pipe.advance().unwrap();
+            let _ = h.pipe.client.stream_recv(1, &mut [0; 16]);
+        }
+        assert_matches!(
+            h.pipe.server.stream_send_status(1),
+            Ok(quiche::StreamSendStatus::Stopped(77))
+        );
+        // Only write callbacks now: no H3 read, fresh packet, or timer may
+        // accidentally consume the receive terminal and hide this exit.
+        for _ in 0..16 {
+            h.driver.process_writes(&mut h.pipe.server).unwrap();
+        }
+        let failure = operation.await.unwrap_err();
+        assert_matches!(
+            failure.outcome,
+            WebTransportOpenStreamOutcome::ResetRequired {
+                wire_error_code: 77,
+                ..
+            }
+        );
+        h.driver.process_writes(&mut h.pipe.server).unwrap();
+        assert_eq!(
+            h.pipe.server.stream_send_status(1),
+            Err(quiche::Error::InvalidStreamState(1))
+        );
+        let stats =
+            server_retention_stats(&selected, &mut h.driver, &mut h.pipe).await;
+        assert_eq!(stats.open_obligations, 0);
+        assert_eq!(stats.associated_streams, 0);
+        assert_eq!(stats.provisional_streams, 0);
+    }
+
+    #[tokio::test]
+    async fn open_obligation_held_offer_drop_after_peer_terminal_and_ack() {
+        for reset in [false, true] {
+            let mut h = BoundedCloseHarness::active(4096).await;
+            let selected = h.controller.as_ref().unwrap().selected();
+            let operation = selected
+                .try_open_stream_obligation(0, WebTransportStreamDirection::Bidi)
+                .unwrap();
+            h.turn();
+            let offer = operation.await.unwrap();
+            h.pipe.advance().unwrap();
+            assert_matches!(
+                h.peer.poll(&mut h.pipe.client),
+                Ok((1, quiche::h3::Event::WebTransportStream { .. }))
+            );
+            h.pipe
+                .client
+                .stream_shutdown(1, quiche::Shutdown::Read, 77)
+                .unwrap();
+            if reset {
+                h.pipe
+                    .client
+                    .stream_shutdown(1, quiche::Shutdown::Write, 91)
+                    .unwrap();
+            } else {
+                h.pipe.client.stream_send(1, &[], true).unwrap();
+            }
+            for _ in 0..16 {
+                h.pipe.advance().unwrap();
+                h.turn();
+                let _ = h.pipe.client.stream_recv(1, &mut [0; 16]);
+            }
+            assert_matches!(
+                h.pipe.server.stream_send_status(1),
+                Ok(quiche::StreamSendStatus::Stopped(77))
+            );
+            assert_eq!(
+                server_retention_stats(&selected, &mut h.driver, &mut h.pipe)
+                    .await
+                    .open_obligations,
+                1
+            );
+            drop(offer);
+            // No packet, ACK, timer, or peer activity after the handoff drop.
+            h.turn();
+            assert_eq!(
+                h.pipe.server.stream_send_status(1),
+                Err(quiche::Error::InvalidStreamState(1))
+            );
+            let stats =
+                server_retention_stats(&selected, &mut h.driver, &mut h.pipe)
+                    .await;
+            assert_eq!(stats.open_obligations, 0);
+            assert_eq!(stats.associated_streams, 0);
+            assert_eq!(stats.send_terminal_states, 0);
+            assert_eq!(stats.receive_terminal_states, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn open_obligation_cancel_serializes_with_real_transport_progress() {
+        for prefix in [false, true] {
+            let mut h = BoundedCloseHarness::active(4096).await;
+            let selected = h.controller.as_ref().unwrap().selected();
+            let operation = selected
+                .try_open_stream_obligation(0, WebTransportStreamDirection::Uni)
+                .unwrap();
+            let barrier = operation.pause_after_progress(prefix);
+            let exposure = std::thread::scope(|scope| {
+                let cancellation = scope.spawn(move || {
+                    barrier.wait();
+                    operation.cancel()
+                });
+                h.turn();
+                cancellation.join().unwrap()
+            });
+            assert_matches!(exposure, super::super::WebTransportOpenExposure::Reserved { prefix_bytes_accepted, .. }
+                if if prefix { prefix_bytes_accepted == 3 } else { prefix_bytes_accepted <= 3 });
+            h.turn();
+            assert_eq!(
+                server_retention_stats(&selected, &mut h.driver, &mut h.pipe)
+                    .await
+                    .open_obligations,
+                1
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn open_obligation_local_capacity_and_cancelled_handoff() {
+        for direction in [
+            WebTransportStreamDirection::Uni,
+            WebTransportStreamDirection::Bidi,
+        ] {
+            let mut settings = BoundedSelectedWebTransportSettings::default();
+            settings.selected.max_active_streams = 1;
+            settings.selected.max_pending_streams = 2;
+            let mut h = BoundedCloseHarness::with_settings(settings, 4096).await;
+            let selected = h.controller.as_ref().unwrap().selected();
+            let first =
+                selected.try_open_stream_obligation(0, direction).unwrap();
+            h.turn();
+            let first = first.await.unwrap();
+            // A queued/returned offer owns the sole active slot. Local capacity
+            // pressure does not reject or allocate another physical ID.
+            let mut second = Box::pin(
+                selected.try_open_stream_obligation(0, direction).unwrap(),
+            );
+            h.turn();
+            assert!(futures::poll!(&mut second).is_pending());
+            let before =
+                server_retention_stats(&selected, &mut h.driver, &mut h.pipe)
+                    .await;
+            assert_eq!(before.associated_streams, 1);
+            assert_eq!(before.open_obligations, 2);
+            for _ in 0..32 {
+                h.driver.process_writes(&mut h.pipe.server).unwrap();
+            }
+            let idle =
+                server_retention_stats(&selected, &mut h.driver, &mut h.pipe)
+                    .await;
+            assert_eq!(
+                idle.stream_open_waiter_work_total,
+                before.stream_open_waiter_work_total
+            );
+            assert!(futures::poll!(&mut second).is_pending());
+
+            // Drop after success is queued and consumed, but before acceptance.
+            drop(first);
+            h.turn();
+            assert!(
+                futures::poll!(&mut second).is_pending(),
+                "RESET admission is not collection"
+            );
+            for _ in 0..32 {
+                h.pipe.advance().unwrap();
+                while let Ok((id, event)) = h.peer.poll(&mut h.pipe.client) {
+                    if matches!(
+                        event,
+                        quiche::h3::Event::WebTransportStream { .. }
+                    ) {
+                        let _ = h.pipe.client.stream_recv(id, &mut [0; 16]);
+                    }
+                }
+                h.turn();
+                if let std::task::Poll::Ready(result) =
+                    futures::poll!(&mut second)
+                {
+                    let id = result.unwrap().accept().unwrap();
+                    assert_eq!(
+                        id & 3,
+                        if direction == WebTransportStreamDirection::Bidi {
+                            1
+                        } else {
+                            3
+                        }
+                    );
+                    h.turn();
+                    let stats = server_retention_stats(
+                        &selected,
+                        &mut h.driver,
+                        &mut h.pipe,
+                    )
+                    .await;
+                    assert_eq!(stats.open_obligations, 0);
+                    assert_eq!(stats.associated_streams, 1);
+                    break;
+                }
+            }
+            assert_eq!(
+                server_retention_stats(&selected, &mut h.driver, &mut h.pipe)
+                    .await
+                    .open_obligations,
+                0
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn open_obligation_queued_drop_registration_and_terminal_accounting() {
+        let mut settings = BoundedSelectedWebTransportSettings::default();
+        settings.selected.max_pending_streams = 1;
+        let mut h = BoundedCloseHarness::with_settings(settings, 4096).await;
+        let selected = h.controller.as_ref().unwrap().selected();
+        let operation = selected
+            .try_open_stream_obligation(0, WebTransportStreamDirection::Uni)
+            .unwrap();
+        assert!(matches!(
+            selected
+                .try_open_stream_obligation(0, WebTransportStreamDirection::Uni),
+            Err(super::super::WebTransportOpenAdmissionError::RegistrationFull)
+        ));
+        drop(operation); // No poll or driver exposure.
+        h.turn();
+        let stats =
+            server_retention_stats(&selected, &mut h.driver, &mut h.pipe).await;
+        assert_eq!(stats.associated_streams, 0);
+        assert_eq!(stats.open_obligations, 0);
+
+        let operation = selected
+            .try_open_stream_obligation(0, WebTransportStreamDirection::Uni)
+            .unwrap();
+        h.turn();
+        let before =
+            server_retention_stats(&selected, &mut h.driver, &mut h.pipe).await;
+        assert_eq!(
+            before.associated_streams, 1,
+            "queued offer must exist: {before:?}"
+        );
+        // Leave success queued in the operation, rather than consuming it.
+        drop(operation);
+        h.turn();
+        let stats =
+            server_retention_stats(&selected, &mut h.driver, &mut h.pipe).await;
+        assert_eq!(
+            stats.open_obligations, 1,
+            "core RESET still owns this opening"
+        );
+        assert_eq!(stats.associated_streams, 1);
+
+        let held = selected
+            .try_open_stream_obligation(4, WebTransportStreamDirection::Uni)
+            .unwrap();
+        h.turn();
+        let hook = h.driver.connection_owner_drop_hook().unwrap();
+        let owner = hook.install();
+        drop(h.driver);
+        drop(h.pipe);
+        drop(owner);
+        let claim = selected.terminal_retention_claim();
+        assert_matches!(selected.try_take_terminal_retention(&claim),
+            WebTransportTerminalRetentionOutcome::Early(pending) if pending.open_obligations == 1);
+        drop(held);
+        assert_matches!(selected.try_take_terminal_retention(&claim),
+            WebTransportTerminalRetentionOutcome::Taken(stats) if stats.open_obligations == 0 && stats.open_obligations_high_water != 0);
+    }
+
+    #[tokio::test]
+    async fn open_obligation_competing_waiters_and_release_before_registration() {
+        let mut settings = BoundedSelectedWebTransportSettings::default();
+        settings.selected.max_active_streams = 1;
+        settings.selected.max_pending_streams = 4;
+        let mut h = BoundedCloseHarness::with_settings(settings, 4096).await;
+        let selected = h.controller.as_ref().unwrap().selected();
+        let first = selected
+            .try_open_stream_obligation(0, WebTransportStreamDirection::Uni)
+            .unwrap();
+        h.turn();
+        let first = first.await.unwrap();
+        // Baseline witness: the legacy API refuses this same local pressure.
+        let legacy = selected.open_unidirectional_stream(0);
+        tokio::pin!(legacy);
+        assert!(futures::poll!(&mut legacy).is_pending());
+        h.turn();
+        assert_eq!(
+            legacy.await,
+            WebTransportOpenStreamOutcome::Rejected(
+                WebTransportSelectionError::ResourceLimit
+            )
+        );
+        let mut pending = (0..3)
+            .map(|_| {
+                Some(Box::pin(
+                    selected
+                        .try_open_stream_obligation(
+                            0,
+                            WebTransportStreamDirection::Uni,
+                        )
+                        .unwrap(),
+                ))
+            })
+            .collect::<Vec<_>>();
+        h.turn();
+        for operation in &mut pending {
+            assert!(futures::poll!(operation.as_mut().unwrap()).is_pending());
+        }
+        drop(first);
+        let mut completed = 0;
+        for _ in 0..128 {
+            h.pipe.advance().unwrap();
+            while let Ok((id, event)) = h.peer.poll(&mut h.pipe.client) {
+                if matches!(event, quiche::h3::Event::WebTransportStream { .. }) {
+                    let _ = h.pipe.client.stream_recv(id, &mut [0; 16]);
+                }
+            }
+            h.turn();
+            for operation in &mut pending {
+                if let Some(future) = operation.as_mut() {
+                    if let std::task::Poll::Ready(result) = futures::poll!(future)
+                    {
+                        drop(result.unwrap());
+                        *operation = None;
+                        completed += 1;
+                    }
+                }
+            }
+            let stats =
+                server_retention_stats(&selected, &mut h.driver, &mut h.pipe)
+                    .await;
+            assert!(stats.associated_streams <= 1);
+            if completed == 3 && stats.open_obligations == 0 {
+                break;
+            }
+        }
+        assert_eq!(completed, 3);
+        assert_eq!(
+            server_retention_stats(&selected, &mut h.driver, &mut h.pipe)
+                .await
+                .open_obligations,
+            0
+        );
+        // Register after the release, without relying on an old wake edge.
+        let next = selected
+            .try_open_stream_obligation(0, WebTransportStreamDirection::Bidi)
+            .unwrap();
+        h.turn();
+        assert_eq!(next.await.unwrap().accept().unwrap() & 3, 1);
+    }
+
+    #[tokio::test]
+    async fn open_obligation_session_close_preserves_unaccepted_core_owner() {
+        let mut settings = BoundedSelectedWebTransportSettings::default();
+        settings.selected.max_active_streams = 1;
+        settings.selected.max_pending_streams = 2;
+        let mut h = BoundedCloseHarness::with_settings(settings, 4096).await;
+        let selected = h.controller.as_ref().unwrap().selected();
+        let operation = selected
+            .try_open_stream_obligation(0, WebTransportStreamDirection::Uni)
+            .unwrap();
+        h.turn();
+        let offer = operation.await.unwrap();
+        h.pipe.advance().unwrap();
+        assert_matches!(
+            h.peer.poll(&mut h.pipe.client),
+            Ok((_, quiche::h3::Event::WebTransportStream { .. }))
+        );
+        let waiting = selected
+            .try_open_stream_obligation(0, WebTransportStreamDirection::Bidi)
+            .unwrap();
+        h.turn();
+        h.close(139, "close with offers");
+        h.turn();
+        let failure = waiting.await.unwrap_err();
+        assert_eq!(
+            failure.outcome,
+            WebTransportOpenStreamOutcome::Rejected(
+                WebTransportSelectionError::ClosingSession
+            )
+        );
+        assert_eq!(
+            failure.exposure,
+            super::super::WebTransportOpenExposure::Unreserved
+        );
+        assert_eq!(offer.accept().unwrap_err().outcome, failure.outcome);
+        h.receive_close(139, "close with offers");
+        h.peer.send_body(&mut h.pipe.client, 0, &[], true).unwrap();
+        h.pipe.advance().unwrap();
+        h.turn();
+        assert_eq!(
+            server_retention_stats(&selected, &mut h.driver, &mut h.pipe)
+                .await
+                .open_obligations,
+            1,
+            "reset issuance must not release its core owner"
+        );
+        for _ in 0..64 {
+            h.pipe.advance().unwrap();
+            while let Ok((id, event)) = h.peer.poll(&mut h.pipe.client) {
+                if matches!(event, quiche::h3::Event::WebTransportStream { .. }) {
+                    let _ = h.pipe.client.stream_recv(id, &mut [0; 16]);
+                }
+            }
+            h.turn();
+            if server_retention_stats(&selected, &mut h.driver, &mut h.pipe)
+                .await
+                .open_obligations ==
+                0
+            {
+                break;
+            }
+        }
+        let stats =
+            server_retention_stats(&selected, &mut h.driver, &mut h.pipe).await;
+        assert_eq!(stats.open_obligations, 0);
+        assert_eq!(stats.associated_streams, 0);
+        assert_eq!(stats.sessions, 0);
     }
 
     #[tokio::test]
