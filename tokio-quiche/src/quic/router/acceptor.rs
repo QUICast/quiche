@@ -45,6 +45,7 @@ use crate::metrics::labels;
 use crate::metrics::Metrics;
 use crate::quic::addr_validation_token::AddrValidationTokenManager;
 use crate::quic::connection::SharedConnectionIdGenerator;
+use crate::quic::listener::ReleaseToken;
 use crate::quic::router::NewConnection;
 use crate::quic::Incoming;
 use crate::settings::QuicTransportEgressStats;
@@ -60,6 +61,7 @@ pub(crate) struct ConnectionAcceptor<S, M> {
     token_manager: AddrValidationTokenManager,
     cid_generator: SharedConnectionIdGenerator,
     metrics: M,
+    release: Option<ReleaseToken>,
 }
 
 pub(crate) struct ConnectionAcceptorConfig {
@@ -88,7 +90,13 @@ where
             token_manager,
             cid_generator,
             metrics,
+            release: None,
         }
+    }
+
+    pub(crate) fn track_release(&mut self, mut token: ReleaseToken) {
+        token.mark_container();
+        self.release = Some(token);
     }
 
     fn accept_conn(
@@ -165,7 +173,8 @@ where
             self.metrics.send_to_wouldblock_duration_s();
         let transport_egress_stats = self.config.transport_egress_stats.clone();
 
-        spawn_with_killswitch(async move {
+        let token = self.release.as_ref().map(ReleaseToken::child);
+        spawn_with_killswitch(ReleaseToken::hold(token, async move {
             let send_buf = &send_buf[..written];
             let to = incoming.peer_addr;
 
@@ -206,7 +215,7 @@ where
                     stats.record_udp_payload_bytes_sent(bytes_sent);
                 }
             }
-        });
+        }));
 
         Ok(None)
     }

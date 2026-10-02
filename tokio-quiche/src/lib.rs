@@ -155,6 +155,14 @@ pub use crate::quic::connection::ConnectionIdGenerator;
 pub use crate::quic::connection::ConnectionOwnerDropHook;
 pub use crate::quic::connection::InitialQuicConnection;
 pub use crate::quic::connection::QuicConnection;
+pub use crate::quic::listener::QuicListenerCompletion;
+pub use crate::quic::listener::QuicListenerEndpoint;
+pub use crate::quic::listener::QuicListenerFailure;
+pub use crate::quic::listener::QuicListenerStartupError;
+pub use crate::quic::listener::QuicListenerStartupFailure;
+pub use crate::quic::listener::QuicListenerTerminal;
+pub use crate::quic::listener::QuicListenerTerminalOutcome;
+pub use crate::quic::listener::QuicListenerTerminalWait;
 pub use crate::result::BoxError;
 pub use crate::result::QuicResult;
 pub use crate::settings::ConnectionParams;
@@ -231,13 +239,15 @@ impl InitialBacklogOverflowEvents {
 /// Errors from processing the client's QUIC initials can also be emitted on
 /// this stream. These do not indicate that the listener itself has failed.
 pub struct QuicConnectionStream<M: Metrics> {
-    connections: mpsc::Receiver<io::Result<InitialQuicConnection<UdpSocket, M>>>,
+    connections: quic::listener::AcceptReceiver<
+        io::Result<InitialQuicConnection<UdpSocket, M>>,
+    >,
     overflow_events: watch::Receiver<Option<InitialBacklogOverflow>>,
 }
 
 impl<M: Metrics> QuicConnectionStream<M> {
     pub(crate) fn new(
-        connections: mpsc::Receiver<
+        connections: quic::listener::AcceptReceiver<
             io::Result<InitialQuicConnection<UdpSocket, M>>,
         >,
         overflow_events: watch::Receiver<Option<InitialBacklogOverflow>>,
@@ -265,7 +275,10 @@ impl<M: Metrics> QuicConnectionStream<M> {
         self.connections.try_recv()
     }
 
-    /// Closes the accepted-connection lane and asks the listener to shut down.
+    /// Stops admission and wakes an idle router. Buffered Initials can still
+    /// be drained; delivered connections continue routing until they release
+    /// their shutdown ownership. This is not completion: use
+    /// [`listen_with_completion`] to retain independent task authority.
     pub fn close(&mut self) {
         self.connections.close();
     }
@@ -316,7 +329,10 @@ where
 
     sockets
         .into_iter()
-        .map(|s| crate::quic::start_listener(s, &params, metrics.clone()))
+        .map(|s| {
+            crate::quic::start_listener(s, &params, metrics.clone())
+                .map(|endpoint| endpoint.incoming)
+        })
         .collect()
 }
 
@@ -343,6 +359,101 @@ where
         .collect::<io::Result<_>>()?;
 
     listen_with_capabilities(quic_sockets, params, metrics)
+}
+
+/// Starts listeners with independent, take-once router completion capabilities.
+///
+/// The input socket collection bounds endpoint/handle count. A later conversion
+/// or startup failure returns all earlier endpoints, already closed for
+/// admission, in [`QuicListenerStartupError`]. No cleanup authority is
+/// discarded. Binding sockets before calling this API remains the caller's
+/// responsibility. Requires a Tokio runtime; a missing runtime returns a
+/// startup error.
+pub fn listen_with_completion<S, M>(
+    sockets: impl IntoIterator<Item = S>, params: ConnectionParams, metrics: M,
+) -> Result<Vec<QuicListenerEndpoint<M>>, QuicListenerStartupError<M>>
+where
+    S: TryInto<QuicListener, Error = io::Error>,
+    M: Metrics,
+{
+    start_listeners_with_completion(
+        sockets.into_iter().map(|socket| {
+            #[cfg_attr(not(target_os = "linux"), expect(unused_mut))]
+            let mut socket = socket.try_into()?;
+            #[cfg(target_os = "linux")]
+            socket.apply_max_capabilities();
+            Ok(socket)
+        }),
+        params,
+        metrics,
+    )
+}
+
+/// Like [`listen_with_completion`], with already configured socket
+/// capabilities. Earlier endpoints and their cleanup authority survive partial
+/// startup errors.
+pub fn listen_with_capabilities_and_completion<M: Metrics>(
+    sockets: impl IntoIterator<Item = QuicListener>, params: ConnectionParams,
+    metrics: M,
+) -> Result<Vec<QuicListenerEndpoint<M>>, QuicListenerStartupError<M>> {
+    start_listeners_with_completion(sockets.into_iter().map(Ok), params, metrics)
+}
+
+fn start_listeners_with_completion<M: Metrics>(
+    mut sockets: impl Iterator<Item = io::Result<QuicListener>>,
+    params: ConnectionParams, metrics: M,
+) -> Result<Vec<QuicListenerEndpoint<M>>, QuicListenerStartupError<M>> {
+    let mut started: Vec<QuicListenerEndpoint<M>> = Vec::new();
+    if let Err(error) = tokio::runtime::Handle::try_current() {
+        return Err(QuicListenerStartupError {
+            error: io::Error::other(error),
+            started,
+            failure: QuicListenerStartupFailure::RuntimeUnavailable,
+        });
+    }
+    if params.settings.capture_quiche_logs {
+        capture_quiche_logs();
+    }
+    loop {
+        let attempt =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                sockets.next().map(|socket| {
+                    socket.and_then(|socket| {
+                        crate::quic::start_listener(
+                            socket,
+                            &params,
+                            metrics.clone(),
+                        )
+                    })
+                })
+            }));
+        let (error, failure) = match attempt {
+            Ok(None) => return Ok(started),
+            Ok(Some(Ok(endpoint))) => {
+                started.push(endpoint);
+                continue;
+            },
+            Ok(Some(Err(error))) => {
+                let failure = QuicListenerStartupFailure::Io(error.kind());
+                (error, failure)
+            },
+            Err(payload) => {
+                drop(payload);
+                (
+                    io::Error::other("listener construction panicked"),
+                    QuicListenerStartupFailure::Panicked,
+                )
+            },
+        };
+        for endpoint in &mut started {
+            endpoint.incoming.close();
+        }
+        return Err(QuicListenerStartupError {
+            error,
+            started,
+            failure,
+        });
+    }
 }
 
 static GLOBAL_LOGGER_ONCE: Once = Once::new();

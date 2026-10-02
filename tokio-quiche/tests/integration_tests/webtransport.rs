@@ -52,6 +52,7 @@ use tokio_quiche::http3::driver::WebTransportStreamWriteLease;
 use tokio_quiche::http3::driver::WebTransportStreamWriteLeaseOutcome;
 use tokio_quiche::http3::driver::WebTransportTerminalRetentionOutcome;
 use tokio_quiche::listen;
+use tokio_quiche::listen_with_completion;
 use tokio_quiche::metrics::DefaultMetrics;
 use tokio_quiche::quic::connect_with_config;
 use tokio_quiche::quiche::h3::Header;
@@ -63,6 +64,8 @@ use tokio_quiche::socket::Socket;
 use tokio_quiche::ClientH3Driver;
 use tokio_quiche::ConnectionOwnerDropHook;
 use tokio_quiche::ConnectionParams;
+use tokio_quiche::QuicListenerCompletion;
+use tokio_quiche::QuicListenerTerminalOutcome;
 use tokio_quiche::QuicResult;
 use tokio_quiche::ServerH3Driver;
 
@@ -1112,6 +1115,89 @@ async fn inbound_refusal_udp_history_preserves_siblings_and_terminal_zero() {
             assert_eq!(stats.transport_queued_bytes(), 0);
         }
     }).await.expect("inbound refusal or authentic cleanup stalled");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn listener_completion_udp_preserves_delivered_connections_and_zero() {
+    timeout(Duration::from_secs(10), async {
+        let settings = BoundedSelectedWebTransportSettings::default();
+        let mut quic = QuicSettings::default();
+        settings.apply_to_quic_settings(&mut quic);
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = socket.local_addr().unwrap();
+        let params = ConnectionParams::new_server(quic, TlsCertificatePaths {
+            cert: TEST_CERT_FILE, private_key: TEST_KEY_FILE, kind: CertificateKind::X509,
+        }, Hooks::default());
+        let mut endpoint = listen_with_completion([socket], params, DefaultMetrics).unwrap().remove(0);
+        let (delivered_tx, mut delivered) = tokio::sync::mpsc::channel(2);
+        let accept = tokio::spawn(async move {
+            for _ in 0..2 {
+                let initial = endpoint.incoming.recv().await.unwrap().unwrap();
+                let (driver, mut controller) = ServerH3Driver::new_bounded_selected_webtransport(settings).unwrap();
+                let connection = initial.start(driver);
+                let mut responder = loop {
+                    if let BoundedServerWebTransportEvent::ConnectRequested { responder, .. } = controller.recv_event().await.unwrap() { break responder; }
+                };
+                responder.try_send_response(response_headers(controller.connect_header_limits())).unwrap();
+                assert_matches!(server_session_event(&mut controller).await, WebTransportSessionEvent::Accepted { .. });
+                delivered_tx.send((controller, connection, responder)).await.unwrap();
+            }
+            endpoint.incoming.close();
+            endpoint.incoming.close();
+            drop(endpoint.incoming);
+            endpoint.terminal
+        });
+        let mut pairs = Vec::new();
+        for request in 0..2 {
+            let mut quic = QuicSettings::default();
+            settings.apply_to_quic_settings(&mut quic);
+            let params = ConnectionParams::new_client(quic, None, Hooks::default());
+            let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            socket.connect(addr).await.unwrap();
+            let (driver, mut client) = ClientH3Driver::new_bounded_selected_webtransport(settings).unwrap();
+            let conn = connect_with_config(Socket::try_from(socket).unwrap(), Some("localhost"), &params, driver).await.unwrap();
+            client.try_connect(request, connect_headers(client.connect_header_limits())).unwrap();
+            assert_matches!(client_session_event(&mut client).await, WebTransportSessionEvent::Accepted { .. });
+            let (server, server_conn, responder) = delivered.recv().await.unwrap();
+            pairs.push((client, conn, server, server_conn, responder));
+        }
+        // The application admission task is actually joined, not inferred gone.
+        let mut terminal = accept.await.unwrap();
+        assert_eq!(terminal.try_take(), QuicListenerTerminalOutcome::Pending);
+        for (n, (mut client, _client_conn, mut server, _server_conn, responder)) in pairs.into_iter().enumerate() {
+            // Second connection must still transfer fresh data AFTER the first
+            // has independently reached authentic terminal ownership zero.
+            let selected = server.selected();
+            let peer = client.selected();
+            let claim = selected.terminal_retention_claim();
+            let peer_claim = peer.terminal_retention_claim();
+            let id = selected.try_open_stream_obligation(0, WebTransportStreamDirection::Uni).unwrap().await.unwrap().accept().unwrap();
+            assert_matches!(client_session_event(&mut client).await, WebTransportSessionEvent::AssociatedStream { stream_id, .. } if stream_id == id);
+            let expected = format!("post-admission fresh sibling {n}");
+            write_complete(&selected, 0, id, expected.as_bytes(), true).await;
+            peer.wait_stream_readable(0, id).await;
+            let read = assert_matches!(peer.read_stream(0, id, 128).await, WebTransportStreamReadOutcome::Terminal(owner) => owner);
+            assert_eq!(read.data(), expected.as_bytes());
+            assert_eq!(read.terminal(), WebTransportStreamReceiveTerminal::Fin);
+            assert_matches!(peer.retire_stream_receive_terminal(0, id).await, WebTransportStreamReceiveTerminalRetirementOutcome::OutstandingRead { .. });
+            drop(read);
+            peer.retire_stream_receive_terminal(0, id).await;
+            selected.retire_stream_send_terminal(0, id).await;
+            server.close_session(0, 139, "listener test".into()).unwrap();
+            assert_matches!(server_session_event(&mut server).await, WebTransportSessionEvent::Terminated { .. });
+            assert_matches!(client_session_event(&mut client).await, WebTransportSessionEvent::Terminated { .. });
+            drop((responder, client, server));
+            for (controller, claim) in [(selected, claim), (peer, peer_claim)] {
+                let stats = assert_matches!(controller.wait_terminal_retention(claim).await, WebTransportTerminalRetentionOutcome::Taken(stats) => stats);
+                assert_eq!(stats.transport_queued_bytes(), 0);
+                assert_eq!(stats.adapter_bytes_upper_bound(), 0);
+                assert_eq!(stats.associated_streams + stats.sessions + stats.queued_commands + stats.waiters + stats.write_leases + stats.receive_terminal_leases + stats.open_obligations, 0);
+            }
+            if n == 0 { assert_eq!(terminal.try_take(), QuicListenerTerminalOutcome::Pending); }
+        }
+        assert_eq!(terminal.wait().await, QuicListenerTerminalOutcome::Taken(QuicListenerCompletion::Clean));
+        assert_eq!(terminal.try_take(), QuicListenerTerminalOutcome::AlreadyTaken);
+    }).await.expect("listener or independent connection completion stalled");
 }
 
 async fn bounded_connect_fin_completion(

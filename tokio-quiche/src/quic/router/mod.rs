@@ -34,6 +34,8 @@ use super::connection::IncomingPacketSource;
 use super::connection::InitialQuicConnection;
 use super::connection::QuicConnectionParams;
 use super::io::worker::WriterConfig;
+use super::listener::AcceptReceiver;
+use super::listener::ReleaseToken;
 use super::QuicheConnection;
 use crate::metrics::labels;
 use crate::metrics::quic_expensive_metrics_ip_reduce;
@@ -44,6 +46,7 @@ use crate::InitialBacklogOverflow;
 use datagram_socket::DatagramSocketRecv;
 use datagram_socket::DatagramSocketSend;
 use foundations::telemetry::log;
+use futures::task::AtomicWaker;
 use quiche::ConnectionId;
 use quiche::Header;
 use quiche::MAX_CONN_ID_LEN;
@@ -74,7 +77,18 @@ use libc::sockaddr_in;
 #[cfg(target_os = "linux")]
 use libc::sockaddr_in6;
 
-type ConnStream<Tx, M> = mpsc::Receiver<io::Result<InitialQuicConnection<Tx, M>>>;
+type ConnStream<Tx, M> = AcceptReceiver<io::Result<InitialQuicConnection<Tx, M>>>;
+
+#[derive(Debug)]
+pub(super) struct ConnectionMapLaneSaturated;
+
+impl std::fmt::Display for ConnectionMapLaneSaturated {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("bounded Connection-ID map command lane saturated")
+    }
+}
+
+impl std::error::Error for ConnectionMapLaneSaturated {}
 
 /// How many incoming packets (GRO batches) to process before checking the
 /// `ConnectionMapCommand` queue again. 30 means "check the command queue once
@@ -314,6 +328,8 @@ where
     /// should be 0 outside of `poll_conn_map_commands`.
     conn_map_cmd_buf: Vec<ConnectionMapCommand>,
     accept_sink: mpsc::Sender<io::Result<InitialQuicConnection<Tx, M>>>,
+    admission_wake: Arc<AtomicWaker>,
+    release: Option<ReleaseToken>,
     initial_backlog_overflow_sink: watch::Sender<Option<InitialBacklogOverflow>>,
     initial_backlog_overflow_total: u64,
     metrics: M,
@@ -350,6 +366,7 @@ where
     ) {
         let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
         let (accept_sink, accept_stream) = mpsc::channel(config.listen_backlog);
+        let admission_wake = Arc::new(AtomicWaker::new());
         let (initial_backlog_overflow_sink, initial_backlog_overflow_stream) =
             watch::channel(None);
         let (conn_map_cmd_tx, conn_map_cmd_rx) = connection_map_command_channel(
@@ -369,6 +386,8 @@ where
                 conn_map_cmd_rx,
                 conn_map_cmd_buf: Vec::with_capacity(CONN_MAP_CMD_BATCH_SIZE),
                 accept_sink,
+                admission_wake: Arc::clone(&admission_wake),
+                release: None,
                 initial_backlog_overflow_sink,
                 initial_backlog_overflow_total: 0,
                 #[cfg(target_os = "linux")]
@@ -399,9 +418,23 @@ where
                 metrics,
 
             },
-            accept_stream,
+            AcceptReceiver::new(accept_stream, admission_wake),
             initial_backlog_overflow_stream,
         )
+    }
+
+    pub(crate) fn track_release(&mut self, token: ReleaseToken) {
+        self.release = Some(token);
+    }
+
+    fn shutdown_result(&self) -> io::Result<()> {
+        // Closing the last worker guard synchronizes its earlier map sends.
+        // Recheck AFTER observing that closure, not only at poll entry.
+        if self.conn_map_cmd_rx.overloaded() {
+            Err(io::Error::other(ConnectionMapLaneSaturated))
+        } else {
+            Ok(())
+        }
     }
 
     fn on_incoming(&mut self, mut incoming: Incoming) -> io::Result<()> {
@@ -914,7 +947,7 @@ where
 
         if cmd_rx.overloaded() {
             return Poll::Ready(Err(io::Error::other(
-                "bounded Connection-ID map command lane saturated",
+                ConnectionMapLaneSaturated,
             )));
         }
 
@@ -990,7 +1023,15 @@ where
     type Output = io::Result<()>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
+        self.admission_wake.register(cx.waker());
         loop {
+            // An already-latched fail-stop cannot become clean just because
+            // admission and the final connection happen to close together.
+            if self.conn_map_cmd_rx.overloaded() {
+                return Poll::Ready(Err(io::Error::other(
+                    ConnectionMapLaneSaturated,
+                )));
+            }
             // First, check whether the app stopped accepting connections.
             if self.shutdown_tx.is_some() && self.accept_sink.is_closed() {
                 self.shutdown_tx = None;
@@ -1000,7 +1041,7 @@ where
             if self.shutdown_tx.is_none() &&
                 self.shutdown_rx.poll_recv(cx).is_ready()
             {
-                return Poll::Ready(Ok(()));
+                return Poll::Ready(self.shutdown_result());
             }
 
             // Third, run the generic `InitialPacketHandler` update.
@@ -1008,9 +1049,10 @@ where
                 // An error here is so rare that it's easier to spawn a separate
                 // task
                 let sender = self.accept_sink.clone();
-                spawn_with_killswitch(async move {
+                let token = self.release.as_ref().map(ReleaseToken::child);
+                spawn_with_killswitch(ReleaseToken::hold(token, async move {
                     let _ = sender.send(Err(error)).await;
-                });
+                }));
             }
 
             // Fourth, update ConnectionMap before receiving packets. This ensures
@@ -1386,6 +1428,329 @@ mod tests {
             _quiche_config: &mut quiche::Config,
         ) -> io::Result<Option<NewConnection>> {
             Ok(None)
+        }
+    }
+
+    struct PendingReceiver;
+
+    impl DatagramSocketRecv for PendingReceiver {
+        fn poll_recv(
+            &mut self, _cx: &mut Context, _buf: &mut tokio::io::ReadBuf,
+        ) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    fn listener_params() -> ConnectionParams<'static> {
+        ConnectionParams::new_server(
+            QuicSettings::default(),
+            TlsCertificatePaths {
+                cert: TEST_CERT_FILE,
+                private_key: TEST_KEY_FILE,
+                kind: crate::settings::CertificateKind::X509,
+            },
+            Hooks::default(),
+        )
+    }
+
+    #[tokio::test]
+    async fn listener_completion_rechecks_overload_after_last_worker_releases() {
+        let mut params = listener_params();
+        params.settings.connection_map_command_capacity = Some(1);
+        let (mut router, accepted, _) = InboundPacketRouter::new(
+            Config::new(&params, SocketCapabilities::default()).unwrap(),
+            Arc::new(NoopDatagramSender),
+            PendingReceiver,
+            SocketAddr::from(([127, 0, 0, 1], 4433)),
+            NoopInitialHandler,
+            DefaultMetrics,
+        );
+        let final_guard = router.shutdown_tx.as_ref().unwrap().clone();
+        drop(accepted);
+        router.shutdown_tx = None;
+        assert!(!router.conn_map_cmd_rx.overloaded()); // poll-entry check
+        let command = || {
+            ConnectionMapCommand::UnmapCid(
+                ConnectionId::from_ref(&[7]).into_owned(),
+            )
+        };
+        router.conn_map_cmd_tx.send(command()).unwrap();
+        assert!(router.conn_map_cmd_tx.send(command()).is_err());
+        drop(final_guard); // final worker races between entry and clean gate
+        assert!(router
+            .shutdown_rx
+            .poll_recv(&mut Context::from_waker(std::task::Waker::noop()))
+            .is_ready());
+        assert!(router
+            .shutdown_result()
+            .unwrap_err()
+            .get_ref()
+            .unwrap()
+            .is::<ConnectionMapLaneSaturated>());
+    }
+
+    #[tokio::test]
+    async fn listener_completion_queued_and_delivered_initials_own_grace() {
+        for overloaded in [false, true] {
+            let mut params = listener_params();
+            params.settings.listen_backlog = 1;
+            params.settings.connection_map_command_capacity = Some(1);
+            let socket = Arc::new(NoopDatagramSender);
+            let weak_socket = Arc::downgrade(&socket);
+            let local = SocketAddr::from(([127, 0, 0, 1], 4433));
+            let peer = SocketAddr::from(([127, 0, 0, 1], 4434));
+            let (mut router, mut accepted, overflow) = InboundPacketRouter::new(
+                Config::new(&params, SocketCapabilities::default()).unwrap(),
+                socket,
+                PendingReceiver,
+                local,
+                NoopInitialHandler,
+                DefaultMetrics,
+            );
+            let commands = router.conn_map_cmd_tx.clone();
+            let (root, release) = ReleaseToken::new();
+            accepted.track_release(root.child());
+            router.track_release(root);
+            router
+                .spawn_new_connection(
+                    test_new_connection(1, local, peer),
+                    local,
+                    peer,
+                )
+                .unwrap();
+            let first = accepted.recv().await.unwrap().unwrap();
+            let weak_ingress = first.incoming_ev_sender.downgrade();
+            router
+                .spawn_new_connection(
+                    test_new_connection(2, local, peer),
+                    local,
+                    peer,
+                )
+                .unwrap();
+            let second = accepted.recv().await.unwrap().unwrap();
+            router
+                .spawn_new_connection(
+                    test_new_connection(3, local, peer),
+                    local,
+                    peer,
+                )
+                .unwrap();
+            assert!(router
+                .spawn_new_connection(
+                    test_new_connection(4, local, peer),
+                    local,
+                    peer
+                )
+                .is_err());
+            assert_eq!(overflow.borrow().unwrap().rejected_total, 1);
+            if overloaded {
+                let command = || {
+                    ConnectionMapCommand::UnmapCid(
+                        ConnectionId::from_ref(&[42]).into_owned(),
+                    )
+                };
+                commands.send(command()).unwrap();
+                assert!(commands.send(command()).is_err());
+            }
+            accepted.close();
+            accepted.close();
+            let mut terminal = super::super::listener::spawn_router(
+                DefaultMetrics,
+                router,
+                release,
+            );
+            // Failure as well as clean completion must wait for backlog release.
+            {
+                let wait = terminal.wait();
+                tokio::pin!(wait);
+                assert!(futures::poll!(&mut wait).is_pending());
+            }
+            drop(accepted);
+            if !overloaded {
+                assert_eq!(
+                    terminal.try_take(),
+                    crate::QuicListenerTerminalOutcome::Pending
+                );
+                drop(first);
+                assert_eq!(
+                    terminal.try_take(),
+                    crate::QuicListenerTerminalOutcome::Pending
+                );
+                drop(second);
+            } else {
+                // Failure does not forge delivered-connection completion.
+                assert_eq!(terminal.wait().await, crate::QuicListenerTerminalOutcome::Taken(crate::QuicListenerCompletion::Failed(crate::QuicListenerFailure::ConnectionMapCommandLaneSaturated)));
+                assert!(weak_socket.upgrade().is_some());
+                drop((first, second));
+            }
+            if !overloaded {
+                assert_eq!(
+                    terminal.wait().await,
+                    crate::QuicListenerTerminalOutcome::Taken(
+                        crate::QuicListenerCompletion::Clean
+                    )
+                );
+            }
+            assert!(weak_socket.upgrade().is_none());
+            assert!(weak_ingress.upgrade().is_none());
+            assert!(commands
+                .send(ConnectionMapCommand::UnmapCid(
+                    ConnectionId::from_ref(&[42]).into_owned()
+                ))
+                .is_err());
+            assert!(overflow.has_changed().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn listener_completion_waits_for_authentic_retry_reply_resources() {
+        struct SendControl {
+            allowed: AtomicBool,
+            wake: AtomicWaker,
+            entered: tokio::sync::Notify,
+        }
+        struct HeldSend(Arc<SendControl>);
+        impl DatagramSocketSend for HeldSend {
+            fn poll_send(
+                &self, cx: &mut Context, buf: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                self.0.wake.register(cx.waker());
+                self.0.entered.notify_one();
+                if self.0.allowed.load(Ordering::Acquire) {
+                    Poll::Ready(Ok(buf.len()))
+                } else {
+                    Poll::Pending
+                }
+            }
+
+            fn poll_send_to(
+                &self, cx: &mut Context, buf: &[u8], _addr: SocketAddr,
+            ) -> Poll<io::Result<usize>> {
+                self.poll_send(cx, buf)
+            }
+        }
+        let control = Arc::new(SendControl {
+            allowed: AtomicBool::new(false),
+            wake: AtomicWaker::new(),
+            entered: tokio::sync::Notify::new(),
+        });
+        let socket = Arc::new(HeldSend(Arc::clone(&control)));
+        let weak = Arc::downgrade(&socket);
+        let local = SocketAddr::from(([127, 0, 0, 1], 4433));
+        let peer = SocketAddr::from(([127, 0, 0, 1], 4434));
+        let config =
+            Config::new(&listener_params(), SocketCapabilities::default())
+                .unwrap();
+        let (root, release) = ReleaseToken::new();
+        let mut acceptor = ConnectionAcceptor::new(
+            ConnectionAcceptorConfig {
+                disable_client_ip_validation: false,
+                qlog_dir: None,
+                qlog_compression: Default::default(),
+                keylog_file: None,
+                #[cfg(target_os = "linux")]
+                with_pktinfo: false,
+                transport_egress_stats: None,
+            },
+            Arc::clone(&socket),
+            Default::default(),
+            Arc::new(SimpleConnectionIdGenerator),
+            DefaultMetrics,
+        );
+        acceptor.track_release(root.child());
+        let (mut router, mut accepted, _) = InboundPacketRouter::new(
+            config,
+            socket,
+            PendingReceiver,
+            local,
+            acceptor,
+            DefaultMetrics,
+        );
+        accepted.track_release(root.child());
+        router.track_release(root);
+        let mut client_config =
+            crate::http3::driver::test_utils::default_quiche_config();
+        let mut client = quiche::connect(
+            None,
+            &ConnectionId::from_ref(&[9; 16]),
+            peer,
+            local,
+            &mut client_config,
+        )
+        .unwrap();
+        let mut buf = vec![0; MAX_DATAGRAM_SIZE];
+        let (len, _) = client.send(&mut buf).unwrap();
+        buf.truncate(len);
+        router
+            .on_incoming(Incoming {
+                peer_addr: peer,
+                local_addr: local,
+                buf,
+                rx_time: None,
+                gro: None,
+                #[cfg(target_os = "linux")]
+                so_mark_data: None,
+            })
+            .unwrap();
+        control.entered.notified().await;
+        drop(accepted);
+        let mut terminal =
+            super::super::listener::spawn_router(DefaultMetrics, router, release);
+        {
+            let wait = terminal.wait();
+            tokio::pin!(wait);
+            assert!(futures::poll!(&mut wait).is_pending());
+        }
+        assert!(weak.upgrade().is_some());
+        control.allowed.store(true, Ordering::Release);
+        control.wake.wake();
+        assert_eq!(
+            terminal.wait().await,
+            crate::QuicListenerTerminalOutcome::Taken(
+                crate::QuicListenerCompletion::Clean
+            )
+        );
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn listener_completion_idle_admission_close_wakes_router() {
+        struct WakeCount(std::sync::atomic::AtomicUsize);
+        impl std::task::Wake for WakeCount {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let params = ConnectionParams::new_server(
+            QuicSettings::default(),
+            TlsCertificatePaths {
+                cert: TEST_CERT_FILE,
+                private_key: TEST_KEY_FILE,
+                kind: crate::settings::CertificateKind::X509,
+            },
+            Hooks::default(),
+        );
+        for explicit_close in [false, true] {
+            let (mut router, mut accepted, _) = InboundPacketRouter::new(
+                Config::new(&params, SocketCapabilities::default()).unwrap(),
+                Arc::new(NoopDatagramSender),
+                PendingReceiver,
+                SocketAddr::from(([127, 0, 0, 1], 4433)),
+                NoopInitialHandler,
+                DefaultMetrics,
+            );
+            let count = Arc::new(WakeCount(Default::default()));
+            let waker = std::task::Waker::from(Arc::clone(&count));
+            let mut cx = Context::from_waker(&waker);
+            assert!(router.poll_unpin(&mut cx).is_pending());
+            if explicit_close {
+                accepted.close();
+            } else {
+                drop(accepted);
+            }
+            // No packet, timer, or subsequent poll can manufacture this wake.
+            assert!(count.0.load(Ordering::SeqCst) > 0);
+            assert!(matches!(router.poll_unpin(&mut cx), Poll::Ready(Ok(()))));
         }
     }
 

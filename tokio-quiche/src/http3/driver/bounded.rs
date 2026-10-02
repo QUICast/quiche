@@ -608,6 +608,13 @@ impl BoundedSelectedWebTransportSettings {
     /// margin covers response-channel bookkeeping/alignment and executor state;
     /// the checked components charge provider-associated response value
     /// storage.
+    ///
+    /// This does not bound endpoint stateless Retry/version-negotiation send
+    /// tasks. Their existing population has no configured finite ceiling.
+    /// The fixed listener component covers completion observation only; each
+    /// helper also retains the reported inline tracking bytes, its existing
+    /// buffers and executor storage. A whole-service hard memory proof must
+    /// address that separate pre-admission population.
     pub fn checked_memory_envelope(
         self, endpoint: BoundedWebTransportEndpoint,
     ) -> Result<BoundedMemoryEnvelope, BoundedProfileError> {
@@ -653,6 +660,10 @@ impl BoundedSelectedWebTransportSettings {
 
         let worker = self.io.expected_profile();
         let fixed_pools = BoundedFixedPoolCeilings {
+            listener_completion_metadata_bytes:
+                crate::quic::listener::completion_metadata_bytes(),
+            listener_auxiliary_task_tracking_bytes:
+                crate::quic::listener::auxiliary_tracking_bytes(),
             shared_egress_bytes_per_worker: worker
                 .send_buffer_pool_capacity_per_worker
                 .checked_mul(worker.send_buffer_allocation_bytes)
@@ -1440,6 +1451,15 @@ pub struct BoundedDynamicMemoryComponents {
 /// Fixed reusable-pool ceilings charged separately from dynamic retention.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BoundedFixedPoolCeilings {
+    /// Inline tracking value per existing auxiliary send task, NOT an aggregate
+    /// ceiling. Retry/version-negotiation task count remains uncapped. Excluded
+    /// from `fixed_egress_bytes`; full task/buffer storage is separate too.
+    pub listener_auxiliary_task_tracking_bytes: usize,
+    /// Per-endpoint fixed admission-wake and completion value storage. Task,
+    /// waker/executor and allocator overhead remain in the implementation
+    /// margin. Charged once, not once per connection; no payloads or
+    /// histories are kept.
+    pub listener_completion_metadata_bytes: usize,
     /// Full-size shared egress storage per Tokio runtime worker.
     pub shared_egress_bytes_per_worker: usize,
     /// Per-connection one-MTU fallback while the shared pool is leased out.
@@ -1483,6 +1503,11 @@ impl BoundedMemoryEnvelope {
             .and_then(|total| {
                 total.checked_add(
                     self.fixed_pools.connection_map_command_lane_bytes,
+                )
+            })
+            .and_then(|total| {
+                total.checked_add(
+                    self.fixed_pools.listener_completion_metadata_bytes,
                 )
             })
             .ok_or(BoundedProfileError::ArithmeticOverflow(

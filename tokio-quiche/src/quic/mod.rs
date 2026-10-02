@@ -106,6 +106,7 @@ mod addr_validation_token;
 pub(crate) mod connection;
 mod hooks;
 mod io;
+pub(crate) mod listener;
 pub mod raw;
 mod router;
 
@@ -296,7 +297,7 @@ where
 
 pub(crate) fn start_listener<M>(
     socket: QuicListener, params: &ConnectionParams, metrics: M,
-) -> std::io::Result<QuicConnectionStream<M>>
+) -> std::io::Result<crate::QuicListenerEndpoint<M>>
 where
     M: Metrics,
 {
@@ -312,7 +313,8 @@ where
     let socket_tx = Arc::new(socket.socket);
     let socket_rx = Arc::clone(&socket_tx);
 
-    let acceptor = ConnectionAcceptor::new(
+    let (release_token, release) = listener::ReleaseToken::new();
+    let mut acceptor = ConnectionAcceptor::new(
         ConnectionAcceptorConfig {
             disable_client_ip_validation: config.disable_client_ip_validation,
             qlog_dir: config.qlog_dir.clone(),
@@ -335,7 +337,8 @@ where
         metrics.clone(),
     );
 
-    let (socket_driver, accept_stream, initial_backlog_overflows) =
+    acceptor.track_release(release_token.child());
+    let (mut socket_driver, mut accept_stream, initial_backlog_overflows) =
         InboundPacketRouter::new(
             config,
             socket_tx,
@@ -345,18 +348,14 @@ where
             metrics.clone(),
         );
 
-    crate::metrics::tokio_task::spawn("quic_udp_listener", metrics, async move {
-        match socket_driver.await {
-            Ok(()) => {
-                log::trace!("incoming packet router finished");
-            },
-            Err(error) => {
-                log::error!("incoming packet router failed"; "error"=>error);
-            },
-        }
-    });
-    Ok(QuicConnectionStream::new(
-        accept_stream,
-        initial_backlog_overflows,
-    ))
+    accept_stream.track_release(release_token.child());
+    socket_driver.track_release(release_token);
+    let terminal = listener::spawn_router(metrics, socket_driver, release);
+    Ok(crate::QuicListenerEndpoint {
+        incoming: QuicConnectionStream::new(
+            accept_stream,
+            initial_backlog_overflows,
+        ),
+        terminal,
+    })
 }

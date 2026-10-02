@@ -36,6 +36,7 @@
 
 use crate::metrics::Metrics;
 use foundations::telemetry::TelemetryContext;
+use futures::future::Either;
 use pin_project::pin_project;
 use std::future::Future;
 use std::pin::Pin;
@@ -177,6 +178,78 @@ where
         tokio::spawn(Instrumented::new(name, metrics, ctx.apply(future)))
     } else {
         tokio::spawn(ctx.apply(future))
+    }
+}
+
+/// Listener joins retain a finite failure rather than an arbitrary panic
+/// payload. Cover the instrumentation too, without adding a monitor task.
+pub(crate) fn spawn_catching<M, T>(
+    name: &str, metrics: M, future: T,
+) -> JoinHandle<Result<T::Output, ()>>
+where
+    T: Future + Send + 'static,
+    T::Output: Send + 'static,
+    M: Metrics,
+{
+    let ctx = TelemetryContext::current();
+    let future = if cfg!(feature = "tokio-task-metrics") {
+        Either::Left(Instrumented::new(name, metrics, ctx.apply(future)))
+    } else {
+        // Construction must not spawn a router and then unwind while dropping
+        // unused user metrics, before its completion handle can be returned.
+        drop(metrics);
+        Either::Right(ctx.apply(future))
+    };
+    tokio::spawn(CatchingTask {
+        future: Some(Box::pin(future)),
+    })
+}
+
+// One construction-time allocation, never a teardown allocation. Keep even a
+// panic in an instrumented future's destructor out of the retained JoinError.
+struct CatchingTask<F> {
+    future: Option<Pin<Box<F>>>,
+}
+
+impl<F> CatchingTask<F> {
+    fn release(&mut self) -> Result<(), ()> {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            drop(self.future.take());
+        }))
+        .map_err(drop)
+    }
+}
+
+impl<F: Future> Future for CatchingTask<F> {
+    type Output = Result<F::Output, ()>;
+
+    fn poll(
+        mut self: Pin<&mut Self>, cx: &mut Context<'_>,
+    ) -> Poll<Self::Output> {
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.future
+                    .as_mut()
+                    .expect("polled after completion")
+                    .as_mut()
+                    .poll(cx)
+            }));
+        match result {
+            Ok(Poll::Pending) => Poll::Pending,
+            Ok(Poll::Ready(output)) =>
+                Poll::Ready(self.release().map(|()| output)),
+            Err(payload) => {
+                drop(payload);
+                let _ = self.release();
+                Poll::Ready(Err(()))
+            },
+        }
+    }
+}
+
+impl<F> Drop for CatchingTask<F> {
+    fn drop(&mut self) {
+        let _ = self.release();
     }
 }
 
