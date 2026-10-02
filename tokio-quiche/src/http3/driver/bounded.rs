@@ -603,7 +603,11 @@ impl BoundedSelectedWebTransportSettings {
     /// Allocator metadata, TLS/backend fixed state, and collection-node
     /// rounding belong in the embedding fixed margin. Kernel queues and a
     /// caller-owned write-lease payload are not charged to the Rust dynamic
-    /// ceiling.
+    /// ceiling. Diagnostic replies retained after provider response handoff
+    /// and application snapshot copies are caller-owned too. The implementation
+    /// margin covers response-channel bookkeeping/alignment and executor state;
+    /// the checked components charge provider-associated response value
+    /// storage.
     pub fn checked_memory_envelope(
         self, endpoint: BoundedWebTransportEndpoint,
     ) -> Result<BoundedMemoryEnvelope, BoundedProfileError> {
@@ -1146,6 +1150,13 @@ impl BoundedSelectedWebTransportSettings {
             mem::size_of::<WebTransportCommand>(),
             "selected command lane",
         )?;
+        let selected_retention_snapshot_values =
+            webtransport::retention_snapshot_value_storage(
+                self.selected.selected_command_capacity,
+            )
+            .ok_or(BoundedProfileError::ArithmeticOverflow(
+                "selected retention snapshot values",
+            ))?;
         let selected_open_obligation_metadata =
             webtransport::open_obligation_metadata_upper_bound(
                 self.selected.selected_command_capacity,
@@ -1291,6 +1302,7 @@ impl BoundedSelectedWebTransportSettings {
             bounded_client_connect_owner_metadata,
             bounded_connect_close_metadata,
             selected_command_lane,
+            selected_retention_snapshot_values,
             selected_open_obligation_metadata,
             h3_command_lane,
             h3_command_payloads,
@@ -1330,6 +1342,7 @@ impl BoundedSelectedWebTransportSettings {
             bounded_client_connect_owner_metadata,
             bounded_connect_close_metadata,
             selected_command_lane,
+            selected_retention_snapshot_values,
             selected_open_obligation_metadata,
             h3_command_lane,
             h3_command_payloads,
@@ -1354,6 +1367,11 @@ impl BoundedSelectedWebTransportSettings {
 /// Checked dynamic user-space envelope components for one connection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BoundedDynamicMemoryComponents {
+    /// Retention-stat response value storage for C reserved/queued requests
+    /// plus one executing request, where C is selected command capacity.
+    /// Channel metadata/alignment belongs to the implementation margin.
+    /// Replies are caller-owned once the provider relinquishes their senders.
+    pub selected_retention_snapshot_values: usize,
     /// Independent waiting-open registrations, reservation/offer indexes, and
     /// caller-held result owners. No payload backing is retained here.
     pub selected_open_obligation_metadata: usize,
@@ -4664,6 +4682,55 @@ mod tests {
                 configured,
             }) if actual_required == required && configured == required - 1
         ));
+    }
+
+    #[test]
+    fn inbound_refusal_snapshot_storage_is_charged_and_checked() {
+        let value = mem::size_of::<
+            Result<
+                WebTransportRetentionStats,
+                super::super::WebTransportDatagramError,
+            >,
+        >();
+        assert_eq!(
+            webtransport::retention_snapshot_value_storage(0),
+            Some(value)
+        );
+        assert_eq!(
+            webtransport::retention_snapshot_value_storage(usize::MAX),
+            None
+        );
+        assert_eq!(
+            webtransport::retention_snapshot_value_storage(usize::MAX / value),
+            None
+        );
+        for endpoint in [
+            BoundedWebTransportEndpoint::Server,
+            BoundedWebTransportEndpoint::Client,
+        ] {
+            let settings = BoundedSelectedWebTransportSettings::default();
+            let envelope = settings.checked_memory_envelope(endpoint).unwrap();
+            assert_eq!(
+                envelope
+                    .dynamic_components
+                    .selected_retention_snapshot_values,
+                (settings.selected.selected_command_capacity + 1) * value
+            );
+            let mut exact = settings;
+            exact.dynamic_retained_memory_ceiling =
+                envelope.dynamic_components.total;
+            assert!(exact.checked_memory_envelope(endpoint).is_ok());
+            exact.dynamic_retained_memory_ceiling -= 1;
+            assert_matches!(
+                exact.checked_memory_envelope(endpoint),
+                Err(BoundedProfileError::DynamicEnvelopeTooSmall { .. })
+            );
+            eprintln!("INT139_INBOUND_ENVELOPE endpoint={endpoint:?} history_bytes={} snapshot_bytes={} reply_bytes={value} reply_storage={} dynamic_total={}",
+                mem::size_of::<super::super::WebTransportInboundStreamRefusalStats>(),
+                mem::size_of::<WebTransportRetentionStats>(),
+                envelope.dynamic_components.selected_retention_snapshot_values,
+                envelope.dynamic_components.total);
+        }
     }
 
     #[test]

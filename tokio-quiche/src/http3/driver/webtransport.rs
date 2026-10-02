@@ -1213,6 +1213,75 @@ impl Drop for WebTransportLiveConnectionSnapshotOperation {
     }
 }
 
+/// Native inbound associated-stream capacity refusals since driver creation.
+///
+/// Exactly one counter increments per refusal decision, including promotion
+/// from provisional buffering. The first failed predicate wins: buffering
+/// checks provisional connection/session then active connection/session;
+/// active admission checks active connection/session then receive-terminal
+/// connection/session. Later predicates are not attributed. A session counter
+/// identifies the limiting scope, not one particular session's history.
+///
+/// Successful admissions, outbound opens, `WT_SESSION_GONE`/invalid
+/// associations, provisional expiry and terminal-read byte/waiter refusals are
+/// excluded. Capacity refusals while waiting for the peer CONNECT-close barrier
+/// count even if the session's local terminal event has already been emitted.
+/// Snapshots do not reset history; the existing take-once terminal accounting
+/// preserves it after connection cleanup. No IDs, payloads or owners are kept.
+/// These counters provide neither per-stream terminal facts nor retry rights.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct WebTransportInboundStreamRefusalStats {
+    /// Active capacity at connection scope, including reservations/buffering
+    /// counted by the native decision being made.
+    pub active_connection: u64,
+    /// Active capacity at per-session scope.
+    pub active_session: u64,
+    /// Provisional capacity at connection scope.
+    pub provisional_connection: u64,
+    /// Provisional capacity at per-session scope.
+    pub provisional_session: u64,
+    /// Retained receive-terminal observation capacity at connection scope.
+    pub receive_terminal_connection: u64,
+    /// Retained receive-terminal observation capacity at per-session scope.
+    pub receive_terminal_session: u64,
+    /// Sticky incompleteness flag: an increment exceeded `u64::MAX`. Counters
+    /// saturate, never wrap. Reaching exactly `u64::MAX` is still complete.
+    pub overflowed: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StreamAdmissionRefusal {
+    ActiveConnection,
+    ActiveSession,
+    ProvisionalConnection,
+    ProvisionalSession,
+    ReceiveTerminalConnection,
+    ReceiveTerminalSession,
+}
+
+impl WebTransportInboundStreamRefusalStats {
+    fn record(&mut self, reason: StreamAdmissionRefusal) {
+        let count = match reason {
+            StreamAdmissionRefusal::ActiveConnection =>
+                &mut self.active_connection,
+            StreamAdmissionRefusal::ActiveSession => &mut self.active_session,
+            StreamAdmissionRefusal::ProvisionalConnection =>
+                &mut self.provisional_connection,
+            StreamAdmissionRefusal::ProvisionalSession =>
+                &mut self.provisional_session,
+            StreamAdmissionRefusal::ReceiveTerminalConnection =>
+                &mut self.receive_terminal_connection,
+            StreamAdmissionRefusal::ReceiveTerminalSession =>
+                &mut self.receive_terminal_session,
+        };
+        if let Some(next) = count.checked_add(1) {
+            *count = next;
+        } else {
+            self.overflowed = true;
+        }
+    }
+}
+
 /// Point-in-time native WebTransport retention accounting.
 ///
 /// Byte counters distinguish physical `DgramBuffer` allocation from logical
@@ -1222,6 +1291,9 @@ impl Drop for WebTransportLiveConnectionSnapshotOperation {
 /// `Bytes` source allocations retained by the application.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct WebTransportRetentionStats {
+    /// Connection-lifetime native inbound capacity-refusal history. These are
+    /// decisions, not current owners or retry/terminal authority.
+    pub inbound_stream_refusals: WebTransportInboundStreamRefusalStats,
     /// Pending, active, closing, or terminal session records.
     pub sessions: usize,
     /// Associated streams currently owned by native WebTransport.
@@ -3745,6 +3817,12 @@ impl WebTransportController {
     }
 
     /// Returns bounded runtime, adapter-lane, and QUIC queue accounting.
+    ///
+    /// Includes cumulative inbound refusal history. After the command lane
+    /// closes, use the existing take-once terminal retention result instead.
+    /// The provider charges response values while it holds their senders;
+    /// after synchronous response handoff, unconsumed replies and copied
+    /// snapshots are caller-owned diagnostic storage, not transport retention.
     pub async fn retention_stats(
         &self,
     ) -> Result<WebTransportRetentionStats, WebTransportDatagramError> {
@@ -4482,11 +4560,15 @@ pub(super) fn runtime_metadata_upper_bound(
     .checked_add(std::mem::size_of::<WebTransportSessionTerminalOutcome>())?
     .checked_add(MAX_CLOSE_MESSAGE_LEN)?
     .checked_add(std::mem::size_of::<u64>())?;
-    let fixed_session_bytes = std::mem::size_of::<Session>()
+    let fixed_session_bytes =
+        std::mem::size_of::<Session>()
         .checked_add(std::mem::size_of::<SessionWork>())?
         .checked_add(MAX_CLOSE_MESSAGE_LEN)?
         .checked_add(std::mem::size_of::<TerminalRetentionState>())?
         .checked_add(std::mem::size_of::<LiveConnectionSnapshotState>())?
+        // Fixed runtime history; the retained snapshot's growth is included
+        // separately by its own size below.
+        .checked_add(std::mem::size_of::<WebTransportInboundStreamRefusalStats>())?
         .checked_add(std::mem::size_of::<WebTransportRetentionStats>())?;
 
     max_pending_streams
@@ -4508,6 +4590,14 @@ pub(super) fn runtime_metadata_upper_bound(
                 .checked_mul(session_terminal_value_bytes)?,
         )?
         .checked_add(fixed_session_bytes)
+}
+
+pub(super) fn retention_snapshot_value_storage(capacity: usize) -> Option<usize> {
+    // Reserved + queued requests share C slots; one dequeued command can be
+    // executing. Completed response storage is owned only by the caller.
+    capacity.checked_add(1)?.checked_mul(std::mem::size_of::<
+        Result<WebTransportRetentionStats, WebTransportDatagramError>,
+    >())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4761,6 +4851,7 @@ enum SessionWork {
 #[derive(Debug)]
 pub(crate) struct Runtime {
     limits: RuntimeLimits,
+    inbound_stream_refusals: WebTransportInboundStreamRefusalStats,
     reset_mode: quiche::h3::WebTransportStreamResetMode,
     write_lease_accounting: Arc<WriteLeaseAccounting>,
     terminal_retention: Arc<TerminalRetentionState>,
@@ -4903,6 +4994,8 @@ impl Runtime {
             },
             reset_mode:
                 quiche::h3::WebTransportStreamResetMode::ReliablePrefixReset,
+            inbound_stream_refusals:
+                WebTransportInboundStreamRefusalStats::default(),
             write_lease_accounting,
             terminal_retention,
             sessions: BTreeMap::new(),
@@ -5382,7 +5475,7 @@ impl Runtime {
                 }
             },
             Some(SessionClassificationState::Pending) => {
-                if self.can_buffer(stream.session_id) {
+                if self.can_buffer_inbound(stream.session_id) {
                     self.buffer_stream(stream);
                 } else {
                     shutdown_stream(qconn, stream, WT_BUFFERED_STREAM_REJECTED);
@@ -5390,7 +5483,7 @@ impl Runtime {
                 Vec::new()
             },
             Some(SessionClassificationState::AwaitingPeerConnectClose) => {
-                if self.can_buffer(stream.session_id) {
+                if self.can_buffer_inbound(stream.session_id) {
                     self.buffer_stream(stream);
                 } else {
                     shutdown_stream(qconn, stream, WT_BUFFERED_STREAM_REJECTED);
@@ -5404,7 +5497,7 @@ impl Runtime {
             None => {
                 if !self.non_session_requests.contains(&stream.session_id) &&
                     !qconn.stream_closed(stream.session_id) &&
-                    self.can_buffer(stream.session_id)
+                    self.can_buffer_inbound(stream.session_id)
                 {
                     self.buffer_stream(stream);
                 } else {
@@ -5432,57 +5525,102 @@ impl Runtime {
     }
 
     fn can_buffer(&self, session_id: u64) -> bool {
-        self.provisional_stream_count() < self.limits.max_pending_streams &&
-            self.provisional_stream_count_for_session(session_id) <
-                self.limits.max_pending_streams_per_session &&
-            self.active_and_provisional_stream_count() <
-                self.limits.max_active_streams &&
-            self.active_and_provisional_stream_count_for_session(session_id) <
-                self.limits.max_active_streams_per_session
+        self.buffer_refusal(session_id).is_none()
+    }
+
+    fn can_buffer_inbound(&mut self, session_id: u64) -> bool {
+        if let Some(reason) = self.buffer_refusal(session_id) {
+            self.inbound_stream_refusals.record(reason);
+            return false;
+        }
+        true
+    }
+
+    fn buffer_refusal(&self, session_id: u64) -> Option<StreamAdmissionRefusal> {
+        if self.provisional_stream_count() >= self.limits.max_pending_streams {
+            return Some(StreamAdmissionRefusal::ProvisionalConnection);
+        }
+        if self.provisional_stream_count_for_session(session_id) >=
+            self.limits.max_pending_streams_per_session
+        {
+            return Some(StreamAdmissionRefusal::ProvisionalSession);
+        }
+        if self.active_and_provisional_stream_count() >=
+            self.limits.max_active_streams
+        {
+            return Some(StreamAdmissionRefusal::ActiveConnection);
+        }
+        if self.active_and_provisional_stream_count_for_session(session_id) >=
+            self.limits.max_active_streams_per_session
+        {
+            return Some(StreamAdmissionRefusal::ActiveSession);
+        }
+        None
     }
 
     fn can_admit_associated_stream(&mut self, stream: AssociatedStream) -> bool {
-        self.can_admit_owned_stream(OwnedStream::new(
+        let refusal = self.owned_stream_refusal(OwnedStream::new(
             stream.session_id,
             stream.direction,
             0,
             false,
-        ))
+        ));
+        if let Some(reason) = refusal {
+            self.inbound_stream_refusals.record(reason);
+        }
+        refusal.is_none()
     }
 
     fn can_admit_owned_stream(&mut self, stream: OwnedStream) -> bool {
+        self.owned_stream_refusal(stream).is_none()
+    }
+
+    fn owned_stream_refusal(
+        &mut self, stream: OwnedStream,
+    ) -> Option<StreamAdmissionRefusal> {
         if self.stream_sessions.len() + self.reserved_open_ids.len() >=
-            self.limits.max_active_streams ||
-            self.active_stream_count_for_session(stream.session_id) +
-                self.reserved_opens_per_session
-                    .get(&stream.session_id)
-                    .copied()
-                    .unwrap_or(0) >=
-                self.limits.max_active_streams_per_session
+            self.limits.max_active_streams
         {
-            return false;
+            return Some(StreamAdmissionRefusal::ActiveConnection);
         }
-        if !stream.has_receive_direction() {
-            return true;
-        }
-        let available = self.receive_terminal_observations +
-            self.reserved_bidi_opens <
-            self.limits.max_receive_terminal_states &&
-            self.receive_terminal_observations_per_session
+        if self.active_stream_count_for_session(stream.session_id) +
+            self.reserved_opens_per_session
                 .get(&stream.session_id)
                 .copied()
-                .unwrap_or(0) +
-                self.reserved_bidi_opens_per_session
-                    .get(&stream.session_id)
-                    .copied()
-                    .unwrap_or(0) <
-                self.limits.max_receive_terminal_states_per_session;
-        if !available {
+                .unwrap_or(0) >=
+            self.limits.max_active_streams_per_session
+        {
+            return Some(StreamAdmissionRefusal::ActiveSession);
+        }
+        if !stream.has_receive_direction() {
+            return None;
+        }
+        let refusal = if self.receive_terminal_observations +
+            self.reserved_bidi_opens >=
+            self.limits.max_receive_terminal_states
+        {
+            Some(StreamAdmissionRefusal::ReceiveTerminalConnection)
+        } else if self
+            .receive_terminal_observations_per_session
+            .get(&stream.session_id)
+            .copied()
+            .unwrap_or(0) +
+            self.reserved_bidi_opens_per_session
+                .get(&stream.session_id)
+                .copied()
+                .unwrap_or(0) >=
+            self.limits.max_receive_terminal_states_per_session
+        {
+            Some(StreamAdmissionRefusal::ReceiveTerminalSession)
+        } else {
+            None
+        };
+        if refusal.is_some() {
             self.receive_terminal_state_saturation_total = self
                 .receive_terminal_state_saturation_total
                 .saturating_add(1);
         }
-        available
+        refusal
     }
 
     fn active_and_provisional_stream_count(&self) -> usize {
@@ -8650,6 +8788,7 @@ impl Runtime {
         let write_leases = self.write_lease_accounting.snapshot();
 
         let mut stats = WebTransportRetentionStats {
+            inbound_stream_refusals: self.inbound_stream_refusals,
             sessions: self.sessions.len(),
             associated_streams,
             provisional_streams,
@@ -9216,6 +9355,322 @@ mod tests {
         let mut pipe = DriverPipe::with_config_and_buf(&mut config).unwrap();
         pipe.handshake().unwrap();
         pipe
+    }
+
+    fn refusal_limits(reason: StreamAdmissionRefusal) -> RuntimeLimits {
+        let mut limits = runtime_limits(8, 8, 8);
+        match reason {
+            StreamAdmissionRefusal::ActiveConnection =>
+                limits.max_active_streams = 1,
+            StreamAdmissionRefusal::ActiveSession =>
+                limits.max_active_streams_per_session = 1,
+            StreamAdmissionRefusal::ProvisionalConnection =>
+                limits.max_pending_streams = 1,
+            StreamAdmissionRefusal::ProvisionalSession =>
+                limits.max_pending_streams_per_session = 1,
+            StreamAdmissionRefusal::ReceiveTerminalConnection =>
+                limits.max_receive_terminal_states = 1,
+            StreamAdmissionRefusal::ReceiveTerminalSession =>
+                limits.max_receive_terminal_states_per_session = 1,
+        }
+        limits
+    }
+
+    fn expected_refusals(
+        reason: StreamAdmissionRefusal, count: u64,
+    ) -> WebTransportInboundStreamRefusalStats {
+        let mut stats = WebTransportInboundStreamRefusalStats::default();
+        match reason {
+            StreamAdmissionRefusal::ActiveConnection =>
+                stats.active_connection = count,
+            StreamAdmissionRefusal::ActiveSession => stats.active_session = count,
+            StreamAdmissionRefusal::ProvisionalConnection =>
+                stats.provisional_connection = count,
+            StreamAdmissionRefusal::ProvisionalSession =>
+                stats.provisional_session = count,
+            StreamAdmissionRefusal::ReceiveTerminalConnection =>
+                stats.receive_terminal_connection = count,
+            StreamAdmissionRefusal::ReceiveTerminalSession =>
+                stats.receive_terminal_session = count,
+        }
+        stats
+    }
+
+    const REFUSAL_REASONS: [StreamAdmissionRefusal; 6] = [
+        StreamAdmissionRefusal::ActiveConnection,
+        StreamAdmissionRefusal::ActiveSession,
+        StreamAdmissionRefusal::ProvisionalConnection,
+        StreamAdmissionRefusal::ProvisionalSession,
+        StreamAdmissionRefusal::ReceiveTerminalConnection,
+        StreamAdmissionRefusal::ReceiveTerminalSession,
+    ];
+
+    #[test]
+    fn inbound_refusal_classifications_count_exact_native_decisions() {
+        for direction in [
+            WebTransportStreamDirection::Bidi,
+            WebTransportStreamDirection::Uni,
+        ] {
+            for reason in REFUSAL_REASONS {
+                for buffering in [false, true] {
+                    if matches!(
+                        reason,
+                        StreamAdmissionRefusal::ProvisionalConnection |
+                            StreamAdmissionRefusal::ProvisionalSession
+                    ) && !buffering ||
+                        matches!(
+                            reason,
+                            StreamAdmissionRefusal::ReceiveTerminalConnection |
+                                StreamAdmissionRefusal::ReceiveTerminalSession
+                        ) && buffering
+                    {
+                        continue;
+                    }
+                    let mut pipe = pipe();
+                    let mut runtime = Runtime::new(refusal_limits(reason));
+                    // Pending and not-yet-observed sessions use the same
+                    // capacity decision. Exercise the pending form here.
+                    if buffering {
+                        runtime.observe_request(0, true);
+                    } else {
+                        activate_session(&mut runtime, 0);
+                    }
+                    let first = if direction == WebTransportStreamDirection::Bidi
+                    {
+                        4
+                    } else {
+                        2
+                    };
+                    for n in 0..3 {
+                        let id = first + n * 4;
+                        pipe.client.stream_send(id, b"fresh", false).unwrap();
+                        pipe.advance().unwrap();
+                        let association = AssociatedStream {
+                            direction,
+                            ..stream(0, id)
+                        };
+                        let events =
+                            runtime.classify(association, &mut pipe.server);
+                        assert_eq!(
+                            events.len(),
+                            usize::from(n == 0 && !buffering)
+                        );
+                        assert_eq!(
+                            runtime
+                                .retention_stats(Some(&pipe.server), 0)
+                                .inbound_stream_refusals,
+                            expected_refusals(reason, n),
+                            "{reason:?} buffering={buffering}"
+                        );
+                        if n == 0 {
+                            // Re-observing an already owned/buffered stream is
+                            // not another native admission decision.
+                            assert!(runtime
+                                .classify(association, &mut pipe.server)
+                                .is_empty());
+                        } else {
+                            pipe.advance().unwrap();
+                            assert_eq!(
+                                pipe.client.stream_capacity(id),
+                                Err(quiche::Error::StreamStopped(
+                                    WT_BUFFERED_STREAM_REJECTED
+                                ))
+                            );
+                        }
+                    }
+                    runtime.clear();
+                    let stats = runtime.retention_stats(None, 0);
+                    assert_eq!(
+                        stats.inbound_stream_refusals,
+                        expected_refusals(reason, 2)
+                    );
+                    assert_eq!(
+                        stats.associated_streams + stats.provisional_streams,
+                        0
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn inbound_refusal_buffered_promotion_uses_active_decision() {
+        for reason in REFUSAL_REASONS.into_iter().filter(|r| {
+            !matches!(
+                r,
+                StreamAdmissionRefusal::ProvisionalConnection |
+                    StreamAdmissionRefusal::ProvisionalSession
+            )
+        }) {
+            let mut pipe = pipe();
+            let mut runtime = Runtime::new(refusal_limits(reason));
+            for id in [4, 8] {
+                pipe.client.stream_send(id, b"x", false).unwrap();
+            }
+            pipe.advance().unwrap();
+            // Unknown-session buffering succeeds before CONNECT. An active
+            // stream takes the relevant capacity before the queued promotion.
+            assert!(runtime.classify(stream(0, 4), &mut pipe.server).is_empty());
+            runtime.observe_request(0, true);
+            runtime.activate(0);
+            assert_eq!(runtime.classify(stream(0, 8), &mut pipe.server).len(), 1);
+            assert_eq!(
+                runtime.inbound_stream_refusals,
+                WebTransportInboundStreamRefusalStats::default()
+            );
+            assert!(runtime.process_work(&mut pipe.server).is_empty());
+            assert_eq!(
+                runtime.inbound_stream_refusals,
+                expected_refusals(reason, 1)
+            );
+            for _ in 0..8 {
+                runtime.process_work(&mut pipe.server);
+            }
+            assert_eq!(
+                runtime.inbound_stream_refusals,
+                expected_refusals(reason, 1)
+            );
+            assert!(runtime.stream_sessions.contains_key(&8));
+        }
+    }
+
+    #[test]
+    fn inbound_refusal_precedence_and_unrelated_controls() {
+        let mut pipe = pipe();
+        for id in [4, 8, 12, 16, 20] {
+            pipe.client.stream_send(id, b"x", false).unwrap();
+        }
+        pipe.advance().unwrap();
+        let mut runtime = Runtime::new(runtime_limits(1, 1, 8));
+        activate_session(&mut runtime, 0);
+        assert_eq!(runtime.classify(stream(0, 4), &mut pipe.server).len(), 1);
+        // All active and observation bounds coincide; active connection wins.
+        runtime.classify(stream(0, 8), &mut pipe.server);
+        let expected =
+            expected_refusals(StreamAdmissionRefusal::ActiveConnection, 1);
+        assert_eq!(runtime.inbound_stream_refusals, expected);
+        assert_eq!(runtime.receive_terminal_state_saturation_total, 0);
+        // Outbound completion and capacity probes must not count as inbound.
+        assert!(!runtime.can_buffer(0));
+        assert!(!runtime.can_admit_owned_stream(OwnedStream::new(
+            0,
+            WebTransportStreamDirection::Bidi,
+            3,
+            true
+        )));
+        assert_eq!(runtime.inbound_stream_refusals, expected);
+        runtime.non_session_requests.insert(16);
+        runtime.classify(stream(16, 12), &mut pipe.server);
+        runtime.terminate(0, WebTransportSessionCloseReason::ConnectionClosed);
+        runtime.classify(stream(0, 16), &mut pipe.server);
+        assert_eq!(runtime.inbound_stream_refusals, expected);
+
+        let mut runtime = Runtime::new(runtime_limits(1, 1, 8));
+        runtime.classify(stream(0, 4), &mut pipe.server);
+        runtime.classify(stream(0, 20), &mut pipe.server);
+        assert_eq!(
+            runtime.inbound_stream_refusals,
+            expected_refusals(StreamAdmissionRefusal::ProvisionalConnection, 1)
+        );
+        // Per-session provisional precedes aggregate active capacity.
+        runtime.limits.max_pending_streams = 8;
+        runtime.classify(stream(0, 8), &mut pipe.server);
+        let mut expected =
+            expected_refusals(StreamAdmissionRefusal::ProvisionalConnection, 1);
+        expected.provisional_session = 1;
+        assert_eq!(runtime.inbound_stream_refusals, expected);
+    }
+
+    #[test]
+    fn inbound_refusal_peer_close_barrier_still_classifies_capacity() {
+        let mut pipe = pipe();
+        let mut runtime = Runtime::new(runtime_limits(1, 1, 8));
+        activate_session(&mut runtime, 0);
+        runtime
+            .begin_local_close(0, CloseCapsule::new(0, String::new()).unwrap());
+        runtime.local_close_committed(0);
+        assert!(runtime.associated_teardown_waiting_for_peer(0));
+        for id in [4, 8] {
+            pipe.client.stream_send(id, b"x", false).unwrap();
+            pipe.advance().unwrap();
+            runtime.classify(stream(0, id), &mut pipe.server);
+        }
+        assert_eq!(runtime.pending_stream_count(), 1);
+        assert_eq!(
+            runtime.inbound_stream_refusals,
+            expected_refusals(StreamAdmissionRefusal::ProvisionalConnection, 1)
+        );
+    }
+
+    #[test]
+    fn inbound_refusal_active_session_and_receive_scope_precedence() {
+        for (active_per_session, expected) in [
+            (1, StreamAdmissionRefusal::ActiveSession),
+            (8, StreamAdmissionRefusal::ReceiveTerminalConnection),
+        ] {
+            let mut pipe = pipe();
+            let mut limits = runtime_limits(8, active_per_session, 8);
+            limits.max_receive_terminal_states = 1;
+            limits.max_receive_terminal_states_per_session = 1;
+            let mut runtime = Runtime::new(limits);
+            activate_session(&mut runtime, 0);
+            for id in [4, 8] {
+                pipe.client.stream_send(id, b"x", false).unwrap();
+                pipe.advance().unwrap();
+                runtime.classify(stream(0, id), &mut pipe.server);
+            }
+            assert_eq!(
+                runtime.inbound_stream_refusals,
+                expected_refusals(expected, 1)
+            );
+            assert_eq!(
+                runtime.receive_terminal_state_saturation_total,
+                u64::from(
+                    expected == StreamAdmissionRefusal::ReceiveTerminalConnection
+                )
+            );
+            // Outbound completion overlaps the legacy observation counter,
+            // but cannot add to the native inbound population.
+            assert!(!runtime.can_admit_owned_stream(OwnedStream::new(
+                0,
+                WebTransportStreamDirection::Bidi,
+                3,
+                true,
+            )));
+            assert_eq!(
+                runtime.inbound_stream_refusals,
+                expected_refusals(expected, 1)
+            );
+            assert_eq!(
+                runtime.receive_terminal_state_saturation_total,
+                2 * u64::from(
+                    expected == StreamAdmissionRefusal::ReceiveTerminalConnection
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn inbound_refusal_overflow_is_explicit_and_history_is_not_ownership() {
+        for reason in REFUSAL_REASONS {
+            let mut stats = expected_refusals(reason, u64::MAX - 1);
+            stats.record(reason);
+            assert_eq!(stats, expected_refusals(reason, u64::MAX));
+            stats.record(reason);
+            let mut expected = expected_refusals(reason, u64::MAX);
+            expected.overflowed = true;
+            assert_eq!(stats, expected);
+            stats.record(reason);
+            assert_eq!(stats, expected);
+            let mut snapshot = WebTransportRetentionStats {
+                inbound_stream_refusals: stats,
+                ..Default::default()
+            };
+            snapshot.settle_terminal(None);
+            assert_eq!(snapshot.inbound_stream_refusals, expected);
+            assert_eq!(snapshot.transport_queued_bytes(), 0);
+            assert_eq!(snapshot.adapter_bytes_upper_bound(), 0);
+        }
     }
 
     fn stream(session_id: u64, stream_id: u64) -> AssociatedStream {

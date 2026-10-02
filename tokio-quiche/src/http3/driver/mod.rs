@@ -150,6 +150,7 @@ pub use self::webtransport::WebTransportDatagramReadyOutcome;
 pub use self::webtransport::WebTransportDatagramSendOperation;
 pub use self::webtransport::WebTransportDatagramSendOutcome;
 pub use self::webtransport::WebTransportDatagramStats;
+pub use self::webtransport::WebTransportInboundStreamRefusalStats;
 pub use self::webtransport::WebTransportLiveConnectionSnapshot;
 pub use self::webtransport::WebTransportLiveConnectionSnapshotOperation;
 pub use self::webtransport::WebTransportLiveConnectionSnapshotOutcome;

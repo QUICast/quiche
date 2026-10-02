@@ -38,6 +38,7 @@ use tokio_quiche::http3::driver::BoundedSelectedWebTransportController;
 use tokio_quiche::http3::driver::BoundedSelectedWebTransportSettings;
 use tokio_quiche::http3::driver::BoundedServerWebTransportController;
 use tokio_quiche::http3::driver::BoundedServerWebTransportEvent;
+use tokio_quiche::http3::driver::WebTransportInboundStreamRefusalStats;
 use tokio_quiche::http3::driver::WebTransportLiveConnectionSnapshotOutcome;
 use tokio_quiche::http3::driver::WebTransportOpenStreamOutcome;
 use tokio_quiche::http3::driver::WebTransportSessionCloseReason;
@@ -973,6 +974,144 @@ async fn open_obligation_udp_retirement_releases_capacity_without_retry() {
             assert!(stats.open_obligation_admitted_total > 0);
         }
     }).await.expect("local open obligation or terminal settlement stalled");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn inbound_refusal_udp_history_preserves_siblings_and_terminal_zero() {
+    timeout(Duration::from_secs(10), async {
+        let mut settings = BoundedSelectedWebTransportSettings::default();
+        let envelope = settings.checked_memory_envelope(
+            tokio_quiche::http3::driver::BoundedWebTransportEndpoint::Server).unwrap();
+        eprintln!("INT139_INBOUND_PRODUCTION_ENVELOPE reply_storage={} dynamic_total={}",
+            envelope.dynamic_components.selected_retention_snapshot_values,
+            envelope.dynamic_components.total);
+        settings.selected.max_active_streams = 16;
+        settings.selected.max_pending_streams = 16;
+        let mut quic = QuicSettings::default();
+        settings.apply_to_quic_settings(&mut quic);
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = socket.local_addr().unwrap();
+        let params = ConnectionParams::new_server(quic, TlsCertificatePaths {
+            cert: TEST_CERT_FILE, private_key: TEST_KEY_FILE, kind: CertificateKind::X509,
+        }, Hooks::default());
+        let mut incoming = listen(vec![socket], params, DefaultMetrics).unwrap().remove(0);
+        let accept = tokio::spawn(async move {
+            let initial = incoming.next().await.unwrap().unwrap();
+            let (driver, mut controller) = ServerH3Driver::new_bounded_selected_webtransport(settings).unwrap();
+            let connection = initial.start(driver);
+            let mut responder = loop {
+                if let BoundedServerWebTransportEvent::ConnectRequested { responder, .. } = controller.recv_event().await.unwrap() {
+                    break responder;
+                }
+            };
+            responder.try_send_response(response_headers(controller.connect_header_limits())).unwrap();
+            assert_matches!(server_session_event(&mut controller).await, WebTransportSessionEvent::Accepted { .. });
+            (controller, connection, responder, incoming)
+        });
+        let client_settings = BoundedSelectedWebTransportSettings::default();
+        let mut quic = QuicSettings::default();
+        client_settings.apply_to_quic_settings(&mut quic);
+        let params = ConnectionParams::new_client(quic, None, Hooks::default());
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        socket.connect(addr).await.unwrap();
+        let (driver, mut client) = ClientH3Driver::new_bounded_selected_webtransport(client_settings).unwrap();
+        let _connection = connect_with_config(Socket::try_from(socket).unwrap(), Some("localhost"), &params, driver).await.unwrap();
+        client.try_connect(139, connect_headers(client.connect_header_limits())).unwrap();
+        assert_matches!(client_session_event(&mut client).await, WebTransportSessionEvent::Accepted { .. });
+        let (mut server, _connection, responder, _listener) = accept.await.unwrap();
+        let selected = server.selected();
+        let peer = client.selected();
+        let claim = selected.terminal_retention_claim();
+        let peer_claim = peer.terminal_retention_claim();
+        let mut siblings = Vec::new();
+        for _ in 0..16 {
+            let id = selected.try_open_stream_obligation(0, WebTransportStreamDirection::Uni).unwrap().await.unwrap().accept().unwrap();
+            assert_matches!(client_session_event(&mut client).await,
+                WebTransportSessionEvent::AssociatedStream { stream_id, .. } if stream_id == id);
+            siblings.push(id);
+        }
+        let before = selected.retention_stats().await.unwrap();
+        assert_eq!(before.associated_streams, 16);
+        assert_eq!(before.inbound_stream_refusals, WebTransportInboundStreamRefusalStats::default());
+        for count in 1..=2 {
+            let id = peer.try_open_stream_obligation(0, WebTransportStreamDirection::Uni).unwrap().await.unwrap().accept().unwrap();
+            assert_matches!(peer.wait_stream_send_terminal(0, id).await,
+                tokio_quiche::http3::driver::WebTransportStreamSendTerminalOutcome::Stopped {
+                    stream_id, wire_error_code: 0x3994_bd84, application_error_code: None,
+                } if stream_id == id);
+            // The exact peer STOP establishes that native classification ran.
+            // No timer or repeated snapshot polling manufactures that boundary.
+            let stats = selected.retention_stats().await.unwrap();
+            assert_eq!(stats.inbound_stream_refusals, WebTransportInboundStreamRefusalStats {
+                active_connection: count, ..WebTransportInboundStreamRefusalStats::default()
+            });
+            assert_eq!(stats.associated_streams, 16);
+            assert_eq!(stats.provisional_streams, before.provisional_streams);
+            assert_eq!(stats.open_obligation_saturation_total, before.open_obligation_saturation_total);
+            assert_eq!(stats.receive_terminal_state_saturation_total, before.receive_terminal_state_saturation_total);
+            assert_matches!(peer.retire_stream_send_terminal(0, id).await,
+                tokio_quiche::http3::driver::WebTransportStreamSendTerminalOutcome::Retired { .. });
+        }
+        {
+            let event = server.recv_event();
+            tokio::pin!(event);
+            assert!(futures::poll!(&mut event).is_pending());
+        }
+        for id in siblings {
+            let expected = format!("fresh sibling {id} after refusal");
+            write_complete(&selected, 0, id, expected.as_bytes(), true).await;
+            peer.wait_stream_readable(0, id).await;
+            let data = assert_matches!(peer.read_stream(0, id, 128).await,
+                WebTransportStreamReadOutcome::Terminal(owner) => owner);
+            assert_eq!(data.data(), expected.as_bytes());
+            assert_eq!(data.terminal(), WebTransportStreamReceiveTerminal::Fin);
+            assert_matches!(peer.retire_stream_receive_terminal(0, id).await,
+                WebTransportStreamReceiveTerminalRetirementOutcome::OutstandingRead { .. });
+            drop(data);
+            assert_matches!(peer.retire_stream_receive_terminal(0, id).await,
+                WebTransportStreamReceiveTerminalRetirementOutcome::Retired { .. });
+            selected.retire_stream_send_terminal(0, id).await;
+        }
+        server.close_session(0, 139, "refusal history".into()).unwrap();
+        assert_matches!(server_session_event(&mut server).await, WebTransportSessionEvent::Terminated { .. });
+        assert_matches!(client_session_event(&mut client).await, WebTransportSessionEvent::Terminated { .. });
+        drop(responder);
+        drop(server);
+        drop(client);
+        for (controller, claim, count) in [(selected, claim, 2), (peer, peer_claim, 0)] {
+            let stats = assert_matches!(controller.wait_terminal_retention(claim).await,
+                WebTransportTerminalRetentionOutcome::Taken(stats) => stats);
+            assert_eq!(stats.inbound_stream_refusals, WebTransportInboundStreamRefusalStats {
+                active_connection: count, ..WebTransportInboundStreamRefusalStats::default()
+            });
+            assert_eq!(stats.sessions, 0);
+            assert_eq!(stats.waiting_open_obligations, 0);
+            assert_eq!(stats.retained_open_handoffs, 0);
+            assert_eq!(stats.stream_open_waiters, 0);
+            assert_eq!(stats.session_terminal_waiters, 0);
+            assert_eq!(stats.send_terminal_waiters, 0);
+            assert_eq!(stats.send_terminal_overloaded_sessions, 0);
+            assert_eq!(stats.receive_terminal_observations, 0);
+            assert_eq!(stats.receive_terminal_waiters, 0);
+            assert_eq!(stats.receive_terminal_bytes, 0);
+            assert_eq!(stats.bounded_client_connect_owners, 0);
+            assert_eq!(stats.metadata_index_entries, 0);
+            assert_eq!(stats.pending_datagrams, 0);
+            assert_eq!(stats.terminal_retention_waiters, 0);
+            assert_eq!(stats.live_connection_snapshot_requests, 0);
+            assert_eq!(stats.queued_commands, 0);
+            assert_eq!(stats.open_obligations, 0);
+            assert_eq!(stats.associated_streams, 0);
+            assert_eq!(stats.provisional_streams, 0);
+            assert_eq!(stats.waiters, 0);
+            assert_eq!(stats.receive_terminal_leases, 0);
+            assert_eq!(stats.send_terminal_states, 0);
+            assert_eq!(stats.receive_terminal_states, 0);
+            assert_eq!(stats.write_leases, 0);
+            assert_eq!(stats.adapter_bytes_upper_bound(), 0);
+            assert_eq!(stats.transport_queued_bytes(), 0);
+        }
+    }).await.expect("inbound refusal or authentic cleanup stalled");
 }
 
 async fn bounded_connect_fin_completion(
