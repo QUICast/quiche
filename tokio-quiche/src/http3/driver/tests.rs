@@ -5,6 +5,8 @@ use assert_matches::assert_matches;
 use super::test_utils::*;
 use super::*;
 
+mod fin_read_wait;
+
 /// Tests for the body receive buffer sizing helper.
 mod body_recv_buf_size {
     use super::*;
@@ -234,6 +236,46 @@ mod client_side_driver {
             .peer
             .send_response(&mut helper.pipe.server, stream_id, &headers, false)
             .unwrap();
+    }
+
+    async fn fin_read_wait_case(delivery: fin_read_wait::Delivery) {
+        for direction in [
+            h3::WebTransportStreamDirection::Unidirectional,
+            h3::WebTransportStreamDirection::Bidirectional,
+        ] {
+            for early_wait in [true, false] {
+                tokio::task::yield_now().await;
+                let mut helper = webtransport_helper();
+                start_webtransport_driver(&mut helper);
+                let (session_id, _body) =
+                    open_pending_webtransport_session(&mut helper, 7);
+                peer_response_status(&mut helper, session_id, 200);
+                helper.advance_and_run_loop().unwrap();
+                fin_read_wait::check(
+                    &mut helper,
+                    session_id,
+                    direction,
+                    delivery,
+                    early_wait,
+                )
+                .await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn fin_read_wait_client_fin_only_control() {
+        fin_read_wait_case(fin_read_wait::Delivery::FinOnly).await;
+    }
+
+    #[tokio::test]
+    async fn fin_read_wait_client_lost_fin() {
+        fin_read_wait_case(fin_read_wait::Delivery::LostFin).await;
+    }
+
+    #[tokio::test]
+    async fn fin_read_wait_client_requeued_tail() {
+        fin_read_wait_case(fin_read_wait::Delivery::RequeuedTail).await;
     }
 
     #[test]
@@ -2072,6 +2114,43 @@ mod server_side_driver {
         accept_pending_webtransport_session(helper, stream_id, &to_client);
 
         (to_client, from_client)
+    }
+
+    async fn fin_read_wait_case(delivery: fin_read_wait::Delivery) {
+        for direction in [
+            h3::WebTransportStreamDirection::Unidirectional,
+            h3::WebTransportStreamDirection::Bidirectional,
+        ] {
+            for early_wait in [true, false] {
+                tokio::task::yield_now().await;
+                let mut helper = webtransport_helper(webtransport_settings());
+                let (_to_client, _from_client) =
+                    accept_webtransport_session(&mut helper);
+                fin_read_wait::check(
+                    &mut helper,
+                    0,
+                    direction,
+                    delivery,
+                    early_wait,
+                )
+                .await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn fin_read_wait_server_fin_only_control() {
+        fin_read_wait_case(fin_read_wait::Delivery::FinOnly).await;
+    }
+
+    #[tokio::test]
+    async fn fin_read_wait_server_lost_fin() {
+        fin_read_wait_case(fin_read_wait::Delivery::LostFin).await;
+    }
+
+    #[tokio::test]
+    async fn fin_read_wait_server_requeued_tail() {
+        fin_read_wait_case(fin_read_wait::Delivery::RequeuedTail).await;
     }
 
     async fn open_server_webtransport_bidi(

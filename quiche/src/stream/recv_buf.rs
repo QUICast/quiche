@@ -127,6 +127,7 @@ impl RecvBuf {
             return Ok(());
         }
 
+        let first_fin = buf.fin() && self.fin_off.is_none();
         if buf.fin() {
             self.fin_off = Some(buf.max_off());
         }
@@ -157,7 +158,13 @@ impl RecvBuf {
             // By this point all spurious empty buffers should have already been
             // discarded, so allowing empty buffers here should be safe.
             if !buf.is_empty() {
-                return Ok(());
+                if !first_fin {
+                    return Ok(());
+                }
+
+                // Duplicate bytes can carry the first FIN. Preserve its
+                // readable marker without retaining the consumed payload.
+                buf = RangeBuf::from(b"", buf.max_off(), true);
             }
         }
 
@@ -266,13 +273,19 @@ impl RecvBuf {
             return Err(Error::StreamReset(self.deliver_reset()));
         }
 
-        while cap > 0 && self.data_is_ready() {
+        while self.data_is_ready() {
             let mut entry = match self.data.first_entry() {
                 Some(entry) => entry,
                 None => break,
             };
 
             let buf = entry.get_mut();
+
+            // An empty FIN marker needs no output capacity, but must be
+            // consumed when EOF is delivered, including on a zero-byte read.
+            if cap == 0 && !buf.is_empty() {
+                break;
+            }
 
             let buf_len = cmp::min(buf.len(), cap);
 
@@ -1187,6 +1200,114 @@ mod tests {
     }
 
     #[rstest]
+    fn empty_fin_zero_read_is_consumed(#[values(true, false)] emit: bool) {
+        let mut recv = RecvBuf::new(8, 8, 8);
+        recv.write(RangeBuf::from(b"", 0, true)).unwrap();
+        assert_emit_discard(&mut recv, emit, 0, 0, true, Some(b""));
+        assert!(!recv.ready());
+        assert!(recv.data.is_empty());
+
+        let mut recv = RecvBuf::new(8, 8, 8);
+        recv.write(RangeBuf::from(b"abc", 0, true)).unwrap();
+        assert_emit_discard(&mut recv, emit, 0, 0, false, Some(b""));
+        assert_eq!(recv.off, 0);
+        assert_eq!(recv.flow_control.consumed(), 0);
+        assert_emit_discard(&mut recv, emit, 3, 3, true, Some(b"abc"));
+        assert!(!recv.ready());
+    }
+
+    #[rstest]
+    fn consumed_tail_first_fin_is_readable(#[values(true, false)] emit: bool) {
+        let mut recv = RecvBuf::new(64, 64, 64);
+        recv.write(RangeBuf::from(b"payload", 0, false)).unwrap();
+        assert_emit_discard(&mut recv, emit, 7, 7, false, Some(b"payload"));
+        assert!(!recv.ready());
+
+        recv.write(RangeBuf::from(b"load", 3, true)).unwrap();
+        assert!(recv.is_fin());
+        assert!(recv.ready(), "the first FIN must remain observable");
+        assert_eq!(recv.readable_len(), 0);
+        assert_eq!(recv.data.len(), 1);
+        assert!(recv.data.values().next().unwrap().data.as_ref().is_empty());
+        assert_eq!(recv.flow_control.consumed(), 7);
+        assert_emit_discard(&mut recv, emit, 0, 0, true, Some(b""));
+        assert!(!recv.ready());
+        assert_eq!(recv.flow_control.consumed(), 7);
+
+        for data in [
+            RangeBuf::from(b"payload", 0, true),
+            RangeBuf::from(b"", 7, true),
+        ] {
+            recv.write(data).unwrap();
+            assert!(!recv.ready(), "duplicate FIN must not resurrect EOF");
+        }
+        assert_eq!(recv.off, 7);
+        assert_eq!(recv.len, 7);
+        assert!(recv.data.is_empty());
+    }
+
+    #[rstest]
+    fn consumed_tail_fin_preserves_gaps_and_partial_reads(
+        #[values(true, false)] emit: bool,
+    ) {
+        let mut recv = RecvBuf::new(64, 64, 64);
+        recv.write(RangeBuf::from(b"abcd", 0, false)).unwrap();
+        assert_emit_discard(&mut recv, emit, 2, 2, false, Some(b"ab"));
+        recv.write(RangeBuf::from(b"gh", 6, false)).unwrap();
+        recv.write(RangeBuf::from(b"fgh", 5, true)).unwrap();
+        assert_emit_discard(&mut recv, emit, 9, 2, false, Some(b"cd"));
+        assert!(!recv.ready());
+        assert!(!recv.is_fin());
+        recv.write(RangeBuf::from(b"cdefg", 2, false)).unwrap();
+        assert_emit_discard(&mut recv, emit, 9, 4, true, Some(b"efgh"));
+        assert!(!recv.ready());
+        assert!(recv.data.is_empty());
+    }
+
+    #[test]
+    fn consumed_tail_fin_keeps_final_size_and_reset_precedence() {
+        let mut recv = RecvBuf::new(8, 8, 8);
+        recv.write(RangeBuf::from(b"payload", 0, false)).unwrap();
+        assert_eq!(recv.emit(&mut [0; 7]), Ok((7, false)));
+        assert_eq!(
+            recv.write(RangeBuf::from(b"load", 2, true)),
+            Err(Error::FinalSize)
+        );
+        assert_eq!(
+            recv.write(RangeBuf::from(b"123456789", 0, true)),
+            Err(Error::FlowControl)
+        );
+        assert_eq!(recv.fin_off, None);
+        assert!(!recv.ready());
+        recv.write(RangeBuf::from(b"payload", 0, true)).unwrap();
+        assert_eq!(
+            recv.write(RangeBuf::from(b"", 8, true)),
+            Err(Error::FinalSize)
+        );
+        recv.reset(42, 7).unwrap();
+        assert_eq!(recv.emit(&mut []), Err(Error::StreamReset(42)));
+        assert!(!recv.ready());
+        recv.write(RangeBuf::from(b"payload", 0, true)).unwrap();
+        assert!(!recv.ready());
+
+        let mut recv = RecvBuf::new(8, 8, 8);
+        recv.write(RangeBuf::from(b"abc", 0, false)).unwrap();
+        assert_eq!(recv.shutdown(), Ok(3));
+        recv.write(RangeBuf::from(b"abc", 0, true)).unwrap();
+        assert!(recv.is_fin());
+        assert!(!recv.ready());
+        assert!(recv.data.is_empty());
+
+        let mut recv = RecvBuf::new(8, 8, 8);
+        recv.write(RangeBuf::from(b"abc", 0, false)).unwrap();
+        recv.reset_at(43, 7, 3).unwrap();
+        recv.write(RangeBuf::from(b"abcdefg", 0, true)).unwrap();
+        assert_eq!(recv.emit(&mut [0; 8]), Ok((3, false)));
+        assert_eq!(recv.emit(&mut []), Err(Error::StreamReset(43)));
+        assert!(!recv.ready());
+    }
+
+    #[rstest]
     fn past_read(#[values(true, false)] emit: bool) {
         let mut recv =
             RecvBuf::new(u64::MAX, DEFAULT_STREAM_WINDOW, DEFAULT_STREAM_WINDOW);
@@ -1216,7 +1337,9 @@ mod tests {
         assert!(recv.write(fourth).is_ok());
         assert_eq!(recv.len, 9);
         assert_eq!(recv.off, 9);
-        assert_eq!(recv.data.len(), 0);
+        assert_eq!(recv.data.len(), 1);
+
+        assert_emit_discard(&mut recv, emit, 1, 0, true, Some(b""));
 
         assert_emit_discard_done(&mut recv, emit);
     }
